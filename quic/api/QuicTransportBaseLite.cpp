@@ -3494,11 +3494,6 @@ void QuicTransportBaseLite::setTransportSettings(
           "ContinuousMemory buffer capacity overflow");
       createBufAccessor(capacity);
     }
-    // TODO: We should let chain based GSO to use bufAccessor in the future as
-    // well.
-    MVCHECK(
-        conn_->bufAccessor ||
-        transportSettings.dataPathType != DataPathType::ContinuousMemory);
     conn_->transportSettings = std::move(transportSettings);
     if (conn_->transportSettings.advertiseSconeSupport ||
         conn_->transportSettings.enableSconeSend) {

@@ -272,6 +272,11 @@ void QuicServerTransport::configureForAccept(ServerAcceptParams&& params) {
 }
 
 void QuicServerTransport::accept(folly::Optional<QuicVersion> quicVersion) {
+  // TODO: We should let chain based GSO to use bufAccessor in the future as
+  // well.
+  MVCHECK(
+      conn_->bufAccessor ||
+      conn_->transportSettings.dataPathType != DataPathType::ContinuousMemory);
   registerAllTransportKnobParamHandlers();
   setIdleTimer();
   updateFlowControlStateWithSettings(
