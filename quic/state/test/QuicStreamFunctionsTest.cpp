@@ -131,6 +131,10 @@ BufPtr makeOneByteBuffer(size_t capacity, uint8_t value = 'x') {
   return buffer;
 }
 
+size_t combinedCapacity(size_t capacity) {
+  return IOBuf::goodSize(capacity, IOBuf::CombinedOption::COMBINED);
+}
+
 TEST_F(QuicStreamFunctionsTestBase, TestCreateBidirectionalStream) {
   const auto stream =
       conn.streamManager->createNextBidirectionalStream().value();
@@ -2949,7 +2953,9 @@ TEST_F(
   EXPECT_EQ(shape.ranges, 1);
   EXPECT_LE(shape.chainElements, 2);
   EXPECT_EQ(shape.payloadBytes, kFragments);
-  EXPECT_LE(shape.retainedCapacity, kReadBufferCoalescingSize + 1);
+  EXPECT_LE(
+      shape.retainedCapacity,
+      combinedCapacity(kReadBufferCoalescingSize) + combinedCapacity(1));
   EXPECT_EQ(stream->currentReadOffset, 0);
   EXPECT_EQ(stream->maxOffsetObserved, 33);
 }
@@ -3036,17 +3042,18 @@ TEST_F(
     }
 
     const auto prefixBytes = 2 * gapFills;
+    const auto prefixBlocks = (prefixBytes + kReadBufferCoalescingSize - 1) /
+        kReadBufferCoalescingSize;
     const auto shape = readBufferShape(*stream);
     EXPECT_EQ(shape.payloadBytes, expectedBytes.size());
-    EXPECT_LE(
-        shape.chainElements,
-        kSuffixElements +
-            (prefixBytes + kReadBufferCoalescingSize - 1) /
-                kReadBufferCoalescingSize);
+    EXPECT_LE(shape.chainElements, kSuffixElements + prefixBlocks);
     EXPECT_LE(
         shape.retainedCapacity,
         kSuffixElements * kBackingCapacity + prefixBytes +
-            kReadBufferCoalescingSize);
+            kReadBufferCoalescingSize +
+            prefixBlocks *
+                (combinedCapacity(kReadBufferCoalescingSize) -
+                 kReadBufferCoalescingSize));
     EXPECT_LE(releasedSuffixElements, 1);
     EXPECT_EQ(
         stream->readBuffer.front().data.chainLength(),
@@ -3266,7 +3273,9 @@ TEST_F(
   const auto shape = readBufferShape(*stream);
   EXPECT_EQ(shape.ranges, 1);
   EXPECT_LE(shape.chainElements, 2);
-  EXPECT_LE(shape.retainedCapacity, kReadBufferCoalescingSize + 1);
+  EXPECT_LE(
+      shape.retainedCapacity,
+      combinedCapacity(kReadBufferCoalescingSize) + combinedCapacity(1));
   const auto* const head = stream->readBuffer.front().data.front();
   ASSERT_NE(head, nullptr);
   const auto* current = head;
