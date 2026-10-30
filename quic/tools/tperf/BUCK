@@ -29,6 +29,24 @@ mvfst_cpp_library(
 )
 
 mvfst_cpp_library(
+    name = "tperf_huge_page_arena",
+    srcs = [
+        "TperfHugePageArena.cpp",
+    ],
+    headers = [
+        "TperfHugePageArena.h",
+    ],
+    deps = [
+        "fbsource//xplat/folly:string",
+        "fbsource//xplat/folly/lang:bits",
+        "//quic/common:mvfst_logging",
+    ],
+    exported_deps = [
+        "fbsource//xplat/folly:cpp_attributes",
+    ],
+)
+
+mvfst_cpp_library(
     name = "tperf_server",
     srcs = [
         "TperfServer.cpp",
@@ -50,6 +68,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/io/async:async_udp_socket",
+        ":tperf_huge_page_arena",
         "//quic/api:quic_batch_writer",
         "//quic/common:mvfst_logging",
         "//quic/logging:file_qlogger",

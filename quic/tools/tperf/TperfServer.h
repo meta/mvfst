@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include <quic/server/QuicServerTransport.h>
 #include <quic/server/QuicSharedUDPSocketFactory.h>
 #include <quic/server/ThreadedQuicServer.h>
+#include <quic/tools/tperf/TperfHugePageArena.h>
 
 namespace quic::tperf {
 
@@ -53,17 +55,29 @@ class TPerfWriteStats {
   };
 
   void recordWrite(const WriteSample& sample) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    writeCalls_++;
-    totalDurationUs_ += sample.durationUs;
-    maxDurationUs_ = std::max(maxDurationUs_, sample.durationUs);
+    writeCalls_.fetch_add(1, std::memory_order_relaxed);
+    totalDurationUs_.fetch_add(sample.durationUs, std::memory_order_relaxed);
+    // Atomic max via CAS loop.
+    uint64_t prevMax = maxDurationUs_.load(std::memory_order_relaxed);
+    while (sample.durationUs > prevMax &&
+           !maxDurationUs_.compare_exchange_weak(
+               prevMax,
+               sample.durationUs,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    totalBufferedPackets_.fetch_add(
+        sample.bufferedPackets, std::memory_order_relaxed);
+    totalBufferedBytes_.fetch_add(
+        sample.bufferedBytes, std::memory_order_relaxed);
+    durationBuckets_[durationBucket(sample.durationUs)].fetch_add(
+        1, std::memory_order_relaxed);
     if (sample.ret < 0) {
-      writeErrors_++;
+      // Rare path: writeErrnos_ map still needs mutex.
+      writeErrors_.fetch_add(1, std::memory_order_relaxed);
+      std::scoped_lock lock(mutex_);
       writeErrnos_[sample.errnoValue]++;
     }
-    totalBufferedPackets_ += sample.bufferedPackets;
-    totalBufferedBytes_ += sample.bufferedBytes;
-    durationBuckets_[durationBucket(sample.durationUs)]++;
   }
 
   // Snapshot of the per-listener-fd MSG_ZEROCOPY kernel counters exposed by
@@ -119,35 +133,55 @@ class TPerfWriteStats {
     uint64_t udpZerocopyInplacePoolAllocationsSnap{};
     uint64_t udpZerocopyInplacePoolReleasesSnap{};
     uint64_t udpZerocopyInplaceOutstandingSlabsSnap{};
+    uint64_t udpZerocopyHugepageHeapFallbacksSnap{};
+    bool hugepageArenaValidSnap{};
+    HugePageArenaInfo hugepageArenaSnap;
     bool listenerKernelSnapshotValidSnap{};
     uint64_t listenerKernelCompletionsZcSnap{};
     uint64_t listenerKernelCompletionsCopiedSnap{};
     uint64_t listenerKernelSendsAckedZcSnap{};
     uint64_t listenerKernelSendsAckedMaybeCopiedSnap{};
     bool listenerKernelZeroCopyEnabledSnap{};
+    // Hot counters are atomic — load them without holding mutex_.
+    writeCallsSnap = writeCalls_.load(std::memory_order_relaxed);
+    if (writeCallsSnap == 0 || writeCallsSnap == lastLoggedWriteCalls_) {
+      return;
+    }
+    lastLoggedWriteCalls_ = writeCallsSnap;
+    writeErrorsSnap = writeErrors_.load(std::memory_order_relaxed);
+    totalBufferedPacketsSnap =
+        totalBufferedPackets_.load(std::memory_order_relaxed);
+    totalBufferedBytesSnap =
+        totalBufferedBytes_.load(std::memory_order_relaxed);
+    maxDurationUsSnap = maxDurationUs_.load(std::memory_order_relaxed);
+    avgDurationUs =
+        totalDurationUs_.load(std::memory_order_relaxed) / writeCallsSnap;
+    for (size_t i = 0; i < durationBuckets_.size(); ++i) {
+      durationBucketsSnap[i] =
+          durationBuckets_[i].load(std::memory_order_relaxed);
+    }
+    udpZerocopyInplaceZcSendsSnap =
+        udpZerocopyInplaceZcSends_.load(std::memory_order_relaxed);
+    udpZerocopyInplaceFallbackSendsSnap =
+        udpZerocopyInplaceFallbackSends_.load(std::memory_order_relaxed);
+    udpZerocopyInplaceZcFailedSendsSnap =
+        udpZerocopyInplaceZcFailedSends_.load(std::memory_order_relaxed);
+    udpZerocopyInplacePoolAcquiresSnap =
+        udpZerocopyInplacePoolAcquires_.load(std::memory_order_relaxed);
+    udpZerocopyInplacePoolAllocationsSnap =
+        udpZerocopyInplacePoolAllocations_.load(std::memory_order_relaxed);
+    udpZerocopyInplacePoolReleasesSnap =
+        udpZerocopyInplacePoolReleases_.load(std::memory_order_relaxed);
+    udpZerocopyInplaceOutstandingSlabsSnap =
+        udpZerocopyInplaceOutstandingSlabs_.load(std::memory_order_relaxed);
+    udpZerocopyHugepageHeapFallbacksSnap =
+        udpZerocopyHugepageHeapFallbacks_.load(std::memory_order_relaxed);
     {
+      // Mutex only for grouped-update fields + errno maps.
       std::lock_guard<std::mutex> lock(mutex_);
-      if (writeCalls_ == 0 || writeCalls_ == lastLoggedWriteCalls_) {
-        return;
-      }
-      lastLoggedWriteCalls_ = writeCalls_;
-      writeCallsSnap = writeCalls_;
-      writeErrorsSnap = writeErrors_;
-      totalBufferedPacketsSnap = totalBufferedPackets_;
-      totalBufferedBytesSnap = totalBufferedBytes_;
-      maxDurationUsSnap = maxDurationUs_;
-      avgDurationUs = totalDurationUs_ / writeCalls_;
-      durationBucketsSnap = durationBuckets_;
       writeErrnosSnap = writeErrnos_;
-      udpZerocopyInplaceZcSendsSnap = udpZerocopyInplaceZcSends_;
-      udpZerocopyInplaceFallbackSendsSnap = udpZerocopyInplaceFallbackSends_;
-      udpZerocopyInplaceZcFailedSendsSnap = udpZerocopyInplaceZcFailedSends_;
-      udpZerocopyInplacePoolAcquiresSnap = udpZerocopyInplacePoolAcquires_;
-      udpZerocopyInplacePoolAllocationsSnap =
-          udpZerocopyInplacePoolAllocations_;
-      udpZerocopyInplacePoolReleasesSnap = udpZerocopyInplacePoolReleases_;
-      udpZerocopyInplaceOutstandingSlabsSnap =
-          udpZerocopyInplaceOutstandingSlabs_;
+      hugepageArenaValidSnap = hugepageArenaValid_;
+      hugepageArenaSnap = hugepageArena_;
       listenerKernelSnapshotValidSnap = listenerKernelSnapshotValid_;
       listenerKernelCompletionsZcSnap = listenerKernelCompletionsZc_;
       listenerKernelCompletionsCopiedSnap = listenerKernelCompletionsCopied_;
@@ -186,6 +220,19 @@ class TPerfWriteStats {
                        << " udp_zc_inplace_outstanding_slabs="
                        << udpZerocopyInplaceOutstandingSlabsSnap;
     }
+    std::ostringstream hugepageStats;
+    if (hugepageArenaValidSnap) {
+      hugepageStats << " udp_zc_hugepage_mode=" << hugepageArenaSnap.mode
+                    << " udp_zc_hugepage_arena_bytes="
+                    << hugepageArenaSnap.arenaBytes
+                    << " udp_zc_hugepage_slab_stride="
+                    << hugepageArenaSnap.slabStride
+                    << " udp_zc_hugepage_slabs=" << hugepageArenaSnap.slabs
+                    << " udp_zc_hugepage_backed_kb="
+                    << hugepageArenaSnap.backedKb
+                    << " udp_zc_hugepage_heap_fallbacks="
+                    << udpZerocopyHugepageHeapFallbacksSnap;
+    }
     std::ostringstream kernelStats;
     if (listenerKernelSnapshotValidSnap) {
       kernelStats << " udp_zc_kernel_completions_zc="
@@ -206,7 +253,8 @@ class TPerfWriteStats {
                << " avg_us=" << avgDurationUs << " max_us=" << maxDurationUsSnap
                << " duration_us={" << durationHist.str() << "}"
                << " errno={" << formatErrnos(writeErrnosSnap) << "}"
-               << udpZerocopyStats.str() << kernelStats.str();
+               << udpZerocopyStats.str() << hugepageStats.str()
+               << kernelStats.str();
   }
 
   // Records a single batch sent by UdpGsoZerocopyInplaceBatchWriter. Exactly
@@ -215,15 +263,14 @@ class TPerfWriteStats {
       bool zcSend,
       bool fallbackSend,
       bool zcFailedSend) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (zcSend) {
-      udpZerocopyInplaceZcSends_++;
+      udpZerocopyInplaceZcSends_.fetch_add(1, std::memory_order_relaxed);
     }
     if (fallbackSend) {
-      udpZerocopyInplaceFallbackSends_++;
+      udpZerocopyInplaceFallbackSends_.fetch_add(1, std::memory_order_relaxed);
     }
     if (zcFailedSend) {
-      udpZerocopyInplaceZcFailedSends_++;
+      udpZerocopyInplaceZcFailedSends_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -232,66 +279,96 @@ class TPerfWriteStats {
   // an in-flight slab back to the idle list after the bookkeeping fires the
   // ReleaseIOBufCallback.
   void recordUdpZerocopyInplacePoolAcquire(bool reused) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    udpZerocopyInplacePoolAcquires_++;
+    udpZerocopyInplacePoolAcquires_.fetch_add(1, std::memory_order_relaxed);
     if (!reused) {
-      udpZerocopyInplacePoolAllocations_++;
+      udpZerocopyInplacePoolAllocations_.fetch_add(
+          1, std::memory_order_relaxed);
     }
-    udpZerocopyInplaceOutstandingSlabs_++;
+    udpZerocopyInplaceOutstandingSlabs_.fetch_add(1, std::memory_order_relaxed);
   }
 
   void recordUdpZerocopyInplacePoolRelease() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    udpZerocopyInplacePoolReleases_++;
-    if (udpZerocopyInplaceOutstandingSlabs_ > 0) {
-      udpZerocopyInplaceOutstandingSlabs_--;
+    udpZerocopyInplacePoolReleases_.fetch_add(1, std::memory_order_relaxed);
+    // Saturating decrement via CAS: never underflow.
+    uint64_t cur =
+        udpZerocopyInplaceOutstandingSlabs_.load(std::memory_order_relaxed);
+    while (cur > 0 &&
+           !udpZerocopyInplaceOutstandingSlabs_.compare_exchange_weak(
+               cur,
+               cur - 1,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
     }
+  }
+
+  // One-time description of a worker's huge-page slab arena, published by
+  // TperfHugePageArena once it has mmap'd and pre-faulted its region.
+  //
+  // Last-writer-wins across workers, like the listener kernel snapshot: every
+  // worker's arena is configured identically, so the published record is
+  // representative rather than aggregate. `backedKb` is per-worker.
+  void recordUdpZerocopyHugepageArena(const HugePageArenaInfo& info) {
+    std::scoped_lock lock(mutex_);
+    hugepageArena_ = info;
+    hugepageArenaValid_ = true;
+  }
+
+  // A slab request that the arena could not satisfy and that fell back to a
+  // malloc'd (4K-backed) slab. Non-zero means the column is no longer a pure
+  // huge-page measurement — size up --udp_zerocopy_hugepage_bytes.
+  void recordUdpZerocopyHugepageHeapFallback() {
+    udpZerocopyHugepageHeapFallbacks_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  HugePageArenaInfo getUdpZerocopyHugepageArenaForTest() {
+    std::scoped_lock lock(mutex_);
+    return hugepageArena_;
+  }
+
+  bool getUdpZerocopyHugepageArenaValidForTest() {
+    std::scoped_lock lock(mutex_);
+    return hugepageArenaValid_;
+  }
+
+  uint64_t getUdpZerocopyHugepageHeapFallbacksForTest() {
+    return udpZerocopyHugepageHeapFallbacks_.load(std::memory_order_relaxed);
   }
 
   // Test-only accessors.
   uint64_t getUdpZerocopyInplacePoolAcquiresForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return udpZerocopyInplacePoolAcquires_;
+    return udpZerocopyInplacePoolAcquires_.load(std::memory_order_relaxed);
   }
 
   uint64_t getUdpZerocopyInplacePoolReleasesForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return udpZerocopyInplacePoolReleases_;
+    return udpZerocopyInplacePoolReleases_.load(std::memory_order_relaxed);
   }
 
   uint64_t getUdpZerocopyInplaceOutstandingSlabsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return udpZerocopyInplaceOutstandingSlabs_;
+    return udpZerocopyInplaceOutstandingSlabs_.load(std::memory_order_relaxed);
   }
 
   uint64_t getWriteCallsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return writeCalls_;
+    return writeCalls_.load(std::memory_order_relaxed);
   }
 
   uint64_t getWriteErrorsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return writeErrors_;
+    return writeErrors_.load(std::memory_order_relaxed);
   }
 
   uint64_t getTotalBufferedPacketsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return totalBufferedPackets_;
+    return totalBufferedPackets_.load(std::memory_order_relaxed);
   }
 
   uint64_t getTotalBufferedBytesForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return totalBufferedBytes_;
+    return totalBufferedBytes_.load(std::memory_order_relaxed);
   }
 
   uint64_t getMaxDurationUsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return maxDurationUs_;
+    return maxDurationUs_.load(std::memory_order_relaxed);
   }
 
   uint64_t getTotalDurationUsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return totalDurationUs_;
+    return totalDurationUs_.load(std::memory_order_relaxed);
   }
 
   uint64_t getWriteErrnoCountForTest(int err) {
@@ -306,18 +383,15 @@ class TPerfWriteStats {
   }
 
   uint64_t getUdpZerocopyInplaceZcSendsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return udpZerocopyInplaceZcSends_;
+    return udpZerocopyInplaceZcSends_.load(std::memory_order_relaxed);
   }
 
   uint64_t getUdpZerocopyInplaceFallbackSendsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return udpZerocopyInplaceFallbackSends_;
+    return udpZerocopyInplaceFallbackSends_.load(std::memory_order_relaxed);
   }
 
   uint64_t getUdpZerocopyInplaceZcFailedSendsForTest() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return udpZerocopyInplaceZcFailedSends_;
+    return udpZerocopyInplaceZcFailedSends_.load(std::memory_order_relaxed);
   }
 
   ListenerKernelSnapshot getListenerKernelSnapshotForTest() {
@@ -400,26 +474,41 @@ class TPerfWriteStats {
       "1000_5000",
       "gte5000"};
 
+  // Hot-path counters are std::atomic so the per-batch record methods
+  // (called O(500K/s) combined across 8 workers during ZC saturation) do
+  // not serialize on mutex_. mutex_ now only guards fields that update in
+  // groups (listener kernel snapshot) or are rare-path maps (errno
+  // histograms), plus the single-threaded lastLoggedWriteCalls_ read/write
+  // in maybeLog. Prior single-mutex design produced ~3.7M/s lock acquires
+  // on the inplace ZC pool path and was the dominant CPU cost in the
+  // 2026-07-24 matrix.
   std::mutex mutex_;
-  uint64_t writeCalls_{0};
-  uint64_t lastLoggedWriteCalls_{0};
-  uint64_t writeErrors_{0};
-  std::map<int, uint64_t> writeErrnos_;
-  uint64_t totalDurationUs_{0};
-  uint64_t maxDurationUs_{0};
-  uint64_t totalBufferedPackets_{0};
-  uint64_t totalBufferedBytes_{0};
-  std::array<uint64_t, 12> durationBuckets_{};
-  uint64_t udpZerocopyInplaceZcSends_{0};
-  uint64_t udpZerocopyInplaceFallbackSends_{0};
-  uint64_t udpZerocopyInplaceZcFailedSends_{0};
-  uint64_t udpZerocopyInplacePoolAcquires_{0};
-  uint64_t udpZerocopyInplacePoolAllocations_{0};
-  uint64_t udpZerocopyInplacePoolReleases_{0};
-  uint64_t udpZerocopyInplaceOutstandingSlabs_{0};
+  std::atomic<uint64_t> writeCalls_{0};
+  uint64_t lastLoggedWriteCalls_{0}; // maybeLog only (single-threaded)
+  std::atomic<uint64_t> writeErrors_{0};
+  std::map<int, uint64_t> writeErrnos_; // guarded by mutex_
+  std::atomic<uint64_t> totalDurationUs_{0};
+  std::atomic<uint64_t> maxDurationUs_{0}; // updated via CAS-max
+  std::atomic<uint64_t> totalBufferedPackets_{0};
+  std::atomic<uint64_t> totalBufferedBytes_{0};
+  std::array<std::atomic<uint64_t>, 12> durationBuckets_{};
+  std::atomic<uint64_t> udpZerocopyInplaceZcSends_{0};
+  std::atomic<uint64_t> udpZerocopyInplaceFallbackSends_{0};
+  std::atomic<uint64_t> udpZerocopyInplaceZcFailedSends_{0};
+  std::atomic<uint64_t> udpZerocopyInplacePoolAcquires_{0};
+  std::atomic<uint64_t> udpZerocopyInplacePoolAllocations_{0};
+  std::atomic<uint64_t> udpZerocopyInplacePoolReleases_{0};
+  std::atomic<uint64_t> udpZerocopyInplaceOutstandingSlabs_{0};
+  // Huge-page slab arena description (grouped update under mutex_) plus the
+  // heap-fallback counter for slabs the arena could not back.
+  bool hugepageArenaValid_{false};
+  HugePageArenaInfo hugepageArena_;
+  std::atomic<uint64_t> udpZerocopyHugepageHeapFallbacks_{0};
   // Listener-fd MSG_ZEROCOPY kernel counter snapshot (from
   // folly::AsyncUDPSocket accessors). Updated by TPerfServer via
-  // recordListenerZeroCopySnapshot before each maybeLog emission.
+  // recordListenerZeroCopySnapshot before each maybeLog emission. These
+  // five fields are updated as a group under mutex_ so readers see a
+  // consistent snapshot.
   bool listenerKernelSnapshotValid_{false};
   uint64_t listenerKernelCompletionsZc_{0};
   uint64_t listenerKernelCompletionsCopied_{0};
@@ -442,6 +531,29 @@ struct TPerfUdpGsoZerocopyConfig {
   // installed by QuicServerWorker calls our release callback when the kernel
   // completion fires, returning the slab to the pool.
   bool inplace{false};
+  // When false, the ZC path skips every per-write stats update (latency
+  // timing, shared atomic counters, the mutex-guarded listener snapshot) so
+  // its CPU cost is comparable with --tx_backend=udp, which records none.
+  bool perWriteStats{true};
+  // When true, slabs are carved out of a per-worker 2MB-huge-page arena
+  // instead of folly::IOBuf::createCombined (malloc). Everything else about
+  // the send path is identical to the plain inplace backend, so the two
+  // backends isolate exactly one variable: the page size backing the
+  // MSG_ZEROCOPY payload.
+  //
+  // Two effects are expected. (1) The kernel coalesces compound sub-pages
+  // into a single skb frag in zerocopy_fill_skb_from_iter() and batches the
+  // folio refcount adds, so a 64KB batch inside one 2MB page produces 1 frag
+  // and ~2 refcount atomics instead of 16 frags and ~32 atomics — which also
+  // collapses the per-send dma_map_page_attrs count by the same factor.
+  // (2) A 2MB folio's _refcount is one cacheline shared by all 512
+  // sub-pages, so arenas MUST be per-worker: two workers allocating from one
+  // huge page would true-share that line. thread_local arenas give us that
+  // for free.
+  bool hugePages{false};
+  // Per-worker huge-page arena size. Caps the number of live slabs a worker
+  // can have to `hugePageBytes / slabStride` regardless of poolBuffers.
+  uint64_t hugePageBytes{64ULL * 1024 * 1024};
 };
 
 } // namespace quic::tperf

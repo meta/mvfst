@@ -154,10 +154,14 @@ DEFINE_string(
 DEFINE_string(
     tx_backend,
     "udp",
-    "Server-side UDP TX backend: 'udp' (default) or 'udp_gso_zerocopy_inplace'. "
-    "The inplace MSG_ZEROCOPY backend requires --use_inplace_write and --gso; "
-    "mvfst encrypts directly into pool-borrowed slabs that the kernel zerocopies, "
-    "with per-fd completion bookkeeping returning slabs to the pool.");
+    "Server-side UDP TX backend: 'udp' (default), 'udp_gso_zerocopy_inplace', "
+    "or 'udp_gso_zerocopy_hugepage'. The inplace MSG_ZEROCOPY backend requires "
+    "--use_inplace_write and --gso; mvfst encrypts directly into pool-borrowed "
+    "slabs that the kernel zerocopies, with per-fd completion bookkeeping "
+    "returning slabs to the pool. The hugepage backend is the inplace backend "
+    "with one variable changed: slabs come from a per-worker 2MB-huge-page "
+    "arena instead of malloc, so the kernel coalesces each batch into a "
+    "single skb frag and one batched folio refcount add.");
 DEFINE_uint64(
     udp_zerocopy_min_bytes,
     1500,
@@ -169,10 +173,26 @@ DEFINE_uint32(
     "Cap on the number of slab IOBufs the inplace MSG_ZEROCOPY pool will allocate. "
     "When exhausted, the writer falls back to plain GSO until the kernel "
     "completes outstanding sends and returns slabs to the idle list.");
+DEFINE_bool(
+    udp_zerocopy_write_stats,
+    true,
+    "Record per-write stats (latency timing, shared counters, kernel ZC "
+    "snapshot) on the inplace/hugepage MSG_ZEROCOPY backends. The 'udp' "
+    "backend records none, so set this to false when comparing CPU cost "
+    "against it. The one-off huge-page arena report is kept either way.");
 DEFINE_string(
     jks_to_patch,
     "",
     "Comma-separated boolean JustKnobs to force true for this process");
+DEFINE_uint64(
+    udp_zerocopy_hugepage_bytes,
+    64ULL * 1024 * 1024,
+    "Per-worker huge-page arena size in bytes for "
+    "--tx_backend=udp_gso_zerocopy_hugepage. Rounded up to a 2MB multiple. "
+    "Caps live slabs per worker at arena_bytes / slab_stride regardless of "
+    "--udp_zerocopy_pool_buffers; when the arena runs dry the writer falls "
+    "back to malloc'd slabs and bumps udp_zc_hugepage_heap_fallbacks, which "
+    "means the run is no longer a pure huge-page measurement.");
 
 namespace quic::tperf {
 
@@ -333,7 +353,13 @@ int main(int argc, char* argv[]) {
     TPerfUdpGsoZerocopyConfig udpGsoZerocopyConfig;
     if (FLAGS_tx_backend == "udp") {
       // Default backend: no override, plain GSO writer.
-    } else if (FLAGS_tx_backend == "udp_gso_zerocopy_inplace") {
+    } else if (
+        FLAGS_tx_backend == "udp_gso_zerocopy_inplace" ||
+        FLAGS_tx_backend == "udp_gso_zerocopy_hugepage") {
+      // Both zerocopy backends run the exact same writer and send path; the
+      // hugepage variant only swaps the slab allocator underneath it, which
+      // is what makes the two comparable as adjacent matrix columns.
+      const bool hugePages = FLAGS_tx_backend == "udp_gso_zerocopy_hugepage";
       // The inplace MSG_ZEROCOPY writer hijacks conn.bufAccessor which only
       // exists when mvfst's ContinuousMemory data path is enabled. That data
       // path requires both --use_inplace_write and --gso (see TPerfServer
@@ -342,9 +368,15 @@ int main(int argc, char* argv[]) {
       // back to the default writer and pretending --tx_backend was honored.
       if (!FLAGS_use_inplace_write || !FLAGS_gso) {
         MVLOG_ERROR
-            << "--tx_backend=udp_gso_zerocopy_inplace requires both "
+            << "--tx_backend=" << FLAGS_tx_backend << " requires both "
             << "--use_inplace_write=true and --gso=true (got use_inplace_write="
             << FLAGS_use_inplace_write << ", gso=" << FLAGS_gso << ")";
+        return 1;
+      }
+      if (hugePages && FLAGS_udp_zerocopy_hugepage_bytes == 0) {
+        MVLOG_ERROR
+            << "--udp_zerocopy_hugepage_bytes=0 is not allowed; "
+            << "set it to a positive size or omit the flag for the default.";
         return 1;
       }
       // --udp_zerocopy_pool_buffers=0 used to be silently ignored by the
@@ -362,9 +394,13 @@ int main(int argc, char* argv[]) {
       udpGsoZerocopyConfig.inplace = true;
       udpGsoZerocopyConfig.minBytes = FLAGS_udp_zerocopy_min_bytes;
       udpGsoZerocopyConfig.poolBuffers = FLAGS_udp_zerocopy_pool_buffers;
+      udpGsoZerocopyConfig.hugePages = hugePages;
+      udpGsoZerocopyConfig.hugePageBytes = FLAGS_udp_zerocopy_hugepage_bytes;
+      udpGsoZerocopyConfig.perWriteStats = FLAGS_udp_zerocopy_write_stats;
     } else {
       MVLOG_ERROR << "Unknown --tx_backend value: " << FLAGS_tx_backend
-                  << " (expected 'udp' or 'udp_gso_zerocopy_inplace')";
+                  << " (expected 'udp', 'udp_gso_zerocopy_inplace', or "
+                  << "'udp_gso_zerocopy_hugepage')";
       return 1;
     }
     TPerfServer server(

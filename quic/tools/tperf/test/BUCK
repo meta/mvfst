@@ -15,6 +15,17 @@ mvfst_cpp_test(
 )
 
 mvfst_cpp_test(
+    name = "TperfHugePageArenaTest",
+    srcs = [
+        "TperfHugePageArenaTest.cpp",
+    ],
+    deps = [
+        "fbsource//xplat/folly/portability:gtest",
+        "//quic/tools/tperf:tperf_huge_page_arena",
+    ],
+)
+
+mvfst_cpp_test(
     name = "TperfWriteStatsTest",
     srcs = [
         "TperfWriteStatsTest.cpp",

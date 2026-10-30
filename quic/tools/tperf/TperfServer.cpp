@@ -20,6 +20,7 @@
 #include <quic/logging/FileQLogger.h>
 #include <quic/logging/oops_logger/GlogOopsLogger.h>
 #include <quic/tools/tperf/PacingObserver.h>
+#include <quic/tools/tperf/TperfHugePageArena.h>
 #include <quic/tools/tperf/TperfServer.h>
 
 #include <array>
@@ -135,6 +136,13 @@ BatchWriterPtr wrapBatchWriterWithTiming(
       new TimingBatchWriter(std::move(batchWriter), writeStats));
 }
 
+// No-op deleter for arena-backed slab IOBufs: the arena owns the memory and
+// outlives every IOBuf wrapping it. Reclaim is explicit, via
+// TperfInplaceZcSlabPool::notifyDroppedSlab, so that it always happens on the
+// owning worker thread — an IOBuf freed by folly on some other thread must
+// not touch the arena's free list.
+void hugePageSlabNoopFree(void* /*buf*/, void* /*userData*/) {}
+
 // Thread-local pool of slab IOBufs reused across MSG_ZEROCOPY sends. mvfst
 // borrows a slab from this pool, encrypts directly into it, and hands
 // ownership to folly's writeChain. The pool implements
@@ -161,6 +169,21 @@ class TperfInplaceZcSlabPool : public folly::AsyncWriter::ReleaseIOBufCallback {
     }
   }
 
+  // Switches fresh-slab allocation from malloc to a per-worker huge-page
+  // arena. Must be called before the first tryAcquireIdle so every slab in
+  // circulation comes from the same allocator.
+  // `arenaStats` receives the one-off arena info and heap-fallback counts
+  // even when per-write stats are disabled: they are what proves a run was
+  // actually huge-page backed.
+  void setHugePages(
+      bool enabled,
+      size_t arenaBytes,
+      std::shared_ptr<TPerfWriteStats> arenaStats) {
+    hugePagesRequested_ = enabled;
+    hugePageArenaBytes_ = arenaBytes;
+    arenaStats_ = std::move(arenaStats);
+  }
+
   BufPtr tryAcquireIdle(
       size_t capacity,
       const std::shared_ptr<TPerfWriteStats>& stats) {
@@ -176,15 +199,18 @@ class TperfInplaceZcSlabPool : public folly::AsyncWriter::ReleaseIOBufCallback {
       }
       return buf;
     }
-    if (totalAllocated_ < maxSlabs_) {
-      auto buf = folly::IOBuf::createCombined(slabCapacity_);
-      ++totalAllocated_;
-      if (stats) {
-        stats->recordUdpZerocopyInplacePoolAcquire(/*reused=*/false);
-      }
-      return buf;
+    if (totalAllocated_ >= maxSlabs_) {
+      return nullptr;
     }
-    return nullptr;
+    auto buf = allocateSlab();
+    if (!buf) {
+      return nullptr;
+    }
+    ++totalAllocated_;
+    if (stats) {
+      stats->recordUdpZerocopyInplacePoolAcquire(/*reused=*/false);
+    }
+    return buf;
   }
 
   // Returns a slab to the idle pool. Decrements the outstanding-slab
@@ -210,9 +236,20 @@ class TperfInplaceZcSlabPool : public folly::AsyncWriter::ReleaseIOBufCallback {
   // totalAllocated_ (so the pool can re-allocate up to the cap) and
   // record the matching release on the outstanding-slabs counter so it
   // doesn't drift upward over persistent ZC failures.
-  void notifyDroppedSlab(const std::shared_ptr<TPerfWriteStats>& stats) {
+  //
+  // `slabMem` is the slab's backing buffer, captured before the BufPtr was
+  // moved into writeChain. For arena-backed slabs it is the only way to get
+  // the memory back: the IOBuf's free function is a no-op precisely so that
+  // reclaim happens here, on the worker thread that owns the arena, rather
+  // than wherever folly happened to destroy the IOBuf.
+  void notifyDroppedSlab(
+      void* slabMem,
+      const std::shared_ptr<TPerfWriteStats>& stats) {
     if (totalAllocated_ > 0) {
       --totalAllocated_;
+    }
+    if (slabMem && arena_.contains(slabMem)) {
+      arena_.freeSlab(slabMem);
     }
     if (stats) {
       stats->recordUdpZerocopyInplacePoolRelease();
@@ -233,11 +270,50 @@ class TperfInplaceZcSlabPool : public folly::AsyncWriter::ReleaseIOBufCallback {
   }
 
  private:
+  // Fresh slab from the huge-page arena when this backend asked for one,
+  // otherwise from malloc. Falls back to malloc — loudly, via the
+  // heap-fallback counter — if the arena could not be created or is full, so
+  // a mis-sized arena degrades into a slower run rather than a stall.
+  BufPtr allocateSlab() {
+    if (!hugePagesRequested_) {
+      return folly::IOBuf::createCombined(slabCapacity_);
+    }
+    if (!hugePagesInitialized_) {
+      hugePagesInitialized_ = true;
+      if (!arena_.init(hugePageArenaBytes_, slabCapacity_)) {
+        MVLOG_ERROR << "tperf hugepage: arena unavailable on this worker; "
+                    << "slabs will be malloc-backed and this run is NOT a "
+                    << "huge-page measurement";
+      } else if (arenaStats_) {
+        arenaStats_->recordUdpZerocopyHugepageArena(arena_.info());
+      }
+    }
+    if (arena_.ready()) {
+      if (void* mem = arena_.allocSlab()) {
+        return folly::IOBuf::takeOwnership(
+            mem,
+            slabCapacity_,
+            /*length=*/0,
+            hugePageSlabNoopFree,
+            /*userData=*/nullptr);
+      }
+    }
+    if (arenaStats_) {
+      arenaStats_->recordUdpZerocopyHugepageHeapFallback();
+    }
+    return folly::IOBuf::createCombined(slabCapacity_);
+  }
+
   std::vector<BufPtr> idle_;
   size_t totalAllocated_{0};
   size_t slabCapacity_{0};
   size_t maxSlabs_{kDefaultMaxSlabs};
   std::shared_ptr<TPerfWriteStats> stats_;
+  bool hugePagesRequested_{false};
+  bool hugePagesInitialized_{false};
+  size_t hugePageArenaBytes_{0};
+  std::shared_ptr<TPerfWriteStats> arenaStats_;
+  TperfHugePageArena arena_;
 };
 
 TperfInplaceZcSlabPool& threadLocalInplaceZcSlabPool() {
@@ -299,11 +375,15 @@ class UdpGsoZerocopyInplaceBatchWriter : public quic::BatchWriter {
       : conn_(conn),
         maxPackets_(maxPackets),
         config_(config),
-        writeStats_(std::move(writeStats)),
+        writeStats_{config.perWriteStats ? writeStats : nullptr},
         pool_(threadLocalInplaceZcSlabPool()) {
     MVCHECK(conn_.nodeType == quic::QuicNodeType::Server);
     pool_.setStats(writeStats_);
     pool_.setMaxSlabs(static_cast<size_t>(config_.poolBuffers));
+    pool_.setHugePages(
+        config_.hugePages,
+        static_cast<size_t>(config_.hugePageBytes),
+        std::move(writeStats));
     auto& accessor = *conn_.bufAccessor;
     if (!accessor.ownsBuffer()) {
       return;
@@ -408,6 +488,10 @@ class UdpGsoZerocopyInplaceBatchWriter : public quic::BatchWriter {
       // restore originalBuf_ in the destructor).
       auto& udpSocket = follySock->getFollySocket();
       auto slabBuf = accessor.obtain();
+      // Capture the backing buffer before ownership moves into writeChain —
+      // on the failure path below it is the only handle left for returning an
+      // arena-backed slab to its arena.
+      void* const slabMem = slabBuf->writableBuffer();
       haveSlabInAccessor_ = false;
       folly::AsyncUDPSocket::WriteOptions opts(gsoVal, true /*zerocopy*/);
       opts.txTime = txTime_;
@@ -430,7 +514,7 @@ class UdpGsoZerocopyInplaceBatchWriter : public quic::BatchWriter {
         // persistent ZC failures drift the counter upward and permanently
         // shrink the effective pool cap.
         zcFailed = true;
-        pool_.notifyDroppedSlab(writeStats_);
+        pool_.notifyDroppedSlab(slabMem, writeStats_);
       } else {
         // Successful ZC send: bookkeeping owns the buf. Publish the
         // per-fd kernel MSG_ZEROCOPY counters into writeStats from this
@@ -1113,10 +1197,12 @@ TPerfServer::TPerfServer(
             bool gsoSupported) -> BatchWriterPtr {
       if (udpGsoZerocopyConfig.enabled && udpGsoZerocopyConfig.inplace &&
           gsoSupported && dataPathType == DataPathType::ContinuousMemory) {
-        return wrapBatchWriterWithTiming(
-            BatchWriterPtr(new UdpGsoZerocopyInplaceBatchWriter(
-                conn, batchSize, udpGsoZerocopyConfig, writeStats)),
-            writeStats);
+        BatchWriterPtr writer(new UdpGsoZerocopyInplaceBatchWriter(
+            conn, batchSize, udpGsoZerocopyConfig, writeStats));
+        if (!udpGsoZerocopyConfig.perWriteStats) {
+          return writer;
+        }
+        return wrapBatchWriterWithTiming(std::move(writer), writeStats);
       }
       // Fall through to the default factory.
       return nullptr;

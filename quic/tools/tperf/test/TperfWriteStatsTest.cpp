@@ -194,4 +194,58 @@ TEST(TperfWriteStatsTest, RecordListenerSnapshotAcceptsStruct) {
   EXPECT_TRUE(stats.getListenerKernelSnapshotValidForTest());
 }
 
+// The huge-page arena description is published once per worker and read by
+// the periodic log. `backedKb` is the field that distinguishes a real
+// huge-page run from one that silently faulted in as 4K, so it must survive
+// the publish intact rather than being derived or dropped.
+TEST(TperfWriteStatsTest, HugepageArenaRecordIsLastWriterWins) {
+  TPerfWriteStats stats;
+
+  EXPECT_FALSE(stats.getUdpZerocopyHugepageArenaValidForTest());
+
+  const HugePageArenaInfo thpArena{
+      .mode = "thp",
+      .arenaBytes = 64ULL * 1024 * 1024,
+      .slabStride = 32768,
+      .slabs = 2048,
+      .backedKb = 65536};
+  stats.recordUdpZerocopyHugepageArena(thpArena);
+
+  EXPECT_TRUE(stats.getUdpZerocopyHugepageArenaValidForTest());
+  EXPECT_EQ(stats.getUdpZerocopyHugepageArenaForTest(), thpArena);
+
+  // A second worker publishing a hugetlb-backed arena fully replaces the
+  // record — no per-field merge that could report "hugetlb" alongside the
+  // first worker's THP byte counts.
+  const HugePageArenaInfo hugetlbArena{
+      .mode = "hugetlb",
+      .arenaBytes = 2ULL * 1024 * 1024,
+      .slabStride = 65536,
+      .slabs = 32,
+      .backedKb = 2048};
+  stats.recordUdpZerocopyHugepageArena(hugetlbArena);
+
+  EXPECT_EQ(stats.getUdpZerocopyHugepageArenaForTest(), hugetlbArena);
+}
+
+// Slabs the arena could not satisfy fall back to malloc. That is survivable
+// but it means the column is no longer a pure huge-page measurement, so the
+// count has to be visible rather than silently absorbed into the pool's
+// generic allocation counter.
+TEST(TperfWriteStatsTest, HugepageHeapFallbacksAreCountedSeparately) {
+  TPerfWriteStats stats;
+
+  EXPECT_EQ(stats.getUdpZerocopyHugepageHeapFallbacksForTest(), 0);
+
+  stats.recordUdpZerocopyInplacePoolAcquire(/*reused=*/false);
+  stats.recordUdpZerocopyHugepageHeapFallback();
+  stats.recordUdpZerocopyHugepageHeapFallback();
+
+  // Heap fallbacks are still pool acquisitions, so they must not perturb the
+  // acquire/outstanding accounting the inplace pool relies on.
+  EXPECT_EQ(stats.getUdpZerocopyHugepageHeapFallbacksForTest(), 2);
+  EXPECT_EQ(stats.getUdpZerocopyInplacePoolAcquiresForTest(), 1);
+  EXPECT_EQ(stats.getUdpZerocopyInplaceOutstandingSlabsForTest(), 1);
+}
+
 } // namespace quic::tperf::test
