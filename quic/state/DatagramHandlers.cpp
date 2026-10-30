@@ -21,7 +21,12 @@ quic::Expected<void, QuicError> handleDatagram(
     QUIC_STATS(conn.statsCallback, onDatagramDroppedOnRead);
     return {};
   }
-  if (frame.length >= conn.datagramState.maxReadFrameSize) {
+  if (!frame.encodedSize.has_value()) {
+    return quic::make_unexpected(QuicError(
+        TransportErrorCode::INTERNAL_ERROR,
+        "DATAGRAM frame is missing decoded wire size"));
+  }
+  if (*frame.encodedSize > conn.datagramState.maxReadFrameSize) {
     return quic::make_unexpected(QuicError(
         TransportErrorCode::PROTOCOL_VIOLATION,
         "DATAGRAM frame exceeds max_datagram_frame_size"));

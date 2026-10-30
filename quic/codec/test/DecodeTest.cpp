@@ -894,6 +894,90 @@ TEST_F(DecodeTest, DatagramNoRemainingData) {
   EXPECT_EQ(result.error().code, TransportErrorCode::FRAME_ENCODING_ERROR);
 }
 
+TEST_F(DecodeTest, DatagramLenPreservesEncodedSizeAcrossVarintBoundaries) {
+  for (const size_t payloadSize : {63, 64, 16383, 16384}) {
+    SCOPED_TRACE(payloadSize);
+    auto buf = folly::IOBuf::create(0);
+    BufAppender appender(buf.get(), payloadSize + sizeof(uint64_t));
+    auto appenderOp = [&](auto val) { appender.writeBE(val); };
+    const QuicInteger encodedLength(payloadSize);
+    encodedLength.encode(appenderOp);
+    const std::string payload(payloadSize, 'd');
+    appender.push(
+        reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+    buf->coalesce();
+    BufQueue queue(std::move(buf));
+
+    auto result = decodeDatagramFrame(queue, true);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->length, payloadSize);
+    EXPECT_EQ(
+        *result->encodedSize,
+        kDatagramFrameTypeSize + encodedLength.getSize().value() + payloadSize);
+  }
+}
+
+TEST_F(DecodeTest, DatagramWithoutLengthPreservesEncodedSize) {
+  constexpr size_t kPayloadSize = 64;
+  BufQueue queue(folly::IOBuf::copyBuffer(std::string(kPayloadSize, 'd')));
+
+  auto result = decodeDatagramFrame(queue, false);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->length, kPayloadSize);
+  EXPECT_EQ(*result->encodedSize, kDatagramFrameTypeSize + kPayloadSize);
+}
+
+TEST_F(DecodeTest, DatagramPreservesActualFrameTypeWidth) {
+  constexpr size_t kPayloadSize = 64;
+  for (const auto frameType : {FrameType::DATAGRAM, FrameType::DATAGRAM_LEN}) {
+    for (const size_t frameTypeSize : {1, 2, 4, 8}) {
+      SCOPED_TRACE(static_cast<uint64_t>(frameType));
+      SCOPED_TRACE(frameTypeSize);
+      auto buf = folly::IOBuf::create(0);
+      BufAppender appender(buf.get(), kPayloadSize + 16);
+      const auto type = static_cast<uint64_t>(frameType);
+      switch (frameTypeSize) {
+        case 1:
+          appender.writeBE<uint8_t>(type);
+          break;
+        case 2:
+          appender.writeBE<uint16_t>((uint16_t{1} << 14) | type);
+          break;
+        case 4:
+          appender.writeBE<uint32_t>((uint32_t{2} << 30) | type);
+          break;
+        case 8:
+          appender.writeBE<uint64_t>((uint64_t{3} << 62) | type);
+          break;
+      }
+      if (frameType == FrameType::DATAGRAM_LEN) {
+        auto appenderOp = [&](auto value) { appender.writeBE(value); };
+        QuicInteger(kPayloadSize).encode(appenderOp);
+      }
+      const std::string payload(kPayloadSize, 'd');
+      appender.push(
+          reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+      buf->coalesce();
+      BufQueue queue(std::move(buf));
+
+      auto result = parseFrame(
+          queue,
+          makeHeader(),
+          CodecParameters(kDefaultAckDelayExponent, QuicVersion::MVFST));
+
+      ASSERT_TRUE(result.has_value());
+      const auto* datagram = result->asDatagramFrame();
+      ASSERT_NE(datagram, nullptr);
+      ASSERT_TRUE(datagram->encodedSize.has_value());
+      const auto lengthSize = frameType == FrameType::DATAGRAM_LEN ? 2 : 0;
+      EXPECT_EQ(
+          *datagram->encodedSize, frameTypeSize + lengthSize + kPayloadSize);
+    }
+  }
+}
+
 std::unique_ptr<folly::IOBuf> CreateMaxStreamsIdFrame(
     unsigned long long maxStreamsId) {
   std::unique_ptr<folly::IOBuf> buf = folly::IOBuf::create(sizeof(QuicInteger));

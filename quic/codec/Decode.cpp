@@ -928,11 +928,13 @@ quic::Expected<uint64_t, TransportErrorCode> parsePlaintextRetryOrNewToken(
   return timestampInMs;
 }
 
-quic::Expected<DatagramFrame, QuicError> decodeDatagramFrame(
+static quic::Expected<DatagramFrame, QuicError> decodeDatagramFrameWithTypeSize(
     BufQueue& queue,
-    bool hasLen) {
+    bool hasLen,
+    size_t frameTypeSize) {
   ContiguousReadCursor cursor(queue.front()->data(), queue.front()->length());
   size_t length = cursor.remaining();
+  size_t encodedSize = frameTypeSize;
   if (hasLen) {
     auto decodeLength = quic::decodeQuicInteger(cursor);
     if (!decodeLength) {
@@ -944,9 +946,17 @@ quic::Expected<DatagramFrame, QuicError> decodeDatagramFrame(
       return quic::make_unexpected(QuicError(
           TransportErrorCode::FRAME_ENCODING_ERROR, "Invalid datagram frame"));
     }
+    encodedSize += decodeLength->second;
     queue.trimStart(decodeLength->second);
   }
-  return DatagramFrame(length, queue.splitAtMost(length));
+  encodedSize += length;
+  return DatagramFrame(length, encodedSize, queue.splitAtMost(length));
+}
+
+quic::Expected<DatagramFrame, QuicError> decodeDatagramFrame(
+    BufQueue& queue,
+    bool hasLen) {
+  return decodeDatagramFrameWithTypeSize(queue, hasLen, kDatagramFrameTypeSize);
 }
 
 quic::Expected<QuicFrame, QuicError> parseFrame(
@@ -1066,14 +1076,16 @@ quic::Expected<QuicFrame, QuicError> parseFrame(
       return decodeFrameAndTrimBufQueue(
           queue, contiguousCursor, decodeHandshakeDoneFrame);
     case FrameType::DATAGRAM: {
-      auto datagramRes = decodeDatagramFrame(queue, false /* hasLen */);
+      auto datagramRes = decodeDatagramFrameWithTypeSize(
+          queue, false /* hasLen */, frameTypeInt->second);
       if (!datagramRes.has_value()) {
         return quic::make_unexpected(datagramRes.error());
       }
       return QuicFrame(*datagramRes);
     }
     case FrameType::DATAGRAM_LEN: {
-      auto datagramRes = decodeDatagramFrame(queue, true /* hasLen */);
+      auto datagramRes = decodeDatagramFrameWithTypeSize(
+          queue, true /* hasLen */, frameTypeInt->second);
       if (!datagramRes.has_value()) {
         return quic::make_unexpected(datagramRes.error());
       }

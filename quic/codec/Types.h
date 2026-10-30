@@ -789,6 +789,7 @@ struct HandshakeDoneFrame {
 
 struct DatagramFrame {
   size_t length;
+  Optional<size_t> encodedSize;
   BufQueue data;
 
   explicit DatagramFrame(size_t len, BufPtr buf)
@@ -796,9 +797,15 @@ struct DatagramFrame {
     MVCHECK_EQ(length, data.chainLength());
   }
 
+  DatagramFrame(size_t len, size_t encodedSizeIn, BufPtr buf)
+      : length(len), encodedSize(encodedSizeIn), data(std::move(buf)) {
+    MVCHECK_EQ(length, data.chainLength());
+  }
+
   // Variant requirement:
   DatagramFrame(const DatagramFrame& other)
       : length(other.length),
+        encodedSize(other.encodedSize),
         data(other.data.front() ? other.data.front()->clone() : nullptr) {
     MVCHECK_EQ(length, data.chainLength());
   }

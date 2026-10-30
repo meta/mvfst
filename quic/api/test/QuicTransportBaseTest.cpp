@@ -319,7 +319,10 @@ class TestQuicTransport
         }
       } else if (type == TestFrameType::DATAGRAM) {
         auto buffer = decodeDatagramFrame(cursor);
-        auto frame = DatagramFrame(buffer.second, std::move(buffer.first));
+        const auto encodedSize = kDatagramFrameTypeSize +
+            QuicInteger(buffer.second).getSize().value() + buffer.second;
+        auto frame =
+            DatagramFrame(buffer.second, encodedSize, std::move(buffer.first));
         auto datagramResult =
             handleDatagram(*conn_, frame, udpPacket.timings.receiveTimePoint);
         if (datagramResult.hasError()) {
@@ -5200,6 +5203,54 @@ TEST_F(QuicTransportImplTestBase, DatagramDisabledRemainsSoftDrop) {
   EXPECT_FALSE(
       transport->getConnectionState().localConnectionError.has_value());
   EXPECT_FALSE(transport->isClosed());
+}
+
+TEST_F(QuicTransportImplTestBase, DatagramMissingWireSizeFailsClosed) {
+  auto& conn = transport->getConnectionState();
+  conn.datagramState.maxReadFrameSize = 256;
+  DatagramFrame frame(1, folly::IOBuf::copyBuffer("d"));
+
+  auto result = handleDatagram(conn, frame, Clock::now());
+
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(result.error().code, TransportErrorCode::INTERNAL_ERROR);
+  EXPECT_TRUE(conn.datagramState.readBuffer.empty());
+}
+
+TEST_F(QuicTransportImplTestBase, DatagramWireSizeBoundaries) {
+  constexpr size_t kPayloadSize = 64;
+  auto& conn = transport->getConnectionState();
+  conn.datagramState.maxReadBufferSize = 1;
+
+  for (const bool hasLength : {false, true}) {
+    for (const size_t frameTypeSize : {1, 2, 4, 8}) {
+      SCOPED_TRACE(hasLength);
+      SCOPED_TRACE(frameTypeSize);
+      const auto lengthSize = hasLength ? 2 : 0;
+      const auto encodedSize = frameTypeSize + lengthSize + kPayloadSize;
+
+      conn.datagramState.maxReadFrameSize = encodedSize;
+      DatagramFrame exactFrame(
+          kPayloadSize,
+          encodedSize,
+          folly::IOBuf::copyBuffer(std::string(kPayloadSize, 'd')));
+      auto exactResult = handleDatagram(conn, exactFrame, Clock::now());
+      ASSERT_FALSE(exactResult.hasError());
+      ASSERT_EQ(conn.datagramState.readBuffer.size(), 1);
+      conn.datagramState.readBuffer.clear();
+
+      conn.datagramState.maxReadFrameSize = encodedSize - 1;
+      DatagramFrame oversizedFrame(
+          kPayloadSize,
+          encodedSize,
+          folly::IOBuf::copyBuffer(std::string(kPayloadSize, 'd')));
+      auto oversizedResult = handleDatagram(conn, oversizedFrame, Clock::now());
+      ASSERT_TRUE(oversizedResult.hasError());
+      EXPECT_EQ(
+          oversizedResult.error().code, TransportErrorCode::PROTOCOL_VIOLATION);
+      EXPECT_TRUE(conn.datagramState.readBuffer.empty());
+    }
+  }
 }
 
 TEST_F(QuicTransportImplTestBase, DatagramBelowAdvertisedSizeIsReadable) {

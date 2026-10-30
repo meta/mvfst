@@ -6609,6 +6609,53 @@ TEST_F(
   EXPECT_TRUE(client->isClosed());
 }
 
+TEST_F(
+    QuicClientTransportAfterStartTest,
+    ReceiveDatagramLenEncodedSizeAtAndAboveLimit) {
+  auto& conn = client->getNonConstConn();
+  conn.datagramState.maxReadBufferSize = 3;
+
+  auto buildDatagramPacket = [&](size_t payloadSize) {
+    ShortHeader header(
+        ProtectionType::KeyPhaseZero, *originalConnId, appDataPacketNum++);
+    RegularQuicPacketBuilder builder(
+        conn.udpSendPacketLen, std::move(header), 0 /* largestAcked */);
+    EXPECT_FALSE(builder.encodePacketHeader().hasError());
+    DatagramFrame frame(
+        payloadSize, IOBuf::copyBuffer(std::string(payloadSize, 'd')));
+    EXPECT_FALSE(writeFrame(frame, builder).hasError());
+    return packetToBuf(std::move(builder).buildPacket());
+  };
+
+  EXPECT_CALL(*quicStats_, onDatagramRead(_)).Times(2);
+  EXPECT_CALL(*quicStats_, onDatagramDroppedOnRead()).Times(0);
+  EXPECT_CALL(clientConnCallback, onConnectionError(_)).Times(0);
+
+  // 1-byte type + 1-byte length + 63-byte payload.
+  conn.datagramState.maxReadFrameSize = 65;
+  deliverData(buildDatagramPacket(63)->coalesce());
+
+  // Crossing 63/64 expands the length varint from one byte to two.
+  // 1-byte type + 2-byte length + 64-byte payload.
+  conn.datagramState.maxReadFrameSize = 67;
+  deliverData(buildDatagramPacket(64)->coalesce());
+  ASSERT_EQ(conn.datagramState.readBuffer.size(), 2);
+  conn.datagramState.readBuffer.clear();
+
+  EXPECT_CALL(
+      clientConnCallback,
+      onConnectionError(IsError(TransportErrorCode::PROTOCOL_VIOLATION)));
+  conn.datagramState.maxReadFrameSize = 66;
+  deliverDataWithoutErrorCheck(buildDatagramPacket(64)->coalesce());
+
+  EXPECT_TRUE(conn.datagramState.readBuffer.empty());
+  ASSERT_TRUE(conn.localConnectionError.has_value());
+  EXPECT_EQ(
+      conn.localConnectionError->code,
+      QuicErrorCode(TransportErrorCode::PROTOCOL_VIOLATION));
+  EXPECT_TRUE(client->isClosed());
+}
+
 TEST_F(QuicClientTransportAfterStartTest, ReceiveDatagramFrameAndStore) {
   auto& conn = client->getNonConstConn();
   conn.datagramState.maxReadFrameSize = std::numeric_limits<uint16_t>::max();
