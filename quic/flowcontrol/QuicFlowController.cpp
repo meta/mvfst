@@ -127,7 +127,8 @@ inline uint64_t calculateMaximumData(const QuicStreamState& stream) {
       kMaxVarInt,
       std::max(
           addAndClampToMaxVarInt(
-              stream.currentReadOffset, stream.flowControlState.windowSize),
+              stream.flowControlState.releasedReadOffset,
+              stream.flowControlState.windowSize),
           stream.flowControlState.advertisedMaxOffset));
 }
 
@@ -263,7 +264,7 @@ bool maybeSendStreamWindowUpdate(
     return false;
   }
   auto newAdvertisedOffset = calculateNewWindowUpdate(
-      stream.currentReadOffset,
+      flowControlState.releasedReadOffset,
       flowControlState.advertisedMaxOffset,
       flowControlState.windowSize,
       stream.conn.lossState.srtt,
@@ -317,6 +318,48 @@ quic::Expected<void, QuicError> updateFlowControlOnStreamData(
       curMaxOffsetObserved - previousMaxOffsetObserved);
 }
 
+quic::Expected<void, QuicError> releaseConnReadFlowControl(
+    QuicConnectionStateBase& conn,
+    uint64_t bytes,
+    TimePoint releaseTime) {
+  auto incrementResult =
+      incrementWithOverFlowCheck(conn.flowControlState.sumCurReadOffset, bytes);
+  if (!incrementResult.has_value()) {
+    return incrementResult;
+  }
+  if (maybeSendConnWindowUpdate(conn, releaseTime)) {
+    MVVLOG(4) << "Release trigger conn window update "
+              << " readOffset=" << conn.flowControlState.sumCurReadOffset
+              << " maxOffset=" << conn.flowControlState.advertisedMaxOffset
+              << " window=" << conn.flowControlState.windowSize;
+  }
+  return {};
+}
+
+namespace {
+// Releases stream and connection receive credit up to newReleasedOffset.
+quic::Expected<void, QuicError> releaseReadFlowControl(
+    QuicStreamState& stream,
+    uint64_t newReleasedOffset,
+    TimePoint releaseTime) {
+  auto& releasedOffset = stream.flowControlState.releasedReadOffset;
+  DCHECK_GE(newReleasedOffset, releasedOffset);
+  auto bytes = newReleasedOffset - releasedOffset;
+  releasedOffset = newReleasedOffset;
+  auto connResult = releaseConnReadFlowControl(stream.conn, bytes, releaseTime);
+  if (!connResult.has_value()) {
+    return connResult;
+  }
+  if (maybeSendStreamWindowUpdate(stream, releaseTime)) {
+    MVVLOG(4) << "Release trigger stream window update stream=" << stream.id
+              << " readOffset=" << releasedOffset
+              << " maxOffset=" << stream.flowControlState.advertisedMaxOffset
+              << " window=" << stream.flowControlState.windowSize;
+  }
+  return {};
+}
+} // namespace
+
 quic::Expected<void, QuicError> updateFlowControlOnRead(
     QuicStreamState& stream,
     uint64_t lastReadOffset,
@@ -331,7 +374,6 @@ quic::Expected<void, QuicError> updateFlowControlOnRead(
       "quic_flow_controller",
       "flow control read offset regression");
   DCHECK_GE(stream.currentReadOffset, lastReadOffset);
-  uint64_t diff = 0;
   if (stream.reliableSizeFromPeer &&
       stream.currentReadOffset >= *stream.reliableSizeFromPeer) {
     PROTO_OOPS_LOG_BUILDER_IF(
@@ -348,31 +390,36 @@ quic::Expected<void, QuicError> updateFlowControlOnRead(
         stream.finalReadOffset.has_value(),
         "We got a reset from the peer, but the finalReadOffset is not set.");
     // We've read all reliable bytes, so we can advance the currentReadOffset
-    // to the final size.
-    diff = *stream.finalReadOffset - lastReadOffset;
+    // to the final size and release everything, even in manualRead mode.
     stream.currentReadOffset = *stream.finalReadOffset;
-  } else {
-    diff = stream.currentReadOffset - lastReadOffset;
+    stream.flowControlState.manualRead = false;
+    return releaseReadFlowControl(stream, *stream.finalReadOffset, readTime);
   }
-  auto incrementResult = incrementWithOverFlowCheck(
-      stream.conn.flowControlState.sumCurReadOffset, diff);
-  if (!incrementResult.has_value()) {
-    return incrementResult;
+  if (stream.flowControlState.manualRead) {
+    return {};
   }
-  if (maybeSendConnWindowUpdate(stream.conn, readTime)) {
-    MVVLOG(4) << "Read trigger conn window update "
-              << " readOffset=" << stream.conn.flowControlState.sumCurReadOffset
-              << " maxOffset="
-              << stream.conn.flowControlState.advertisedMaxOffset
-              << " window=" << stream.conn.flowControlState.windowSize;
+  return releaseReadFlowControl(stream, stream.currentReadOffset, readTime);
+}
+
+quic::Expected<void, QuicError> releaseManualReadFlowControl(
+    QuicStreamState& stream,
+    uint64_t bytes,
+    TimePoint releaseTime) {
+  DCHECK(stream.flowControlState.manualRead);
+  DCHECK_LE(bytes, stream.unreleasedReadBytes());
+  return releaseReadFlowControl(
+      stream, stream.flowControlState.releasedReadOffset + bytes, releaseTime);
+}
+
+quic::Expected<void, QuicError> endManualReadFlowControl(
+    QuicStreamState& stream,
+    TimePoint releaseTime) {
+  if (!stream.flowControlState.manualRead) {
+    return {};
   }
-  if (maybeSendStreamWindowUpdate(stream, readTime)) {
-    MVVLOG(4) << "Read trigger stream window update stream=" << stream.id
-              << " readOffset=" << stream.currentReadOffset
-              << " maxOffset=" << stream.flowControlState.advertisedMaxOffset
-              << " window=" << stream.flowControlState.windowSize;
-  }
-  return {};
+  stream.flowControlState.manualRead = false;
+  return releaseReadFlowControl(
+      stream, stream.deliveredReadOffset(), releaseTime);
 }
 
 quic::Expected<void, QuicError> updateFlowControlOnReceiveReset(
@@ -407,22 +454,14 @@ quic::Expected<void, QuicError> updateFlowControlOnReceiveReset(
   if (stream.currentReadOffset >= *stream.reliableSizeFromPeer) {
     // We only advance the currentReadOffset to the final size if the
     // application has read all of the reliable bytes. We don't do this
-    // earlier because we'll buffer additional data that arrives.
-    auto diff = *stream.finalReadOffset - stream.currentReadOffset;
+    // earlier because we'll buffer additional data that arrives. In manualRead
+    // mode this also releases bytes that the app read but hadn't released.
+    auto& releasedOffset = stream.flowControlState.releasedReadOffset;
+    auto diff = *stream.finalReadOffset - releasedOffset;
+    releasedOffset = *stream.finalReadOffset;
     stream.currentReadOffset = *stream.finalReadOffset;
-    auto incrementResult = incrementWithOverFlowCheck(
-        stream.conn.flowControlState.sumCurReadOffset, diff);
-    if (!incrementResult.has_value()) {
-      return incrementResult;
-    }
-    if (maybeSendConnWindowUpdate(stream.conn, resetTime)) {
-      MVVLOG(4) << "Reset trigger conn window update "
-                << " readOffset="
-                << stream.conn.flowControlState.sumCurReadOffset
-                << " maxOffset="
-                << stream.conn.flowControlState.advertisedMaxOffset
-                << " window=" << stream.conn.flowControlState.windowSize;
-    }
+    stream.flowControlState.manualRead = false;
+    return releaseConnReadFlowControl(stream.conn, diff, resetTime);
   }
   return {};
 }
@@ -655,30 +694,24 @@ uint64_t getSendConnFlowControlBytesAPI(const QuicConnectionStateBase& conn) {
 
 uint64_t getRecvStreamFlowControlBytes(const QuicStreamState& stream) {
   const auto advertisedMaxOffset = stream.flowControlState.advertisedMaxOffset;
-  const auto currentReadOffset = stream.currentReadOffset;
-  if (advertisedMaxOffset < currentReadOffset) {
-    // It's possible for current read offset to exceed advertised offset,
-    // because of the way we handle eofs with current read offset. We increment
-    // read offset to be 1 over the FIN offset to indicate that we have read the
-    // FIN.
-    PROTO_OOPS_LOG_BUILDER_IF(
-        stream.conn.nodeType == QuicNodeType::Server &&
-            currentReadOffset != advertisedMaxOffset + 1,
-        stream.conn.oopsLogger,
-        proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
-            .setStreamId(stream.id)
-            .setErrorCode(
-                static_cast<uint64_t>(LocalErrorCode::INTERNAL_ERROR)),
-        "quic_flow_controller",
-        fmt::format(
-            "recv stream flow control budget underflow: "
-            "advertisedMaxOffset={} currentReadOffset={}",
-            advertisedMaxOffset,
-            currentReadOffset));
-    DCHECK_EQ(currentReadOffset, advertisedMaxOffset + 1);
-    return 0;
-  }
-  return advertisedMaxOffset - currentReadOffset;
+  const auto releasedOffset = stream.flowControlState.releasedReadOffset;
+  PROTO_OOPS_LOG_BUILDER_IF(
+      stream.conn.nodeType == QuicNodeType::Server &&
+          advertisedMaxOffset < releasedOffset,
+      stream.conn.oopsLogger,
+      proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+          .setStreamId(stream.id)
+          .setErrorCode(static_cast<uint64_t>(LocalErrorCode::INTERNAL_ERROR)),
+      "quic_flow_controller",
+      fmt::format(
+          "recv stream flow control budget underflow: "
+          "advertisedMaxOffset={} releasedReadOffset={}",
+          advertisedMaxOffset,
+          releasedOffset));
+  DCHECK_GE(advertisedMaxOffset, releasedOffset);
+  return advertisedMaxOffset > releasedOffset
+      ? advertisedMaxOffset - releasedOffset
+      : 0;
 }
 
 uint64_t getRecvConnFlowControlBytes(const QuicConnectionStateBase& conn) {

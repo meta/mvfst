@@ -518,6 +518,16 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::stopSending(
   if (!stream) {
     return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
   }
+  if (stream->flowControlState.manualRead) {
+    auto releaseResult = endManualReadFlowControl(*stream, Clock::now());
+    if (!releaseResult.has_value()) {
+      closeImpl(QuicError(
+          QuicErrorCode(releaseResult.error().code),
+          std::string("stopSending() error")));
+      return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
+    }
+    updateWriteLooper(true);
+  }
   if (stream->recvState == StreamRecvState::Closed) {
     // skip STOP_SENDING if ingress is already closed
     return {};
@@ -1210,6 +1220,74 @@ QuicTransportBaseLite::read(StreamId id, size_t maxLen) {
   } catch (const std::exception& ex) {
     return quic::make_unexpected(handleExceptionAndClose(ex, "read() error"));
   }
+}
+
+quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::setStreamManualRead(
+    StreamId id) {
+  if (isSendingStream(conn_->nodeType, id)) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  if (closeState_ != CloseState::OPEN) {
+    return quic::make_unexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  auto* stream = conn_->streamManager->getStreamIfExists(id);
+  if (!stream) {
+    return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+  }
+  if (stream->streamReadError || stream->ingressRetired) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  stream->flowControlState.manualRead = true;
+  return {};
+}
+
+quic::Expected<void, LocalErrorCode>
+QuicTransportBaseLite::releaseManualReadFlowControl(
+    StreamId id,
+    uint64_t bytes) {
+  if (isSendingStream(conn_->nodeType, id)) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  if (closeState_ != CloseState::OPEN) {
+    return quic::make_unexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  quic::Expected<void, QuicError> releaseResult;
+  auto* stream = conn_->streamManager->getStreamIfExists(id);
+  if (stream) {
+    if ((stream->streamReadError || stream->ingressRetired) &&
+        !stream->flowControlState.manualRead) {
+      // A reset or dropped ingress already released everything.
+      return {};
+    }
+    if (!stream->flowControlState.manualRead) {
+      return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+    }
+    if (bytes == 0) {
+      return {};
+    }
+    if (bytes > stream->unreleasedReadBytes()) {
+      return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+    }
+    releaseResult =
+        quic::releaseManualReadFlowControl(*stream, bytes, Clock::now());
+  } else if (bytes == 0) {
+    return {};
+  } else {
+    auto consumed =
+        conn_->streamManager->consumeRemovedUnreleasedReadBytes(id, bytes);
+    if (!consumed.has_value()) {
+      return quic::make_unexpected(consumed.error());
+    }
+    releaseResult = releaseConnReadFlowControl(*conn_, bytes, Clock::now());
+  }
+  if (!releaseResult.has_value()) {
+    closeImpl(QuicError(
+        QuicErrorCode(releaseResult.error().code),
+        std::string("releaseManualReadFlowControl() error")));
+    return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
+  }
+  updateWriteLooper(true);
+  return {};
 }
 
 void QuicTransportBaseLite::setQLogger(std::shared_ptr<QLogger> qLogger) {

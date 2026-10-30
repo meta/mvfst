@@ -193,6 +193,38 @@ TEST_P(QuicStreamManagerTest, TestAppIdleCreateBidiStream) {
   EXPECT_EQ(getResult.value(), nullptr); // Check stream is gone (nullptr)
 }
 
+TEST_P(QuicStreamManagerTest, RemovedStreamKeepsUnreleasedReadBytes) {
+  auto& manager = *conn.streamManager;
+  auto releasedId = manager.createNextBidirectionalStream().value()->id;
+  auto unreleasedId = manager.createNextBidirectionalStream().value()->id;
+  auto* released = manager.findStream(releasedId);
+  auto* unreleased = manager.findStream(unreleasedId);
+  for (auto* stream : {released, unreleased}) {
+    stream->flowControlState.manualRead = true;
+    stream->finalReadOffset = 100;
+    stream->currentReadOffset = 101;
+    stream->sendState = StreamSendState::Closed;
+    stream->recvState = StreamRecvState::Closed;
+  }
+  released->flowControlState.releasedReadOffset = 100;
+  unreleased->flowControlState.releasedReadOffset = 60;
+
+  ASSERT_FALSE(manager.removeClosedStream(releasedId).hasError());
+  ASSERT_FALSE(manager.removeClosedStream(unreleasedId).hasError());
+  EXPECT_FALSE(manager.removedUnreleasedReadBytes(releasedId).has_value());
+  EXPECT_EQ(manager.removedUnreleasedReadBytes(unreleasedId), 40u);
+
+  EXPECT_EQ(
+      manager.consumeRemovedUnreleasedReadBytes(releasedId, 1).error(),
+      LocalErrorCode::STREAM_NOT_EXISTS);
+  EXPECT_EQ(
+      manager.consumeRemovedUnreleasedReadBytes(unreleasedId, 41).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  ASSERT_FALSE(
+      manager.consumeRemovedUnreleasedReadBytes(unreleasedId, 40).hasError());
+  EXPECT_FALSE(manager.removedUnreleasedReadBytes(unreleasedId).has_value());
+}
+
 TEST_P(QuicStreamManagerTest, TestAppIdleCreateUnidiStream) {
   auto& manager = *conn.streamManager;
   EXPECT_FALSE(manager.isAppIdle());

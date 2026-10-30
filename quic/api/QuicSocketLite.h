@@ -371,6 +371,38 @@ class QuicSocketLite {
       size_t maxLen) = 0;
 
   /**
+   * Stops read() and consume() on this stream from releasing receive flow
+   * control credit. The app releases it with releaseManualReadFlowControl()
+   * as its own buffers drain. Data already read stays released. Holding
+   * unreleased data blocks the peer exactly like leaving it unread.
+   *
+   * A received reset, stopSending() or stopSendingAndDropIngress() releases
+   * all of the stream's data automatically and ends manual mode. Fails with
+   * INVALID_OPERATION on a stream without a receive side or one already reset
+   * or dropped. Calling it again on a manual stream succeeds.
+   */
+  virtual quic::Expected<void, LocalErrorCode> setStreamManualRead(
+      StreamId /* id */) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+
+  /**
+   * Releases stream and connection receive credit for bytes of data already
+   * returned by read() or consume() on a stream in manual mode.
+   *
+   * Fails with INVALID_OPERATION if the stream never opted in or bytes exceeds
+   * the read but unreleased data. Data up to FIN must be released too. After
+   * the transport removes a closed stream, releasing its remaining bytes only
+   * returns connection credit. Once a reset or dropped ingress has released
+   * everything, calls for that stream succeed as no-ops.
+   */
+  virtual quic::Expected<void, LocalErrorCode> releaseManualReadFlowControl(
+      StreamId /* id */,
+      uint64_t /* bytes */) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+
+  /**
    * Set the read callback for the given stream.  Note that read callback is
    * expected to be set all the time. Removing read callback indicates that
    * stream is no longer intended to be read again. This will issue a

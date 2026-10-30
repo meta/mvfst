@@ -229,6 +229,13 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
       StreamId id,
       size_t maxLen) override;
 
+  quic::Expected<void, LocalErrorCode> setStreamManualRead(
+      StreamId id) override;
+
+  quic::Expected<void, LocalErrorCode> releaseManualReadFlowControl(
+      StreamId id,
+      uint64_t bytes) override;
+
   virtual void setQLogger(std::shared_ptr<QLogger> qLogger);
 
   [[nodiscard]] const std::shared_ptr<QLogger> getQLogger() const;

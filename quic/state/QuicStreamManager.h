@@ -340,6 +340,33 @@ class QuicStreamManager {
     return !windowUpdates_.empty();
   }
 
+  // Deducts bytes from a removed stream's unreleased read bytes.
+  [[nodiscard]] quic::Expected<void, LocalErrorCode>
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  consumeRemovedUnreleasedReadBytes(StreamId streamId, uint64_t bytes) {
+    auto it = removedUnreleasedReadBytes_.find(streamId);
+    if (it == removedUnreleasedReadBytes_.end()) {
+      return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+    }
+    if (bytes > it->second) {
+      return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+    }
+    it->second -= bytes;
+    if (it->second == 0) {
+      removedUnreleasedReadBytes_.erase(it);
+    }
+    return {};
+  }
+
+  [[nodiscard]] Optional<uint64_t> removedUnreleasedReadBytes(
+      StreamId streamId) const {
+    auto it = removedUnreleasedReadBytes_.find(streamId);
+    if (it == removedUnreleasedReadBytes_.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
   auto& closedStreams() {
     return closedStreams_;
   }
@@ -565,6 +592,10 @@ class QuicStreamManager {
   UnorderedMap<StreamId, ApplicationErrorCode> stopSendingStreams_;
   UnorderedSet<StreamId> windowUpdates_;
   UnorderedSet<StreamId> flowControlUpdated_;
+
+  // Read bytes that the app hasn't released yet on removed streams, in
+  // manualRead mode.
+  UnorderedMap<StreamId, uint64_t> removedUnreleasedReadBytes_;
 
   // Streams that were removed from the write queue because they are blocked
   // on connection flow control.

@@ -53,6 +53,24 @@ bool maybeSendStreamWindowUpdate(QuicStreamState& stream, TimePoint updateTime);
     QuicStreamState& stream,
     TimePoint resetTime);
 
+// Releases bytes of read but unreleased data in manualRead mode. The caller
+// checks that bytes <= stream.unreleasedReadBytes().
+[[nodiscard]] quic::Expected<void, QuicError> releaseManualReadFlowControl(
+    QuicStreamState& stream,
+    uint64_t bytes,
+    TimePoint releaseTime);
+
+// Releases all read data and ends manualRead for the stream.
+[[nodiscard]] quic::Expected<void, QuicError> endManualReadFlowControl(
+    QuicStreamState& stream,
+    TimePoint releaseTime);
+
+// Releases connection receive credit only, e.g. for a removed stream.
+[[nodiscard]] quic::Expected<void, QuicError> releaseConnReadFlowControl(
+    QuicConnectionStateBase& conn,
+    uint64_t bytes,
+    TimePoint releaseTime);
+
 [[nodiscard]] quic::Expected<void, QuicError> updateFlowControlOnWriteToSocket(
     QuicStreamState& stream,
     uint64_t length);

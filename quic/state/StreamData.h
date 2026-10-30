@@ -397,7 +397,23 @@ struct QuicStreamState : public QuicStreamLike {
     // received yet). Set when we write a blocked data frame on the stream;
     // cleared when we receive a flow control update for the stream.
     bool pendingBlockedFrame{false};
+    // See QuicSocketLite::setStreamManualRead().
+    bool manualRead{false};
+    // Offset up to which receive credit has been released. Never exceeds
+    // deliveredReadOffset().
+    uint64_t releasedReadOffset{0};
   };
+
+  // Offset of the data delivered to the app, excluding the FIN byte.
+  [[nodiscard]] uint64_t deliveredReadOffset() const noexcept {
+    return finalReadOffset ? std::min(currentReadOffset, *finalReadOffset)
+                           : currentReadOffset;
+  }
+
+  // Bytes delivered to the app but not yet released for flow control.
+  [[nodiscard]] uint64_t unreleasedReadBytes() const noexcept {
+    return deliveredReadOffset() - flowControlState.releasedReadOffset;
+  }
 
   StreamFlowControlState flowControlState;
 

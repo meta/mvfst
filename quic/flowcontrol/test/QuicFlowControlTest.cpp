@@ -178,7 +178,7 @@ TEST_F(QuicFlowControlTest, ConnAndStreamAutotuningAreIndependent) {
     conn_.pendingEvents.connWindowUpdate = false;
 
     QuicStreamState stream(3 + 4 * i, conn_);
-    stream.currentReadOffset = 51;
+    stream.flowControlState.releasedReadOffset = 51;
     stream.flowControlState.windowSize = 100;
     stream.flowControlState.advertisedMaxOffset = 100;
     stream.flowControlState.timeOfLastFlowControlUpdate = lastUpdateTime;
@@ -223,7 +223,7 @@ TEST_F(QuicFlowControlTest, StreamUpdateCadenceUsesStreamAutotuningFlag) {
         testCase.streamAutotuning;
 
     QuicStreamState stream(3 + 4 * i, conn_);
-    stream.currentReadOffset = 1;
+    stream.flowControlState.releasedReadOffset = 1;
     stream.flowControlState.windowSize = 100;
     stream.flowControlState.advertisedMaxOffset = 100;
     stream.flowControlState.timeOfLastFlowControlUpdate = lastUpdateTime;
@@ -317,7 +317,7 @@ TEST_F(QuicFlowControlTest, StreamAutotuningHonorsConfiguredCap) {
           *testCase.maximumWindowOverride;
     }
     QuicStreamState stream(3 + 4 * i, conn_);
-    stream.currentReadOffset = testCase.initialWindow;
+    stream.flowControlState.releasedReadOffset = testCase.initialWindow;
     stream.flowControlState.windowSize = testCase.initialWindow;
     stream.flowControlState.advertisedMaxOffset = testCase.initialWindow;
     stream.flowControlState.timeOfLastFlowControlUpdate = lastUpdateTime;
@@ -361,7 +361,7 @@ TEST_F(QuicFlowControlTest, ZeroRttFrequencyAllowsImmediateTimeBasedUpdates) {
   conn_.flowControlState.timeOfLastFlowControlUpdate = lastUpdateTime;
 
   QuicStreamState stream(3, conn_);
-  stream.currentReadOffset = 1;
+  stream.flowControlState.releasedReadOffset = 1;
   stream.flowControlState.windowSize = 100;
   stream.flowControlState.advertisedMaxOffset = 100;
   stream.flowControlState.timeOfLastFlowControlUpdate = lastUpdateTime;
@@ -511,7 +511,7 @@ TEST_F(QuicFlowControlTest, GeneratedReceiveLimitsSaturateAtMaxVarInt) {
 
   QuicStreamState stream(3, conn_);
   stream.flowControlState.advertisedMaxOffset = kMaxVarInt - 10;
-  stream.currentReadOffset = kMaxVarInt - 20;
+  stream.flowControlState.releasedReadOffset = kMaxVarInt - 20;
   stream.flowControlState.windowSize = 5;
   const auto firstStreamLimit = generateMaxStreamDataFrame(stream).maximumData;
   EXPECT_EQ(kMaxVarInt - 10, firstStreamLimit);
@@ -525,7 +525,7 @@ TEST_F(QuicFlowControlTest, GeneratedReceiveLimitsSaturateAtMaxVarInt) {
 TEST_F(QuicFlowControlTest, MaybeSendStreamWindowUpdate) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 100;
+  stream.flowControlState.releasedReadOffset = 100;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
 
@@ -536,7 +536,7 @@ TEST_F(QuicFlowControlTest, MaybeSendStreamWindowUpdate) {
 
   EXPECT_CALL(*quicStats_, onStreamFlowControlUpdate()).Times(0);
   maybeSendStreamWindowUpdate(stream, Clock::now());
-  stream.currentReadOffset += 200;
+  stream.flowControlState.releasedReadOffset += 200;
   // Should send window update
   EXPECT_CALL(*quicStats_, onStreamFlowControlUpdate()).Times(1);
   maybeSendStreamWindowUpdate(stream, Clock::now());
@@ -596,7 +596,7 @@ TEST_F(QuicFlowControlTest, DontSendStreamWindowUpdateOnRemoteHalfClosed) {
 TEST_F(QuicFlowControlTest, MaybeSendStreamWindowUpdateChangeWindowSmaller) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 300;
+  stream.flowControlState.releasedReadOffset = 300;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
 
@@ -611,18 +611,20 @@ TEST_F(QuicFlowControlTest, MaybeSendStreamWindowUpdateChangeWindowSmaller) {
   stream.flowControlState.windowSize = 10;
   // change the read bytes to be within the maybeSendUpdate size of the previous
   // window
-  stream.currentReadOffset = stream.flowControlState.advertisedMaxOffset - 15;
+  stream.flowControlState.releasedReadOffset =
+      stream.flowControlState.advertisedMaxOffset - 15;
   // Should send window update
   EXPECT_CALL(*quicStats_, onStreamFlowControlUpdate()).Times(1);
   maybeSendStreamWindowUpdate(stream, sendTime);
   EXPECT_FALSE(conn_.streamManager->pendingWindowUpdate(stream.id));
 
   // put within current window
-  stream.currentReadOffset = stream.flowControlState.advertisedMaxOffset - 4;
+  stream.flowControlState.releasedReadOffset =
+      stream.flowControlState.advertisedMaxOffset - 4;
   maybeSendStreamWindowUpdate(stream, sendTime);
   EXPECT_EQ(
       generateMaxStreamDataFrame(stream).maximumData,
-      stream.currentReadOffset + 10);
+      stream.flowControlState.releasedReadOffset + 10);
 }
 
 TEST_F(QuicFlowControlTest, MaybeWriteBlockedAfterAPIWrite) {
@@ -723,7 +725,7 @@ TEST_F(QuicFlowControlTest, MaybeWriteBlockedAfterSocketWrite) {
 TEST_F(QuicFlowControlTest, MaybeSendStreamWindowUpdateChangeWindowLarger) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 301;
+  stream.flowControlState.releasedReadOffset = 301;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
 
@@ -741,7 +743,8 @@ TEST_F(QuicFlowControlTest, MaybeSendStreamWindowUpdateChangeWindowLarger) {
   maybeSendStreamWindowUpdate(stream, Clock::now());
   EXPECT_EQ(
       generateMaxStreamDataFrame(stream).maximumData,
-      stream.currentReadOffset + stream.flowControlState.windowSize);
+      stream.flowControlState.releasedReadOffset +
+          stream.flowControlState.windowSize);
 }
 
 TEST_F(QuicFlowControlTest, SendingConnectionWindowUpdate) {
@@ -767,7 +770,7 @@ TEST_F(QuicFlowControlTest, SendingConnectionWindowUpdate) {
 TEST_F(QuicFlowControlTest, SendingStreamWindowUpdate) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 300;
+  stream.flowControlState.releasedReadOffset = 300;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
 
@@ -789,7 +792,7 @@ TEST_F(QuicFlowControlTest, TestStreamFlowControlAutotuneDisabled) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
   stream.conn.transportSettings.useNewStreamBlockedCondition = true;
-  stream.currentReadOffset = 300;
+  stream.flowControlState.releasedReadOffset = 300;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
   stream.flowControlState.timeOfLastFlowControlUpdate = Clock::now();
@@ -801,14 +804,15 @@ TEST_F(QuicFlowControlTest, TestStreamFlowControlAutotuneDisabled) {
   EXPECT_EQ(stream.flowControlState.windowSize, 500);
   EXPECT_EQ(
       frameOffset,
-      stream.currentReadOffset + stream.flowControlState.windowSize);
+      stream.flowControlState.releasedReadOffset +
+          stream.flowControlState.windowSize);
 }
 
 TEST_F(QuicFlowControlTest, HandleStreamBlockedNeverAutotunes) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
   stream.conn.transportSettings.useNewStreamBlockedCondition = true;
-  stream.currentReadOffset = 300;
+  stream.flowControlState.releasedReadOffset = 300;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
   stream.flowControlState.timeOfLastFlowControlUpdate = Clock::now() - 1ms;
@@ -825,7 +829,8 @@ TEST_F(QuicFlowControlTest, HandleStreamBlockedNeverAutotunes) {
   EXPECT_EQ(stream.flowControlState.windowSize, 500);
   EXPECT_EQ(
       frameOffset,
-      stream.currentReadOffset + stream.flowControlState.windowSize);
+      stream.flowControlState.releasedReadOffset +
+          stream.flowControlState.windowSize);
 }
 
 TEST_F(QuicFlowControlTest, LostConnectionWindowUpdate) {
@@ -870,7 +875,7 @@ TEST_F(QuicFlowControlTest, HandleStreamWindowUpdateClosedStream) {
 TEST_F(QuicFlowControlTest, LostStreamWindowUpdate) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 300;
+  stream.flowControlState.releasedReadOffset = 300;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
   stream.flowControlState.timeOfLastFlowControlUpdate = Clock::now();
@@ -930,7 +935,7 @@ TEST_F(QuicFlowControlTest, HandleConnBlockedSmallerWindow) {
 TEST_F(QuicFlowControlTest, HandleStreamBlocked) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 300;
+  stream.flowControlState.releasedReadOffset = 300;
   stream.flowControlState.windowSize = 500;
   stream.flowControlState.advertisedMaxOffset = 400;
 
@@ -1033,6 +1038,7 @@ TEST_F(QuicFlowControlTest, UpdateFlowControlOnReadBasic) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
   stream.currentReadOffset = 200;
+  stream.flowControlState.releasedReadOffset = 100;
   stream.flowControlState.windowSize = 200;
   stream.flowControlState.advertisedMaxOffset = 250;
 
@@ -1057,6 +1063,7 @@ TEST_F(QuicFlowControlTest, UpdateFlowControlOnReadReliableReset1) {
   stream.reliableSizeFromPeer = 100;
   stream.finalReadOffset = 150;
   stream.currentReadOffset = 10;
+  stream.flowControlState.releasedReadOffset = 10;
   stream.flowControlState.windowSize = 20;
   stream.flowControlState.advertisedMaxOffset = 10000;
 
@@ -1080,6 +1087,7 @@ TEST_F(QuicFlowControlTest, UpdateFlowControlOnReadReliableReset2) {
   stream.reliableSizeFromPeer = 100;
   stream.finalReadOffset = 150;
   stream.currentReadOffset = 10;
+  stream.flowControlState.releasedReadOffset = 10;
   stream.flowControlState.windowSize = 20;
   stream.flowControlState.advertisedMaxOffset = 10000;
 
@@ -1124,6 +1132,7 @@ TEST_F(QuicFlowControlTest, UpdateFlowControlOnReceiveReset2) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
   stream.currentReadOffset = 10;
+  stream.flowControlState.releasedReadOffset = 10;
   stream.flowControlState.windowSize = 20;
   stream.flowControlState.advertisedMaxOffset = 10000;
 
@@ -1145,6 +1154,7 @@ TEST_F(QuicFlowControlTest, UpdateFlowControlOnReceiveReset3) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
   stream.currentReadOffset = 10;
+  stream.flowControlState.releasedReadOffset = 10;
   stream.flowControlState.windowSize = 20;
   stream.flowControlState.advertisedMaxOffset = 10000;
 
@@ -1159,6 +1169,122 @@ TEST_F(QuicFlowControlTest, UpdateFlowControlOnReceiveReset3) {
   ASSERT_FALSE(result.hasError());
   EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 180);
   EXPECT_EQ(stream.currentReadOffset, 150);
+}
+
+TEST_F(QuicFlowControlTest, ManualReadDefersReleaseUntilExplicit) {
+  QuicStreamState stream(3, conn_);
+  stream.flowControlState.manualRead = true;
+  stream.flowControlState.windowSize = 200;
+  stream.flowControlState.advertisedMaxOffset = 250;
+  conn_.flowControlState.windowSize = 500;
+  conn_.flowControlState.advertisedMaxOffset = 400;
+  conn_.flowControlState.sumCurReadOffset = 100;
+
+  // The read moves the cursor but releases nothing.
+  stream.currentReadOffset = 200;
+  ASSERT_FALSE(updateFlowControlOnRead(stream, 0, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 100);
+  EXPECT_EQ(stream.flowControlState.releasedReadOffset, 0);
+  EXPECT_EQ(stream.unreleasedReadBytes(), 200);
+  EXPECT_FALSE(conn_.pendingEvents.connWindowUpdate);
+  EXPECT_FALSE(conn_.streamManager->pendingWindowUpdate(stream.id));
+  EXPECT_EQ(getRecvStreamFlowControlBytes(stream), 250);
+
+  EXPECT_CALL(*quicStats_, onConnFlowControlUpdate());
+  EXPECT_CALL(*quicStats_, onStreamFlowControlUpdate());
+  ASSERT_FALSE(
+      releaseManualReadFlowControl(stream, 200, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 300);
+  EXPECT_EQ(stream.flowControlState.releasedReadOffset, 200);
+  EXPECT_EQ(stream.unreleasedReadBytes(), 0);
+  EXPECT_TRUE(conn_.pendingEvents.connWindowUpdate);
+  EXPECT_TRUE(conn_.streamManager->pendingWindowUpdate(stream.id));
+  EXPECT_EQ(generateMaxStreamDataFrame(stream).maximumData, 400);
+}
+
+TEST_F(QuicFlowControlTest, ManualReadUnreleasedBytesExcludeFin) {
+  QuicStreamState stream(3, conn_);
+  stream.flowControlState.manualRead = true;
+  stream.finalReadOffset = 100;
+  stream.currentReadOffset = 101;
+  stream.flowControlState.releasedReadOffset = 60;
+  EXPECT_EQ(stream.unreleasedReadBytes(), 40);
+}
+
+TEST_F(QuicFlowControlTest, ManualReadReceiveResetReleasesEverything) {
+  QuicStreamState stream(3, conn_);
+  stream.flowControlState.manualRead = true;
+  stream.flowControlState.advertisedMaxOffset = 10000;
+  conn_.flowControlState.windowSize = 1000;
+  conn_.flowControlState.advertisedMaxOffset = 10000;
+  stream.currentReadOffset = 100;
+  stream.flowControlState.releasedReadOffset = 40;
+  conn_.flowControlState.sumCurReadOffset = 40;
+
+  stream.reliableSizeFromPeer = 0;
+  stream.finalReadOffset = 150;
+  ASSERT_FALSE(
+      updateFlowControlOnReceiveReset(stream, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 150);
+  EXPECT_EQ(stream.currentReadOffset, 150);
+  EXPECT_EQ(stream.flowControlState.releasedReadOffset, 150);
+  EXPECT_EQ(stream.unreleasedReadBytes(), 0);
+  EXPECT_FALSE(stream.flowControlState.manualRead);
+}
+
+TEST_F(QuicFlowControlTest, ManualReadReliableResetReleasesAfterReliableRead) {
+  QuicStreamState stream(3, conn_);
+  stream.flowControlState.manualRead = true;
+  stream.flowControlState.advertisedMaxOffset = 10000;
+  conn_.flowControlState.windowSize = 1000;
+  conn_.flowControlState.advertisedMaxOffset = 10000;
+  stream.reliableSizeFromPeer = 100;
+  stream.finalReadOffset = 150;
+
+  // Reading reliable bytes doesn't release anything.
+  stream.currentReadOffset = 20;
+  ASSERT_FALSE(updateFlowControlOnRead(stream, 0, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 0);
+
+  // Reading the last reliable byte releases everything up to the final size.
+  stream.currentReadOffset = 100;
+  ASSERT_FALSE(updateFlowControlOnRead(stream, 20, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 150);
+  EXPECT_EQ(stream.currentReadOffset, 150);
+  EXPECT_EQ(stream.unreleasedReadBytes(), 0);
+  EXPECT_FALSE(stream.flowControlState.manualRead);
+}
+
+TEST_F(QuicFlowControlTest, EndManualReadReleasesAndRevertsToAuto) {
+  QuicStreamState stream(3, conn_);
+  stream.flowControlState.manualRead = true;
+  stream.flowControlState.windowSize = 1000;
+  stream.flowControlState.advertisedMaxOffset = 10000;
+  conn_.flowControlState.windowSize = 1000;
+  conn_.flowControlState.advertisedMaxOffset = 10000;
+  stream.currentReadOffset = 100;
+  stream.flowControlState.releasedReadOffset = 30;
+  conn_.flowControlState.sumCurReadOffset = 30;
+
+  ASSERT_FALSE(endManualReadFlowControl(stream, Clock::now()).hasError());
+  EXPECT_FALSE(stream.flowControlState.manualRead);
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 100);
+  EXPECT_EQ(stream.flowControlState.releasedReadOffset, 100);
+
+  // Later reads release credit as usual.
+  stream.currentReadOffset = 120;
+  ASSERT_FALSE(updateFlowControlOnRead(stream, 100, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 120);
+}
+
+TEST_F(QuicFlowControlTest, ReleaseConnReadFlowControl) {
+  conn_.flowControlState.windowSize = 500;
+  conn_.flowControlState.advertisedMaxOffset = 400;
+  conn_.flowControlState.sumCurReadOffset = 100;
+  EXPECT_CALL(*quicStats_, onConnFlowControlUpdate());
+  ASSERT_FALSE(releaseConnReadFlowControl(conn_, 200, Clock::now()).hasError());
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 300);
+  EXPECT_TRUE(conn_.pendingEvents.connWindowUpdate);
 }
 
 TEST_F(QuicFlowControlTest, ReceiveResetCreditCanAutotuneConnectionWindow) {
@@ -1393,19 +1519,31 @@ TEST_F(QuicFlowControlTest, GetRecvConnFlowControlBytes) {
 TEST_F(QuicFlowControlTest, GetRecvStreamFlowControlBytes) {
   StreamId id = 3;
   QuicStreamState stream(id, conn_);
-  stream.currentReadOffset = 200;
+  stream.flowControlState.releasedReadOffset = 200;
   stream.flowControlState.advertisedMaxOffset = 300;
   EXPECT_EQ(100, getRecvStreamFlowControlBytes(stream));
 
-  stream.currentReadOffset = 200;
   stream.flowControlState.advertisedMaxOffset = 200;
   EXPECT_EQ(0, getRecvStreamFlowControlBytes(stream));
+}
 
-  // Current read offset can be greater than advertised max offset, since
-  // that's how we account for whether or not we read the eof.
-  stream.currentReadOffset = 201;
-  stream.flowControlState.advertisedMaxOffset = 200;
-  EXPECT_EQ(0, getRecvStreamFlowControlBytes(stream));
+// Reading the FIN moves currentReadOffset one past the final size, but the
+// released offset and the advertised limit stop at the final size.
+TEST_F(QuicFlowControlTest, ReadThroughFinStopsReleaseAtFinalSize) {
+  QuicStreamState stream(3, conn_);
+  stream.flowControlState.windowSize = 100;
+  stream.flowControlState.advertisedMaxOffset = 100;
+  conn_.flowControlState.windowSize = 1000;
+  conn_.flowControlState.advertisedMaxOffset = 1000;
+  stream.finalReadOffset = 100;
+  stream.currentReadOffset = 100;
+  ASSERT_FALSE(updateFlowControlOnRead(stream, 0, Clock::now()).hasError());
+  stream.currentReadOffset = 101;
+  EXPECT_EQ(conn_.flowControlState.sumCurReadOffset, 100);
+  EXPECT_EQ(stream.flowControlState.releasedReadOffset, 100);
+  EXPECT_EQ(stream.unreleasedReadBytes(), 0);
+  EXPECT_EQ(getRecvStreamFlowControlBytes(stream), 0);
+  EXPECT_EQ(generateMaxStreamDataFrame(stream).maximumData, 200);
 }
 
 TEST_F(QuicFlowControlTest, OnConnWindowUpdateSentWithoutPendingEvent) {

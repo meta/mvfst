@@ -117,6 +117,11 @@ quic::Expected<void, QuicError> onResetQuicStream(
     if (!result) {
       return quic::make_unexpected(result.error());
     }
+  } else if (appReadAllBytes) {
+    auto result = endManualReadFlowControl(stream, Clock::now());
+    if (!result) {
+      return quic::make_unexpected(result.error());
+    }
   }
   stream.conn.streamManager->updateReadableStreams(stream);
   stream.conn.streamManager->updateWritableStreams(stream);
@@ -174,6 +179,10 @@ quic::Expected<void, QuicError> retireIngress(QuicStreamState& stream) {
   stream.conn.streamManager->updateReadBufferRanges(
       stream.readBuffer.size(), 0);
   stream.readBuffer.clear();
+  auto releaseResult = endManualReadFlowControl(stream, Clock::now());
+  if (!releaseResult.has_value()) {
+    return releaseResult;
+  }
   auto closeResult = maybeCloseRetiredIngress(stream);
   if (!closeResult.has_value()) {
     return closeResult;

@@ -1758,6 +1758,301 @@ TEST_F(QuicTransportImplTestBase, ReadData) {
   transport.reset();
 }
 
+// On a manual stream, read() releases no credit. The app releases it with
+// releaseManualReadFlowControl(), and stopSending() releases the rest.
+TEST_F(QuicTransportImplTestBase, ManualReadReleaseFlowControl) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  NiceMock<MockReadCallback> readCb;
+  ASSERT_FALSE(transport->setReadCallback(id, &readCb).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  auto readResult = transport->read(id, 0);
+  ASSERT_TRUE(readResult.has_value());
+  EXPECT_EQ(readResult.value().first->computeChainDataLength(), len);
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore);
+  auto* stream = transport->getStream(id);
+  EXPECT_EQ(stream->unreleasedReadBytes(), len);
+
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id, len + 1).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 4).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 4);
+  EXPECT_EQ(stream->unreleasedReadBytes(), len - 4);
+
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id + 400, 1).error(),
+      LocalErrorCode::STREAM_NOT_EXISTS);
+
+  ASSERT_FALSE(transport->stopSending(id, GenericApplicationErrorCode::NO_ERROR)
+                   .hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  EXPECT_FALSE(stream->flowControlState.manualRead);
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id, 4).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  transport.reset();
+}
+
+TEST_F(QuicTransportImplTestBase, ManualReadConsumeDefersRelease) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_FALSE(transport->consume(id, 5).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore);
+  EXPECT_EQ(transport->getStream(id)->unreleasedReadBytes(), 5);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 5).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 5);
+  transport.reset();
+}
+
+// Releasing enough credit queues MAX_STREAM_DATA. Reading alone does not.
+TEST_F(QuicTransportImplTestBase, ManualReadReleaseQueuesWindowUpdate) {
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  auto transportSettings = transport->getTransportSettings();
+  transportSettings.advertisedInitialBidiLocalStreamFlowControlWindow = len + 2;
+  transport->setTransportSettings(transportSettings);
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0));
+
+  ASSERT_TRUE(transport->read(id, 0).has_value());
+  EXPECT_FALSE(conn.streamManager->pendingWindowUpdate(id));
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, len).hasError());
+  EXPECT_TRUE(conn.streamManager->pendingWindowUpdate(id));
+  transport.reset();
+}
+
+// A reset after a partial release returns everything the app read and the
+// unread tail. A duplicate reset releases nothing more.
+TEST_F(QuicTransportImplTestBase, ManualReadResetReleasesEverythingOnce) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_TRUE(transport->read(id, 0).has_value());
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 4).hasError());
+  auto* stream = transport->getStream(id);
+  RstStreamFrame rst(id, GenericApplicationErrorCode::NO_ERROR, len + 10);
+  ASSERT_FALSE(receiveRstStreamSMHandler(*stream, rst).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len + 10);
+  EXPECT_FALSE(stream->flowControlState.manualRead);
+
+  ASSERT_FALSE(receiveRstStreamSMHandler(*stream, rst).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len + 10);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 4).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len + 10);
+  transport.reset();
+}
+
+// A reliable reset releases nothing until the app reads the reliable bytes,
+// then releases everything up to the final size.
+TEST_F(QuicTransportImplTestBase, ManualReadReliableResetReleasesAfterRead) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  auto* stream = transport->getStream(id);
+  ASSERT_FALSE(receiveRstStreamSMHandler(
+                   *stream,
+                   RstStreamFrame(
+                       id, GenericApplicationErrorCode::NO_ERROR, 2 * len, len))
+                   .hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore);
+
+  ASSERT_TRUE(transport->read(id, 0).has_value());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 2 * len);
+  EXPECT_FALSE(stream->flowControlState.manualRead);
+  transport.reset();
+}
+
+// stopSending() releases read data even when the receive side has already
+// closed on FIN.
+TEST_F(QuicTransportImplTestBase, ManualReadStopSendingAfterFin) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0, true));
+  auto* stream = transport->getStream(id);
+  stream->recvState = StreamRecvState::Closed;
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_TRUE(transport->read(id, 5).has_value());
+  ASSERT_FALSE(transport->stopSending(id, GenericApplicationErrorCode::NO_ERROR)
+                   .hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 5);
+  EXPECT_FALSE(stream->flowControlState.manualRead);
+  transport.reset();
+}
+
+// Dropping ingress releases the held bytes and the discarded ones.
+TEST_F(QuicTransportImplTestBase, ManualReadDropIngressReleasesEverything) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0, true));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_TRUE(transport->read(id, 5).has_value());
+  ASSERT_FALSE(
+      transport
+          ->stopSendingAndDropIngress(id, GenericApplicationErrorCode::NO_ERROR)
+          .hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  EXPECT_FALSE(transport->getStream(id)->flowControlState.manualRead);
+  EXPECT_FALSE(transport->releaseManualReadFlowControl(id, 5).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  EXPECT_EQ(
+      transport->setStreamManualRead(id).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  transport.reset();
+}
+
+// After FIN is read and the stream is removed, the app can still release the
+// remaining bytes. Only connection credit moves.
+TEST_F(QuicTransportImplTestBase, ManualReadReleaseAfterStreamRemoved) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0, true));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  auto readResult = transport->read(id, 0);
+  ASSERT_TRUE(readResult.has_value());
+  EXPECT_TRUE(readResult.value().second);
+  auto* stream = transport->getStream(id);
+  stream->recvState = StreamRecvState::Closed;
+  stream->sendState = StreamSendState::Closed;
+  ASSERT_FALSE(conn.streamManager->removeClosedStream(id).hasError());
+  EXPECT_EQ(conn.streamManager->removedUnreleasedReadBytes(id), len);
+
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id, len + 1).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 4).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 4);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, len - 4).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  EXPECT_FALSE(conn.streamManager->removedUnreleasedReadBytes(id).has_value());
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id, 1).error(),
+      LocalErrorCode::STREAM_NOT_EXISTS);
+  EXPECT_FALSE(transport->releaseManualReadFlowControl(id, 0).hasError());
+  transport.reset();
+}
+
+// A reset received after the app read FIN still releases the unreleased bytes.
+TEST_F(QuicTransportImplTestBase, ManualReadResetAfterFinReleases) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0, true));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_TRUE(transport->read(id, 0).has_value());
+  auto* stream = transport->getStream(id);
+  ASSERT_FALSE(
+      receiveRstStreamSMHandler(
+          *stream,
+          RstStreamFrame(id, GenericApplicationErrorCode::NO_ERROR, len))
+          .hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  EXPECT_EQ(stream->unreleasedReadBytes(), 0);
+  transport.reset();
+}
+
+TEST_F(QuicTransportImplTestBase, SetStreamManualReadErrors) {
+  auto id = transport->createBidirectionalStream().value();
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id, 1).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  auto sendOnly = transport->createUnidirectionalStream().value();
+  EXPECT_EQ(
+      transport->setStreamManualRead(sendOnly).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  EXPECT_EQ(
+      transport->setStreamManualRead(id + 400).error(),
+      LocalErrorCode::STREAM_NOT_EXISTS);
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+
+  auto resetId = transport->createBidirectionalStream().value();
+  auto* resetStream = transport->getStream(resetId);
+  ASSERT_FALSE(
+      receiveRstStreamSMHandler(
+          *resetStream,
+          RstStreamFrame(resetId, GenericApplicationErrorCode::NO_ERROR, 0))
+          .hasError());
+  EXPECT_EQ(
+      transport->setStreamManualRead(resetId).error(),
+      LocalErrorCode::INVALID_OPERATION);
+  transport.reset();
+}
+
+// Opting in after some data was read leaves that data released. Only later
+// reads wait for an explicit release.
+TEST_F(QuicTransportImplTestBase, SetStreamManualReadAfterRead) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_TRUE(transport->read(id, 5).has_value());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 5);
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  EXPECT_EQ(
+      transport->releaseManualReadFlowControl(id, 1).error(),
+      LocalErrorCode::INVALID_OPERATION);
+
+  ASSERT_TRUE(transport->read(id, 3).has_value());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 5);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 3).hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + 8);
+  transport.reset();
+}
+
+// A reset on a stream that never opted in leaves it in automatic mode, and a
+// release after the reset is a no-op.
+TEST_F(QuicTransportImplTestBase, ResetLeavesAutoStreamOff) {
+  auto id = transport->createBidirectionalStream().value();
+  auto* stream = transport->getStream(id);
+  ASSERT_FALSE(
+      receiveRstStreamSMHandler(
+          *stream, RstStreamFrame(id, GenericApplicationErrorCode::NO_ERROR, 0))
+          .hasError());
+  EXPECT_FALSE(stream->flowControlState.manualRead);
+  ASSERT_FALSE(transport->releaseManualReadFlowControl(id, 1).hasError());
+  transport.reset();
+}
+
 // TODO The finest copypasta around. We need a better story for parameterizing
 // unidirectional vs. bidirectional.
 TEST_F(QuicTransportImplTestBase, UnidirectionalReadData) {

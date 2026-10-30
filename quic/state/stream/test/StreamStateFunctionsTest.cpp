@@ -420,6 +420,7 @@ TEST_F(StreamStateFunctionsTests, ResetNoFlowControlGenerated) {
   RstStreamFrame rst(id, GenericApplicationErrorCode::UNKNOWN, 90);
 
   stream.currentReadOffset = 80;
+  stream.flowControlState.releasedReadOffset = 80;
   stream.maxOffsetObserved = 90;
   stream.flowControlState.advertisedMaxOffset = 100;
 
@@ -448,6 +449,7 @@ TEST_F(StreamStateFunctionsTests, ResetFlowControlGenerated) {
   EXPECT_GT(conn.flowControlState.sumCurStreamBufferLen, 0);
   RstStreamFrame rst(id, GenericApplicationErrorCode::UNKNOWN, 100);
   stream.currentReadOffset = 80;
+  stream.flowControlState.releasedReadOffset = 80;
   stream.maxOffsetObserved = 90;
   stream.flowControlState.advertisedMaxOffset = 100;
 

@@ -567,7 +567,8 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
     // This is set to 0 initially so that we can't send any data until we know
     // the peer's flow control offset.
     uint64_t peerAdvertisedMaxOffset{0};
-    // The sum of the min(read offsets) of all the streams on the conn.
+    // The sum of the released read offsets of all streams, including removed
+    // streams.
     uint64_t sumCurReadOffset{0};
     // The sum of the max(offset) observed on all the streams on the conn.
     uint64_t sumMaxObservedOffset{0};

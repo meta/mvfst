@@ -214,6 +214,7 @@ QuicStreamManager::QuicStreamManager(
   stopSendingStreams_ = std::move(other.stopSendingStreams_);
   windowUpdates_ = std::move(other.windowUpdates_);
   flowControlUpdated_ = std::move(other.flowControlUpdated_);
+  removedUnreleasedReadBytes_ = std::move(other.removedUnreleasedReadBytes_);
   numStreamsWithLoss_ = other.numStreamsWithLoss_;
   other.numStreamsWithLoss_ = 0;
   numReadBufferRanges_ = other.numReadBufferRanges_;
@@ -1090,6 +1091,9 @@ quic::Expected<void, QuicError> QuicStreamManager::removeClosedStream(
   }
 
   updateReadBufferRanges(it->second.readBuffer.size(), 0);
+  if (auto unreleased = it->second.unreleasedReadBytes(); unreleased > 0) {
+    removedUnreleasedReadBytes_[streamId] = unreleased;
+  }
 
   // Erase the main stream state
   streams_.erase(it);

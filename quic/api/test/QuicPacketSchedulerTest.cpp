@@ -1588,6 +1588,7 @@ TEST_P(QuicPacketSchedulerTest, CloneWillGenerateNewWindowUpdate) {
   conn.flowControlState.sumCurReadOffset = 300;
   conn.flowControlState.windowSize = 3000;
   stream->currentReadOffset = 200;
+  stream->flowControlState.releasedReadOffset = 200;
   stream->flowControlState.windowSize = 1500;
 
   ShortHeader header(
