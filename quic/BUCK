@@ -1,34 +1,7 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_library")
 load("@fbsource//tools/build_defs:fb_native_wrapper.bzl", "fb_native")
-load("@prelude//configurations:constraint_alias.bzl", "constraint_with_aliases")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_library")
 
 oncall("traffic_protocols")
-
-constraint_with_aliases(
-    name = "use_alt_crypto",
-    aliases = {
-        "use_alt_crypto-enabled": "enabled",
-    },
-    default = "unspecified",
-    values = [
-        "enabled",
-        "unspecified",
-    ],
-    visibility = ["PUBLIC"],
-)
-
-constraint_with_aliases(
-    name = "force_alt_crypto",
-    aliases = {
-        "force_alt_crypto-enabled": "enabled",
-    },
-    default = "unspecified",
-    values = [
-        "enabled",
-        "unspecified",
-    ],
-    visibility = ["PUBLIC"],
-)
 
 # Deps for the `config` target's exported_deps, split by which mvfst-config
 # header the `headers` select picks. Keep these on the same select axes as

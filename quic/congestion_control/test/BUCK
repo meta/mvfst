@@ -1,5 +1,5 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_library", "mvfst_cpp_test")
 load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_library", "mvfst_cpp_test")
 
 oncall("traffic_protocols")
 
@@ -331,6 +331,7 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "//quic/api/test:api_mocks",
         "//quic/api/test:mocks",
         "//quic/congestion_control:ecn_l4s_tracker",
     ],

@@ -1,6 +1,8 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_binary", "mvfst_cpp_library")
-load("@fbcode_macros//build_defs:build_file_migration.bzl", "fbcode_target")
-load("@fbsource//tools/build_defs:cell_defs.bzl", "get_fbsource_cell")
+load("@fbsource//tools/build_defs:fb_xplat_cxx_library.bzl", "fb_xplat_cxx_library")
+load("@fbsource//tools/build_defs:fbsource_utils.bzl", "is_fbcode_compatible")
+load("@fbsource//tools/build_defs:platform_defs.bzl", "ANDROID", "APPLE", "CXX", "FBCODE", "WINDOWS")
+load("@fbsource//xplat/pfh/Infra_Networking_Core:DEFS.bzl", "Infra_Networking_Core")
+load("@fbsource//xplat/quic:defs.bzl", "CXXFLAGS", "mvfst_cpp_binary", "mvfst_cpp_library")
 
 oncall("traffic_protocols")
 
@@ -105,32 +107,43 @@ mvfst_cpp_library(
     ],
 )
 
-_TPERF_KNOBS_PATCHER_SRCS = (
-    select({
-        "DEFAULT": ["TperfKnobsPatcherXPlat.cpp"],
-        "ovr_config//os/constraints:linux": ["TperfKnobsPatcherFbcode.cpp"],
-    })
-    if get_fbsource_cell() == "fbcode"
-    else ["TperfKnobsPatcherXPlat.cpp"]
-)
+# The knobs patcher only exists for fbcode Linux builds. `fbcode//justknobs`
+# is not an xplat project, so this target bypasses the fbcode -> fbsource dep
+# conversion (which would drop it) and spells its deps out as fbsource targets.
+_FBCODE_LINUX = "ovr_config//runtime:fbcode"
 
-_TPERF_KNOBS_PATCHER_DEPS = (
-    select({
-        "DEFAULT": [],
-        "ovr_config//os/constraints:linux": [
-            "fbsource//xplat/folly:string",
-            "//justknobs:justknobs_patches",
-        ],
-    })
-    if get_fbsource_cell() == "fbcode"
-    else []
-)
-
-mvfst_cpp_library(
+# Declared directly so the fbcode-only deps survive: the `mvfst_cpp_*` macros
+# convert fbcode deps to xplat ones and drop the ones they cannot map.
+fb_xplat_cxx_library(
     name = "tperf_knobs_patcher",
-    srcs = _TPERF_KNOBS_PATCHER_SRCS,
-    headers = ["TperfKnobsPatcher.h"],
-    deps = ["//quic/common:mvfst_logging"] + _TPERF_KNOBS_PATCHER_DEPS,
+    srcs = select({
+        "DEFAULT": ["TperfKnobsPatcherXPlat.cpp"],
+        _FBCODE_LINUX: select({
+            "DEFAULT": ["TperfKnobsPatcherXPlat.cpp"],
+            "ovr_config//os/constraints:linux": ["TperfKnobsPatcherFbcode.cpp"],
+        }),
+    }),
+    header_namespace = "quic/tools/tperf",
+    exported_headers = ["TperfKnobsPatcher.h"],
+    compiler_flags = CXXFLAGS,
+    feature = Infra_Networking_Core,
+    platforms = (CXX, ANDROID, APPLE, FBCODE, WINDOWS),
+    visibility = ["PUBLIC"],
+    deps = ["fbsource//xplat/quic/common:mvfst_logging"]
+    + (
+        select({
+            "DEFAULT": [],
+            _FBCODE_LINUX: select({
+                "DEFAULT": [],
+                "ovr_config//os/constraints:linux": [
+                    "fbcode//justknobs:justknobs_patches",
+                    "fbsource//xplat/folly:string",
+                ],
+            }),
+        })
+        if is_fbcode_compatible()
+        else []
+    ),
 )
 
 _TPERF_DEPS = [
@@ -161,10 +174,8 @@ mvfst_cpp_binary(
 # they compose with the selected platform/build mode rather than pinning one.
 # use_alt_crypto -> QUIC_DEFAULT_AEAD = XSecCryptoAead; force_alt_crypto -> the
 # bridge always uses xsec (bypasses the JK). No flag; :tperf is the OpenSSL
-# baseline. fbcode-cell only: the xsec sources live in fbcode/quic/facebook,
-# whose xplat mirror is a header-less shadow stub.
-fbcode_target(
-    _kind = mvfst_cpp_binary,
+# baseline. fbcode only: the xsec sources live in fbcode/quic/facebook.
+mvfst_cpp_binary(
     name = "tperf-xsec",
     srcs = [
         "tperf.cpp",
@@ -173,14 +184,14 @@ fbcode_target(
         "fbcode//quic:use_alt_crypto-enabled",
         "fbcode//quic:force_alt_crypto-enabled",
     ],
+    platforms = (FBCODE,),
     deps = _TPERF_DEPS
     + [
         "//xsec_crypto/cpp20/haberdashery/aead/extensions:aes128gcm_zen4_extension",
     ],
 )
 
-fbcode_target(
-    _kind = mvfst_cpp_binary,
+mvfst_cpp_binary(
     name = "tperf-xsec-zen4",
     srcs = [
         "tperf.cpp",
@@ -189,6 +200,7 @@ fbcode_target(
         "fbcode//quic:use_alt_crypto-enabled",
         "fbcode//quic:force_alt_crypto-enabled",
     ],
+    platforms = (FBCODE,),
     deps = _TPERF_DEPS
     + [
         "//xsec_crypto/cpp20/haberdashery/aead/extensions:aes128gcm_zen4_benchmark_extension",

@@ -1,4 +1,4 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_benchmark", "mvfst_cpp_library", "mvfst_cpp_test")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_benchmark", "mvfst_cpp_library", "mvfst_cpp_test")
 
 oncall("traffic_protocols")
 

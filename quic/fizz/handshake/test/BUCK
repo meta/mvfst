@@ -1,5 +1,5 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_test", "mvfst_fbcode_only")
 load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_test", "mvfst_fbcode_only")
 
 oncall("traffic_protocols")
 

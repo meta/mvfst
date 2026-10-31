@@ -1,5 +1,5 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_library")
 load("@fbsource//tools/build_defs/dirsync:fb_dirsync_cpp_unittest.bzl", "fb_dirsync_cpp_unittest")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_library")
 
 oncall("traffic_protocols")
 

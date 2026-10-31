@@ -1,4 +1,4 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_test")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_test")
 
 oncall("traffic_protocols")
 
@@ -8,7 +8,6 @@ mvfst_cpp_test(
         "PacketUtilsTest.cpp",
     ],
     deps = [
-        "fbsource//xplat/folly:network_address",
         "//quic/xsk:xsk_lib",
     ],
 )

@@ -1,4 +1,4 @@
-load("@fbcode//quic:defs.bzl", "mvfst_cpp_library", "mvfst_fbcode_only")
+load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_library", "mvfst_fbcode_only")
 
 oncall("traffic_protocols")
 
@@ -111,25 +111,37 @@ mvfst_cpp_library(
         "FizzTransportParameters.h",
         "QuicFizzFactory.h",
     ],
+    # The xsec crypto bridge only exists in fbcode (justknobs, xsec_crypto).
+    fbcode_only_deps = select({
+        "DEFAULT": [],
+        "ovr_config//runtime/constraints:fbcode": select({
+            "DEFAULT": [],  # @fb-only
+            "fbcode//quic:use_alt_crypto-enabled": ["fbcode//quic/facebook/handshake:xsec_ecb_packet_number_cipher"],  # @fb-only
+            "ovr_config//build_mode:arvr_mode[enabled]": [],  # @fb-only
+            "ovr_config//runtime/constraints:android-host-test": [],  # @fb-only
+        }),  # @fb-only
+    }),
+    fbcode_only_exported_deps = select({
+        "DEFAULT": [],
+        "ovr_config//runtime/constraints:fbcode": select({
+            "DEFAULT": [],  # @fb-only
+            "fbcode//quic:use_alt_crypto-enabled": ["fbcode//quic/facebook/handshake:xsec_crypto_bridge"],  # @fb-only
+            "ovr_config//build_mode:arvr_mode[enabled]": [],  # @fb-only
+            "ovr_config//runtime/constraints:android-host-test": [],  # @fb-only
+        }),  # @fb-only
+    }),
     preprocessor_flags = select({
         "DEFAULT": [],
         "fbsource//xplat/fizz/constraints:profile[mnscrypto-only]": ["-DMVFST_MBED"],  # @fb-only
     }),
     deps = [
         ":fizz_bridge",  # @manual included via QUIC_DEFAULT_AEAD_HEADER macro
+        ":fizz_packet_number_cipher",
         "//fizz/crypto:crypto",
         "//fizz/crypto:utils",
         "//fizz/crypto/aead:aead",
         "//quic/common:optional",
-    ] + select({
-        "DEFAULT": [":fizz_packet_number_cipher"],
-        "ovr_config//runtime/constraints:fbcode": select({
-            "DEFAULT": [":fizz_packet_number_cipher"],  # @fb-only
-            "fbcode//quic:use_alt_crypto-enabled": ["fbcode//quic/facebook/handshake:xsec_ecb_packet_number_cipher"],  # @fb-only
-            "ovr_config//build_mode:arvr_mode[enabled]": [":fizz_packet_number_cipher"],  # @fb-only
-            "ovr_config//runtime/constraints:android-host-test": [":fizz_packet_number_cipher"],  # @fb-only
-        }),  # @fb-only
-    }),
+    ],
     exported_deps = [
         "//fizz/protocol:default_factory",
         "//fizz/record:record",
@@ -139,13 +151,5 @@ mvfst_cpp_library(
         "//quic/handshake:handshake",
         "//quic/handshake:retry_integrity_tag_generator",
         "//quic/handshake:transport_parameters",
-    ] + select({
-        "DEFAULT": [],
-        "ovr_config//runtime/constraints:fbcode": select({
-            "DEFAULT": [],  # @fb-only
-            "fbcode//quic:use_alt_crypto-enabled": ["fbcode//quic/facebook/handshake:xsec_crypto_bridge"],  # @fb-only
-            "ovr_config//build_mode:arvr_mode[enabled]": [],  # @fb-only
-            "ovr_config//runtime/constraints:android-host-test": [],  # @fb-only
-        }),  # @fb-only
-    }),
+    ],
 )
