@@ -215,7 +215,6 @@ mvfst_cpp_test(
         "TransportKnobsTest.cpp",
     ],
     deps = [
-        "fbsource//xplat/folly:format",
         "fbsource//xplat/folly/portability:gtest",
         "//quic:constants",
         "//quic/common:transport_knobs",

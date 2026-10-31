@@ -11,7 +11,6 @@
 #include <chrono>
 #include <limits>
 
-#include <folly/Format.h>
 #include <folly/portability/GTest.h>
 
 namespace quic::test {
