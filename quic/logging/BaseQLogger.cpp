@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/String.h>
 #include <quic/common/StringUtils.h>
 #include <quic/logging/BaseQLogger.h>
 

@@ -84,6 +84,7 @@ mvfst_cpp_library(
         "QLoggerTypes.h",
     ],
     deps = [
+        "fbsource//xplat/folly:string",
         "fbsource//xplat/folly/lang:bits",
         "//quic:exception",
         "//quic/common:string_utils",

@@ -45,6 +45,7 @@ mvfst_add_library(mvfst_logging_base_qlogger
     mvfst_common_string_utils
     mvfst_exception
     Folly::folly_lang_bits
+    Folly::folly_string
   EXPORTED_DEPS
     mvfst_codec_types
     mvfst_logging_qlogger
