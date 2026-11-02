@@ -3935,10 +3935,10 @@ TEST_F(QuicServerTest, ZeroRttPacketRoute) {
   auto verifyZeroRtt = [&](const quic::SocketAddress& /*local*/,
                            const NetworkData& networkData) noexcept {
     EXPECT_GT(networkData.getPackets().size(), 0);
-    const auto& packet = networkData.getPackets()[0];
-    ASSERT_TRUE(packet.peerAddress.has_value());
-    EXPECT_EQ(*packet.peerAddress, reader->getSocket().address());
-    EXPECT_TRUE(folly::IOBufEqualTo()(*data, *packet.buf.front()));
+    const auto& routedPacket = networkData.getPackets()[0];
+    ASSERT_TRUE(routedPacket.peerAddress.has_value());
+    EXPECT_EQ(*routedPacket.peerAddress, reader->getSocket().address());
+    EXPECT_TRUE(folly::IOBufEqualTo()(*data, *routedPacket.buf.front()));
     b1.post();
   };
   EXPECT_CALL(*transport, onNetworkData(_, _)).WillOnce(Invoke(verifyZeroRtt));
