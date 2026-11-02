@@ -86,7 +86,7 @@ mvfst_cpp_library(
         "TestClientUtils.h",
     ],
     exported_deps = [
-        "//fizz/protocol:certificate_verifier",
+        "fbsource//xplat/fizz/protocol:certificate_verifier",
     ],
 )
 
@@ -142,11 +142,11 @@ mvfst_cpp_library(
         "TestUtils.h",
     ],
     deps = [
-        "//fizz/backend:openssl",
-        "//fizz/crypto/test:TestUtil",
-        "//fizz/protocol/clock/test:mock_clock",
-        "//fizz/protocol/test:mocks",
-        "//fizz/server:cert_manager",
+        "fbsource//xplat/fizz/backend:openssl",
+        "fbsource//xplat/fizz/crypto/test:TestUtil",
+        "fbsource//xplat/fizz/protocol/clock/test:mock_clock",
+        "fbsource//xplat/fizz/protocol/test:mocks",
+        "fbsource//xplat/fizz/server:cert_manager",
         "//quic/api:transport_helpers",
         "//quic/common:mvfst_logging",
         "//quic/common:string_utils",
@@ -158,10 +158,10 @@ mvfst_cpp_library(
         "//quic/state/stream:stream",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/client:fizz_client_context",
+        "fbsource//xplat/fizz/server:fizz_server_context",
         ":test_packet_builders",
         ":test_transport_utils",
-        "//fizz/client:fizz_client_context",
-        "//fizz/server:fizz_server_context",
         "//quic/api:quic_batch_writer",
         "//quic/codec:pktbuilder",
         "//quic/codec:types",

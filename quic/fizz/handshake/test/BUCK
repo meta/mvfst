@@ -10,9 +10,9 @@ mvfst_cpp_test(
     ],
     network_access = network_access_utils.none(),
     deps = [
+        "fbsource//xplat/fizz/record/test:extension_tests_base",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//fizz/record/test:extension_tests_base",
         "//quic:constants",
         "//quic/common/test:test_utils",
         "//quic/fizz/handshake:fizz_handshake",
@@ -26,9 +26,9 @@ mvfst_cpp_test(
     ],
     network_access = network_access_utils.none(),
     deps = [
+        "fbsource//xplat/fizz/protocol:types",
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/folly/ssl:openssl_ptr_types",
-        "//fizz/protocol:types",
         "//quic/fizz/handshake:contiguous_aead",
         "//quic/fizz/handshake:fizz_bridge",
         "//quic/fizz/handshake:fizz_handshake",
@@ -48,8 +48,8 @@ mvfst_fbcode_only(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//third-party/fmt:fmt",
+        "fbsource//xplat/fizz/protocol:types",
         "fbsource//xplat/folly/portability:gtest",
-        "//fizz/protocol:types",
         "//quic/fizz/handshake:fizz_bridge",
         "//quic/fizz/handshake:fizz_handshake",
         "//quic/fizz/handshake:haberdashery_aead",
@@ -63,9 +63,9 @@ mvfst_cpp_test(
     ],
     network_access = network_access_utils.none(),
     deps = [
+        "fbsource//xplat/fizz/crypto/aead/test:mocks",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//fizz/crypto/aead/test:mocks",
         "//quic/common:string_utils",
         "//quic/common/test:test_utils",
         "//quic/fizz/handshake:fizz_handshake",
@@ -81,8 +81,8 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/fizz/record:record",
         "fbsource//xplat/folly/portability:gtest",
-        "//fizz/record:record",
         "//quic/common:string_utils",
         "//quic/fizz/handshake:fizz_handshake",
         "//quic/fizz/handshake:fizz_packet_number_cipher",

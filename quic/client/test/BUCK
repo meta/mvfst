@@ -27,9 +27,9 @@ mvfst_cpp_test(
     ],
     supports_static_listing = False,
     deps = [
+        "fbsource//xplat/fizz/record:record",
+        "fbsource//xplat/fizz/util:status",
         ":mocks",
-        "//fizz/record:record",
-        "//fizz/util:status",
         "//quic/api:transport_helpers",
         "//quic/api/test:api_mocks",
         "//quic/client:cached_server_tp",

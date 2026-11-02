@@ -19,8 +19,8 @@ mvfst_cpp_library(
         "//quic/fizz/client/handshake:fizz_client_handshake",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/client:async_fizz_client",
         "fbsource//xplat/folly/io:socket_option_map",
-        "//fizz/client:async_fizz_client",
         "//quic/api:loop_detector_callback",
         "//quic/api:transport",
         "//quic/client:client",

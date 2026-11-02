@@ -19,13 +19,13 @@ mvfst_cpp_library(
         "//quic/state:stream_functions",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/protocol:default_certificate_verifier",
+        "fbsource//xplat/fizz/server:fizz_server",
+        "fbsource//xplat/fizz/server:fizz_server_context",
         "fbsource//xplat/folly:optional",
         "fbsource//xplat/folly/io/async:delayed_destruction",
         ":app_token",
         ":server_extension",
-        "//fizz/protocol:default_certificate_verifier",
-        "//fizz/server:fizz_server",
-        "//fizz/server:fizz_server_context",
         "//quic:constants",
         "//quic:exception",
         "//quic/handshake:handshake",
@@ -39,8 +39,8 @@ mvfst_cpp_library(
         "ServerTransportParametersExtension.h",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/server:server_extensions",
         ":stateless_reset_generator",
-        "//fizz/server:server_extensions",
         "//quic/fizz/handshake:fizz_handshake",
         "//quic/state:quic_state_machine",
     ],
@@ -71,8 +71,8 @@ mvfst_cpp_library(
         "DefaultAppTokenValidator.h",
     ],
     deps = [
+        "fbsource//xplat/fizz/server:resumption_state",
         "fbsource//xplat/folly:network_address",
-        "//fizz/server:resumption_state",
         "//quic:constants",
         "//quic/api:transport",
         "//quic/api:transport_helpers",
@@ -82,8 +82,8 @@ mvfst_cpp_library(
         "//quic/server/state:server",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/server:protocol",
         "fbsource//xplat/folly/io:iobuf",
-        "//fizz/server:protocol",
         "//quic/common:optional",
     ],
 )
@@ -97,13 +97,13 @@ mvfst_cpp_library(
         "StatelessResetGenerator.h",
     ],
     deps = [
+        "fbsource//xplat/fizz/backend:openssl",
+        "fbsource//xplat/fizz/util:status",
         "fbsource//xplat/folly:range",
-        "//fizz/backend:openssl",
-        "//fizz/util:status",
     ],
     exported_deps = [
-        "//fizz/crypto:crypto",
-        "//fizz/crypto:hkdf",
+        "fbsource//xplat/fizz/crypto:crypto",
+        "fbsource//xplat/fizz/crypto:hkdf",
         "//quic/codec:types",
     ],
 )
@@ -122,8 +122,8 @@ mvfst_cpp_library(
         "//quic/common:mvfst_logging",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/server:aead_token_cipher",
         "fbsource//xplat/folly/io:iobuf",
-        "//fizz/server:aead_token_cipher",
         "//quic/codec:types",
     ],
 )

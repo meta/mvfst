@@ -86,6 +86,7 @@ mvfst_cpp_library(
         "//quic/state:transport_settings_functions",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/record:record",
         "fbsource//xplat/folly:function",
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly:thread_local",
@@ -97,7 +98,6 @@ mvfst_cpp_library(
         "fbsource//xplat/folly/io/async:async_udp_socket",
         "fbsource//xplat/folly/io/async:scoped_event_base_thread",
         ":rate_limiter",
-        "//fizz/record:record",
         "//quic:constants",
         "//quic/api:transport",
         "//quic/api:transport_helpers",

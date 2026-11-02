@@ -11,8 +11,8 @@ mvfst_cpp_library(
         "FizzBridge.h",
     ],
     exported_deps = [
-        "//fizz/crypto/aead:aead",
-        "//fizz/protocol:types",
+        "fbsource//xplat/fizz/crypto/aead:aead",
+        "fbsource//xplat/fizz/protocol:types",
         "//quic:constants",
         "//quic/handshake:aead",
     ],
@@ -27,11 +27,11 @@ mvfst_cpp_library(
         "ContiguousAead.h",
     ],
     deps = [
-        "//fizz/crypto/aead:cryptoutil",
+        "fbsource//xplat/fizz/crypto/aead:cryptoutil",
         "//quic/common:mvfst_logging",
     ],
     exported_deps = [
-        "//fizz/crypto/aead:aead",
+        "fbsource//xplat/fizz/crypto/aead:aead",
         "//quic/handshake:aead",
     ],
 )
@@ -66,7 +66,7 @@ mvfst_fbcode_only(
         ],
     }),
     exported_deps = [
-        "//fizz/crypto/aead:aead",
+        "fbsource//xplat/fizz/crypto/aead:aead",
         "//quic/handshake:aead",
     ],
 )
@@ -135,16 +135,16 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/constraints:profile[mnscrypto-only]": ["-DMVFST_MBED"],  # @fb-only
     }),
     deps = [
+        "fbsource//xplat/fizz/crypto:crypto",
+        "fbsource//xplat/fizz/crypto:utils",
+        "fbsource//xplat/fizz/crypto/aead:aead",
         ":fizz_bridge",  # @manual included via QUIC_DEFAULT_AEAD_HEADER macro
         ":fizz_packet_number_cipher",
-        "//fizz/crypto:crypto",
-        "//fizz/crypto:utils",
-        "//fizz/crypto/aead:aead",
         "//quic/common:optional",
     ],
     exported_deps = [
-        "//fizz/protocol:default_factory",
-        "//fizz/record:record",
+        "fbsource//xplat/fizz/protocol:default_factory",
+        "fbsource//xplat/fizz/record:record",
         "//quic/common:buf_util",
         "//quic/common:mvfst_logging",
         "//quic/folly_utils:folly_utils",

@@ -96,9 +96,9 @@ mvfst_cpp_library(
         "//quic/state:stream_functions",
     ],
     exported_deps = [
+        "fbsource//xplat/fizz/protocol:certificate_base",
         "fbsource//xplat/folly:exception_wrapper",
         "fbsource//xplat/folly/io/async:delayed_destruction",
-        "//fizz/protocol:certificate_base",
         "//quic:constants",
         "//quic:exception",
         "//quic/common:expected",
@@ -145,8 +145,8 @@ mvfst_cpp_library(
         "handshake/CachedServerTransportParametersSerialization.h",
     ],
     deps = [
-        "//fizz/record:record",
-        "//fizz/util:status",
+        "fbsource//xplat/fizz/record:record",
+        "fbsource//xplat/fizz/util:status",
     ],
     exported_deps = [
         "fbsource//xplat/folly:range",

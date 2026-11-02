@@ -229,14 +229,14 @@ mvfst_cpp_library(
     ],
     deps = select({
         "DEFAULT": [
-            "//fizz/record:record",
+            "fbsource//xplat/fizz/record:record",
         ],
         "ovr_config//os/constraints:android": select({
             "DEFAULT": [
                 "fbsource//xplat/mobilenetwork:tls_common",  # @manual
             ],
             "ovr_config//build_mode:arvr_mode[enabled]": [
-                "//fizz/record:record",
+                "fbsource//xplat/fizz/record:record",
             ],
         }),
         "ovr_config//os/constraints:iphoneos": [
