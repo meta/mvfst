@@ -8,6 +8,7 @@
 #include <quic/common/MvfstLogging.h>
 #include <quic/observer/SocketObserverInterface.h>
 
+#include <algorithm>
 #include <utility>
 
 namespace quic {
@@ -209,10 +210,8 @@ void SocketObserverInterface::PacketsWrittenEvent::
   DCHECK_EQ(numAckElicitingPacketsWritten, newOutstandingPackets.size());
 
   // Now sort that vector by totalAckElicitingPacketsSent.
-  std::sort(
-      std::begin(newOutstandingPackets),
-      std::end(newOutstandingPackets),
-      [](const auto& pkt1, const auto& pkt2) {
+  std::ranges::sort(
+      newOutstandingPackets, [](const auto& pkt1, const auto& pkt2) {
         const auto& pkt1TotalAckElicitingPacketsSent =
             pkt1.get().metadata.totalAckElicitingPacketsSent;
         const auto& pkt2TotalAckElicitingPacketsSent =
