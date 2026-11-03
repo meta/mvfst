@@ -202,8 +202,9 @@ class LibevQuicAsyncUDPSocket : public QuicAsyncUDPSocketImpl {
    */
   quic::Expected<void, QuicError> setReusePort(bool) override {
     MVCHECK(false, __func__ << " not implemented in LibevQuicAsyncUDPSocket");
-    // Return success as it's just a warning, or error if strictness needed
+#if MVFST_LOGGING_DISABLED
     return {};
+#endif
   }
 
   /**
