@@ -202,18 +202,14 @@ TEST(ServerTransportParametersTest, TestQuicV1Fields) {
   auto serverParams = getServerExtension(extensions, QuicVersion::QUIC_V1);
   EXPECT_TRUE(serverParams.has_value());
   auto quicTransportParams = serverParams.value().parameters;
-  auto hasInitialSourceCid = std::any_of(
-      quicTransportParams.cbegin(),
-      quicTransportParams.cend(),
-      [](const TransportParameter& p) {
+  auto hasInitialSourceCid =
+      std::ranges::any_of(quicTransportParams, [](const TransportParameter& p) {
         return p.parameter ==
             TransportParameterId::initial_source_connection_id;
       });
   EXPECT_TRUE(hasInitialSourceCid);
-  auto hasOriginalDestCid = std::any_of(
-      quicTransportParams.cbegin(),
-      quicTransportParams.cend(),
-      [](const TransportParameter& p) {
+  auto hasOriginalDestCid =
+      std::ranges::any_of(quicTransportParams, [](const TransportParameter& p) {
         return p.parameter ==
             TransportParameterId::original_destination_connection_id;
       });
@@ -252,18 +248,14 @@ TEST(ServerTransportParametersTest, TestMvfstFields) {
   auto serverParams = getServerExtension(extensions, QuicVersion::MVFST);
   EXPECT_TRUE(serverParams.has_value());
   auto quicTransportParams = serverParams.value().parameters;
-  auto hasInitialSourceCid = std::any_of(
-      quicTransportParams.cbegin(),
-      quicTransportParams.cend(),
-      [](const TransportParameter& p) {
+  auto hasInitialSourceCid =
+      std::ranges::any_of(quicTransportParams, [](const TransportParameter& p) {
         return p.parameter ==
             TransportParameterId::initial_source_connection_id;
       });
   EXPECT_FALSE(hasInitialSourceCid);
-  auto hasOriginalDestCid = std::any_of(
-      quicTransportParams.cbegin(),
-      quicTransportParams.cend(),
-      [](const TransportParameter& p) {
+  auto hasOriginalDestCid =
+      std::ranges::any_of(quicTransportParams, [](const TransportParameter& p) {
         return p.parameter ==
             TransportParameterId::original_destination_connection_id;
       });
