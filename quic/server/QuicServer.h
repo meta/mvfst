@@ -90,6 +90,10 @@ class QuicServer {
       std::function<void(quic::TransportSettings&)>;
 
   // Worker ids are encoded in 8 bits of the connection id.
+  // TODO(T295792877): use this in
+  // thrift/lib/cpp2/server/ThriftQuicServer.cpp and
+  // proxygen/lib/http/coro/server/HTTPServer.cpp instead of their own
+  // redefinitions
   static constexpr size_t kMaxWorkers = std::numeric_limits<uint8_t>::max() + 1;
 
   static std::shared_ptr<QuicServer> createQuicServer(ServerOptions options) {
