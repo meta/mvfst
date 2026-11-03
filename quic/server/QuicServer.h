@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -87,6 +88,9 @@ class QuicServer {
  public:
   using TransportSettingsOverrideFn =
       std::function<void(quic::TransportSettings&)>;
+
+  // Worker ids are encoded in 8 bits of the connection id.
+  static constexpr size_t kMaxWorkers = std::numeric_limits<uint8_t>::max() + 1;
 
   static std::shared_ptr<QuicServer> createQuicServer(ServerOptions options) {
     return std::make_shared<QuicServer>(std::move(options));

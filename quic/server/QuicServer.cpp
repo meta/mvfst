@@ -18,6 +18,7 @@
 #include <quic/server/SlidingWindowRateLimiter.h>
 #include <iterator>
 #include <stdexcept>
+#include <string>
 
 FOLLY_GFLAGS_DEFINE_int32(
     qs_conn_id_version,
@@ -138,9 +139,10 @@ void QuicServer::bindImpl(
     const std::vector<folly::EventBase*>& evbs,
     const std::vector<int>& inheritedFds) {
   MVCHECK(phase_ == State::Created, "QuicServer::bind requires Created state");
-  if (evbs.size() > std::numeric_limits<uint8_t>::max()) {
+  if (evbs.size() > kMaxWorkers) {
     throw std::invalid_argument(
-        "Quic Server does not support more than 255 workers");
+        "Quic Server does not support more than " +
+        std::to_string(kMaxWorkers) + " workers");
   }
   MVCHECK(!evbs.empty());
   {

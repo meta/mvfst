@@ -9,6 +9,7 @@
 #include <quic/server/QuicServer.h>
 #include <quic/server/ThreadedQuicServer.h>
 
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Promise.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/test/MockAsyncUDPSocket.h>
@@ -3064,6 +3065,13 @@ class QuicServerMultiWorkerRoutingTest : public QuicServerTest {
       uint8_t encodedWorkerId,
       folly::EventBase* injectFromEvb,
       folly::EventBase* expectedFactoryEvb) {
+    folly::Baton<> baton;
+    folly::EventBase* factoryEvb = nullptr;
+    auto shutdownGuard = folly::makeGuard([&] {
+      std::thread shutdownThread([&] { shutdownServer(); });
+      shutdownThread.join();
+    });
+
     DefaultConnectionIdAlgo algo;
     auto dcid =
         algo
@@ -3076,8 +3084,6 @@ class QuicServerMultiWorkerRoutingTest : public QuicServerTest {
         ConnectionId::createAndMaybeCrash({1, 2, 3, 4, 5, 6, 7, 8});
     auto data = createData(kMinInitialPacketSize + 10);
 
-    folly::Baton<> baton;
-    folly::EventBase* factoryEvb = nullptr;
     EXPECT_CALL(*factory_, _make(_, _, _))
         .WillOnce(
             Invoke([&](folly::EventBase* evb,
@@ -3101,9 +3107,6 @@ class QuicServerMultiWorkerRoutingTest : public QuicServerTest {
 
     ASSERT_TRUE(baton.try_wait_for(std::chrono::seconds(5)));
     EXPECT_EQ(factoryEvb, expectedFactoryEvb);
-
-    std::thread t([&] { shutdownServer(); });
-    t.join();
   }
 };
 
@@ -3165,6 +3168,28 @@ TEST_F(
       /*encodedWorkerId=*/1,
       /*injectFromEvb=*/evbThreadA.getEventBase(),
       /*expectedFactoryEvb=*/evbThreadB.getEventBase());
+}
+
+TEST_F(QuicServerMultiWorkerRoutingTest, AllWorkerIdsInUseRouteToOwningWorker) {
+  constexpr size_t kNumWorkers = 256;
+  std::vector<std::unique_ptr<folly::ScopedEventBaseThread>> threads;
+  std::vector<folly::EventBase*> evbs;
+  for (size_t i = 0; i < kNumWorkers; ++i) {
+    threads.push_back(std::make_unique<folly::ScopedEventBaseThread>());
+    evbs.push_back(threads.back()->getEventBase());
+  }
+  initializeServer(evbs);
+
+  const auto fds = server_->getAllListeningSocketFDs();
+  const std::set<int> distinctFds(fds.begin(), fds.end());
+  EXPECT_EQ(distinctFds.size(), kNumWorkers);
+  EXPECT_EQ(distinctFds.count(-1), 0);
+
+  runMultiWorkerRoutingTest(
+      /*encodedHostId=*/serverHostId_,
+      /*encodedWorkerId=*/kNumWorkers - 1,
+      /*injectFromEvb=*/evbs.front(),
+      /*expectedFactoryEvb=*/evbs.back());
 }
 
 TEST_F(QuicServerTest, OverrideTakeoverAddressTest) {
@@ -4061,7 +4086,12 @@ TEST(QuicServerWorkerCountTest, RequestedCountIsCappedByCpuCount) {
 }
 
 TEST(QuicServerWorkerCountTest, DerivedCountIsCappedAtTheStartLimit) {
-  const size_t limit = std::numeric_limits<uint8_t>::max();
+  const size_t limit = std::numeric_limits<uint8_t>::max() + 1;
+  EXPECT_EQ(
+      ThreadedQuicServer::numWorkersToCreate(limit - 1, limit + 1), limit - 1);
+  EXPECT_EQ(ThreadedQuicServer::numWorkersToCreate(limit, limit + 1), limit);
+  EXPECT_EQ(
+      ThreadedQuicServer::numWorkersToCreate(limit + 1, limit + 1), limit);
   EXPECT_EQ(ThreadedQuicServer::numWorkersToCreate(0, limit), limit);
   EXPECT_EQ(ThreadedQuicServer::numWorkersToCreate(0, limit + 1), limit);
   // An H100 host has 384 cpus (D76638451).
@@ -4280,12 +4310,12 @@ TEST_F(QuicServerTest, RepeatedStartIsNoop) {
   EXPECT_EQ(server_->state(), QuicServer::State::Stopped);
 }
 
-TEST_F(QuicServerTest, BindRejectsMoreThan255Workers) {
+TEST_F(QuicServerTest, BindRejectsMoreThan256Workers) {
   std::vector<std::unique_ptr<folly::EventBase>> owned;
   std::vector<folly::EventBase*> evbs;
-  owned.reserve(256);
-  evbs.reserve(256);
-  for (int i = 0; i < 256; ++i) {
+  owned.reserve(257);
+  evbs.reserve(257);
+  for (int i = 0; i < 257; ++i) {
     owned.push_back(std::make_unique<folly::EventBase>());
     evbs.push_back(owned.back().get());
   }

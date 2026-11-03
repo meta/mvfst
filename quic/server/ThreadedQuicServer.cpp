@@ -11,6 +11,8 @@
 #include <quic/common/MvfstLogging.h>
 #include <quic/server/QuicServerBackend.h>
 
+#include <algorithm>
+
 namespace quic {
 
 ThreadedQuicServer::ThreadedQuicServer(
@@ -38,10 +40,13 @@ size_t ThreadedQuicServer::numWorkersToCreate(
   if (maxWorkers == 0) {
     maxWorkers = numCpu;
   }
-  return std::min(
-      {numCpu,
-       maxWorkers,
-       static_cast<size_t>(std::numeric_limits<uint8_t>::max())});
+  const auto numWorkers = std::min(numCpu, maxWorkers);
+  if (numWorkers > QuicServer::kMaxWorkers) {
+    MVLOG_WARNING << "QuicServer supports at most " << QuicServer::kMaxWorkers
+                  << " workers; capping requested " << numWorkers;
+    return QuicServer::kMaxWorkers;
+  }
+  return numWorkers;
 }
 
 SocketAddress ThreadedQuicServer::bind(
