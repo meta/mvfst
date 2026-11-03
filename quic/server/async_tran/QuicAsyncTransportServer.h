@@ -28,8 +28,11 @@ class QuicAsyncTransportServer {
   void setFizzContext(
       std::shared_ptr<const fizz::server::FizzServerContext> ctx);
 
+  // Zero uses the available CPU count.
+  // Capped at QuicServer::kMaxWorkers.
   void start(const quic::SocketAddress& address, size_t numThreads = 0);
 
+  // Borrows the EventBases, which must satisfy QuicServer::bind's contract.
   void start(
       const quic::SocketAddress& address,
       std::vector<folly::EventBase*> evbs);

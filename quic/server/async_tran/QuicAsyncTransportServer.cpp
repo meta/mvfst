@@ -37,6 +37,11 @@ void QuicAsyncTransportServer::start(
   if (numThreads == 0) {
     numThreads = folly::available_concurrency();
   }
+  if (numThreads > QuicServer::kMaxWorkers) {
+    MVLOG_WARNING << "QuicServer supports at most " << QuicServer::kMaxWorkers
+                  << " workers; capping requested " << numThreads;
+    numThreads = QuicServer::kMaxWorkers;
+  }
   std::vector<folly::EventBase*> evbs;
   for (size_t i = 0; i < numThreads; ++i) {
     auto scopedEvb = std::make_unique<folly::ScopedEventBaseThread>();

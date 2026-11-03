@@ -5,12 +5,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
 #include <atomic>
+#include <stdexcept>
 
 #include <folly/futures/Future.h>
 #include <folly/io/async/test/MockAsyncTransport.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include <folly/system/HardwareConcurrency.h>
 
 #include <folly/io/async/AsyncTransport.h>
 #include <quic/api/test/Mocks.h>
@@ -28,11 +31,24 @@ using namespace testing;
 
 namespace quic::test {
 
-class QuicAsyncTransportServerTest : public Test {
+class TestAsyncTransportServer : public QuicAsyncTransportServer {
+ public:
+  using QuicAsyncTransportServer::QuicAsyncTransportServer;
+
+  size_t numWorkerThreads() const {
+    return workerEvbs_.size();
+  }
+
+  size_t numAcceptors() const {
+    return acceptors_.size();
+  }
+};
+
+class QuicAsyncTransportServerTest : public TestWithParam<size_t> {
  public:
   void SetUp() override {
     clientEvb_ = std::make_shared<FollyQuicEventBase>(&evb);
-    createServer();
+    ASSERT_NO_THROW(createServer());
     createClient();
   }
 
@@ -54,13 +70,20 @@ class QuicAsyncTransportServerTest : public Test {
     EXPECT_CALL(serverReadCB_, readEOF_()).WillOnce(Return());
     EXPECT_CALL(serverWriteCB_, writeSuccess_()).WillOnce(Return());
 
-    server_ = std::make_shared<QuicAsyncTransportServer>([this](auto sock) {
+    server_ = std::make_shared<TestAsyncTransportServer>([this](auto sock) {
       sock->setReadCB(&serverReadCB_);
       serverAsyncWrapper_ = std::move(sock);
     });
     server_->setFizzContext(test::createServerCtx());
     quic::SocketAddress addr("::1", 0);
-    server_->start(addr, 1);
+    server_->start(addr, GetParam());
+    const auto expectedWorkers = std::min<size_t>(
+        GetParam() == 0 ? folly::available_concurrency() : GetParam(), 256);
+    EXPECT_EQ(server_->numWorkerThreads(), expectedWorkers);
+    EXPECT_EQ(server_->numAcceptors(), expectedWorkers);
+    EXPECT_EQ(
+        server_->quicServer().getAllListeningSocketFDs().size(),
+        expectedWorkers);
     serverAddr_ = server_->quicServer().getAddress();
   }
 
@@ -99,18 +122,24 @@ class QuicAsyncTransportServerTest : public Test {
   }
 
   void TearDown() override {
-    server_->shutdown();
-    server_ = nullptr;
-    clientEvb_->runInEventBaseThreadAndWait([&] {
-      clientAsyncWrapper_ = nullptr;
-      client_ = nullptr;
-    });
-    clientEvb_->terminateLoopSoon();
-    clientEvbThread_.join();
+    if (server_) {
+      server_->shutdown();
+      EXPECT_EQ(server_->numWorkerThreads(), 0);
+      EXPECT_EQ(server_->numAcceptors(), 0);
+      server_ = nullptr;
+    }
+    if (clientEvbThread_.joinable()) {
+      clientEvb_->runInEventBaseThreadAndWait([&] {
+        clientAsyncWrapper_ = nullptr;
+        client_ = nullptr;
+      });
+      clientEvb_->terminateLoopSoon();
+      clientEvbThread_.join();
+    }
   }
 
  protected:
-  std::shared_ptr<QuicAsyncTransportServer> server_;
+  std::shared_ptr<TestAsyncTransportServer> server_;
   quic::SocketAddress serverAddr_;
   folly::AsyncTransport::UniquePtr serverAsyncWrapper_;
   folly::test::MockWriteCallback serverWriteCB_;
@@ -128,7 +157,7 @@ class QuicAsyncTransportServerTest : public Test {
   folly::Promise<std::string> clientReadPromise_;
 };
 
-TEST_F(QuicAsyncTransportServerTest, ReadWrite) {
+TEST_P(QuicAsyncTransportServerTest, ReadWrite) {
   auto [promise, future] = folly::makePromiseContract<std::string>();
   clientReadPromise_ = std::move(promise);
 
@@ -140,6 +169,44 @@ TEST_F(QuicAsyncTransportServerTest, ReadWrite) {
 
   std::string clientReadString = std::move(future).get(1s);
   EXPECT_EQ(clientReadString, "jaja ding dong");
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    WorkerCounts,
+    QuicAsyncTransportServerTest,
+    Values(0, 1, 257));
+
+TEST(QuicAsyncTransportServerWorkerTest, RejectsOversizedBorrowedWorkers) {
+  folly::ScopedEventBaseThread evbThread;
+  TestAsyncTransportServer server([](auto) {});
+  EXPECT_THROW(
+      server.start(
+          quic::SocketAddress("::1", 0),
+          std::vector<folly::EventBase*>(257, evbThread.getEventBase())),
+      std::invalid_argument);
+  EXPECT_EQ(server.numWorkerThreads(), 0);
+  EXPECT_EQ(server.numAcceptors(), 0);
+  EXPECT_TRUE(server.quicServer().getAllListeningSocketFDs().empty());
+}
+
+TEST(QuicAsyncTransportServerWorkerTest, BorrowedWorkersRemainCallerOwned) {
+  folly::ScopedEventBaseThread first;
+  folly::ScopedEventBaseThread second;
+  TestAsyncTransportServer server([](auto) {});
+  server.setFizzContext(test::createServerCtx());
+  std::vector<folly::EventBase*> evbs{
+      first.getEventBase(), second.getEventBase()};
+  server.start(quic::SocketAddress("::1", 0), evbs);
+  EXPECT_EQ(server.numWorkerThreads(), 0);
+  EXPECT_EQ(server.numAcceptors(), evbs.size());
+  EXPECT_EQ(server.quicServer().getAllListeningSocketFDs().size(), evbs.size());
+  server.shutdown();
+  EXPECT_EQ(server.numAcceptors(), 0);
+  for (auto* evb : evbs) {
+    bool ran = false;
+    evb->runInEventBaseThreadAndWait([&] { ran = true; });
+    EXPECT_TRUE(ran);
+  }
 }
 
 TEST(QuicAsyncTransportServerRotateTest, RotateAfterStartUsesNewContext) {
