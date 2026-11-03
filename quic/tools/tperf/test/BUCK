@@ -8,9 +8,9 @@ mvfst_cpp_test(
         "PacingObserverTest.cpp",
     ],
     deps = [
-        "//quic/common/test:test_utils",
-        "//quic/logging/test:mocks",
-        "//quic/tools/tperf:pacing_observer",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/logging/test:mocks",
+        "fbsource//xplat/quic/tools/tperf:pacing_observer",
     ],
 )
 
@@ -21,7 +21,7 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/tools/tperf:tperf_huge_page_arena",
+        "fbsource//xplat/quic/tools/tperf:tperf_huge_page_arena",
     ],
 )
 
@@ -32,6 +32,6 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/tools/tperf:tperf_server",
+        "fbsource//xplat/quic/tools/tperf:tperf_server",
     ],
 )

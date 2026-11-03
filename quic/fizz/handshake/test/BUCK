@@ -13,9 +13,9 @@ mvfst_cpp_test(
         "fbsource//xplat/fizz/record/test:extension_tests_base",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:constants",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
     ],
 )
 
@@ -29,9 +29,9 @@ mvfst_cpp_test(
         "fbsource//xplat/fizz/protocol:types",
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/folly/ssl:openssl_ptr_types",
-        "//quic/fizz/handshake:contiguous_aead",
-        "//quic/fizz/handshake:fizz_bridge",
-        "//quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/fizz/handshake:contiguous_aead",
+        "fbsource//xplat/quic/fizz/handshake:fizz_bridge",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
     ],
 )
 
@@ -50,9 +50,9 @@ mvfst_fbcode_only(
         "fbsource//third-party/fmt:fmt",
         "fbsource//xplat/fizz/protocol:types",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/fizz/handshake:fizz_bridge",
-        "//quic/fizz/handshake:fizz_handshake",
-        "//quic/fizz/handshake:haberdashery_aead",
+        "fbsource//xplat/quic/fizz/handshake:fizz_bridge",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/fizz/handshake:haberdashery_aead",
     ],
 )
 
@@ -66,10 +66,10 @@ mvfst_cpp_test(
         "fbsource//xplat/fizz/crypto/aead/test:mocks",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/common:string_utils",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/handshake:fizz_handshake",
-        "//quic/handshake/test:mocks",
+        "fbsource//xplat/quic/common:string_utils",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/handshake/test:mocks",
     ],
 )
 
@@ -83,8 +83,8 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/fizz/record:record",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/common:string_utils",
-        "//quic/fizz/handshake:fizz_handshake",
-        "//quic/fizz/handshake:fizz_packet_number_cipher",
+        "fbsource//xplat/quic/common:string_utils",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/fizz/handshake:fizz_packet_number_cipher",
     ],
 )

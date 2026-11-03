@@ -38,7 +38,7 @@ mvfst_cpp_library(
         "ThreadLocalXskContainer.h",
     ],
     deps = [
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
         "fbsource//xplat/folly:thread_local",
@@ -56,16 +56,16 @@ mvfst_cpp_library(
     deps = [
         "fbsource//xplat/folly:benchmark",
         "fbsource//xplat/folly/net:net_ops",
-        "//quic/common:linux_kernel_version",
-        "//quic/common:string_utils",
+        "fbsource//xplat/quic/common:linux_kernel_version",
+        "fbsource//xplat/quic/common:string_utils",
     ],
     exported_deps = [
         "fbsource//xplat/folly:network_address",
         "fbsource//xplat/folly/container:f14_hash",
         "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:optional",
         ":xsk_lib",
-        "//quic/common:expected",
-        "//quic/common:mvfst_logging",
-        "//quic/common:optional",
     ],
 )

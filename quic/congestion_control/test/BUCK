@@ -10,7 +10,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:gmock",
-        "//quic/congestion_control:bbr",
+        "fbsource//xplat/quic/congestion_control:bbr",
     ],
 )
 
@@ -20,7 +20,7 @@ mvfst_cpp_library(
         "TestingCubic.h",
     ],
     exported_deps = [
-        "//quic/congestion_control:cubic",
+        "fbsource//xplat/quic/congestion_control:cubic",
     ],
 )
 
@@ -33,11 +33,11 @@ mvfst_cpp_library(
         "Utils.h",
     ],
     deps = [
-        "//quic/congestion_control:congestion_control_functions",
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
     ],
     exported_deps = [
-        "//quic/congestion_control:congestion_controller",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )
 
@@ -49,9 +49,9 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:constants",
-        "//quic/congestion_control:congestion_control_functions",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )
 
@@ -63,9 +63,9 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
         ":TestingCubic",
         ":test_utils",
-        "//quic/common/test:test_utils",
     ],
 )
 
@@ -80,11 +80,11 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:cubic",
+        "fbsource//xplat/quic/state/test:mocks",
         ":TestingCubic",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:cubic",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -96,10 +96,10 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:newreno",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:newreno",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
     ],
 )
 
@@ -111,11 +111,11 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:copa",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:copa",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -128,12 +128,12 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr",
+        "fbsource//xplat/quic/congestion_control:bbr_bandwidth_sampler",
+        "fbsource//xplat/quic/state/test:mocks",
         ":mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr",
-        "//quic/congestion_control:bbr_bandwidth_sampler",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -146,7 +146,7 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/congestion_control:bbr_rtt_sampler",
+        "fbsource//xplat/quic/congestion_control:bbr_rtt_sampler",
     ],
 )
 
@@ -159,8 +159,8 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr_bandwidth_sampler",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr_bandwidth_sampler",
     ],
 )
 
@@ -172,7 +172,7 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/congestion_control:bandwidth",
+        "fbsource//xplat/quic/congestion_control:bandwidth",
     ],
 )
 
@@ -184,9 +184,9 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/congestion_control:pacer",
-        "//quic/logging/test:mocks",
-        "//quic/state/test:mocks",
+        "fbsource//xplat/quic/congestion_control:pacer",
+        "fbsource//xplat/quic/logging/test:mocks",
+        "fbsource//xplat/quic/state/test:mocks",
     ],
 )
 
@@ -199,11 +199,11 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr",
+        "fbsource//xplat/quic/congestion_control:static_cwnd_congestion_controller",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr",
-        "//quic/congestion_control:static_cwnd_congestion_controller",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -215,8 +215,8 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:exception",
-        "//quic/congestion_control:simulated_tbf",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/congestion_control:simulated_tbf",
     ],
 )
 
@@ -227,14 +227,14 @@ mvfst_cpp_test(
     ],
     network_access = network_access_utils.none(),
     deps = [
+        "fbsource//xplat/quic/api:transport_helpers",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr",
+        "fbsource//xplat/quic/congestion_control:bbr_bandwidth_sampler",
+        "fbsource//xplat/quic/congestion_control:simulated_tbf",
+        "fbsource//xplat/quic/congestion_control:throttling_signal_provider",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/api:transport_helpers",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr",
-        "//quic/congestion_control:bbr_bandwidth_sampler",
-        "//quic/congestion_control:simulated_tbf",
-        "//quic/congestion_control:throttling_signal_provider",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -247,10 +247,10 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr2",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr2",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -263,11 +263,11 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr2",
+        "fbsource//xplat/quic/state:ack_handler",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr2",
-        "//quic/state:ack_handler",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -280,12 +280,12 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_bw",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_rtt",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control/modular:bbr2_probe_bw",
-        "//quic/congestion_control/modular:bbr2_probe_rtt",
-        "//quic/congestion_control/modular:bbr2_startup",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -298,11 +298,11 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_rtt",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control/modular:bbr2_probe_rtt",
-        "//quic/congestion_control/modular:bbr2_startup",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -315,11 +315,11 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_bw",
+        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control/modular:bbr2_probe_bw",
-        "//quic/congestion_control/modular:bbr2_startup",
-        "//quic/state/test:mocks",
     ],
 )
 
@@ -331,9 +331,9 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/api/test:api_mocks",
-        "//quic/api/test:mocks",
-        "//quic/congestion_control:ecn_l4s_tracker",
+        "fbsource//xplat/quic/api/test:api_mocks",
+        "fbsource//xplat/quic/api/test:mocks",
+        "fbsource//xplat/quic/congestion_control:ecn_l4s_tracker",
     ],
 )
 
@@ -346,11 +346,11 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bandwidth",
+        "fbsource//xplat/quic/congestion_control:bbr2",
+        "fbsource//xplat/quic/state:transport_settings_functions",
+        "fbsource//xplat/quic/state/test:mocks",
         ":test_utils",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bandwidth",
-        "//quic/congestion_control:bbr2",
-        "//quic/state:transport_settings_functions",
-        "//quic/state/test:mocks",
     ],
 )

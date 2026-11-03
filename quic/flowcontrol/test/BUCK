@@ -11,9 +11,9 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//third-party/googletest:gmock",
-        "//quic/client:state_and_handshake",
-        "//quic/common/test:test_utils",
-        "//quic/flowcontrol:flow_control",
-        "//quic/state/test:mocks",
+        "fbsource//xplat/quic/client:state_and_handshake",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/flowcontrol:flow_control",
+        "fbsource//xplat/quic/state/test:mocks",
     ],
 )

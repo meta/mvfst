@@ -8,6 +8,6 @@ mvfst_cpp_test(
         "PacketUtilsTest.cpp",
     ],
     deps = [
-        "//quic/xsk:xsk_lib",
+        "fbsource//xplat/quic/xsk:xsk_lib",
     ],
 )

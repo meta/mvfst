@@ -10,7 +10,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly:glog",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
 )
 
@@ -94,9 +94,9 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly:glog",
         "fbsource//xplat/folly:intrusive_list",
+        "fbsource//xplat/quic/common:mvfst_logging",
         ":eventbase",
         ":quic_timer",
-        "//quic/common:mvfst_logging",
     ],
     exported_external_deps = [
         "libev",

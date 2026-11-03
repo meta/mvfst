@@ -15,14 +15,14 @@ mvfst_cpp_library(
         "StreamStateFunctions.h",
     ],
     deps = [
-        "//quic/common:mvfst_logging",
-        "//quic/flowcontrol:flow_control",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/state:connection_oops_fields",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/flowcontrol:flow_control",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/state:connection_oops_fields",
     ],
     exported_deps = [
-        "//quic/state:quic_state_machine",
-        "//quic/state:quic_stream_utilities",
-        "//quic/state:stream_functions",
+        "fbsource//xplat/quic/state:quic_state_machine",
+        "fbsource//xplat/quic/state:quic_stream_utilities",
+        "fbsource//xplat/quic/state:stream_functions",
     ],
 )

@@ -17,9 +17,9 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/client:early_data_rejection",
         "fbsource//xplat/fizz/protocol:exporter",
         "fbsource//xplat/fizz/protocol:protocol",
-        "//quic/codec:pktbuilder",
-        "//quic/common:mvfst_logging",
-        "//quic/fizz/handshake:fizz_bridge",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/fizz/handshake:fizz_bridge",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/client:actions",
@@ -30,10 +30,10 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/client:protocol",
         "fbsource//xplat/fizz/extensions/clientpadding:types",
         "fbsource//xplat/fizz/protocol:default_certificate_verifier",
+        "fbsource//xplat/quic/client:client_extension",
+        "fbsource//xplat/quic/client:state_and_handshake",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
         ":psk_cache",
-        "//quic/client:client_extension",
-        "//quic/client:state_and_handshake",
-        "//quic/fizz/handshake:fizz_handshake",
     ],
 )
 
@@ -44,8 +44,8 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/fizz/client:psk_cache",
-        "//quic/client:cached_server_tp",
-        "//quic/common:optional",
+        "fbsource//xplat/quic/client:cached_server_tp",
+        "fbsource//xplat/quic/common:optional",
     ],
 )
 
@@ -55,6 +55,6 @@ mvfst_cpp_library(
         "QuicTokenCache.h",
     ],
     exported_deps = [
-        "//quic/common:optional",
+        "fbsource//xplat/quic/common:optional",
     ],
 )

@@ -12,11 +12,11 @@ mvfst_cpp_library(
         "ServerHandshakeFactory.h",
     ],
     deps = [
-        "//quic/common:mvfst_logging",
-        "//quic/fizz/handshake:fizz_bridge",  # @manual direct include from ServerHandshake.cpp
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/state:connection_oops_fields",
-        "//quic/state:stream_functions",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/fizz/handshake:fizz_bridge",  # @manual direct include from ServerHandshake.cpp
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/state:connection_oops_fields",
+        "fbsource//xplat/quic/state:stream_functions",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/protocol:default_certificate_verifier",
@@ -24,12 +24,12 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/server:fizz_server_context",
         "fbsource//xplat/folly:optional",
         "fbsource//xplat/folly/io/async:delayed_destruction",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/handshake:handshake",
+        "fbsource//xplat/quic/state:quic_state_machine",
         ":app_token",
         ":server_extension",
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/handshake:handshake",
-        "//quic/state:quic_state_machine",
     ],
 )
 
@@ -40,9 +40,9 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/fizz/server:server_extensions",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/state:quic_state_machine",
         ":stateless_reset_generator",
-        "//quic/fizz/handshake:fizz_handshake",
-        "//quic/state:quic_state_machine",
     ],
 )
 
@@ -55,10 +55,10 @@ mvfst_cpp_library(
         "AppToken.h",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/common:expected",
-        "//quic/handshake:transport_parameters",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/handshake:transport_parameters",
     ],
 )
 
@@ -73,18 +73,18 @@ mvfst_cpp_library(
     deps = [
         "fbsource//xplat/fizz/server:resumption_state",
         "fbsource//xplat/folly:network_address",
-        "//quic:constants",
-        "//quic/api:transport",
-        "//quic/api:transport_helpers",
-        "//quic/common:mvfst_logging",
-        "//quic/fizz/server/handshake:handshake_app_token",
-        "//quic/handshake:transport_parameters",
-        "//quic/server/state:server",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/api:transport",
+        "fbsource//xplat/quic/api:transport_helpers",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/fizz/server/handshake:handshake_app_token",
+        "fbsource//xplat/quic/handshake:transport_parameters",
+        "fbsource//xplat/quic/server/state:server",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/server:protocol",
         "fbsource//xplat/folly/io:iobuf",
-        "//quic/common:optional",
+        "fbsource//xplat/quic/common:optional",
     ],
 )
 
@@ -104,7 +104,7 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/fizz/crypto:crypto",
         "fbsource//xplat/fizz/crypto:hkdf",
-        "//quic/codec:types",
+        "fbsource//xplat/quic/codec:types",
     ],
 )
 
@@ -118,12 +118,12 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly:range",
-        "//quic/codec:decode",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/codec:decode",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/server:aead_token_cipher",
         "fbsource//xplat/folly/io:iobuf",
-        "//quic/codec:types",
+        "fbsource//xplat/quic/codec:types",
     ],
 )

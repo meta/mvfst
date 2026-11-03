@@ -8,10 +8,10 @@ mvfst_cpp_library(
         "Aead.h",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/common:expected",
-        "//quic/common:optional",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:optional",
     ],
 )
 
@@ -26,13 +26,13 @@ mvfst_cpp_library(
         "HandshakeLayer.h",
     ],
     exported_deps = [
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/codec:packet_number_cipher",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:mvfst_logging",
         ":aead",
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/codec:packet_number_cipher",
-        "//quic/codec:types",
-        "//quic/common:expected",
-        "//quic/common:mvfst_logging",
     ],
 )
 
@@ -45,15 +45,15 @@ mvfst_cpp_library(
         "TransportParameters.h",
     ],
     deps = [
-        "//quic/common:buf_util",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/codec:types",
-        "//quic/common:expected",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
 )
 
@@ -64,6 +64,6 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/io:iobuf",
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
 )

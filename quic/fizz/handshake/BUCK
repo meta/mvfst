@@ -13,8 +13,8 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/fizz/crypto/aead:aead",
         "fbsource//xplat/fizz/protocol:types",
-        "//quic:constants",
-        "//quic/handshake:aead",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/handshake:aead",
     ],
 )
 
@@ -28,11 +28,11 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/fizz/crypto/aead:cryptoutil",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/crypto/aead:aead",
-        "//quic/handshake:aead",
+        "fbsource//xplat/quic/handshake:aead",
     ],
 )
 
@@ -67,7 +67,7 @@ mvfst_fbcode_only(
     }),
     exported_deps = [
         "fbsource//xplat/fizz/crypto/aead:aead",
-        "//quic/handshake:aead",
+        "fbsource//xplat/quic/handshake:aead",
     ],
 )
 
@@ -88,13 +88,13 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/constraints:profile[mnscrypto-only]": ["-DMVFST_MBED"],  # @fb-only
     }),
     deps = [
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
-        "//quic/codec:packet_number_cipher",
+        "fbsource//xplat/quic/codec:packet_number_cipher",
     ] + select({
         "DEFAULT": ["fbsource//xplat/folly/ssl:openssl_ptr_types"],
-        "fbsource//xplat/fizz/constraints:profile[mnscrypto-only]": ["//quic/facebook/mbed:mbed_packetnum_cipher"],  # @fb-only
+        "fbsource//xplat/fizz/constraints:profile[mnscrypto-only]": ["fbsource//xplat/quic/facebook/mbed:mbed_packetnum_cipher"],  # @fb-only
     }),
 )
 
@@ -116,7 +116,7 @@ mvfst_cpp_library(
         "DEFAULT": [],
         "ovr_config//runtime/constraints:fbcode": select({
             "DEFAULT": [],  # @fb-only
-            "fbcode//quic:use_alt_crypto-enabled": ["fbcode//quic/facebook/handshake:xsec_ecb_packet_number_cipher"],  # @fb-only
+            "fbcode//quic:use_alt_crypto-enabled": ["fbsource//xplat/quic/facebook/handshake:xsec_ecb_packet_number_cipher"],  # @fb-only
             "ovr_config//build_mode:arvr_mode[enabled]": [],  # @fb-only
             "ovr_config//runtime/constraints:android-host-test": [],  # @fb-only
         }),  # @fb-only
@@ -125,7 +125,7 @@ mvfst_cpp_library(
         "DEFAULT": [],
         "ovr_config//runtime/constraints:fbcode": select({
             "DEFAULT": [],  # @fb-only
-            "fbcode//quic:use_alt_crypto-enabled": ["fbcode//quic/facebook/handshake:xsec_crypto_bridge"],  # @fb-only
+            "fbcode//quic:use_alt_crypto-enabled": ["fbsource//xplat/quic/facebook/handshake:xsec_crypto_bridge"],  # @fb-only
             "ovr_config//build_mode:arvr_mode[enabled]": [],  # @fb-only
             "ovr_config//runtime/constraints:android-host-test": [],  # @fb-only
         }),  # @fb-only
@@ -138,18 +138,18 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/crypto:crypto",
         "fbsource//xplat/fizz/crypto:utils",
         "fbsource//xplat/fizz/crypto/aead:aead",
+        "fbsource//xplat/quic/common:optional",
         ":fizz_bridge",  # @manual included via QUIC_DEFAULT_AEAD_HEADER macro
         ":fizz_packet_number_cipher",
-        "//quic/common:optional",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/protocol:default_factory",
         "fbsource//xplat/fizz/record:record",
-        "//quic/common:buf_util",
-        "//quic/common:mvfst_logging",
-        "//quic/folly_utils:folly_utils",
-        "//quic/handshake:handshake",
-        "//quic/handshake:retry_integrity_tag_generator",
-        "//quic/handshake:transport_parameters",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/folly_utils:folly_utils",
+        "fbsource//xplat/quic/handshake:handshake",
+        "fbsource//xplat/quic/handshake:retry_integrity_tag_generator",
+        "fbsource//xplat/quic/handshake:transport_parameters",
     ],
 )

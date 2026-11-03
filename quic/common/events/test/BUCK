@@ -10,7 +10,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/common/events:eventbase",
+        "fbsource//xplat/quic/common/events:eventbase",
     ],
 )
 
@@ -22,8 +22,8 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/events:folly_eventbase",
         ":QuicEventBaseTestBase",
-        "//quic/common/events:folly_eventbase",
     ],
 )
 
@@ -36,8 +36,8 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/events:libev_eventbase",
         ":QuicEventBaseTestBase",
-        "//quic/common/events:libev_eventbase",
     ],
     external_deps = [
         "libev",
@@ -51,6 +51,6 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:gmock",
-        "//quic/common/events:eventbase",
+        "fbsource//xplat/quic/common/events:eventbase",
     ],
 )

@@ -10,15 +10,15 @@ mvfst_cpp_library(
     headers = ["QuicFlowController.h"],
     deps = [
         "fbsource//third-party/fmt:fmt",
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/common:mvfst_logging",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/state:connection_oops_fields",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/state:connection_oops_fields",
     ],
     exported_deps = [
-        "//quic/codec:types",
-        "//quic/common:expected",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )

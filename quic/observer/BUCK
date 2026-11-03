@@ -7,8 +7,8 @@ mvfst_cpp_library(
     headers = ["SocketObserverContainer.h"],
     exported_deps = [
         "fbsource//xplat/folly:observer_container",
+        "fbsource//xplat/quic/common:mvfst_logging",
         ":socket_observer_interface",
-        "//quic/common:mvfst_logging",
     ],
 )
 
@@ -29,13 +29,13 @@ mvfst_cpp_library(
         "ovr_config//os/constraints:iphoneos": ["facebook/SocketObserverInterfaceMobile.cpp"],
     }),
     headers = ["SocketObserverInterface.h"],
-    deps = ["//quic/common:mvfst_logging"],
+    deps = ["fbsource//xplat/quic/common:mvfst_logging"],
     exported_deps = [
-        "//quic:exception",
-        "//quic/common:function_ref",
-        "//quic/state:ack_event",
-        "//quic/state:outstanding_packet",
-        "//quic/state:quic_stream_utilities",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/common:function_ref",
+        "fbsource//xplat/quic/state:ack_event",
+        "fbsource//xplat/quic/state:outstanding_packet",
+        "fbsource//xplat/quic/state:quic_stream_utilities",
     ],
 )
 

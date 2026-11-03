@@ -10,7 +10,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:gmock",
-        "//quic/logging:qlogger",
+        "fbsource//xplat/quic/logging:qlogger",
     ],
 )
 
@@ -25,10 +25,10 @@ mvfst_cpp_test(
         "fbsource//xplat/folly:file_util",
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly/portability:filesystem",
-        "//quic/common:mvfst_logging",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:bbr",
-        "//quic/logging:file_qlogger",
-        "//quic/logging:qlogger",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr",
+        "fbsource//xplat/quic/logging:file_qlogger",
+        "fbsource//xplat/quic/logging:qlogger",
     ],
 )

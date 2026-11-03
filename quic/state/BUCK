@@ -11,11 +11,11 @@ mvfst_cpp_library(
         "StreamSendBuffer.h",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic/common:circular_deque",
-        "//quic/common:function_ref",
-        "//quic/common:interval_set",
-        "//quic/common:optional",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/common:function_ref",
+        "fbsource//xplat/quic/common:interval_set",
+        "fbsource//xplat/quic/common:optional",
     ],
 )
 
@@ -26,9 +26,9 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/io:socket_option_map",
+        "fbsource//xplat/quic/codec:types",
         ":cloned_packet_identifier",
         ":loss_state",
-        "//quic/codec:types",
     ],
 )
 
@@ -38,9 +38,9 @@ mvfst_cpp_library(
         "LossEvent.h",
     ],
     exported_deps = [
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:optional",
         ":outstanding_packet",
-        "//quic:constants",
-        "//quic/common:optional",
     ],
 )
 
@@ -50,8 +50,8 @@ mvfst_cpp_library(
         "EarlyDataAppParamsHandler.h",
     ],
     exported_deps = [
-        "//quic/common:buf_util",
-        "//quic/common:optional",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common:optional",
     ],
 )
 
@@ -61,8 +61,8 @@ mvfst_cpp_library(
         "LossState.h",
     ],
     exported_deps = [
-        "//quic/codec:types",
-        "//quic/common:enum_array",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:enum_array",
     ],
 )
 
@@ -73,9 +73,9 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly:network_address",
-        "//quic:constants",
-        "//quic/common:optional",
-        "//quic/priority:priority_queue",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:optional",
+        "fbsource//xplat/quic/priority:priority_queue",
     ],
 )
 
@@ -86,9 +86,9 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly:random",
-        "//quic:constants",
-        "//quic/codec:types",
-        "//quic/common:interval_set",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:interval_set",
     ],
 )
 
@@ -102,7 +102,7 @@ mvfst_cpp_library(
     ],
     deps = [],
     exported_deps = [
-        "//quic/codec:types",
+        "fbsource//xplat/quic/codec:types",
     ],
 )
 
@@ -115,8 +115,8 @@ mvfst_cpp_library(
         "QuicStreamUtilities.h",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic/codec:types",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/codec:types",
     ],
 )
 
@@ -135,12 +135,33 @@ mvfst_cpp_library(
         "StreamData.h",
     ],
     deps = [
-        "//quic/logging:qlogger_macros",
-        "//quic/priority:http_priority_queue",
+        "fbsource//xplat/quic/logging:qlogger_macros",
+        "fbsource//xplat/quic/priority:http_priority_queue",
     ],
     exported_deps = [
         "fbsource//xplat/folly/container:f14_hash",
         "fbsource//xplat/folly/io/async:delayed_destruction",
+        "fbsource//xplat/quic:config",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:buf_accessor",
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:function_ref",
+        "fbsource//xplat/quic/common:interval_set",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:optional",
+        "fbsource//xplat/quic/common/udpsocket:quic_async_udp_socket",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
+        "fbsource//xplat/quic/congestion_control:packet_processor",
+        "fbsource//xplat/quic/congestion_control:throttling_signal_provider",
+        "fbsource//xplat/quic/datagram:datagram_flow_manager",
+        "fbsource//xplat/quic/handshake:handshake",
+        "fbsource//xplat/quic/logging:qlogger",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/observer:socket_observer_types",
+        "fbsource//xplat/quic/priority:priority_queue",
         ":ack_event",
         ":ack_states",
         ":cloned_packet_identifier",
@@ -151,27 +172,6 @@ mvfst_cpp_library(
         ":stats_callback",
         ":stream_send_buffer",
         ":transport_settings",
-        "//quic:config",
-        "//quic:constants",
-        "//quic/codec:codec",
-        "//quic/codec:types",
-        "//quic/common:buf_accessor",
-        "//quic/common:circular_deque",
-        "//quic/common:expected",
-        "//quic/common:function_ref",
-        "//quic/common:interval_set",
-        "//quic/common:mvfst_logging",
-        "//quic/common:optional",
-        "//quic/common/udpsocket:quic_async_udp_socket",
-        "//quic/congestion_control:congestion_controller",
-        "//quic/congestion_control:packet_processor",
-        "//quic/congestion_control:throttling_signal_provider",
-        "//quic/datagram:datagram_flow_manager",
-        "//quic/handshake:handshake",
-        "//quic/logging:qlogger",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/observer:socket_observer_types",
-        "//quic/priority:priority_queue",
     ],
 )
 
@@ -181,8 +181,8 @@ mvfst_cpp_library(
         "ConnectionOopsFields.h",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/logging/oops_logger:oops_fields",
         ":quic_state_machine",
-        "//quic/logging/oops_logger:oops_fields",
     ],
 )
 
@@ -199,25 +199,25 @@ mvfst_cpp_library(
     deps = [
         "fbsource//xplat/folly:map_util",
         "fbsource//xplat/folly/tracing:static_tracepoint",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/loss:loss",
+        "fbsource//xplat/quic/observer:socket_observer_macros",
         ":connection_oops_fields",
         ":state_functions",
         ":stream_functions",
-        "//quic/common:mvfst_logging",
-        "//quic/congestion_control:congestion_control_functions",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/loss:loss",
-        "//quic/observer:socket_observer_macros",
     ],
     exported_deps = [
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:function_ref",
+        "fbsource//xplat/quic/common:interval_set",
+        "fbsource//xplat/quic/common:optional",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
         ":outstanding_packet",
         ":quic_state_machine",
-        "//quic:constants",
-        "//quic/codec:types",
-        "//quic/common:expected",
-        "//quic/common:function_ref",
-        "//quic/common:interval_set",
-        "//quic/common:optional",
-        "//quic/congestion_control:congestion_controller",
     ],
 )
 
@@ -230,16 +230,16 @@ mvfst_cpp_library(
         "QuicStreamFunctions.h",
     ],
     deps = [
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/common:mvfst_logging",
-        "//quic/flowcontrol:flow_control",
-        "//quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/flowcontrol:flow_control",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:function_ref",
         ":quic_state_machine",
-        "//quic/common:expected",
-        "//quic/common:function_ref",
     ],
 )
 
@@ -252,20 +252,20 @@ mvfst_cpp_library(
         "QuicStateFunctions.h",
     ],
     deps = [
-        "//quic/common:mvfst_logging",
-        "//quic/common:time_util",
-        "//quic/logging:qlogger_macros",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/state:connection_oops_fields",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:time_util",
+        "fbsource//xplat/quic/logging:qlogger_macros",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/state:connection_oops_fields",
     ],
     exported_deps = [
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:interval_set",
+        "fbsource//xplat/quic/common:network_data",
         ":quic_state_machine",
-        "//quic:constants",
-        "//quic/codec:pktbuilder",
-        "//quic/codec:types",
-        "//quic/common:expected",
-        "//quic/common:interval_set",
-        "//quic/common:network_data",
     ],
 )
 
@@ -283,26 +283,26 @@ mvfst_cpp_library(
     }),
     exported_deps = select({
         "DEFAULT": [
-            "//quic:constants",
-            "//quic:exception",
-            "//quic/common:optional",
+            "fbsource//xplat/quic:constants",
+            "fbsource//xplat/quic:exception",
+            "fbsource//xplat/quic/common:optional",
         ],
         "ovr_config//os/constraints:android": select({
             "DEFAULT": [
-                "//quic:constants",
-                "//quic:exception",
-                "//quic/common:optional",
+                "fbsource//xplat/quic:constants",
+                "fbsource//xplat/quic:exception",
+                "fbsource//xplat/quic/common:optional",
             ],
             "ovr_config//build_mode:arvr_mode[enabled]": [
-                "//quic:constants",
-                "//quic:exception",
-                "//quic/common:optional",
+                "fbsource//xplat/quic:constants",
+                "fbsource//xplat/quic:exception",
+                "fbsource//xplat/quic/common:optional",
             ],
         }),
         "ovr_config//os/constraints:iphoneos": [
-            "//quic:constants",
-            "//quic:exception",
-            "//quic/common:optional",
+            "fbsource//xplat/quic:constants",
+            "fbsource//xplat/quic:exception",
+            "fbsource//xplat/quic/common:optional",
         ],
     }),
 )
@@ -329,17 +329,17 @@ mvfst_cpp_library(
         "SimpleFrameFunctions.h",
     ],
     deps = [
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/state/stream:stream",
         ":connection_oops_fields",
         ":state_functions",
-        "//quic:constants",
-        "//quic/common:mvfst_logging",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/state/stream:stream",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:expected",
         ":quic_state_machine",
-        "//quic/codec:types",
-        "//quic/common:expected",
     ],
 )
 
@@ -352,11 +352,11 @@ mvfst_cpp_library(
         "TimestampFrameFunctions.h",
     ],
     deps = [
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/codec:types",
         ":quic_state_machine",
-        "//quic/codec:types",
     ],
 )
 
@@ -367,9 +367,9 @@ mvfst_cpp_library(
         "QuicConnectionStats.h",
     ],
     exported_deps = [
-        "//quic:config",
-        "//quic:constants",
-        "//quic/congestion_control:congestion_controller",
+        "fbsource//xplat/quic:config",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
     ],
 )
 
@@ -382,8 +382,8 @@ mvfst_cpp_library(
         "DatagramHandlers.h",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/codec:types",
         ":quic_state_machine",
-        "//quic/codec:types",
     ],
 )
 
@@ -397,13 +397,13 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly:map_util",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:optional",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
         ":outstanding_packet",
-        "//quic/codec:types",
-        "//quic/common:optional",
-        "//quic/congestion_control:congestion_controller",
     ],
 )
 
@@ -416,11 +416,11 @@ mvfst_cpp_library(
         "QuicAckFrequencyFunctions.h",
     ],
     deps = [
-        "//quic/common:mvfst_logging",
-        "//quic/common:time_util",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:time_util",
     ],
     exported_deps = [
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )
 

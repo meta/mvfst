@@ -10,8 +10,8 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:pktbuilder",
-        "//quic/common/test:test_utils",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/common/test:test_utils",
     ],
 )
 
@@ -22,10 +22,10 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:exception",
-        "//quic/codec:header_codec",
-        "//quic/common:optional",
-        "//quic/common/test:test_utils",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/codec:header_codec",
+        "fbsource//xplat/quic/common:optional",
+        "fbsource//xplat/quic/common/test:test_utils",
     ],
 )
 
@@ -36,12 +36,12 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:exception",
-        "//quic/codec:codec",
-        "//quic/codec:pktbuilder",
-        "//quic/common:string_utils",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/common:string_utils",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
     ],
 )
 
@@ -58,18 +58,18 @@ mvfst_cpp_test(
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:decode",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/state:ack_handler",
+        "fbsource//xplat/quic/state:state_functions",
+        "fbsource//xplat/quic/state:transport_settings",
         ":mocks",
-        "//quic:constants",
-        "//quic:exception",
-        "//quic/codec:codec",
-        "//quic/codec:decode",
-        "//quic/codec:types",
-        "//quic/common:buf_util",
-        "//quic/common:circular_deque",
-        "//quic/common/test:test_utils",
-        "//quic/state:ack_handler",
-        "//quic/state:state_functions",
-        "//quic/state:transport_settings",
     ],
 )
 
@@ -82,9 +82,9 @@ mvfst_cpp_test(
         "fbsource//xplat/folly/container:array",
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:decode",
-        "//quic/codec:types",
-        "//quic/common/test:test_utils",
+        "fbsource//xplat/quic/codec:decode",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common/test:test_utils",
     ],
 )
 
@@ -96,8 +96,8 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:packet_number",
-        "//quic/codec:types",
+        "fbsource//xplat/quic/codec:packet_number",
+        "fbsource//xplat/quic/codec:types",
     ],
 )
 
@@ -112,10 +112,10 @@ mvfst_cpp_test(
         "fbsource//xplat/folly/container:array",
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:codec",
-        "//quic/codec:decode",
-        "//quic/codec:types",
-        "//quic/common/test:test_utils",
+        "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:decode",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common/test:test_utils",
     ],
 )
 
@@ -127,7 +127,7 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:types",
+        "fbsource//xplat/quic/codec:types",
     ],
 )
 
@@ -139,9 +139,9 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/hash:fnv_hash",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:types",
-        "//quic/common:contiguous_cursor",
-        "//quic/common:string_utils",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:contiguous_cursor",
+        "fbsource//xplat/quic/common:string_utils",
     ],
 )
 
@@ -154,12 +154,12 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
         ":mocks",
-        "//quic/codec:codec",
-        "//quic/codec:pktbuilder",
-        "//quic/codec:types",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/handshake:fizz_handshake",
     ],
 )
 
@@ -171,15 +171,15 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/codec:pktrebuilder",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
+        "fbsource//xplat/quic/server/state:server",
+        "fbsource//xplat/quic/state:quic_state_machine",
+        "fbsource//xplat/quic/state/stream:stream",
         ":mocks",
-        "//quic/codec:codec",
-        "//quic/codec:pktbuilder",
-        "//quic/codec:pktrebuilder",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
-        "//quic/server/state:server",
-        "//quic/state:quic_state_machine",
-        "//quic/state/stream:stream",
     ],
 )
 
@@ -192,11 +192,11 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:exception",
-        "//quic/codec:types",
-        "//quic/common:contiguous_cursor",
-        "//quic/common:mvfst_logging",
-        "//quic/common:string_utils",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:contiguous_cursor",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:string_utils",
     ],
 )
 
@@ -208,12 +208,12 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:decode",
-        "//quic/codec:types",
-        "//quic/common:buf_util",
-        "//quic/common/test:test_utils",
-        "//quic/congestion_control:ecn_l4s_tracker",
-        "//quic/state:ack_event",
+        "fbsource//xplat/quic/codec:decode",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:ecn_l4s_tracker",
+        "fbsource//xplat/quic/state:ack_event",
     ],
 )
 
@@ -224,6 +224,6 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/codec:types",
+        "fbsource//xplat/quic/codec:types",
     ],
 )

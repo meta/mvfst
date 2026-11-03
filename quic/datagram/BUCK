@@ -10,10 +10,10 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly/container:f14_hash",
         "fbsource//xplat/folly/io:iobuf",
-        "//quic:constants",
-        "//quic/common:buf_util",
-        "//quic/common:circular_deque",
-        "//quic/common:expected",
-        "//quic/priority:priority_queue",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/priority:priority_queue",
     ],
 )

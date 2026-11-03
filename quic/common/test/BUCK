@@ -8,7 +8,7 @@ mvfst_cpp_test(
         "IntervalSetTest.cpp",
     ],
     deps = [
-        "//quic/common:interval_set",
+        "fbsource//xplat/quic/common:interval_set",
     ],
 )
 
@@ -18,9 +18,9 @@ mvfst_cpp_test(
         "FunctionLooperTest.cpp",
     ],
     deps = [
-        "//quic/api:transport_lite",
-        "//quic/common/events:folly_eventbase",
-        "//quic/common/events:highres_quic_timer",
+        "fbsource//xplat/quic/api:transport_lite",
+        "fbsource//xplat/quic/common/events:folly_eventbase",
+        "fbsource//xplat/quic/common/events:highres_quic_timer",
     ],
 )
 
@@ -30,7 +30,7 @@ mvfst_cpp_test(
         "VariantTest.cpp",
     ],
     deps = [
-        "//quic/common:variant",
+        "fbsource//xplat/quic/common:variant",
     ],
 )
 
@@ -42,7 +42,7 @@ mvfst_cpp_test(
     deps = [
         "fbsource//third-party/fmt:fmt",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:exception",
+        "fbsource//xplat/quic:exception",
     ],
 )
 
@@ -53,7 +53,7 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/common:buf_accessor",
+        "fbsource//xplat/quic/common:buf_accessor",
     ],
 )
 
@@ -64,9 +64,9 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly/io:iobuf",
-        "//quic/common:buf_accessor",
-        "//quic/common:buf_util",
-        "//quic/common:string_utils",
+        "fbsource//xplat/quic/common:buf_accessor",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common:string_utils",
     ],
 )
 
@@ -76,7 +76,7 @@ mvfst_cpp_test(
         "ChainedByteRangeTest.cpp",
     ],
     deps = [
-        "//quic/common:buf_util",
+        "fbsource//xplat/quic/common:buf_util",
     ],
 )
 
@@ -99,14 +99,14 @@ mvfst_cpp_library(
         "TestPacketBuilders.h",
     ],
     deps = [
-        "//quic/state:state_functions",
+        "fbsource//xplat/quic/state:state_functions",
     ],
     exported_deps = [
-        "//quic/api:quic_batch_writer",
-        "//quic/codec:pktbuilder",
-        "//quic/codec:types",
-        "//quic/state:ack_states",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic/api:quic_batch_writer",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/state:ack_states",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )
 
@@ -119,17 +119,17 @@ mvfst_cpp_library(
         "TestTransportUtils.h",
     ],
     deps = [
-        "//quic/common:string_utils",
-        "//quic/congestion_control:cubic",
-        "//quic/flowcontrol:flow_control",
+        "fbsource//xplat/quic/common:string_utils",
+        "fbsource//xplat/quic/congestion_control:cubic",
+        "fbsource//xplat/quic/flowcontrol:flow_control",
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:gmock",
-        "//quic/common:buf_util",
-        "//quic/common:expected",
-        "//quic/common:mvfst_logging",
-        "//quic/handshake/test:mocks",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common:expected",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/handshake/test:mocks",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )
 
@@ -147,34 +147,34 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/protocol/clock/test:mock_clock",
         "fbsource//xplat/fizz/protocol/test:mocks",
         "fbsource//xplat/fizz/server:cert_manager",
-        "//quic/api:transport_helpers",
-        "//quic/common:mvfst_logging",
-        "//quic/common:string_utils",
-        "//quic/fizz/server/handshake:handshake_app_token",
-        "//quic/server/handshake:stateless_reset_generator",
-        "//quic/state:ack_event",
-        "//quic/state:loss_state",
-        "//quic/state:outstanding_packet",
-        "//quic/state/stream:stream",
+        "fbsource//xplat/quic/api:transport_helpers",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:string_utils",
+        "fbsource//xplat/quic/fizz/server/handshake:handshake_app_token",
+        "fbsource//xplat/quic/server/handshake:stateless_reset_generator",
+        "fbsource//xplat/quic/state:ack_event",
+        "fbsource//xplat/quic/state:loss_state",
+        "fbsource//xplat/quic/state:outstanding_packet",
+        "fbsource//xplat/quic/state/stream:stream",
     ],
     exported_deps = [
         "fbsource//xplat/fizz/client:fizz_client_context",
         "fbsource//xplat/fizz/server:fizz_server_context",
+        "fbsource//xplat/quic/api:quic_batch_writer",
+        "fbsource//xplat/quic/codec:pktbuilder",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/common:buf_util",
+        "fbsource//xplat/quic/common/testutil:mock_async_udp_socket",
+        "fbsource//xplat/quic/fizz/client/handshake:psk_cache",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
+        "fbsource//xplat/quic/handshake/test:mocks",
+        "fbsource//xplat/quic/logging:file_qlogger",
+        "fbsource//xplat/quic/server/state:server",
+        "fbsource//xplat/quic/state:ack_states",
+        "fbsource//xplat/quic/state:quic_state_machine",
         ":test_packet_builders",
         ":test_transport_utils",
-        "//quic/api:quic_batch_writer",
-        "//quic/codec:pktbuilder",
-        "//quic/codec:types",
-        "//quic/common:buf_util",
-        "//quic/common/testutil:mock_async_udp_socket",
-        "//quic/fizz/client/handshake:psk_cache",
-        "//quic/fizz/handshake:fizz_handshake",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
-        "//quic/handshake/test:mocks",
-        "//quic/logging:file_qlogger",
-        "//quic/server/state:server",
-        "//quic/state:ack_states",
-        "//quic/state:quic_state_machine",
     ],
 )
 
@@ -184,7 +184,7 @@ mvfst_cpp_test(
         "TimeUtilTest.cpp",
     ],
     deps = [
-        "//quic/common:time_util",
+        "fbsource//xplat/quic/common:time_util",
     ],
 )
 
@@ -195,7 +195,7 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//third-party/glog:glog",
-        "//quic/common:quic_buffer",
+        "fbsource//xplat/quic/common:quic_buffer",
     ],
 )
 
@@ -205,7 +205,7 @@ mvfst_cpp_test(
         "QuicRangeConversionTest.cpp",
     ],
     deps = [
-        "//quic/common:quic_buffer",
+        "fbsource//xplat/quic/common:quic_buffer",
     ],
 )
 
@@ -217,8 +217,8 @@ mvfst_cpp_test(
     deps = [
         "fbsource//third-party/fmt:fmt",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic:constants",
-        "//quic/common:transport_knobs",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:transport_knobs",
     ],
 )
 
@@ -229,9 +229,9 @@ mvfst_cpp_test(
     ],
     deps = [
         "fbsource//xplat/folly:random",
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/common:mvfst_logging",
         ":test_utils",
-        "//quic/common:circular_deque",
-        "//quic/common:mvfst_logging",
     ],
 )
 
@@ -243,8 +243,8 @@ mvfst_cpp_benchmark(
     headers = [],
     deps = [
         "fbsource//xplat/folly:benchmark",
-        "//quic/common:circular_deque",
-        "//quic/common/test:test_utils",
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/common/test:test_utils",
     ],
 )
 
@@ -256,9 +256,9 @@ mvfst_cpp_test(
     deps = [
         "fbsource//third-party/googletest:gmock",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/common:socket_util",
-        "//quic/common/events:folly_eventbase",
-        "//quic/common/udpsocket:folly_async_udp_socket",
+        "fbsource//xplat/quic/common:socket_util",
+        "fbsource//xplat/quic/common/events:folly_eventbase",
+        "fbsource//xplat/quic/common/udpsocket:folly_async_udp_socket",
     ],
 )
 
@@ -268,7 +268,7 @@ mvfst_cpp_test(
         "ContiguousCursorTest.cpp",
     ],
     deps = [
-        "//quic/common:contiguous_cursor",
+        "fbsource//xplat/quic/common:contiguous_cursor",
     ],
 )
 
@@ -278,8 +278,8 @@ mvfst_cpp_test(
         "StringUtilsTest.cpp",
     ],
     deps = [
-        "//quic:constants",
-        "//quic/common:string_utils",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:string_utils",
     ],
 )
 
@@ -289,6 +289,6 @@ mvfst_cpp_test(
         "LinuxKernelVersionTest.cpp",
     ],
     deps = [
-        "//quic/common:linux_kernel_version",
+        "fbsource//xplat/quic/common:linux_kernel_version",
     ],
 )

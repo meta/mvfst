@@ -12,7 +12,7 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/datagram:datagram_flow_manager",
-        "//quic/priority:http_priority_queue",
+        "fbsource//xplat/quic/datagram:datagram_flow_manager",
+        "fbsource//xplat/quic/priority:http_priority_queue",
     ],
 )

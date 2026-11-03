@@ -16,13 +16,13 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly/system:hardware_concurrency",
-        "//quic/common:mvfst_logging",
-        "//quic/congestion_control:server_congestion_controller_factory",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/congestion_control:server_congestion_controller_factory",
     ],
     exported_deps = [
         "fbsource//xplat/folly/io/async:async_transport",
         "fbsource//xplat/folly/io/async:scoped_event_base_thread",
-        "//quic/api:stream_async_transport",
-        "//quic/server:server",
+        "fbsource//xplat/quic/api:stream_async_transport",
+        "fbsource//xplat/quic/server:server",
     ],
 )

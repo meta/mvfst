@@ -11,8 +11,8 @@ mvfst_cpp_library(
         "QLoggerConstants.h",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic/codec:types",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/codec:types",
     ],
 )
 
@@ -29,7 +29,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/json:dynamic",
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
 )
 
@@ -42,9 +42,9 @@ mvfst_cpp_library(
         "QLogger.h",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/priority:priority_queue",
         ":qlogger_constants",
-        "//quic/codec:types",
-        "//quic/priority:priority_queue",
     ],
 )
 
@@ -86,15 +86,15 @@ mvfst_cpp_library(
     deps = [
         "fbsource//xplat/folly:string",
         "fbsource//xplat/folly/lang:bits",
-        "//quic:exception",
-        "//quic/common:string_utils",
+        "fbsource//xplat/quic:exception",
+        "fbsource//xplat/quic/common:string_utils",
     ],
     exported_deps = [
         "fbsource//xplat/folly:dynamic",
+        "fbsource//xplat/quic/codec:types",
+        "fbsource//xplat/quic/priority:priority_queue",
         ":qlogger",
         ":qlogger_constants",
-        "//quic/codec:types",
-        "//quic/priority:priority_queue",
     ],
 )
 
@@ -108,16 +108,16 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly:dynamic",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
         "fbsource//xplat/folly:dynamic",
         "fbsource//xplat/folly/compression:compression",
         "fbsource//xplat/folly/logging:logging",
+        "fbsource//xplat/quic/codec:types",
         ":base_qlogger",
         ":qlog_schema",
         ":qlogger_constants",
-        "//quic/codec:types",
     ],
 )
 

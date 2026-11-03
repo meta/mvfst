@@ -13,7 +13,7 @@ mvfst_cpp_library(
         "ovr_config//os/constraints:windows": {"MvfstCheck.h": "facebook/MvfstCheck-mobile.h"},  # @fb-only
     }),
     exported_deps = [
-        "//quic:logging_config",
+        "fbsource//xplat/quic:logging_config",
     ] + select({
         "DEFAULT": ["fbsource//third-party/glog:glog"],
         "ovr_config//os/constraints:android": [],
@@ -45,8 +45,8 @@ mvfst_cpp_library(
     }),
     exported_deps = [
         "fbsource//third-party/glog:glog",
+        "fbsource//xplat/quic:logging_config",
         ":mvfst_check",
-        "//quic:logging_config",
     ] + select({
         "DEFAULT": ["fbsource//xplat/folly/logging:logging"],
         "ovr_config//os/constraints:android": [],
@@ -79,8 +79,8 @@ mvfst_cpp_library(
         "QuicRange.h",
     ],
     deps = [
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
         ":mvfst_logging",
-        "//quic/logging/oops_logger:oops_logger",
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:sys_uio",
@@ -107,7 +107,7 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/lang:align",
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
 )
 
@@ -124,8 +124,8 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly:range",
         "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/quic:constants",
         ":mvfst_logging",
-        "//quic:constants",
     ],
 )
 
@@ -148,8 +148,8 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly/io:socket_option_map",
         "fbsource//xplat/folly/net:net_ops",
+        "fbsource//xplat/quic:exception",
         ":expected",
-        "//quic:exception",
     ],
 )
 
@@ -163,11 +163,11 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//third-party/fmt:fmt",
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
     exported_deps = [
+        "fbsource//xplat/quic:exception",
         ":expected",
-        "//quic:exception",
     ],
 )
 
@@ -207,11 +207,11 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:sockets",
+        "fbsource//xplat/quic:config",
+        "fbsource//xplat/quic:constants",
         ":buf_util",
         ":optional",
         ":time_points",
-        "//quic:config",
-        "//quic:constants",
     ],
 )
 
@@ -221,8 +221,8 @@ mvfst_cpp_library(
         "TimePoints.h",
     ],
     exported_deps = [
+        "fbsource//xplat/quic:constants",
         ":optional",
-        "//quic:constants",
     ],
 )
 
@@ -232,7 +232,7 @@ mvfst_cpp_library(
         "TimeUtil.h",
     ],
     exported_deps = [
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
 )
 
@@ -246,8 +246,8 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly:dynamic",
+        "fbsource//xplat/quic:constants",
         ":mvfst_logging",
-        "//quic:constants",
     ],
     exported_deps = [
         ":optional",
@@ -260,7 +260,7 @@ mvfst_cpp_library(
         "Optional.h",
     ],
     exported_deps = [
-        "//quic:config",
+        "fbsource//xplat/quic:config",
     ],
 )
 
@@ -276,7 +276,7 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//xplat/folly:utility",
         "fbsource//xplat/folly/lang:bits",
-        "//quic:constants",
+        "fbsource//xplat/quic:constants",
     ],
 )
 
@@ -286,7 +286,7 @@ mvfst_cpp_library(
         "Expected.h",
     ],
     exported_deps = [
-        "//quic/common/third-party:expected",
+        "fbsource//xplat/quic/common/third-party:expected",
     ],
 )
 

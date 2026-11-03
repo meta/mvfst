@@ -17,16 +17,16 @@ mvfst_cpp_library(
     deps = [
         "fbsource//xplat/fizz/crypto:utils",
         "fbsource//xplat/folly/io/async:async_udp_socket",
-        "//quic/common:mvfst_logging",
-        "//quic/common/test:test_client_utils",
-        "//quic/common/udpsocket:folly_async_udp_socket",
-        "//quic/fizz/client/handshake:fizz_client_handshake",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common/test:test_client_utils",
+        "fbsource//xplat/quic/common/udpsocket:folly_async_udp_socket",
+        "fbsource//xplat/quic/fizz/client/handshake:fizz_client_handshake",
     ],
     exported_deps = [
         "fbsource//xplat/folly/io/async:async_base",
         "fbsource//xplat/folly/stats:histogram",
-        "//quic/client:client",
-        "//quic/common/events:folly_eventbase",
+        "fbsource//xplat/quic/client:client",
+        "fbsource//xplat/quic/common/events:folly_eventbase",
     ],
 )
 
@@ -41,7 +41,7 @@ mvfst_cpp_library(
     deps = [
         "fbsource//xplat/folly:string",
         "fbsource//xplat/folly/lang:bits",
-        "//quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:mvfst_logging",
     ],
     exported_deps = [
         "fbsource//xplat/folly:cpp_attributes",
@@ -61,22 +61,22 @@ mvfst_cpp_library(
         "fbsource//xplat/fizz/record:record",
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/stats:histogram",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/common/udpsocket:folly_async_udp_socket",
+        "fbsource//xplat/quic/congestion_control:server_congestion_controller_factory",
+        "fbsource//xplat/quic/congestion_control:static_cwnd_congestion_controller",
+        "fbsource//xplat/quic/logging/oops_logger:glog_oops_logger",
         ":pacing_observer",
-        "//quic/common/test:test_utils",
-        "//quic/common/udpsocket:folly_async_udp_socket",
-        "//quic/congestion_control:server_congestion_controller_factory",
-        "//quic/congestion_control:static_cwnd_congestion_controller",
-        "//quic/logging/oops_logger:glog_oops_logger",
     ],
     exported_deps = [
         "fbsource//xplat/folly/io/async:async_udp_socket",
+        "fbsource//xplat/quic/api:quic_batch_writer",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/logging:file_qlogger",
+        "fbsource//xplat/quic/observer:socket_observer_types",
+        "fbsource//xplat/quic/server:accept_observer",
+        "fbsource//xplat/quic/server:server",
         ":tperf_huge_page_arena",
-        "//quic/api:quic_batch_writer",
-        "//quic/common:mvfst_logging",
-        "//quic/logging:file_qlogger",
-        "//quic/observer:socket_observer_types",
-        "//quic/server:accept_observer",
-        "//quic/server:server",
     ],
 )
 
@@ -101,9 +101,9 @@ mvfst_cpp_library(
         "fbsource//xplat/folly/io/async:async_base",
         "fbsource//xplat/folly/io/async:async_socket",
         "fbsource//xplat/folly/io/async:server_socket",
-        "//quic/common:mvfst_logging",
-        "//quic/common/test:test_client_utils",
-        "//quic/common/test:test_utils",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common/test:test_client_utils",
+        "fbsource//xplat/quic/common/test:test_utils",
     ],
 )
 
@@ -154,7 +154,7 @@ _TPERF_DEPS = [
     "fbsource//xplat/folly/init:init",
     "fbsource//xplat/folly/portability:gflags",
     "fbsource//xplat/folly:string",
-    "//quic/common:mvfst_logging",
+    "fbsource//xplat/quic/common:mvfst_logging",
 ] + select({
     "DEFAULT": ["fbsource//xplat/folly:memcpy-use"],
     "ovr_config//os:windows": [],
@@ -213,10 +213,10 @@ mvfst_cpp_library(
         "PacingObserver.h",
     ],
     exported_deps = [
-        "//quic:constants",
-        "//quic/api:transport",
-        "//quic/common:mvfst_logging",
-        "//quic/congestion_control:bandwidth",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/api:transport",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/congestion_control:bandwidth",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )

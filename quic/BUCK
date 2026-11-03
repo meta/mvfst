@@ -11,11 +11,11 @@ _CONFIG_SERVER_DEPS = [
     "fbsource//xplat/folly:small_vector",  # @manual
     "fbsource//xplat/folly/container:f14_hash",  # @manual
     "fbsource//xplat/folly/container:heap_vector_types",  # @manual
-    "//quic/common/third-party:tiny_optional",  # @manual
+    "fbsource//xplat/quic/common/third-party:tiny_optional",  # @manual
 ]
 
 _CONFIG_SOCKET_ADDRESS_MOBILE_DEPS = [
-    "//quic/common/address:quic_socket_address",  # @manual
+    "fbsource//xplat/quic/common/address:quic_socket_address",  # @manual
 ]
 
 mvfst_cpp_library(
@@ -41,13 +41,13 @@ mvfst_cpp_library(
     exported_deps = select({
         "DEFAULT": [
             "fbsource//xplat/folly/lang:assume",
-            "//quic/common/third-party:better_enums",
+            "fbsource//xplat/quic/common/third-party:better_enums",
         ],
         "ovr_config//os/constraints:android": select({
             "DEFAULT": [],
             "ovr_config//build_mode:arvr_mode[enabled]": [
                 "fbsource//xplat/folly/lang:assume",
-                "//quic/common/third-party:better_enums",
+                "fbsource//xplat/quic/common/third-party:better_enums",
             ],
         }),
         "ovr_config//os/constraints:iphoneos": [],
@@ -133,8 +133,8 @@ _CONSTANTS_TYPEALIASES_MOBILE_DEPS = [
     ":config",
     ":enum",
     "fbsource//xplat/folly/chrono:clock",
-    "//quic/common:quic_buffer",
-    "//quic/common:quic_iobuf_queue",
+    "fbsource//xplat/quic/common:quic_buffer",
+    "fbsource//xplat/quic/common:quic_iobuf_queue",
 ]
 
 mvfst_cpp_library(
@@ -198,7 +198,7 @@ mvfst_cpp_library(
         "QuicException.h",
     ],
     deps = select({
-        "DEFAULT": ["//quic/common:mvfst_logging"],
+        "DEFAULT": ["fbsource//xplat/quic/common:mvfst_logging"],
         "ovr_config//os/constraints:android": [],
         "ovr_config//os/constraints:iphoneos": [],
     })
@@ -206,10 +206,10 @@ mvfst_cpp_library(
     exported_deps = [
         "fbsource//third-party/fmt:fmt",
         "fbsource//xplat/folly:range",
+        "fbsource//xplat/quic/common:optional",
+        "fbsource//xplat/quic/common:variant",
         ":constants",
         ":tls_exception",
-        "//quic/common:optional",
-        "//quic/common:variant",
     ],
 )
 

@@ -12,16 +12,16 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly/portability:sockets",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:socket_util",
+        "fbsource//xplat/quic/state:quic_state_machine",
         "//common/network:mvfst_hooks",  # @manual
-        "//quic/common:mvfst_logging",
-        "//quic/common:socket_util",
-        "//quic/state:quic_state_machine",
     ],
     exported_deps = [
         "fbsource//xplat/folly/io:socket_option_map",
         "fbsource//xplat/folly/net:net_ops",
-        "//quic/client:state_and_handshake",
-        "//quic/common/events:eventbase",
-        "//quic/common/udpsocket:quic_async_udp_socket",
+        "fbsource//xplat/quic/client:state_and_handshake",
+        "fbsource//xplat/quic/common/events:eventbase",
+        "fbsource//xplat/quic/common/udpsocket:quic_async_udp_socket",
     ],
 )

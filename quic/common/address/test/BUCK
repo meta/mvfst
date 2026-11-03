@@ -11,8 +11,8 @@ mvfst_cpp_test(
         "fbsource//xplat/folly:network_address",
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/folly/portability:sockets",
-        "//quic/common/address:quic_address_util",
-        "//quic/common/address:quic_socket_address",
-        "//quic/common/address:quic_socket_address_bridge",
+        "fbsource//xplat/quic/common/address:quic_address_util",
+        "fbsource//xplat/quic/common/address:quic_socket_address",
+        "fbsource//xplat/quic/common/address:quic_socket_address_bridge",
     ],
 )

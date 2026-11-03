@@ -18,18 +18,18 @@ fb_dirsync_cpp_unittest(
         "fbsource//xplat/fizz/server/test:mocks",
         "fbsource//xplat/folly/io/async:scoped_event_base_thread",
         "fbsource//xplat/folly/io/async:ssl_context",
-        "//quic:constants",
-        "//quic/common:mvfst_logging",
-        "//quic/common:string_utils",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/client/handshake:fizz_client_handshake",
-        "//quic/fizz/handshake:fizz_bridge",
-        "//quic/fizz/handshake:fizz_handshake",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
-        "//quic/fizz/server/handshake:handshake_app_token",
-        "//quic/server/handshake:app_token",
-        "//quic/server/handshake:server_handshake",
-        "//quic/state:quic_state_machine",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/common:string_utils",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/client/handshake:fizz_client_handshake",
+        "fbsource//xplat/quic/fizz/handshake:fizz_bridge",
+        "fbsource//xplat/quic/fizz/handshake:fizz_handshake",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
+        "fbsource//xplat/quic/fizz/server/handshake:handshake_app_token",
+        "fbsource//xplat/quic/server/handshake:app_token",
+        "fbsource//xplat/quic/server/handshake:server_handshake",
+        "fbsource//xplat/quic/state:quic_state_machine",
     ],
 )
 
@@ -42,10 +42,10 @@ fb_dirsync_cpp_unittest(
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
         "fbsource//xplat/fizz/protocol/test:test_util",
-        "//quic:constants",
-        "//quic/common/test:test_utils",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
-        "//quic/server/handshake:server_extension",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
+        "fbsource//xplat/quic/server/handshake:server_extension",
     ],
 )
 
@@ -57,9 +57,9 @@ fb_dirsync_cpp_unittest(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//third-party/googletest:gtest",
-        "//quic:constants",
-        "//quic/fizz/server/handshake:handshake_app_token",
-        "//quic/server/state:server",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/fizz/server/handshake:handshake_app_token",
+        "fbsource//xplat/quic/server/state:server",
     ],
 )
 
@@ -73,13 +73,13 @@ fb_dirsync_cpp_unittest(
         "fbsource//third-party/googletest:gmock",
         "fbsource//third-party/googletest:gtest",
         "fbsource//xplat/fizz/server:resumption_state",
-        "//quic:constants",
-        "//quic/api/test:mocks",
-        "//quic/fizz/server/handshake:fizz_server_handshake",
-        "//quic/fizz/server/handshake:handshake_app_token",
-        "//quic/server/handshake:default_app_token_validator",
-        "//quic/server/state:server",
-        "//quic/state/test:mocks",
+        "fbsource//xplat/quic:constants",
+        "fbsource//xplat/quic/api/test:mocks",
+        "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
+        "fbsource//xplat/quic/fizz/server/handshake:handshake_app_token",
+        "fbsource//xplat/quic/server/handshake:default_app_token_validator",
+        "fbsource//xplat/quic/server/state:server",
+        "fbsource//xplat/quic/state/test:mocks",
     ],
 )
 
@@ -92,7 +92,7 @@ fb_dirsync_cpp_unittest(
         "fbsource//xplat/folly:network_address",
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/server/handshake:stateless_reset_generator",
+        "fbsource//xplat/quic/server/handshake:stateless_reset_generator",
     ],
 )
 
@@ -105,6 +105,6 @@ fb_dirsync_cpp_unittest(
     deps = [
         "fbsource//xplat/folly:random",
         "fbsource//xplat/folly/portability:gtest",
-        "//quic/server/handshake:token_generator",
+        "fbsource//xplat/quic/server/handshake:token_generator",
     ],
 )

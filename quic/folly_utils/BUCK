@@ -11,10 +11,10 @@ mvfst_cpp_library(
     headers = [
         "Utils.h",
     ],
-    deps = ["//quic/common:mvfst_logging"],
+    deps = ["fbsource//xplat/quic/common:mvfst_logging"],
     exported_deps = [
         "fbsource//xplat/folly/io:iobuf",
-        "//quic/common:optional",
+        "fbsource//xplat/quic/common:optional",
     ],
 )
 
@@ -28,7 +28,7 @@ mvfst_cpp_library(
     ],
     deps = [
         "fbsource//xplat/folly/io:iobuf",
-        "//quic/common:quic_buffer",
+        "fbsource//xplat/quic/common:quic_buffer",
     ],
     exported_deps = ["fbsource//xplat/folly/lang:assume"],
 )
@@ -41,7 +41,7 @@ mvfst_cpp_test(
     network_access = network_access_utils.none(),
     deps = [
         "fbsource//xplat/folly/io:iobuf",
+        "fbsource//xplat/quic/common:quic_buffer",
         ":buf_conv",
-        "//quic/common:quic_buffer",
     ],
 )

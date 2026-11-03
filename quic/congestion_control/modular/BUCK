@@ -11,16 +11,16 @@ mvfst_cpp_library(
         "Bbr2Shared.h",
     ],
     deps = [
-        "//quic/congestion_control:congestion_control_functions",
-        "//quic/logging:qlogger_constants",
-        "//quic/logging:qlogger_macros",
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
+        "fbsource//xplat/quic/logging:qlogger_constants",
+        "fbsource//xplat/quic/logging:qlogger_macros",
     ],
     exported_deps = [
-        "//quic/congestion_control:bandwidth",
-        "//quic/congestion_control:congestion_controller",
-        "//quic/congestion_control/third_party:chromium_windowed_filter",
-        "//quic/state:quic_state_machine",
-        "//quic/state:transport_settings",
+        "fbsource//xplat/quic/congestion_control:bandwidth",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
+        "fbsource//xplat/quic/congestion_control/third_party:chromium_windowed_filter",
+        "fbsource//xplat/quic/state:quic_state_machine",
+        "fbsource//xplat/quic/state:transport_settings",
     ],
 )
 
@@ -33,13 +33,13 @@ mvfst_cpp_library(
         "Bbr2ProbeRtt.h",
     ],
     deps = [
-        "//quic/congestion_control:congestion_control_functions",
-        "//quic/logging/oops_logger:oops_logger",
-        "//quic/state:connection_oops_fields",
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
+        "fbsource//xplat/quic/logging/oops_logger:oops_logger",
+        "fbsource//xplat/quic/state:connection_oops_fields",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
         ":bbr2_shared",
-        "//quic/congestion_control:congestion_controller",
     ],
 )
 
@@ -52,13 +52,13 @@ mvfst_cpp_library(
         "Bbr2ProbeBw.h",
     ],
     deps = [
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
         ":bbr2_probe_rtt",
-        "//quic/congestion_control:congestion_control_functions",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/congestion_control:bandwidth",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
         ":bbr2_shared",
-        "//quic/congestion_control:bandwidth",
-        "//quic/congestion_control:congestion_controller",
     ],
 )
 
@@ -71,18 +71,18 @@ mvfst_cpp_library(
         "Bbr2Startup.h",
     ],
     deps = [
+        "fbsource//xplat/quic/congestion_control:congestion_control_functions",
+        "fbsource//xplat/quic/logging:qlogger_macros",
+        "fbsource//xplat/quic/state:stats_callback",
         ":bbr2_probe_bw",
         ":bbr2_probe_rtt",
-        "//quic/congestion_control:congestion_control_functions",
-        "//quic/logging:qlogger_macros",
-        "//quic/state:stats_callback",
     ],
     exported_deps = [
+        "fbsource//xplat/quic/congestion_control:bandwidth",
+        "fbsource//xplat/quic/congestion_control:congestion_controller",
+        "fbsource//xplat/quic/congestion_control/third_party:chromium_windowed_filter",
+        "fbsource//xplat/quic/state:quic_state_machine",
+        "fbsource//xplat/quic/state:transport_settings",
         ":bbr2_shared",
-        "//quic/congestion_control:bandwidth",
-        "//quic/congestion_control:congestion_controller",
-        "//quic/congestion_control/third_party:chromium_windowed_filter",
-        "//quic/state:quic_state_machine",
-        "//quic/state:transport_settings",
     ],
 )

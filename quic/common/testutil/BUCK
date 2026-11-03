@@ -9,7 +9,7 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "fbsource//xplat/folly/portability:gmock",
-        "//quic/common/events:folly_eventbase",
-        "//quic/common/udpsocket:folly_async_udp_socket",
+        "fbsource//xplat/quic/common/events:folly_eventbase",
+        "fbsource//xplat/quic/common/udpsocket:folly_async_udp_socket",
     ],
 )
