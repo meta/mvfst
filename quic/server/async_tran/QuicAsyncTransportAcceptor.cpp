@@ -74,6 +74,8 @@ class ServerTransportConnectionSetupCallback
     MVCHECK(false);
   }
 
+  using QuicSocket::ConnectionCallback::onConnectionEnd;
+
   void onConnectionEnd() noexcept override {
     MVCHECK(false);
   }

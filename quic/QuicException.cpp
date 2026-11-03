@@ -129,6 +129,8 @@ std::string toString(LocalErrorCode code) {
     case quic::LocalErrorCode::MIGRATION_FAILED:
       return "Migration failed";
   }
+  MVLOG_WARNING << "toString has unhandled LocalErrorCode";
+  return "Unknown error";
 }
 
 std::string toString(TransportErrorCode code) {

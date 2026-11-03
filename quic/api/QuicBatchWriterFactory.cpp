@@ -80,13 +80,11 @@ BatchWriterPtr BatchWriterFactory::makeBatchWriter(
     }
       [[fallthrough]];
     case quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG:
-      switch (dataPathType) {
-        case DataPathType::ChainedMemory:
-          return BatchWriterPtr(new SendmmsgPacketBatchWriter(batchSize));
-        case DataPathType::ContinuousMemory:
-          return BatchWriterPtr(
-              new SendmmsgInplacePacketBatchWriter(conn, batchSize));
+      if (dataPathType == DataPathType::ContinuousMemory) {
+        return BatchWriterPtr(
+            new SendmmsgInplacePacketBatchWriter(conn, batchSize));
       }
+      return BatchWriterPtr(new SendmmsgPacketBatchWriter(batchSize));
     case quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO: {
       if (gsoSupported) {
         if (dataPathType == DataPathType::ChainedMemory) {
