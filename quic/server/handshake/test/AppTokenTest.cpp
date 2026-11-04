@@ -328,7 +328,8 @@ TEST(AppTokenTest, TestEncodeAndDecodeCwndHint) {
       kDefaultStreamFlowControlWindow,
       std::numeric_limits<uint32_t>::max() - 8,
       std::numeric_limits<uint32_t>::max() - 9,
-      std::numeric_limits<uint32_t>::max() - 10);
+      2 /* extendedAckSupport */,
+      std::numeric_limits<uint32_t>::max() - 10 /* cwndHintBytes */);
   ASSERT_FALSE(transportParamsResult.hasError());
   appToken.transportParams = std::move(transportParamsResult.value());
   appToken.sourceAddresses = {
