@@ -83,6 +83,7 @@ fb_dirsync_cpp_unittest(
     name = "QuicServerTransportTest",
     srcs = [
         "QuicServerTransportTest.cpp",
+        "QuicTransportCryptoTest.cpp",
     ],
     supports_static_listing = False,
     deps = [
@@ -90,6 +91,7 @@ fb_dirsync_cpp_unittest(
         "//quic:constants",
         "//quic/codec:pktbuilder",
         "//quic/common:transport_knobs",
+        "//quic/fizz/client/test:quic_client_transport_test_util",
         "//quic/fizz/handshake:fizz_handshake",
         "//quic/fizz/server/handshake:handshake_app_token",
         "//quic/logging:file_qlogger",

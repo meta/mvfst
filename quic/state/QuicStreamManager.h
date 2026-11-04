@@ -231,6 +231,12 @@ class QuicStreamManager {
     return numStreamsWithLoss_ > 0;
   }
 
+  [[nodiscard]] size_t numReadBufferRanges() const noexcept {
+    return numReadBufferRanges_;
+  }
+
+  void updateReadBufferRanges(size_t before, size_t after);
+
   void removeLoss(StreamId id);
   void addLoss(StreamId id);
 
@@ -566,6 +572,7 @@ class QuicStreamManager {
 
   // Counter of streams that have bytes in loss buffer
   size_t numStreamsWithLoss_{0};
+  size_t numReadBufferRanges_{0};
   UnorderedSet<StreamId> readableStreams_;
   UnorderedSet<StreamId> peekableStreams_;
 

@@ -89,42 +89,135 @@ void writeDataToQuicStream(
       "Cannot append data to the crypto stream send buffer");
 }
 
-// Helper function which appends a raw data range to what MUST be a "tail" of
-// a logic IOBuf chain, buf. The function will pack data into the available
-// tail agressively, and allocate in terms of appendLen until the push is
-// complete.
-static void pushToTail(Buf* dst, BufPtr src, size_t allocSize) {
-  size_t appended = 0;
-  auto len = src->length();
-  auto data = src->data();
-  while (appended < len) {
-    // If there's no tail room or that buffer is shared, trying to use the tail
-    // will cause problems.
-    if (dst->tailroom() == 0 || dst->isSharedOne()) {
-      // If the buffer we are pushing has tail room, just use that one.
-      // Otherwise, we have to allocate one.
-      BufPtr newBuf;
-      if (src->tailroom() > 0 && !src->isSharedOne()) {
-        src->trimStart(appended);
-        dst->appendChain(std::move(src));
+static bool
+retainReadBuffer(const Buf& buffer, size_t length, size_t allocationSize) {
+  return length >= (allocationSize + 1) / 2 &&
+      buffer.capacity() - length <= length;
+}
+
+static void copyReadBuffer(const Buf& src, uint8_t* dst) {
+  const auto* current = &src;
+  do {
+    memcpy(dst, current->data(), current->length());
+    dst += current->length();
+    current = current->next();
+  } while (current != &src);
+}
+
+static Buf* appendReadBuffer(BufPtr& dst, BufPtr src) {
+  auto* appended = src.get();
+  if (dst) {
+    dst->appendToChain(std::move(src));
+  } else {
+    dst = std::move(src);
+  }
+  return appended;
+}
+
+static void pushToTail(BufPtr& dst, BufPtr src, size_t allocationSize) {
+  size_t copied = 0;
+  while (copied < src->length()) {
+    const auto remaining = src->length() - copied;
+    auto* tail = dst ? dst->prev() : nullptr;
+    if (!tail || tail->tailroom() == 0 || tail->isSharedOne()) {
+      if (retainReadBuffer(*src, remaining, allocationSize)) {
+        src->trimStart(copied);
+        appendReadBuffer(dst, std::move(src));
         return;
       }
-      newBuf = BufHelpers::createCombined(allocSize);
-      dst->appendChain(std::move(newBuf));
-      dst = dst->next();
+      tail = appendReadBuffer(
+          dst, BufHelpers::createCombined(std::max(allocationSize, remaining)));
     }
-    auto toAppend = std::min(dst->tailroom(), len - appended);
-    memcpy(dst->writableTail(), data, toAppend);
-    dst->append(toAppend);
-    appended += toAppend;
-    data += toAppend;
+    const auto toCopy = std::min(tail->tailroom(), remaining);
+    memcpy(tail->writableTail(), src->data() + copied, toCopy);
+    tail->append(toCopy);
+    copied += toCopy;
   }
+}
+
+static void pushToTail(BufQueue& dst, BufQueue&& src, size_t allocationSize) {
+  const auto length = dst.chainLength() + src.chainLength();
+  auto dstData = dst.move();
+  auto srcData = src.move();
+  if (allocationSize == 0) {
+    appendReadBuffer(dstData, std::move(srcData));
+  } else {
+    while (srcData) {
+      auto rest = srcData->pop();
+      pushToTail(dstData, std::move(srcData), allocationSize);
+      srcData = std::move(rest);
+    }
+  }
+  dst = BufQueue(std::move(dstData), length);
+}
+
+static void pushToHead(BufQueue& dst, BufQueue&& src, size_t allocationSize) {
+  MVCHECK_GT(allocationSize, 0, "Invalid coalescing allocation size");
+  const auto sourceLength = src.chainLength();
+  const auto length = dst.chainLength() + sourceLength;
+  auto dstData = dst.move();
+  auto prefix = src.move();
+
+  if (dstData && !dstData->isSharedOne() &&
+      dstData->headroom() >= sourceLength) {
+    dstData->prepend(sourceLength);
+    copyReadBuffer(*prefix, dstData->writableData());
+    dst = BufQueue(std::move(dstData), length);
+    return;
+  }
+
+  if (prefix->isChained() ||
+      !retainReadBuffer(*prefix, sourceLength, allocationSize)) {
+    const auto capacity = std::max(allocationSize, sourceLength);
+    auto compact = BufHelpers::createCombined(capacity);
+    compact->advance(capacity - sourceLength);
+    copyReadBuffer(*prefix, compact->writableTail());
+    compact->append(sourceLength);
+    prefix = std::move(compact);
+  }
+  if (dstData) {
+    prefix->appendToChain(std::move(dstData));
+  }
+  dstData = std::move(prefix);
+  dst = BufQueue(std::move(dstData), length);
+}
+
+static void
+mergeReadBufferData(BufQueue& left, BufQueue&& right, size_t allocationSize) {
+  const auto leftLength = left.chainLength();
+  const auto rightLength = right.chainLength();
+  if (allocationSize > 0 && leftLength < allocationSize) {
+    pushToHead(right, std::move(left), allocationSize);
+    left = std::move(right);
+    return;
+  }
+  if (allocationSize > 0 && rightLength < allocationSize) {
+    pushToTail(left, std::move(right), allocationSize);
+    return;
+  }
+  auto data = left.move();
+  appendReadBuffer(data, right.move());
+  left = BufQueue(std::move(data), leftLength + rightLength);
+}
+
+static void compactReadBufferData(
+    StreamBuffer& buffer,
+    uint32_t coalescingSize) {
+  if (coalescingSize == 0 || buffer.data.empty()) {
+    return;
+  }
+  const auto allocationSize =
+      std::min<size_t>(coalescingSize, buffer.data.chainLength());
+  BufQueue compact;
+  pushToTail(compact, std::move(buffer.data), allocationSize);
+  buffer.data = std::move(compact);
 }
 
 quic::Expected<void, QuicError> appendDataToReadBufferCommon(
     QuicStreamLike& stream,
     StreamBuffer buffer,
     uint32_t coalescingSize,
+    size_t maxReadBufferRanges,
     FunctionRef<quic::Expected<void, QuicError>(uint64_t, uint64_t)>
         connFlowControlVisitor) {
   auto& readBuffer = stream.readBuffer;
@@ -190,6 +283,7 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
 
   // Nothing in the buffer, just append it.
   if (it == readBuffer.end()) {
+    compactReadBufferData(buffer, coalescingSize);
     readBuffer.emplace_back(std::move(buffer));
     return {};
   }
@@ -202,6 +296,7 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
 
   StreamBuffer* current = &buffer;
   bool currentAlreadyInserted = false;
+  bool currentDataCompacted = false;
   bool done = false;
   it = std::lower_bound(
       it,
@@ -229,8 +324,19 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
         currentEnd <= itEnd) {
       // Left overlap. Done.
       it->data.trimStartAtMost(currentEnd - it->offset);
+      if (!currentAlreadyInserted && !startOverlap && coalescingSize > 0) {
+        pushToHead(it->data, std::move(current->data), coalescingSize);
+        it->offset = current->offset;
+        it->eof = it->eof || current->eof;
+        return {};
+      }
+      current->eof = current->eof || it->eof;
       if (it->data.chainLength() > 0) {
-        current->data.append(it->data.move());
+        if (!currentAlreadyInserted) {
+          compactReadBufferData(*current, coalescingSize);
+          currentDataCompacted = true;
+        }
+        mergeReadBufferData(current->data, std::move(it->data), coalescingSize);
       }
       if (!startOverlap) {
         startOverlap = it;
@@ -255,20 +361,8 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
         currentEnd > itEnd) {
       // Right overlap. Not done.
       current->data.trimStartAtMost(itEnd - current->offset);
-      if (coalescingSize > kDefaultUDPSendPacketLen) {
-        auto itData = it->data.move();
-        auto itDataTail = itData->prev();
-        auto currentData = current->data.move();
-        while (currentData != nullptr) {
-          auto rest = currentData->pop();
-          pushToTail(itDataTail, std::move(currentData), coalescingSize);
-          itDataTail = itData->prev();
-          currentData = std::move(rest);
-        }
-        it->data.append(std::move(itData));
-      } else {
-        it->data.append(current->data.move());
-      }
+      pushToTail(it->data, std::move(current->data), coalescingSize);
+      it->eof = it->eof || current->eof;
       current = &(*it);
       currentAlreadyInserted = true;
       PROTO_OOPS_LOG_IF(
@@ -298,6 +392,15 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
         "invalid read buffer overlap range");
     MVDCHECK(
         *startOverlap != readBuffer.end() || *endOverlap == readBuffer.end());
+    if (*startOverlap == *endOverlap && maxReadBufferRanges > 0 &&
+        readBuffer.size() >= maxReadBufferRanges) {
+      return quic::make_unexpected(QuicError(
+          QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
+          "Stream read buffer range limit exceeded"));
+    }
+    if (!currentDataCompacted) {
+      compactReadBufferData(*current, coalescingSize);
+    }
     auto insertIt = readBuffer.erase(*startOverlap, *endOverlap);
     readBuffer.emplace(insertIt, std::move(*current));
     return {};
@@ -327,6 +430,12 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
   }
   auto last = readBuffer.end() - 1;
   if (current->offset > last->offset + last->data.chainLength()) {
+    if (maxReadBufferRanges > 0 && readBuffer.size() >= maxReadBufferRanges) {
+      return quic::make_unexpected(QuicError(
+          QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
+          "Stream read buffer range limit exceeded"));
+    }
+    compactReadBufferData(*current, coalescingSize);
     readBuffer.emplace_back(std::move(*current));
   }
   return {};
@@ -335,14 +444,27 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
 quic::Expected<void, QuicError> appendDataToReadBuffer(
     QuicStreamState& stream,
     StreamBuffer buffer) {
-  return appendDataToReadBufferCommon(
+  const auto rangesBefore = stream.readBuffer.size();
+  auto result = appendDataToReadBufferCommon(
       stream,
       std::move(buffer),
-      0,
+      kReadBufferCoalescingSize,
+      kMaxStreamReadBufferRanges,
       [&stream](uint64_t previousMaxOffsetObserved, uint64_t bufferEndOffset) {
         return updateFlowControlOnStreamData(
             stream, previousMaxOffsetObserved, bufferEndOffset);
       });
+  auto& streamManager = *stream.conn.streamManager;
+  streamManager.updateReadBufferRanges(rangesBefore, stream.readBuffer.size());
+  if (!result.has_value()) {
+    return result;
+  }
+  if (streamManager.numReadBufferRanges() > kMaxConnectionReadBufferRanges) {
+    return quic::make_unexpected(QuicError(
+        QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
+        "Connection read buffer range limit exceeded"));
+  }
+  return {};
 }
 
 quic::Expected<void, QuicError> appendDataToReadBuffer(
@@ -360,6 +482,7 @@ quic::Expected<void, QuicError> appendDataToReadBuffer(
   return appendDataToReadBufferCommon(
       stream,
       std::move(buffer),
+      0,
       0,
       [](uint64_t, uint64_t) -> quic::Expected<void, QuicError> { return {}; });
 }
@@ -442,7 +565,10 @@ quic::Expected<std::pair<BufPtr, bool>, QuicError> readDataFromQuicStream(
   uint64_t lastReadOffset = stream.currentReadOffset;
 
   BufPtr data;
+  const auto rangesBefore = stream.readBuffer.size();
   std::tie(data, eof) = readDataInOrderFromReadBuffer(stream, amount);
+  stream.conn.streamManager->updateReadBufferRanges(
+      rangesBefore, stream.readBuffer.size());
   // Update flow control before handling eof as eof is not subject to flow
   // control
   auto flowControlResult =
@@ -492,7 +618,10 @@ quic::Expected<void, QuicError> consumeDataFromQuicStream(
 
   uint64_t lastReadOffset = stream.currentReadOffset;
 
+  const auto rangesBefore = stream.readBuffer.size();
   readDataInOrderFromReadBuffer(stream, amount, true /* sinkData */);
+  stream.conn.streamManager->updateReadBufferRanges(
+      rangesBefore, stream.readBuffer.size());
   // Update flow control before handling eof as eof is not subject to flow
   // control
   auto flowControlResult =
@@ -660,6 +789,8 @@ void processTxStopSending(QuicStreamState& stream) {
    */
   if (stream.conn.transportSettings.dropIngressOnStopSending) {
     stream.stopSendingRequested = true;
+    stream.conn.streamManager->updateReadBufferRanges(
+        stream.readBuffer.size(), 0);
     stream.readBuffer.clear();
     stream.conn.streamManager->updateReadableStreams(stream);
     stream.conn.streamManager->updatePeekableStreams(stream);

@@ -91,7 +91,10 @@ quic::Expected<void, QuicError> onResetQuicStream(
         TransportErrorCode::FINAL_SIZE_ERROR, "Reset in middle of stream"));
   }
   // Drop non-reliable data:
+  const auto rangesBefore = stream.readBuffer.size();
   stream.removeFromReadBufferStartingAtOffset(*stream.reliableSizeFromPeer);
+  stream.conn.streamManager->updateReadBufferRanges(
+      rangesBefore, stream.readBuffer.size());
   stream.finalReadOffset = frame.finalSize;
   stream.streamReadError = frame.errorCode;
   // If the currentReadOffset > finalReadOffset we have already processed
@@ -168,6 +171,8 @@ bool isAllDataReceivedUntil(const QuicStreamState& stream, uint64_t offset) {
 
 quic::Expected<void, QuicError> retireIngress(QuicStreamState& stream) {
   stream.markIngressRetired();
+  stream.conn.streamManager->updateReadBufferRanges(
+      stream.readBuffer.size(), 0);
   stream.readBuffer.clear();
   auto closeResult = maybeCloseRetiredIngress(stream);
   if (!closeResult.has_value()) {

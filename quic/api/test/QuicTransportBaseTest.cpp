@@ -467,6 +467,12 @@ class TestQuicTransport
     updateReadLooper();
   }
 
+  void addStreamReset(const RstStreamFrame& frame) {
+    ASSERT_FALSE(receiveRstStreamSMHandler(*getStream(frame.streamId), frame)
+                     .hasError());
+    updateReadLooper();
+  }
+
   void addDatagram(BufPtr data, TimePoint recvTime = Clock::now()) {
     auto buf = encodeDatagramFrame(std::move(data));
     SocketAddress addr("127.0.0.1", 1000);
@@ -1892,6 +1898,51 @@ TEST_F(QuicTransportImplTestBase, ReadError) {
       readCb1, readError(stream1, IsError(LocalErrorCode::STREAM_CLOSED)));
   transport->addStreamReadError(stream1, LocalErrorCode::STREAM_CLOSED);
   transport->driveReadCallbacks();
+  transport.reset();
+}
+
+TEST_F(QuicTransportImplTestBase, ResetReadCallbackWhilePaused) {
+  auto id = transport->createBidirectionalStream().value();
+  StrictMock<MockReadCallback> readCb;
+  ASSERT_FALSE(transport->setReadCallback(id, &readCb).hasError());
+  ASSERT_FALSE(transport->pauseRead(id).hasError());
+
+  constexpr auto kError = GenericApplicationErrorCode::UNKNOWN;
+  transport->addStreamReset(RstStreamFrame(id, kError, 0));
+  bool delivered = false;
+  EXPECT_CALL(readCb, readError(id, IsError(kError))).WillOnce([&](auto, auto) {
+    delivered = true;
+  });
+  fEvb->loopOnce(EVLOOP_NONBLOCK);
+  EXPECT_TRUE(delivered);
+  EXPECT_FALSE(transport->readLooper()->isRunning());
+  transport.reset();
+}
+
+TEST_F(QuicTransportImplTestBase, ReliableResetReadCallbackWhilePaused) {
+  auto id = transport->createBidirectionalStream().value();
+  StrictMock<MockReadCallback> readCb;
+  ASSERT_FALSE(transport->setReadCallback(id, &readCb).hasError());
+  ASSERT_FALSE(transport->pauseRead(id).hasError());
+  constexpr size_t kReliableSize = 4;
+  transport->addDataToStream(
+      id, StreamBuffer(folly::IOBuf::copyBuffer("data"), 0));
+
+  constexpr auto kError = GenericApplicationErrorCode::UNKNOWN;
+  transport->addStreamReset(
+      RstStreamFrame(id, kError, kReliableSize, kReliableSize));
+  EXPECT_FALSE(transport->readLooper()->isRunning());
+  fEvb->loopOnce(EVLOOP_NONBLOCK);
+  EXPECT_FALSE(transport->readLooper()->isRunning());
+
+  ASSERT_FALSE(transport->read(id, kReliableSize).hasError());
+  bool delivered = false;
+  EXPECT_CALL(readCb, readError(id, IsError(kError))).WillOnce([&](auto, auto) {
+    delivered = true;
+  });
+  fEvb->loopOnce(EVLOOP_NONBLOCK);
+  EXPECT_TRUE(delivered);
+  EXPECT_FALSE(transport->readLooper()->isRunning());
   transport.reset();
 }
 

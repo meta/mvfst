@@ -322,6 +322,8 @@ class ServerHandshake : public Handshake {
   std::shared_ptr<ServerTransportParametersExtension> transportParams_;
 
  private:
+  void checkForUnexpectedCryptoData();
+
   virtual void initializeImpl(
       HandshakeCallback* callback,
       std::unique_ptr<fizz::server::AppTokenValidator> validator,

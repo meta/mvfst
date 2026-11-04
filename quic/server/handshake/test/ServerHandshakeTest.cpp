@@ -429,7 +429,37 @@ TEST_F(ServerHandshakeTest, TestHandshakeSuccess) {
   EXPECT_TRUE(handshakeSuccess);
 }
 
-TEST_F(ServerHandshakeTest, TestHandshakeSuccessIgnoreNonHandshake) {
+TEST_F(ServerHandshakeTest, TestRejectInitialDataAfterClientHello) {
+  clientServerRound();
+  ASSERT_FALSE(ex.hasError());
+  ASSERT_EQ(
+      handshake->getState().readRecordLayer()->getEncryptionLevel(),
+      fizz::EncryptionLevel::Handshake);
+
+  auto result = handshake->doHandshake(
+      folly::IOBuf::copyBuffer("unexpected crypto data"),
+      EncryptionLevel::Initial);
+
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(result.error().code, TransportErrorCode::PROTOCOL_VIOLATION);
+}
+
+TEST_F(ServerHandshakeTest, TestRejectHandshakeDataAfterClientFinished) {
+  clientServerRound();
+  serverClientRound();
+  clientServerRound();
+  ASSERT_FALSE(ex.hasError());
+  ASSERT_EQ(handshake->getPhase(), ServerHandshake::Phase::Established);
+
+  auto result = handshake->doHandshake(
+      folly::IOBuf::copyBuffer("unexpected crypto data"),
+      EncryptionLevel::Handshake);
+
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(result.error().code, TransportErrorCode::PROTOCOL_VIOLATION);
+}
+
+TEST_F(ServerHandshakeTest, TestHandshakeSuccessIgnoreNonHandshakeWrite) {
   fizz::WriteToSocket write;
   fizz::TLSContent content;
   content.contentType = fizz::ContentType::alert;
@@ -438,7 +468,8 @@ TEST_F(ServerHandshakeTest, TestHandshakeSuccessIgnoreNonHandshake) {
   content.data = folly::IOBuf::copyBuffer(contentDataOpt.value());
   content.encryptionLevel = fizz::EncryptionLevel::Plaintext;
   write.contents.push_back(std::move(content));
-  clientWrites.push_back(std::move(write));
+  handshake->onWriteData(write);
+  EXPECT_TRUE(cryptoState->initialStream.writeBuffer.empty());
   clientServerRound();
   EXPECT_EQ(handshake->getPhase(), ServerHandshake::Phase::Handshake);
   serverClientRound();
@@ -611,6 +642,40 @@ class ServerHandshakePskTest : public ServerHandshakeTest {
   std::shared_ptr<fizz::server::TicketCipher> ticketCipher;
   fizz::client::CachedPsk psk;
 };
+
+class ServerHandshakeAsyncDecryptTest : public ServerHandshakePskTest {
+ public:
+  std::shared_ptr<fizz::server::TicketCipher> makeTicketCipher() override {
+    auto cipher = std::make_shared<AsyncRejectingTicketCipher>();
+    cipher->setDecryptAsync(true, promise.getFuture());
+    return cipher;
+  }
+};
+
+TEST_F(
+    ServerHandshakeAsyncDecryptTest,
+    TestRejectInitialDataBufferedDuringClientHello) {
+  clientServerRound();
+  ASSERT_FALSE(ex.hasError());
+  ASSERT_EQ(
+      handshake->getState().readRecordLayer()->getEncryptionLevel(),
+      fizz::EncryptionLevel::Plaintext);
+  ASSERT_FALSE(handshake
+                   ->doHandshake(
+                       folly::IOBuf::copyBuffer("unexpected crypto data"),
+                       EncryptionLevel::Initial)
+                   .hasError());
+
+  EXPECT_CALL(serverCallback, onCryptoEventAvailable()).WillOnce(Invoke([&] {
+    auto result = handshake->getFirstOneRttReadCipher();
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(result.error().code, TransportErrorCode::PROTOCOL_VIOLATION);
+  }));
+  promise.setValue();
+  evb.loop();
+
+  EXPECT_EQ(conn->getDestructorGuardCount(), 0);
+}
 
 class ServerHandshakeHRRTest : public ServerHandshakePskTest {
  public:
