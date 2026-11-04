@@ -728,4 +728,46 @@ TEST_F(StreamStateFunctionsTests, RetireIngressRejectsFinalSizeAboveWindow) {
       *result.error().code.asTransportErrorCode(),
       TransportErrorCode::FLOW_CONTROL_ERROR);
 }
+
+TEST_F(StreamStateFunctionsTests, ReadBufferRangesReleasedOnResetAndRetire) {
+  auto conn = createUnifiedConn();
+  const auto resetId =
+      conn->streamManager->createNextBidirectionalStream().value()->id;
+  const auto retireId =
+      conn->streamManager->createNextBidirectionalStream().value()->id;
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   *conn->streamManager->findStream(resetId),
+                   StreamBuffer(folly::IOBuf::copyBuffer("r"), 1))
+                   .hasError());
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   *conn->streamManager->findStream(resetId),
+                   StreamBuffer(folly::IOBuf::copyBuffer("r"), 3))
+                   .hasError());
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   *conn->streamManager->findStream(retireId),
+                   StreamBuffer(folly::IOBuf::copyBuffer("r"), 1))
+                   .hasError());
+  const auto expectExactReadBufferRangeCount = [&] {
+    EXPECT_EQ(
+        conn->streamManager->numReadBufferRanges(),
+        conn->streamManager->findStream(resetId)->readBuffer.size() +
+            conn->streamManager->findStream(retireId)->readBuffer.size());
+  };
+  expectExactReadBufferRangeCount();
+
+  ASSERT_FALSE(
+      onResetQuicStream(
+          *conn->streamManager->findStream(resetId),
+          RstStreamFrame(resetId, GenericApplicationErrorCode::UNKNOWN, 4, 2))
+          .hasError());
+  EXPECT_EQ(conn->streamManager->findStream(resetId)->readBuffer.size(), 1);
+  expectExactReadBufferRangeCount();
+  ASSERT_FALSE(
+      retireIngress(*conn->streamManager->findStream(retireId)).hasError());
+  expectExactReadBufferRangeCount();
+  ASSERT_FALSE(
+      retireIngress(*conn->streamManager->findStream(resetId)).hasError());
+
+  expectExactReadBufferRangeCount();
+}
 } // namespace quic::test

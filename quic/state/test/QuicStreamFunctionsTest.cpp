@@ -18,6 +18,9 @@
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/test/MockQuicStats.h>
 
+#include <array>
+#include <set>
+
 using namespace folly;
 using namespace testing;
 
@@ -86,11 +89,13 @@ using QuicStreamFunctionsTestBase = QuicStreamFunctionsTest;
 struct ReadBufferShape {
   size_t ranges{0};
   size_t chainElements{0};
+  size_t backingAllocations{0};
   size_t payloadBytes{0};
   size_t retainedCapacity{0};
 
   bool operator==(const ReadBufferShape& other) const {
     return ranges == other.ranges && chainElements == other.chainElements &&
+        backingAllocations == other.backingAllocations &&
         payloadBytes == other.payloadBytes &&
         retainedCapacity == other.retainedCapacity;
   }
@@ -98,6 +103,7 @@ struct ReadBufferShape {
 
 ReadBufferShape readBufferShape(const QuicStreamLike& stream) {
   ReadBufferShape shape;
+  std::set<const uint8_t*> backingAllocations;
   shape.ranges = stream.readBuffer.size();
   for (const auto& range : stream.readBuffer) {
     shape.payloadBytes += range.data.chainLength();
@@ -108,7 +114,10 @@ ReadBufferShape readBufferShape(const QuicStreamLike& stream) {
     const auto* current = head;
     do {
       ++shape.chainElements;
-      shape.retainedCapacity += current->capacity();
+      if (backingAllocations.insert(current->buffer()).second) {
+        ++shape.backingAllocations;
+        shape.retainedCapacity += current->capacity();
+      }
       current = current->next();
     } while (current != head);
   }
@@ -2924,7 +2933,7 @@ TEST_F(
 
 TEST_F(
     QuicStreamFunctionsTestBase,
-    AscendingDenseFragmentsRetainOneChainElementPerFrame) {
+    AscendingDenseFragmentsUseBoundedOwnedStorage) {
   constexpr size_t kFragments = 32;
   constexpr size_t kBackingCapacity = 1404;
   auto* stream = conn.streamManager->createNextBidirectionalStream().value();
@@ -2938,17 +2947,17 @@ TEST_F(
 
   const auto shape = readBufferShape(*stream);
   EXPECT_EQ(shape.ranges, 1);
-  EXPECT_EQ(shape.chainElements, kFragments);
+  EXPECT_LE(shape.chainElements, 2);
   EXPECT_EQ(shape.payloadBytes, kFragments);
-  EXPECT_GE(shape.retainedCapacity, kFragments * kBackingCapacity);
+  EXPECT_LE(shape.retainedCapacity, kReadBufferCoalescingSize + 1);
   EXPECT_EQ(stream->currentReadOffset, 0);
   EXPECT_EQ(stream->maxOffsetObserved, 33);
 }
 
 TEST_F(
     QuicStreamFunctionsTestBase,
-    DescendingDenseFragmentsRetainOneChainElementPerFrame) {
-  constexpr size_t kFragments = 32;
+    DescendingDenseFragmentsUseBoundedOwnedStorage) {
+  constexpr size_t kFragments = 2 * kReadBufferCoalescingSize;
   auto* stream = conn.streamManager->createNextBidirectionalStream().value();
 
   for (size_t offset = kFragments; offset > 0; --offset) {
@@ -2959,11 +2968,249 @@ TEST_F(
 
   const auto shape = readBufferShape(*stream);
   EXPECT_EQ(shape.ranges, 1);
-  EXPECT_EQ(shape.chainElements, kFragments);
+  EXPECT_LE(shape.chainElements, 3);
   EXPECT_EQ(shape.payloadBytes, kFragments);
-  EXPECT_GE(shape.retainedCapacity, kFragments);
+  EXPECT_LE(shape.retainedCapacity, kFragments + kReadBufferCoalescingSize + 1);
   EXPECT_EQ(stream->currentReadOffset, 0);
-  EXPECT_EQ(stream->maxOffsetObserved, 33);
+  EXPECT_EQ(stream->maxOffsetObserved, kFragments + 1);
+}
+
+TEST_F(
+    QuicStreamFunctionsTestBase,
+    RepeatedGapFillDoesNotRepackExistingSuffix) {
+  constexpr std::array<size_t, 3> kGapFillCounts = {32, 256, 2048};
+  constexpr size_t kSuffixElements = 8;
+  constexpr size_t kBackingCapacity = 1404;
+  for (const auto gapFills : kGapFillCounts) {
+    SCOPED_TRACE(gapFills);
+    size_t releasedSuffixElements = 0;
+    BufPtr suffix;
+    std::string expectedBytes(2 * gapFills, '\0');
+    for (size_t offset = 0; offset < 2 * gapFills; ++offset) {
+      expectedBytes[offset] = static_cast<char>('a' + offset % 26);
+    }
+    for (size_t index = 0; index < kSuffixElements; ++index) {
+      auto element = IOBuf::takeOwnership(
+          new uint8_t[kBackingCapacity],
+          kBackingCapacity,
+          kReadBufferCoalescingSize,
+          [](void* buffer, void* userData) {
+            ++*static_cast<size_t*>(userData);
+            delete[] static_cast<uint8_t*>(buffer);
+          },
+          &releasedSuffixElements);
+      memset(element->writableData(), 'A' + index, element->length());
+      expectedBytes.append(element->length(), 'A' + index);
+      if (suffix) {
+        suffix->appendToChain(std::move(element));
+      } else {
+        suffix = std::move(element);
+      }
+    }
+
+    auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+    EXPECT_FALSE(appendDataToReadBuffer(
+                     *stream, StreamBuffer(std::move(suffix), 2 * gapFills))
+                     .hasError());
+    for (size_t gap = gapFills; gap > 0; --gap) {
+      const auto segmentOffset = 2 * (gap - 1);
+      EXPECT_FALSE(appendDataToReadBuffer(
+                       *stream,
+                       StreamBuffer(
+                           makeOneByteBuffer(
+                               kBackingCapacity,
+                               static_cast<uint8_t>('a' + segmentOffset % 26)),
+                           segmentOffset))
+                       .hasError());
+      EXPECT_EQ(stream->readBuffer.size(), 2);
+      EXPECT_FALSE(
+          appendDataToReadBuffer(
+              *stream,
+              StreamBuffer(
+                  makeOneByteBuffer(
+                      kBackingCapacity,
+                      static_cast<uint8_t>('a' + (segmentOffset + 1) % 26)),
+                  segmentOffset + 1))
+              .hasError());
+      EXPECT_EQ(stream->readBuffer.size(), 1);
+    }
+
+    const auto prefixBytes = 2 * gapFills;
+    const auto shape = readBufferShape(*stream);
+    EXPECT_EQ(shape.payloadBytes, expectedBytes.size());
+    EXPECT_LE(
+        shape.chainElements,
+        kSuffixElements +
+            (prefixBytes + kReadBufferCoalescingSize - 1) /
+                kReadBufferCoalescingSize);
+    EXPECT_LE(
+        shape.retainedCapacity,
+        kSuffixElements * kBackingCapacity + prefixBytes +
+            kReadBufferCoalescingSize);
+    EXPECT_LE(releasedSuffixElements, 1);
+    EXPECT_EQ(
+        stream->readBuffer.front().data.chainLength(),
+        stream->readBuffer.front().data.front()->computeChainDataLength());
+    {
+      auto readResult = readDataFromQuicStream(*stream);
+      ASSERT_FALSE(readResult.hasError());
+      ASSERT_NE(readResult->first, nullptr);
+      EXPECT_EQ(readResult->first->toString(), expectedBytes);
+    }
+    EXPECT_EQ(releasedSuffixElements, kSuffixElements);
+  }
+}
+
+TEST_F(
+    QuicStreamFunctionsTestBase,
+    CompleteOverlapGapFillDoesNotRepackExistingSuffix) {
+  constexpr size_t kGapFills = 256;
+  constexpr size_t kSuffixElements = 8;
+  constexpr size_t kBackingCapacity = 1404;
+  size_t releasedSuffixElements = 0;
+  BufPtr suffix;
+  std::string expectedBytes(3 * kGapFills, '\0');
+  for (size_t index = 0; index < kSuffixElements; ++index) {
+    auto element = IOBuf::takeOwnership(
+        new uint8_t[kBackingCapacity],
+        kBackingCapacity,
+        kReadBufferCoalescingSize,
+        [](void* buffer, void* userData) {
+          ++*static_cast<size_t*>(userData);
+          delete[] static_cast<uint8_t*>(buffer);
+        },
+        &releasedSuffixElements);
+    memset(element->writableData(), 'A' + index, element->length());
+    expectedBytes.append(element->length(), 'A' + index);
+    if (suffix) {
+      suffix->appendToChain(std::move(element));
+    } else {
+      suffix = std::move(element);
+    }
+  }
+
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   *stream, StreamBuffer(std::move(suffix), 3 * kGapFills))
+                   .hasError());
+  for (size_t gap = kGapFills; gap > 0; --gap) {
+    const auto baseOffset = 3 * (gap - 1);
+    ASSERT_FALSE(
+        appendDataToReadBuffer(
+            *stream,
+            StreamBuffer(
+                makeOneByteBuffer(kBackingCapacity, 'x'), baseOffset + 1))
+            .hasError());
+    ASSERT_EQ(stream->readBuffer.size(), 2);
+
+    auto incoming = IOBuf::create(kBackingCapacity);
+    incoming->append(3);
+    for (size_t index = 0; index < incoming->length(); ++index) {
+      const auto value = static_cast<uint8_t>('a' + (baseOffset + index) % 26);
+      incoming->writableData()[index] = value;
+      expectedBytes[baseOffset + index] = value;
+    }
+    ASSERT_FALSE(appendDataToReadBuffer(
+                     *stream, StreamBuffer(std::move(incoming), baseOffset))
+                     .hasError());
+    ASSERT_EQ(stream->readBuffer.size(), 1);
+  }
+
+  const auto prefixBytes = 3 * kGapFills;
+  const auto shape = readBufferShape(*stream);
+  EXPECT_EQ(shape.payloadBytes, expectedBytes.size());
+  EXPECT_LE(
+      shape.chainElements,
+      kSuffixElements +
+          (prefixBytes + kReadBufferCoalescingSize - 1) /
+              kReadBufferCoalescingSize);
+  EXPECT_LE(
+      shape.retainedCapacity,
+      kSuffixElements * kBackingCapacity + prefixBytes +
+          kReadBufferCoalescingSize);
+  EXPECT_EQ(releasedSuffixElements, 0);
+  EXPECT_EQ(
+      stream->readBuffer.front().data.chainLength(),
+      stream->readBuffer.front().data.front()->computeChainDataLength());
+  {
+    auto readResult = readDataFromQuicStream(*stream);
+    ASSERT_FALSE(readResult.hasError());
+    ASSERT_NE(readResult->first, nullptr);
+    EXPECT_EQ(readResult->first->toString(), expectedBytes);
+  }
+  EXPECT_EQ(releasedSuffixElements, kSuffixElements);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, BufferedRangeMergeDirectionsStayBounded) {
+  const auto makeBuffer = [](size_t length, uint8_t value, bool chained) {
+    const auto firstLength = chained ? length / 2 : length;
+    auto data = IOBuf::create(firstLength);
+    data->append(firstLength);
+    memset(data->writableData(), value, firstLength);
+    if (chained) {
+      auto rest = IOBuf::create(length - firstLength);
+      rest->append(length - firstLength);
+      memset(rest->writableData(), value, rest->length());
+      data->appendToChain(std::move(rest));
+    }
+    return data;
+  };
+  const auto checkMerge = [&makeBuffer, this](
+                              size_t leftLength,
+                              size_t rightLength,
+                              size_t overlap,
+                              bool chainedLeft,
+                              bool chainedRight) {
+    auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+    ASSERT_FALSE(
+        appendDataToReadBuffer(
+            *stream, StreamBuffer(makeBuffer(leftLength, 'l', chainedLeft), 0))
+            .hasError());
+    ASSERT_FALSE(
+        appendDataToReadBuffer(
+            *stream,
+            StreamBuffer(
+                makeBuffer(rightLength, 'r', chainedRight), leftLength + 1))
+            .hasError());
+    ASSERT_EQ(stream->readBuffer.size(), 2);
+
+    const auto middleLength = overlap + 1;
+    auto middle = IOBuf::create(1404);
+    middle->append(middleLength);
+    memset(middle->writableData(), 'm', middleLength);
+    ASSERT_FALSE(appendDataToReadBuffer(
+                     *stream, StreamBuffer(std::move(middle), leftLength))
+                     .hasError());
+
+    std::string expected(leftLength, 'l');
+    expected.append(middleLength, 'm');
+    expected.append(rightLength - overlap, 'r');
+    const auto shape = readBufferShape(*stream);
+    ASSERT_EQ(shape.ranges, 1);
+    EXPECT_EQ(shape.payloadBytes, expected.size());
+    EXPECT_LE(
+        shape.chainElements,
+        (expected.size() + kReadBufferCoalescingSize - 1) /
+                kReadBufferCoalescingSize +
+            1);
+    EXPECT_LE(
+        shape.retainedCapacity, expected.size() + kReadBufferCoalescingSize);
+    EXPECT_EQ(
+        stream->readBuffer.front().data.chainLength(),
+        stream->readBuffer.front().data.front()->computeChainDataLength());
+    auto readResult = readDataFromQuicStream(*stream);
+    ASSERT_FALSE(readResult.hasError());
+    ASSERT_NE(readResult->first, nullptr);
+    EXPECT_EQ(readResult->first->toString(), expected);
+  };
+
+  constexpr auto kShort = kReadBufferCoalescingSize / 4;
+  constexpr auto kLong = kReadBufferCoalescingSize;
+  checkMerge(kShort, kShort, 0, false, false);
+  checkMerge(kShort, kLong, 0, false, true);
+  checkMerge(kLong, kShort, 0, false, false);
+  checkMerge(kLong, kLong, 0, true, false);
+  checkMerge(kLong, kLong, kLong - 11, false, false);
 }
 
 TEST_F(
@@ -2999,7 +3246,7 @@ TEST_F(
 
 TEST_F(
     QuicStreamFunctionsTestBase,
-    DenseFragmentsRetainSlicesOfOneSharedBackingAllocation) {
+    DenseFragmentsReleaseSharedBackingAllocation) {
   constexpr size_t kFragments = 32;
   constexpr size_t kBackingCapacity = 1404;
   auto* stream = conn.streamManager->createNextBidirectionalStream().value();
@@ -3018,35 +3265,167 @@ TEST_F(
 
   const auto shape = readBufferShape(*stream);
   EXPECT_EQ(shape.ranges, 1);
-  EXPECT_EQ(shape.chainElements, kFragments);
+  EXPECT_LE(shape.chainElements, 2);
+  EXPECT_LE(shape.retainedCapacity, kReadBufferCoalescingSize + 1);
   const auto* const head = stream->readBuffer.front().data.front();
   ASSERT_NE(head, nullptr);
   const auto* current = head;
   do {
-    EXPECT_EQ(current->buffer(), sharedBuffer);
+    EXPECT_NE(current->buffer(), sharedBuffer);
     current = current->next();
   } while (current != head);
 }
 
-TEST_F(
-    QuicStreamFunctionsTestBase,
-    DirectInputRetainsElementLargerThanMaxReceivePacket) {
+TEST_F(QuicStreamFunctionsTestBase, EfficientPacketSizedInputRemainsZeroCopy) {
   auto* stream = conn.streamManager->createNextBidirectionalStream().value();
-  const auto inputSize = conn.transportSettings.maxRecvPacketSize * 2;
-  auto input = IOBuf::create(inputSize);
-  input->append(inputSize);
-  const auto* const inputBuffer = input->buffer();
+  constexpr auto kInputSize = kReadBufferCoalescingSize;
+  auto first = IOBuf::create(kInputSize);
+  first->append(kInputSize);
+  const auto* const firstBuffer = first->buffer();
+  auto second = IOBuf::create(kInputSize);
+  second->append(kInputSize);
+  const auto* const secondBuffer = second->buffer();
 
   ASSERT_FALSE(
-      appendDataToReadBuffer(*stream, StreamBuffer(std::move(input), 1))
+      appendDataToReadBuffer(*stream, StreamBuffer(std::move(first), 0))
+          .hasError());
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   *stream, StreamBuffer(std::move(second), kInputSize))
+                   .hasError());
+
+  const auto shape = readBufferShape(*stream);
+  EXPECT_EQ(shape.ranges, 1);
+  EXPECT_EQ(shape.chainElements, 2);
+  EXPECT_EQ(shape.backingAllocations, 2);
+  EXPECT_EQ(shape.payloadBytes, 2 * kInputSize);
+  EXPECT_GT(shape.retainedCapacity, conn.transportSettings.maxRecvPacketSize);
+  const auto* const head = stream->readBuffer.front().data.front();
+  ASSERT_NE(head, nullptr);
+  EXPECT_EQ(head->buffer(), firstBuffer);
+  EXPECT_EQ(head->next()->buffer(), secondBuffer);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, InOrderSmallInputUsesBoundedOwnedStorage) {
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  auto input = makeOneByteBuffer(1404);
+  const auto* const inputBuffer = input->buffer();
+  const auto inputCapacity = input->capacity();
+
+  ASSERT_FALSE(
+      appendDataToReadBuffer(*stream, StreamBuffer(std::move(input), 0))
           .hasError());
 
   const auto shape = readBufferShape(*stream);
   EXPECT_EQ(shape.ranges, 1);
   EXPECT_EQ(shape.chainElements, 1);
-  EXPECT_EQ(shape.payloadBytes, inputSize);
-  EXPECT_GT(shape.retainedCapacity, conn.transportSettings.maxRecvPacketSize);
-  EXPECT_EQ(stream->readBuffer.front().data.front()->buffer(), inputBuffer);
+  EXPECT_EQ(shape.payloadBytes, 1);
+  EXPECT_LT(shape.retainedCapacity, inputCapacity);
+  EXPECT_NE(stream->readBuffer.front().data.front()->buffer(), inputBuffer);
+}
+
+void fillReadBufferRanges(QuicStreamState& stream, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    ASSERT_FALSE(appendDataToReadBuffer(
+                     stream, StreamBuffer(makeOneByteBuffer(1), 1 + 2 * i))
+                     .hasError());
+  }
+}
+
+TEST_F(QuicStreamFunctionsTestBase, StreamReadBufferRangeLimit) {
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  fillReadBufferRanges(*stream, kMaxStreamReadBufferRanges);
+
+  auto result = appendDataToReadBuffer(
+      *stream,
+      StreamBuffer(makeOneByteBuffer(1), 1 + 2 * kMaxStreamReadBufferRanges));
+  ASSERT_TRUE(result.hasError());
+  const auto* error = result.error().code.asLocalErrorCode();
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(*error, LocalErrorCode::INTERNAL_ERROR);
+  EXPECT_EQ(stream->readBuffer.size(), kMaxStreamReadBufferRanges);
+
+  ASSERT_FALSE(
+      appendDataToReadBuffer(*stream, StreamBuffer(makeOneByteBuffer(1), 2))
+          .hasError());
+  EXPECT_LT(stream->readBuffer.size(), kMaxStreamReadBufferRanges);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, ConnectionReadBufferRangeLimit) {
+  const auto streamsToFill =
+      kMaxConnectionReadBufferRanges / kMaxStreamReadBufferRanges;
+  for (size_t i = 0; i < streamsToFill; ++i) {
+    auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+    fillReadBufferRanges(*stream, kMaxStreamReadBufferRanges);
+  }
+  EXPECT_EQ(
+      conn.streamManager->numReadBufferRanges(),
+      kMaxConnectionReadBufferRanges);
+
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  auto result =
+      appendDataToReadBuffer(*stream, StreamBuffer(makeOneByteBuffer(1), 1));
+  ASSERT_TRUE(result.hasError());
+  const auto* error = result.error().code.asLocalErrorCode();
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(*error, LocalErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(
+    QuicStreamFunctionsTestBase,
+    ReadBufferRangesReleasedOnReadStopAndClose) {
+  conn.transportSettings.dropIngressOnStopSending = true;
+  const auto createBufferedStream = [&](uint64_t offset, size_t length) {
+    const auto id =
+        conn.streamManager->createNextBidirectionalStream().value()->id;
+    EXPECT_FALSE(
+        appendDataToReadBuffer(
+            *conn.streamManager->findStream(id),
+            StreamBuffer(
+                folly::IOBuf::copyBuffer(std::string(length, 'r')), offset))
+            .hasError());
+    return id;
+  };
+  const auto readStream = createBufferedStream(0, 2);
+  const auto consumeStream = createBufferedStream(0, 2);
+  const auto stopStream = createBufferedStream(1, 1);
+  const auto closeStream = createBufferedStream(1, 1);
+  const std::array<StreamId, 4> managedStreams = {
+      readStream, consumeStream, stopStream, closeStream};
+  const auto expectExactReadBufferRangeCount = [&] {
+    size_t numRanges = 0;
+    for (const auto streamId : managedStreams) {
+      if (const auto* stream = conn.streamManager->findStream(streamId)) {
+        numRanges += stream->readBuffer.size();
+      }
+    }
+    EXPECT_EQ(conn.streamManager->numReadBufferRanges(), numRanges);
+  };
+  expectExactReadBufferRangeCount();
+
+  ASSERT_FALSE(
+      readDataFromQuicStream(*conn.streamManager->findStream(readStream), 1)
+          .hasError());
+  expectExactReadBufferRangeCount();
+  ASSERT_FALSE(consumeDataFromQuicStream(
+                   *conn.streamManager->findStream(consumeStream), 1)
+                   .hasError());
+  expectExactReadBufferRangeCount();
+  ASSERT_FALSE(
+      readDataFromQuicStream(*conn.streamManager->findStream(readStream))
+          .hasError());
+  expectExactReadBufferRangeCount();
+  ASSERT_FALSE(consumeDataFromQuicStream(
+                   *conn.streamManager->findStream(consumeStream), 1)
+                   .hasError());
+  expectExactReadBufferRangeCount();
+  processTxStopSending(*conn.streamManager->findStream(stopStream));
+  expectExactReadBufferRangeCount();
+  auto* closeState = conn.streamManager->findStream(closeStream);
+  closeState->sendState = StreamSendState::Closed;
+  closeState->recvState = StreamRecvState::Closed;
+  ASSERT_FALSE(conn.streamManager->removeClosedStream(closeStream).hasError());
+
+  expectExactReadBufferRangeCount();
 }
 
 } // namespace quic::test

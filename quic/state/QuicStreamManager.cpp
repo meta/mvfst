@@ -216,6 +216,8 @@ QuicStreamManager::QuicStreamManager(
   flowControlUpdated_ = std::move(other.flowControlUpdated_);
   numStreamsWithLoss_ = other.numStreamsWithLoss_;
   other.numStreamsWithLoss_ = 0;
+  numReadBufferRanges_ = other.numReadBufferRanges_;
+  other.numReadBufferRanges_ = 0;
   readableStreams_ = std::move(other.readableStreams_);
   peekableStreams_ = std::move(other.peekableStreams_);
   writeQueue_ = std::move(other.writeQueue_);
@@ -345,6 +347,21 @@ std::vector<StreamId> QuicStreamManager::openReceiveStreamIds() const {
   openUnidirectionalPeerStreams_.appendTo(streamIds);
   openBidirectionalLocalStreams_.appendTo(streamIds);
   return streamIds;
+}
+
+void QuicStreamManager::updateReadBufferRanges(size_t before, size_t after) {
+  if (after >= before) {
+    numReadBufferRanges_ += after - before;
+    return;
+  }
+  const auto decrement = before - after;
+  PROTO_OOPS_LOG_IF(
+      decrement > numReadBufferRanges_,
+      proto_oops::getThreadLocalOopsLogger(),
+      "quic_stream_manager",
+      "read buffer range count underflow");
+  MVDCHECK_GE(numReadBufferRanges_, decrement);
+  numReadBufferRanges_ -= decrement;
 }
 
 void QuicStreamManager::removeLoss(StreamId id) {
@@ -1072,6 +1089,8 @@ quic::Expected<void, QuicError> QuicStreamManager::removeClosedStream(
     numControlStreams_--;
   }
 
+  updateReadBufferRanges(it->second.readBuffer.size(), 0);
+
   // Erase the main stream state
   streams_.erase(it);
   QUIC_STATS(conn_.statsCallback, onQuicStreamClosed);
@@ -1246,6 +1265,7 @@ void QuicStreamManager::clearOpenStreams() {
   openBidirectionalPeerStreams_.clear();
   openUnidirectionalPeerStreams_.clear();
   streams_.clear();
+  numReadBufferRanges_ = 0;
 }
 
 } // namespace quic

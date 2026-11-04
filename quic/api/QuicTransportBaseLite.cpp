@@ -1563,14 +1563,18 @@ void QuicTransportBaseLite::updateReadLooper() {
     readLooper_->stop();
     return;
   }
-  auto matcherFn = [&readCallbacks = readCallbacks_](StreamId s) {
-    auto readCb = readCallbacks.find(s);
-    if (readCb == readCallbacks.end()) {
+  auto matcherFn = [this](StreamId s) {
+    auto readCb = readCallbacks_.find(s);
+    if (readCb == readCallbacks_.end() || !readCb->second.readCb) {
       return false;
     }
-    // TODO: if the stream has an error and it is also paused we should
-    // still return an error
-    return readCb->second.readCb && readCb->second.resumed;
+    if (readCb->second.resumed) {
+      return true;
+    }
+    auto* stream = conn_->streamManager->getStreamIfExists(s);
+    return stream && stream->streamReadError &&
+        (!stream->reliableSizeFromPeer ||
+         *stream->reliableSizeFromPeer <= stream->currentReadOffset);
   };
   auto iter = std::find_if(
       conn_->streamManager->readableStreams().begin(),

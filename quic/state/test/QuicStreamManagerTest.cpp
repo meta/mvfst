@@ -935,6 +935,25 @@ TEST_P(QuicStreamManagerTest, RetiringNewPeerStreamsSurvivesMovingTheManager) {
       Optional<ApplicationErrorCode>{ApplicationErrorCode{7}});
 }
 
+TEST_P(QuicStreamManagerTest, ReadBufferRangeAccountingSurvivesMoveAndClear) {
+  auto& manager = *conn.streamManager;
+  auto* stream = manager.createNextBidirectionalStream().value();
+  const auto streamId = stream->id;
+  stream->readBuffer.emplace_back(folly::IOBuf::copyBuffer("data"), 1);
+  manager.updateReadBufferRanges(0, 1);
+
+  QuicStreamManager moved(
+      conn, conn.nodeType, conn.transportSettings, std::move(manager));
+
+  EXPECT_EQ(conn.streamManager->numReadBufferRanges(), 0);
+  ASSERT_NE(moved.findStream(streamId), nullptr);
+  EXPECT_EQ(
+      moved.numReadBufferRanges(),
+      moved.findStream(streamId)->readBuffer.size());
+  moved.clearOpenStreams();
+  EXPECT_EQ(moved.numReadBufferRanges(), 0);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     QuicStreamManagerTest,
     QuicStreamManagerTest,

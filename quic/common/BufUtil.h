@@ -26,6 +26,11 @@ class BufQueue {
     }
   }
 
+  BufQueue(BufPtr chain, size_t chainLength)
+      : chain_(std::move(chain)), chainLength_(chainLength) {
+    MVDCHECK_EQ(chainLength_, chain_ ? chain_->computeChainDataLength() : 0);
+  }
+
   BufQueue(BufQueue&& other) noexcept
       : chain_(std::move(other.chain_)), chainLength_(other.chainLength_) {
     other.chainLength_ = 0;

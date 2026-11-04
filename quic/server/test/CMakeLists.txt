@@ -38,8 +38,10 @@ quic_add_test(TARGET QuicClientServerIntegrationTest
 quic_add_test(TARGET QuicServerTransportTest
   SOURCES
   QuicServerTransportTest.cpp
+  QuicTransportCryptoTest.cpp
   DEPENDS
   Folly::folly
+  mvfst_client_client
   mvfst_codec_pktbuilder
   mvfst_codec_types
   mvfst_folly_utils

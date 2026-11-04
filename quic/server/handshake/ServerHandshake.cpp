@@ -41,6 +41,10 @@ void ServerHandshake::initialize(
 quic::Expected<void, QuicError> ServerHandshake::doHandshake(
     BufPtr data,
     EncryptionLevel encryptionLevel) {
+  if (error_) {
+    return quic::make_unexpected(
+        QuicError(error_->second, std::move(error_->first)));
+  }
   SCOPE_EXIT {
     inHandshakeStack_ = false;
   };
@@ -60,6 +64,7 @@ quic::Expected<void, QuicError> ServerHandshake::doHandshake(
     default:
       MVCHECK(false, "Unhandled EncryptionLevel");
   }
+  checkForUnexpectedCryptoData();
   processPendingEvents();
   if (error_) {
     return quic::make_unexpected(
@@ -371,6 +376,20 @@ void ServerHandshake::processPendingEvents() {
   }
 }
 
+void ServerHandshake::checkForUnexpectedCryptoData() {
+  if (error_) {
+    return;
+  }
+  const auto readLevel = getReadRecordLayerEncryptionLevel();
+  if ((readLevel != EncryptionLevel::Initial && !initialReadBuf_.empty()) ||
+      (readLevel == EncryptionLevel::AppData && !handshakeReadBuf_.empty())) {
+    onError(
+        std::make_pair(
+            "Unexpected crypto data at an obsolete encryption level",
+            TransportErrorCode::PROTOCOL_VIOLATION));
+  }
+}
+
 const Optional<BufPtr>& ServerHandshake::getAppToken() const {
   static Optional<BufPtr> empty;
   if (!state_.appToken().has_value()) {
@@ -588,6 +607,7 @@ void ServerHandshake::processActions(
     }
   }
 
+  checkForUnexpectedCryptoData();
   actionGuard_ = folly::DelayedDestruction::DestructorGuard(nullptr);
   if (callback_ && !inHandshakeStack_ && handshakeEventAvailable_) {
     callback_->onCryptoEventAvailable();

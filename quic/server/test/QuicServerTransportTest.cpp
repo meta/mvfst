@@ -1143,9 +1143,20 @@ TEST_F(QuicServerTransportTest, RecvRstStreamFrame) {
       server->getNonConstConn().streamManager->getStream(streamId);
   ASSERT_FALSE(streamResult.hasError());
   auto stream = streamResult.value();
-  stream->readBuffer.emplace_back(IOBuf::copyBuffer(words.at(0)), 0, false);
-  stream->readBuffer.emplace_back(
-      IOBuf::copyBuffer(words.at(1)), words.at(0).length(), false);
+  ASSERT_FALSE(
+      appendDataToReadBuffer(
+          *stream, StreamBuffer(IOBuf::copyBuffer(words.at(0)), 0, false))
+          .hasError());
+  ASSERT_FALSE(
+      appendDataToReadBuffer(
+          *stream,
+          StreamBuffer(
+              IOBuf::copyBuffer(words.at(1)), words.at(0).length(), false))
+          .hasError());
+  ASSERT_GT(server->getConn().streamManager->numReadBufferRanges(), 0);
+  EXPECT_EQ(
+      server->getConn().streamManager->numReadBufferRanges(),
+      stream->readBuffer.size());
 
   auto wordsBuf2 = IOBuf::copyBuffer(words.at(2));
   stream->retransmissionBuffer.emplace(
@@ -1185,6 +1196,7 @@ TEST_F(QuicServerTransportTest, RecvRstStreamFrame) {
       server->getNonConstConn().streamManager->findStream(streamId);
   ASSERT_TRUE(updatedStream);
   EXPECT_TRUE(updatedStream->readBuffer.empty());
+  EXPECT_EQ(server->getConn().streamManager->numReadBufferRanges(), 0);
   // We can verify retx buffer isn't empty here. The writeBuffer though could be
   // empty since deliverData can cause a write synchrously.
   EXPECT_FALSE(updatedStream->retransmissionBuffer.empty());
