@@ -242,6 +242,45 @@ TEST_P(HappyEyeballsBatchTest, PreservesPacketsAcrossSocketAttempts) {
   ASSERT_TRUE(batch.flush().has_value());
 }
 
+TEST(QuicBatch, FirstAddressFailureReportedOnlyBeforeHappyEyeballsFinishes) {
+  using namespace ::testing;
+  for (bool finished : {false, true}) {
+    folly::EventBase evb;
+    auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+    quic::test::MockAsyncUDPSocket sock(qEvb);
+    QuicClientConnectionState conn(
+        FizzClientQuicHandshakeContext::Builder().build());
+    BufAccessor accessor(4096);
+    conn.bufAccessor = &accessor;
+    auto& happy = conn.happyEyeballsState;
+    happy.finished = finished;
+    happy.shouldWriteToFirstSocket = true;
+    int failures = 0;
+    happy.firstAddressFailureCallback = [&](const SocketAddress&) {
+      ++failures;
+    };
+    EXPECT_CALL(sock, write(_, _, _)).WillOnce(SetErrnoAndReturn(EIO, -1));
+    EXPECT_CALL(sock, pauseRead());
+    const SocketAddress address("::1", 2345);
+    IOBufQuicBatch batch(
+        BatchWriterFactory::makeBatchWriter(
+            QuicBatchingMode::BATCHING_MODE_NONE,
+            1,
+            DataPathType::ChainedMemory,
+            conn,
+            true),
+        sock,
+        address,
+        nullptr,
+        &happy);
+    auto packet = folly::IOBuf::copyBuffer("packet");
+    const auto size = packet->computeChainDataLength();
+    (void)batch.write(std::move(packet), size);
+    (void)batch.flush();
+    EXPECT_EQ(failures, finished ? 0 : 1) << "finished=" << finished;
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     MemoryPaths,
     HappyEyeballsBatchTest,

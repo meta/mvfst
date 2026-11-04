@@ -1458,6 +1458,12 @@ void QuicClientTransportLite::errMessage(
           happyEyeballsState.connAttemptDelayTimeout->timeoutExpired();
           cancelTimeout(happyEyeballsState.connAttemptDelayTimeout);
         }
+        // Last, so the callback sees the transport after the switch to the
+        // second socket rather than partway through it.
+        if (happyEyeballsState.firstAddressFailureCallback) {
+          happyEyeballsState.firstAddressFailureCallback(
+              clientConn_->peerAddress);
+        }
       } else if (
           cmsg.cmsg_level == SOL_IP &&
           happyEyeballsState.shouldWriteToSecondSocket) {

@@ -70,6 +70,7 @@ quic::Expected<bool, QuicError> IOBufQuicBatch::flushInternal() {
   }
 
   bool written = false;
+  bool firstAddressFailed = false;
   Optional<int> firstSocketErrno;
   if (!happyEyeballsState_ || happyEyeballsState_->shouldWriteToFirstSocket) {
     auto consumed = batchWriter_->write(sock_, peerAddress_);
@@ -84,6 +85,9 @@ quic::Expected<bool, QuicError> IOBufQuicBatch::flushInternal() {
 
       if (!happyEyeballsState_->shouldWriteToFirstSocket) {
         sock_.pauseRead();
+        // Once the race is decided the first socket is the winner's, so a
+        // later write failure is not a first-address failure.
+        firstAddressFailed = !happyEyeballsState_->finished;
       }
     }
   }
@@ -113,6 +117,14 @@ quic::Expected<bool, QuicError> IOBufQuicBatch::flushInternal() {
     if (!happyEyeballsState_->shouldWriteToSecondSocket) {
       happyEyeballsState_->secondSocket->pauseRead();
     }
+  }
+
+  // Report the failure only after both sockets' state is settled, and keep the
+  // write's errno, which the error handling below reads.
+  if (firstAddressFailed && happyEyeballsState_->firstAddressFailureCallback) {
+    const int savedErrno = errno;
+    happyEyeballsState_->firstAddressFailureCallback(peerAddress_);
+    errno = savedErrno;
   }
 
   if (!written && statsCallback_) {

@@ -160,6 +160,15 @@ class QuicClientTransportLite
 
   bool hasZeroRttWriteCipher() const;
 
+  // Called with the failed address when Happy Eyeballs gives up on the first
+  // address. It runs synchronously from the transport's write and socket-error
+  // paths, so it must not throw or close/destroy the transport.
+  void setHappyEyeballsFirstAddressFailureCallback(
+      std::function<void(const quic::SocketAddress&)> callback) {
+    clientConn_->happyEyeballsState.firstAddressFailureCallback =
+        std::move(callback);
+  }
+
   // From QuicTransportBase
   quic::Expected<void, QuicError> onReadData(
       const quic::SocketAddress& localAddress,

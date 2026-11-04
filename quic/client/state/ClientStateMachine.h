@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <quic/client/handshake/ClientHandshake.h>
 #include <quic/client/handshake/ClientHandshakeFactory.h>
 #include <quic/common/NetworkData.h>
@@ -109,6 +111,8 @@ struct QuicClientConnectionState : public QuicConnectionStateBase {
     // Whether HappyEyeballs has finished
     // The signal of finishing is first successful decryption of a packet
     bool finished{false};
+
+    std::function<void(const quic::SocketAddress&)> firstAddressFailureCallback;
   };
 
   HappyEyeballsState happyEyeballsState;

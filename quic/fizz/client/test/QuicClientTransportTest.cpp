@@ -2369,6 +2369,12 @@ class QuicClientTransportHappyEyeballsTest
       const SocketAddress& firstAddress,
       const SocketAddress& secondAddress) {
     auto& conn = client->getConn();
+    int firstAddressFailures = 0;
+    client->setHappyEyeballsFirstAddressFailureCallback(
+        [&](const SocketAddress& failedAddress) {
+          ++firstAddressFailures;
+          EXPECT_EQ(failedAddress, firstAddress);
+        });
     EXPECT_CALL(*sock, write(firstAddress, _, _))
         .WillOnce(SetErrnoAndReturn(EBADF, -1));
     // Socket is paused read once during happy eyeballs
@@ -2382,6 +2388,7 @@ class QuicClientTransportHappyEyeballsTest
     // Give up first socket
     EXPECT_FALSE(conn.happyEyeballsState.shouldWriteToFirstSocket);
     EXPECT_TRUE(conn.happyEyeballsState.shouldWriteToSecondSocket);
+    EXPECT_EQ(firstAddressFailures, 1);
     EXPECT_FALSE(client->happyEyeballsConnAttemptDelayTimeout()
                      .isTimerCallbackScheduled());
 
@@ -2396,6 +2403,12 @@ class QuicClientTransportHappyEyeballsTest
       [[maybe_unused]] const SocketAddress& firstAddress,
       [[maybe_unused]] const SocketAddress& secondAddress) {
     auto& conn = client->getConn();
+    int firstAddressFailures = 0;
+    client->setHappyEyeballsFirstAddressFailureCallback(
+        [&](const SocketAddress& failedAddress) {
+          ++firstAddressFailures;
+          EXPECT_EQ(failedAddress, firstAddress);
+        });
     EXPECT_CALL(*sock, write(firstAddress, _, _));
     // Socket is paused read once during happy eyeballs
     // Socket is paused read for the second time when QuicClientTransport dies
@@ -2422,6 +2435,7 @@ class QuicClientTransportHappyEyeballsTest
     client->errMessage(cmsgbuf.hdr);
     EXPECT_FALSE(conn.happyEyeballsState.shouldWriteToFirstSocket);
     EXPECT_TRUE(conn.happyEyeballsState.shouldWriteToSecondSocket);
+    EXPECT_EQ(firstAddressFailures, 1);
     EXPECT_FALSE(client->happyEyeballsConnAttemptDelayTimeout()
                      .isTimerCallbackScheduled());
 
