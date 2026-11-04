@@ -68,6 +68,7 @@ mvfst_cpp_test(
         "fbsource//xplat/quic/fizz/client/handshake:fizz_client_handshake",
         "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",
         "fbsource//xplat/quic/server/state:server",
+        "fbsource//xplat/quic/state:quic_state_machine",
         "fbsource//xplat/quic/state:quic_stream_utilities",
         "fbsource//xplat/quic/state:stream_functions",
         ":mocks",

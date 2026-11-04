@@ -2578,10 +2578,20 @@ void QuicTransportBaseLite::handleDeliveryCallbacks() {
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     auto maxOffsetToDeliver = getLargestDeliverableOffset(*stream);
 
-    if (maxOffsetToDeliver.has_value() && !stream->usesUnifiedSendBuffer()) {
+    if (maxOffsetToDeliver.has_value() && !stream->usesUnifiedSendBuffer() &&
+        *maxOffsetToDeliver >= stream->writeBufferStartOffset) {
       size_t amountTrimmed = stream->writeBuffer.trimStartAtMost(
-          *maxOffsetToDeliver - stream->writeBufferStartOffset);
+          *maxOffsetToDeliver - stream->writeBufferStartOffset + 1);
       stream->writeBufferStartOffset += amountTrimmed;
+      if (const auto* head = stream->writeBuffer.front();
+          head && head->length() == 0) {
+        const auto remainingLength = stream->writeBuffer.chainLength();
+        auto data = stream->writeBuffer.move();
+        do {
+          data = data->pop();
+        } while (data && data->length() == 0);
+        stream->writeBuffer = BufQueue(std::move(data), remainingLength);
+      }
     }
 
     if (maxOffsetToDeliver.has_value()) {

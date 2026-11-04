@@ -145,6 +145,7 @@ uint64_t getNumPacketsTxWithNewData(const QuicStreamState& stream);
     StreamBuffer buffer,
     uint32_t coalescingSize,
     size_t maxReadBufferRanges,
+    const QuicErrorCode& readBufferLimitErrorCode,
     FunctionRef<quic::Expected<void, QuicError>(uint64_t, uint64_t)>
         connFlowControlVisitor);
 

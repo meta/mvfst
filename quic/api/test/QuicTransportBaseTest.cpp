@@ -2815,6 +2815,105 @@ TEST_F(QuicTransportImplTestBase, DeliveryCallbackUnsetOne) {
 
 TEST_F(
     QuicTransportImplTestBase,
+    LegacyAckReleasesPayloadBeforeDeliveryCallback) {
+  transport->transportConn->oneRttWriteCipher = test::createNoOpAead();
+  for (bool fin : {false, true}) {
+    SCOPED_TRACE(fin);
+    const auto streamId = transport->createBidirectionalStream().value();
+    auto* stream = transport->getStream(streamId);
+    ASSERT_FALSE(stream->usesUnifiedSendBuffer());
+    auto data = IOBuf::create(64 * 1024);
+    data->append(3);
+    memcpy(data->writableData(), "abc", 3);
+    ASSERT_FALSE(
+        transport->writeChain(streamId, std::move(data), fin).hasError());
+    transport->invokeWriteSocketData();
+    ASSERT_EQ(stream->retransmissionBuffer.size(), 1);
+
+    StrictMock<MockByteEventCallback> callback;
+    const uint64_t ackOffset = fin ? 3 : 2;
+    EXPECT_CALL(
+        callback, onByteEventRegistered(getAckMatcher(streamId, ackOffset)));
+    ASSERT_FALSE(
+        transport->registerDeliveryCallback(streamId, ackOffset, &callback)
+            .hasError());
+    EXPECT_CALL(callback, onByteEvent(getAckMatcher(streamId, ackOffset)))
+        .WillOnce(Invoke([&](ByteEvent) {
+          EXPECT_EQ(stream->writeBuffer.front(), nullptr);
+          EXPECT_EQ(stream->writeBufferStartOffset, 3);
+        }));
+
+    ASSERT_FALSE(
+        sendAckSMHandler(*stream, WriteStreamFrame(streamId, 0, 3, fin))
+            .hasError());
+    transport->invokeProcessCallbacksAfterNetworkData();
+    EXPECT_TRUE(stream->writeBuffer.empty());
+    EXPECT_EQ(stream->writeBuffer.front(), nullptr);
+    EXPECT_EQ(stream->writeBufferStartOffset, 3);
+  }
+}
+
+TEST_F(QuicTransportImplTestBase, LegacyAckPreservesUnackedSuffix) {
+  transport->transportConn->oneRttWriteCipher = test::createNoOpAead();
+  for (bool keepShared : {false, true}) {
+    SCOPED_TRACE(keepShared);
+    const auto streamId = transport->createBidirectionalStream().value();
+    auto* stream = transport->getStream(streamId);
+    ASSERT_FALSE(stream->usesUnifiedSendBuffer());
+    auto releases = std::make_shared<size_t>(0);
+    auto data = IOBuf::takeOwnership(
+        new uint8_t[64 * 1024],
+        64 * 1024,
+        3,
+        [](void* buffer, void* context) {
+          auto* counter = static_cast<std::shared_ptr<size_t>*>(context);
+          ++**counter;
+          delete counter;
+          delete[] static_cast<uint8_t*>(buffer);
+        },
+        new std::shared_ptr<size_t>(releases));
+    memcpy(data->writableData(), "abc", 3);
+    auto externalClone = keepShared ? data->clone() : nullptr;
+    ASSERT_FALSE(
+        transport->writeChain(streamId, std::move(data), false).hasError());
+    transport->invokeWriteSocketData();
+    ASSERT_FALSE(
+        transport->writeChain(streamId, IOBuf::copyBuffer("def"), false)
+            .hasError());
+    transport->invokeWriteSocketData();
+    ASSERT_EQ(stream->retransmissionBuffer.size(), 2);
+
+    const WriteStreamFrame first(streamId, 0, 3, false);
+    ASSERT_FALSE(sendAckSMHandler(*stream, first).hasError());
+    transport->invokeProcessCallbacksAfterNetworkData();
+    ASSERT_NE(stream->writeBuffer.front(), nullptr);
+    EXPECT_GT(stream->writeBuffer.front()->length(), 0);
+    EXPECT_EQ(stream->writeBuffer.front()->toString(), "def");
+    EXPECT_EQ(stream->writeBufferStartOffset, 3);
+    EXPECT_EQ(*releases, keepShared ? 0 : 1);
+    if (externalClone) {
+      EXPECT_EQ(externalClone->toString(), "abc");
+      externalClone.reset();
+      EXPECT_EQ(*releases, 1);
+    }
+
+    ASSERT_FALSE(sendAckSMHandler(*stream, first).hasError());
+    transport->invokeProcessCallbacksAfterNetworkData();
+    ASSERT_NE(stream->writeBuffer.front(), nullptr);
+    EXPECT_EQ(stream->writeBuffer.front()->toString(), "def");
+    EXPECT_EQ(stream->writeBufferStartOffset, 3);
+
+    ASSERT_FALSE(
+        sendAckSMHandler(*stream, WriteStreamFrame(streamId, 3, 3, false))
+            .hasError());
+    transport->invokeProcessCallbacksAfterNetworkData();
+    EXPECT_EQ(stream->writeBuffer.front(), nullptr);
+    EXPECT_EQ(stream->writeBufferStartOffset, 6);
+  }
+}
+
+TEST_F(
+    QuicTransportImplTestBase,
     UnifiedAckRetiresPayloadBeforeDeliveryCallback) {
   transport->transportConn->transportSettings.useUnifiedAppStreamSendBuffer =
       true;

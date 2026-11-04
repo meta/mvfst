@@ -97,6 +97,7 @@ mvfst_cpp_test(
         "fbsource//xplat/quic/logging/oops_logger:oops_logger",
         "fbsource//xplat/quic/server/state:server",
         "fbsource//xplat/quic/state:datagram_handler",
+        "fbsource//xplat/quic/state:quic_state_machine",
         "fbsource//xplat/quic/state:quic_stream_utilities",
         "fbsource//xplat/quic/state:stream_functions",
         "fbsource//xplat/quic/state/stream:stream",

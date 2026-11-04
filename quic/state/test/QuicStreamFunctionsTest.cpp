@@ -2846,6 +2846,137 @@ TEST_F(QuicStreamFunctionsTestBase, CryptoStreamBufferLimitExceeded) {
       QuicErrorCode(TransportErrorCode::CRYPTO_BUFFER_EXCEEDED));
 }
 
+TEST_F(QuicStreamFunctionsTestBase, CryptoDenseFragmentsUseBoundedStorage) {
+  constexpr size_t kFragments = 4096;
+  for (bool descending : {false, true}) {
+    SCOPED_TRACE(descending);
+    QuicCryptoStream cryptoStream;
+    std::string expected(kFragments, 'a');
+    for (size_t i = 0; i < kFragments; ++i) {
+      const auto offset = descending ? kFragments - i : i + 1;
+      const auto value = static_cast<uint8_t>('a' + offset % 26);
+      expected[offset - 1] = value;
+      ASSERT_FALSE(
+          appendDataToReadBuffer(
+              cryptoStream, StreamBuffer(makeOneByteBuffer(1, value), offset))
+              .hasError());
+    }
+    const auto shape = readBufferShape(cryptoStream);
+    const auto blocks = (kFragments + kReadBufferCoalescingSize - 1) /
+        kReadBufferCoalescingSize;
+    EXPECT_EQ(shape.ranges, 1);
+    EXPECT_EQ(shape.payloadBytes, kFragments);
+    EXPECT_LE(shape.chainElements, blocks + 1);
+    EXPECT_LE(shape.backingAllocations, blocks + 1);
+    EXPECT_LE(
+        shape.retainedCapacity,
+        blocks * combinedCapacity(kReadBufferCoalescingSize) +
+            combinedCapacity(1));
+    EXPECT_EQ(readDataFromCryptoStream(cryptoStream), nullptr);
+
+    ASSERT_FALSE(appendDataToReadBuffer(
+                     cryptoStream, StreamBuffer(IOBuf::copyBuffer("!"), 0))
+                     .hasError());
+    auto data = readDataFromCryptoStream(cryptoStream);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(data->toString(), "!" + expected);
+    EXPECT_TRUE(cryptoStream.readBuffer.empty());
+  }
+}
+
+TEST_F(QuicStreamFunctionsTestBase, OverwrittenReadBufferReleasesOldStorage) {
+  std::string expected(1401, 'a');
+  for (size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = 'a' + i % 26;
+  }
+  const auto checkOverwrite = [&](auto& stream, bool keepSuffix) {
+    size_t suffixCapacity = 0;
+    if (keepSuffix) {
+      auto suffix = IOBuf::copyBuffer("z");
+      suffixCapacity = std::max(suffix->capacity(), combinedCapacity(1));
+      ASSERT_FALSE(appendDataToReadBuffer(
+                       stream, StreamBuffer(std::move(suffix), expected.size()))
+                       .hasError());
+    }
+    size_t lastInputCapacity = 0;
+    for (size_t offset = 169; offset > 0; --offset) {
+      auto data =
+          IOBuf::copyBuffer(expected.data() + offset, expected.size() - offset);
+      lastInputCapacity = data->capacity();
+      ASSERT_FALSE(
+          appendDataToReadBuffer(stream, StreamBuffer(std::move(data), offset))
+              .hasError());
+    }
+    const auto shape = readBufferShape(stream);
+    EXPECT_EQ(shape.ranges, 1);
+    EXPECT_EQ(shape.payloadBytes, expected.size() - 1 + keepSuffix);
+    EXPECT_LE(shape.chainElements, keepSuffix ? 2 : 1);
+    EXPECT_LE(shape.backingAllocations, keepSuffix ? 2 : 1);
+    EXPECT_LE(
+        shape.retainedCapacity,
+        std::max(lastInputCapacity, combinedCapacity(expected.size() - 1)) +
+            suffixCapacity);
+    ASSERT_EQ(stream.readBuffer.size(), 1);
+    EXPECT_EQ(stream.readBuffer.front().offset, 1);
+    EXPECT_EQ(
+        stream.readBuffer.front().data.front()->toString(),
+        expected.substr(1) + (keepSuffix ? "z" : ""));
+  };
+
+  for (bool keepSuffix : {false, true}) {
+    SCOPED_TRACE(keepSuffix);
+    auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+    checkOverwrite(*stream, keepSuffix);
+    QuicCryptoStream cryptoStream;
+    checkOverwrite(cryptoStream, keepSuffix);
+  }
+}
+
+TEST_F(QuicStreamFunctionsTestBase, CryptoReadBufferRangeLimit) {
+  auto& cryptoStream = conn.cryptoState->handshakeStream;
+  for (size_t i = 0; i < kMaxStreamReadBufferRanges; ++i) {
+    ASSERT_FALSE(
+        appendDataToReadBuffer(
+            cryptoStream, StreamBuffer(makeOneByteBuffer(1), 2 + 4 * i))
+            .hasError());
+  }
+  const auto shape = readBufferShape(cryptoStream);
+  for (const auto offset :
+       {size_t(0), size_t(4), 2 + 4 * kMaxStreamReadBufferRanges}) {
+    auto result = appendDataToReadBuffer(
+        cryptoStream, StreamBuffer(makeOneByteBuffer(1), offset));
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(
+        result.error().code,
+        QuicErrorCode(TransportErrorCode::CRYPTO_BUFFER_EXCEEDED));
+    EXPECT_TRUE(readBufferShape(cryptoStream) == shape);
+  }
+
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   cryptoStream, StreamBuffer(makeOneByteBuffer(1), 2))
+                   .hasError());
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   cryptoStream, StreamBuffer(IOBuf::copyBuffer("xxx"), 3))
+                   .hasError());
+  EXPECT_EQ(cryptoStream.readBuffer.size(), kMaxStreamReadBufferRanges - 1);
+  ASSERT_FALSE(
+      appendDataToReadBuffer(
+          cryptoStream,
+          StreamBuffer(
+              makeOneByteBuffer(1), 2 + 4 * kMaxStreamReadBufferRanges))
+          .hasError());
+  EXPECT_EQ(cryptoStream.readBuffer.size(), kMaxStreamReadBufferRanges);
+
+  std::string expected(3 + 4 * kMaxStreamReadBufferRanges, 'x');
+  ASSERT_FALSE(appendDataToReadBuffer(
+                   cryptoStream, StreamBuffer(IOBuf::copyBuffer(expected), 0))
+                   .hasError());
+  auto data = readDataFromCryptoStream(cryptoStream);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(data->toString(), expected);
+  EXPECT_TRUE(cryptoStream.readBuffer.empty());
+}
+
 TEST_F(QuicStreamFunctionsTestBase, AppendBeyondStreamFlowControlRejected) {
   // Regression for T279928027: a STREAM fragment whose end offset exceeds the
   // advertised stream flow-control window must abort the append with
@@ -3201,7 +3332,8 @@ TEST_F(QuicStreamFunctionsTestBase, BufferedRangeMergeDirectionsStayBounded) {
                 kReadBufferCoalescingSize +
             1);
     EXPECT_LE(
-        shape.retainedCapacity, expected.size() + kReadBufferCoalescingSize);
+        shape.retainedCapacity,
+        expected.size() + combinedCapacity(kReadBufferCoalescingSize));
     EXPECT_EQ(
         stream->readBuffer.front().data.chainLength(),
         stream->readBuffer.front().data.front()->computeChainDataLength());

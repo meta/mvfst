@@ -119,12 +119,15 @@ static void pushToTail(BufPtr& dst, BufPtr src, size_t allocationSize) {
   while (copied < src->length()) {
     const auto remaining = src->length() - copied;
     auto* tail = dst ? dst->prev() : nullptr;
-    if (!tail || tail->tailroom() == 0 || tail->isSharedOne()) {
-      if (retainReadBuffer(*src, remaining, allocationSize)) {
-        src->trimStart(copied);
-        appendReadBuffer(dst, std::move(src));
-        return;
-      }
+    const bool tailWritable =
+        tail && tail->tailroom() > 0 && !tail->isSharedOne();
+    if ((!tailWritable || tail->tailroom() < remaining) &&
+        retainReadBuffer(*src, remaining, allocationSize)) {
+      src->trimStart(copied);
+      appendReadBuffer(dst, std::move(src));
+      return;
+    }
+    if (!tailWritable) {
       tail = appendReadBuffer(
           dst, BufHelpers::createCombined(std::max(allocationSize, remaining)));
     }
@@ -166,6 +169,9 @@ static void pushToHead(BufQueue& dst, BufQueue&& src, size_t allocationSize) {
     return;
   }
 
+  while (dstData && dstData->length() == 0) {
+    dstData = dstData->pop();
+  }
   if (prefix->isChained() ||
       !retainReadBuffer(*prefix, sourceLength, allocationSize)) {
     const auto capacity = std::max(allocationSize, sourceLength);
@@ -218,6 +224,7 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
     StreamBuffer buffer,
     uint32_t coalescingSize,
     size_t maxReadBufferRanges,
+    const QuicErrorCode& readBufferLimitErrorCode,
     FunctionRef<quic::Expected<void, QuicError>(uint64_t, uint64_t)>
         connFlowControlVisitor) {
   auto& readBuffer = stream.readBuffer;
@@ -395,8 +402,7 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
     if (*startOverlap == *endOverlap && maxReadBufferRanges > 0 &&
         readBuffer.size() >= maxReadBufferRanges) {
       return quic::make_unexpected(QuicError(
-          QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
-          "Stream read buffer range limit exceeded"));
+          readBufferLimitErrorCode, "Stream read buffer range limit exceeded"));
     }
     if (!currentDataCompacted) {
       compactReadBufferData(*current, coalescingSize);
@@ -432,8 +438,7 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
   if (current->offset > last->offset + last->data.chainLength()) {
     if (maxReadBufferRanges > 0 && readBuffer.size() >= maxReadBufferRanges) {
       return quic::make_unexpected(QuicError(
-          QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
-          "Stream read buffer range limit exceeded"));
+          readBufferLimitErrorCode, "Stream read buffer range limit exceeded"));
     }
     compactReadBufferData(*current, coalescingSize);
     readBuffer.emplace_back(std::move(*current));
@@ -450,6 +455,7 @@ quic::Expected<void, QuicError> appendDataToReadBuffer(
       std::move(buffer),
       kReadBufferCoalescingSize,
       kMaxStreamReadBufferRanges,
+      QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
       [&stream](uint64_t previousMaxOffsetObserved, uint64_t bufferEndOffset) {
         return updateFlowControlOnStreamData(
             stream, previousMaxOffsetObserved, bufferEndOffset);
@@ -482,8 +488,9 @@ quic::Expected<void, QuicError> appendDataToReadBuffer(
   return appendDataToReadBufferCommon(
       stream,
       std::move(buffer),
-      0,
-      0,
+      kReadBufferCoalescingSize,
+      kMaxStreamReadBufferRanges,
+      QuicErrorCode(TransportErrorCode::CRYPTO_BUFFER_EXCEEDED),
       [](uint64_t, uint64_t) -> quic::Expected<void, QuicError> { return {}; });
 }
 
