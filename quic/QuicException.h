@@ -14,6 +14,7 @@
 #include <quic/common/Optional.h>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <quic/common/Variant.h>
 
@@ -28,9 +29,9 @@ DECLARE_VARIANT_TYPE(QuicErrorCode, QUIC_ERROR_CODE)
 
 struct QuicError {
   QuicError(QuicErrorCode codeIn, std::string&& messageIn)
-      : code(codeIn), message(std::move(messageIn)) {}
+      : code(std::move(codeIn)), message(std::move(messageIn)) {}
 
-  explicit QuicError(QuicErrorCode codeIn) : code(codeIn) {}
+  explicit QuicError(QuicErrorCode codeIn) : code(std::move(codeIn)) {}
 
   bool operator==(const QuicError& other) const {
     return code == other.code && message == other.message;
