@@ -533,7 +533,7 @@ class QuicServerWorker : public FollyAsyncUDPSocketAlias::ReadCallback,
    * integrators observing newly-created per-conn UDP fds see the alias
    * path on equal footing with the non-zero-copy path.
    */
-  std::unique_ptr<FollyAsyncUDPSocketAlias> makeAlias() const;
+  [[nodiscard]] std::unique_ptr<FollyAsyncUDPSocketAlias> makeAlias() const;
 
   /**
    * Tries to get the encrypted retry token from a client initial packet

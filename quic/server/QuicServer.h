@@ -147,13 +147,13 @@ class QuicServer {
   void shutdown(LocalErrorCode error = LocalErrorCode::SHUTTING_DOWN);
 
   // Bound address by value (cold-path snapshot). Requires bind().
-  quic::SocketAddress getAddress() const;
+  [[nodiscard]] quic::SocketAddress getAddress() const;
 
-  std::vector<folly::EventBase*> getWorkerEvbs() const noexcept;
+  [[nodiscard]] std::vector<folly::EventBase*> getWorkerEvbs() const noexcept;
 
-  const TransportSettings& getTransportSettings() const noexcept;
+  [[nodiscard]] const TransportSettings& getTransportSettings() const noexcept;
 
-  ProcessId getProcessId() const noexcept;
+  [[nodiscard]] ProcessId getProcessId() const noexcept;
 
   // Live controls: copied to each worker on its EventBase.
   void setHostId(uint32_t hostId) noexcept;
@@ -177,13 +177,14 @@ class QuicServer {
 
   void stopPacketForwarding(std::chrono::milliseconds delay);
 
-  int getListeningSocketFD() const;
+  [[nodiscard]] int getListeningSocketFD() const;
 
-  std::vector<int> getAllListeningSocketFDs() const noexcept;
+  [[nodiscard]] std::vector<int> getAllListeningSocketFDs() const noexcept;
 
-  int getTakeoverHandlerSocketFD() const;
+  [[nodiscard]] int getTakeoverHandlerSocketFD() const;
 
-  TakeoverProtocolVersion getTakeoverProtocolVersion() const noexcept;
+  [[nodiscard]] TakeoverProtocolVersion getTakeoverProtocolVersion()
+      const noexcept;
 
   // Enables SO_ZEROCOPY on every worker listener; see QuicServerWorker.
   quic::Expected<void, QuicError> enableZeroCopy();
