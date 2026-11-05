@@ -68,7 +68,7 @@ class ContiguousReadCursor {
   }
 
   [[nodiscard]] ByteRange peekBytes() const noexcept {
-    return ByteRange(data_, end_);
+    return {data_, end_};
   }
 
   // lambda that returns bool if should rollback to where data_ was before
