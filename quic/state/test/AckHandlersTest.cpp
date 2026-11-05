@@ -27,6 +27,7 @@
 #include <quic/state/test/MockQuicStats.h>
 #include <quic/state/test/Mocks.h>
 
+#include <algorithm>
 #include <numeric>
 
 #include <array>
@@ -886,13 +887,10 @@ TEST_P(AckHandlersTest, TestAckMultipleSequentialBlocksLoss) {
 
   // 15 is lost, 16 is not, if we get an ack covering both both should be
   // cleared.
-  auto itr = std::find_if(
-      conn.outstandings.packets.begin(),
-      conn.outstandings.packets.end(),
-      [](auto& op) {
-        auto seqno = op.packet.header.getPacketSequenceNum();
-        return seqno == 15 || seqno == 16;
-      });
+  auto itr = std::ranges::find_if(conn.outstandings.packets, [](auto& op) {
+    auto seqno = op.packet.header.getPacketSequenceNum();
+    return seqno == 15 || seqno == 16;
+  });
   EXPECT_TRUE(itr != conn.outstandings.packets.end());
   EXPECT_TRUE(itr->declaredLost);
   EXPECT_EQ(itr->packet.header.getPacketSequenceNum(), 15);
@@ -915,13 +913,10 @@ TEST_P(AckHandlersTest, TestAckMultipleSequentialBlocksLoss) {
               -> quic::Expected<void, quic::QuicError> { return {}; },
           Clock::now())
           .hasError());
-  itr = std::find_if(
-      conn.outstandings.packets.begin(),
-      conn.outstandings.packets.end(),
-      [](auto& op) {
-        auto seqno = op.packet.header.getPacketSequenceNum();
-        return seqno == 15 || seqno == 16;
-      });
+  itr = std::ranges::find_if(conn.outstandings.packets, [](auto& op) {
+    auto seqno = op.packet.header.getPacketSequenceNum();
+    return seqno == 15 || seqno == 16;
+  });
   EXPECT_TRUE(itr == conn.outstandings.packets.end());
 
   // Duplicate ACK much later, should clear out declared lost.
@@ -1025,7 +1020,7 @@ TEST_P(AckHandlersTest, TestAckBlocksWithGaps) {
 
   StreamId start = 45;
   std::vector<StreamId> ids(45 - 33 + 1);
-  std::generate(ids.begin(), ids.end(), [&]() { return start--; });
+  std::ranges::generate(ids, [&]() { return start--; });
   EXPECT_TRUE(
       std::equal(
           streams.rbegin(),
@@ -1036,7 +1031,7 @@ TEST_P(AckHandlersTest, TestAckBlocksWithGaps) {
 
   start = 21;
   std::vector<StreamId> ids2(10);
-  std::generate(ids2.begin(), ids2.end(), [&]() { return start--; });
+  std::ranges::generate(ids2, [&]() { return start--; });
   EXPECT_TRUE(
       std::equal(
           streams.rbegin() + (45 - 33 + 1),
@@ -1055,21 +1050,11 @@ TEST_P(AckHandlersTest, TestAckBlocksWithGaps) {
       actualPacketNumbers.push_back(op.packet.header.getPacketSequenceNum());
     }
   }
-  EXPECT_TRUE(
-      std::equal(
-          actualPacketNumbers.begin(),
-          actualPacketNumbers.end(),
-          remainingPackets.begin(),
-          remainingPackets.end()));
+  EXPECT_TRUE(std::ranges::equal(actualPacketNumbers, remainingPackets));
 
   std::vector<PacketNum> actualLostPackets = {10, 11};
 
-  EXPECT_TRUE(
-      std::equal(
-          actualLostPackets.begin(),
-          actualLostPackets.end(),
-          lostPackets.begin(),
-          lostPackets.end()));
+  EXPECT_TRUE(std::ranges::equal(actualLostPackets, lostPackets));
 }
 
 TEST_P(AckHandlersTest, TestNonSequentialPacketNumbers) {
@@ -1167,7 +1152,7 @@ TEST_P(AckHandlersTest, TestNonSequentialPacketNumbers) {
 
   StreamId start = 20;
   std::vector<StreamId> ids(20 - 10 + 1);
-  std::generate(ids.begin(), ids.end(), [&]() { return start--; });
+  std::ranges::generate(ids, [&]() { return start--; });
   EXPECT_TRUE(
       std::equal(
           streams.rbegin() + 1,
@@ -1184,21 +1169,15 @@ TEST_P(AckHandlersTest, TestNonSequentialPacketNumbers) {
   }
 
   std::vector<PacketNum> actualPacketNumbers;
-  std::transform(
-      conn.outstandings.packets.begin(),
-      conn.outstandings.packets.end(),
+  std::ranges::transform(
+      conn.outstandings.packets,
       std::back_insert_iterator<decltype(actualPacketNumbers)>(
           actualPacketNumbers),
       [](const auto& packet) {
         return packet.packet.header.getPacketSequenceNum();
       });
 
-  EXPECT_TRUE(
-      std::equal(
-          actualPacketNumbers.begin(),
-          actualPacketNumbers.end(),
-          remainingPackets.begin(),
-          remainingPackets.end()));
+  EXPECT_TRUE(std::ranges::equal(actualPacketNumbers, remainingPackets));
 }
 
 TEST_P(AckHandlersTest, AckVisitorForAckTest) {
@@ -8411,7 +8390,6 @@ TEST_P(AckHandlersTest, ParseAckTimestampsWithNulloptLatestRecvdPacketNum) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-
     AckHandlersTests,
     AckHandlersTest,
     Values(
@@ -8835,10 +8813,8 @@ class AckEventFirstArrivalTest : public AckEventUndeliveredStreamFrameTest {
   const AckEvent::AckPacket& ackedPacket(
       const AckEvent& ack,
       PacketNum packetNum) {
-    const auto it = std::find_if(
-        ack.ackedPackets.begin(),
-        ack.ackedPackets.end(),
-        [packetNum](const auto& packet) {
+    const auto it =
+        std::ranges::find_if(ack.ackedPackets, [packetNum](const auto& packet) {
           return packet.packetNum == packetNum;
         });
     CHECK(it != ack.ackedPackets.end());
