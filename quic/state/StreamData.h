@@ -242,6 +242,10 @@ struct QuicStreamLike {
       } else if (
           lastElement.offset + lastElement.data.chainLength() >=
           startingOffset) {
+        if (lastElement.offset + lastElement.data.chainLength() >
+            startingOffset) {
+          lastElement.eof = false;
+        }
         lastElement.data = lastElement.data.splitAtMost(
             size_t(startingOffset - lastElement.offset));
         return;
@@ -258,6 +262,9 @@ struct QuicStreamLike {
       if (offset >= startingOffset) {
         offsetsToRemove.insert(offset);
       } else if (offset + buf->data.chainLength() >= startingOffset) {
+        if (offset + buf->data.chainLength() > startingOffset) {
+          buf->eof = false;
+        }
         buf->data = buf->data.splitAtMost(size_t(startingOffset - offset));
       }
     }

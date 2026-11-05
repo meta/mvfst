@@ -705,6 +705,126 @@ TEST_F(QuicResetSentStateTest, ResetSentToClosedTransition4) {
   EXPECT_EQ(stream.sendState, StreamSendState::ResetSent);
 }
 
+void ackFramesStraddlingReliableSize(
+    bool unified,
+    const std::vector<uint64_t>& chunkLens,
+    bool fin,
+    uint64_t reliableSize) {
+  BufAccessor bufAccessor(kDefaultMaxUDPPayload * kDefaultQuicMaxBatchSize);
+  auto conn = createConn(&bufAccessor);
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = unified;
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  Optional<ConnectionId> serverChosenConnId = *conn->clientConnectionId;
+  serverChosenConnId.value().data()[0] ^= 0x01;
+  EventBase evb;
+  auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+  auto sock = std::make_unique<quic::test::MockAsyncUDPSocket>(qEvb);
+  ON_CALL(*sock, getGSO).WillByDefault(testing::Return(0));
+
+  std::vector<WriteStreamFrame> sentFrames;
+  for (size_t i = 0; i < chunkLens.size(); ++i) {
+    auto buf = IOBuf::create(chunkLens[i]);
+    buf->append(chunkLens[i]);
+    const auto& packet = writeQuicPacket(
+        *conn,
+        *conn->clientConnectionId,
+        *serverChosenConnId,
+        *sock,
+        *stream,
+        *buf,
+        fin && i + 1 == chunkLens.size());
+    const WriteStreamFrame* streamFrame = nullptr;
+    for (const auto& frame : packet.frames) {
+      if (const auto* f = frame.asWriteStreamFrame()) {
+        ASSERT_EQ(streamFrame, nullptr);
+        streamFrame = f;
+      }
+    }
+    ASSERT_NE(streamFrame, nullptr);
+    ASSERT_EQ(streamFrame->len, chunkLens[i]);
+    sentFrames.push_back(*streamFrame);
+  }
+
+  ASSERT_FALSE(sendRstSMHandler(
+                   *stream, GenericApplicationErrorCode::UNKNOWN, reliableSize)
+                   .hasError());
+  ASSERT_EQ(stream->sendState, StreamSendState::ResetSent);
+  ASSERT_EQ(stream->reliableSizeToPeer, reliableSize);
+  if (!unified) {
+    const auto straddleOffset = sentFrames.back().offset;
+    ASSERT_LT(straddleOffset, reliableSize);
+    auto straddle = stream->retransmissionBuffer.find(straddleOffset);
+    ASSERT_NE(straddle, stream->retransmissionBuffer.end());
+    EXPECT_EQ(
+        straddle->second->data.chainLength(), reliableSize - straddleOffset);
+    EXPECT_FALSE(straddle->second->eof);
+  }
+
+  for (auto it = sentFrames.rbegin(); it != sentFrames.rend(); ++it) {
+    ASSERT_FALSE(sendAckSMHandler(*stream, *it).hasError());
+  }
+  EXPECT_TRUE(stream->allBytesAckedTill(reliableSize - 1));
+  if (!unified) {
+    EXPECT_FALSE(stream->allBytesAckedTill(reliableSize));
+  }
+
+  ASSERT_FALSE(sendRstAckSMHandler(*stream, reliableSize).hasError());
+  EXPECT_EQ(stream->sendState, StreamSendState::Closed);
+}
+
+TEST_F(QuicResetSentStateTest, AckFrameTruncatedByReliableReset) {
+  ackFramesStraddlingReliableSize(false, {517}, false, 3);
+}
+
+TEST_F(QuicResetSentStateTest, AckFrameTruncatedByReliableResetFin) {
+  ackFramesStraddlingReliableSize(false, {517}, true, 3);
+}
+
+TEST_F(QuicResetSentStateTest, AckNonZeroOffsetFrameTruncatedByReliableReset) {
+  ackFramesStraddlingReliableSize(false, {100, 417}, false, 150);
+}
+
+TEST_F(QuicResetSentStateTest, LostFinTruncatedByReliableReset) {
+  BufAccessor bufAccessor(kDefaultMaxUDPPayload * kDefaultQuicMaxBatchSize);
+  auto conn = createConn(&bufAccessor);
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  Optional<ConnectionId> serverChosenConnId = *conn->clientConnectionId;
+  serverChosenConnId.value().data()[0] ^= 0x01;
+  EventBase evb;
+  auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+  auto sock = std::make_unique<quic::test::MockAsyncUDPSocket>(qEvb);
+  ON_CALL(*sock, getGSO).WillByDefault(testing::Return(0));
+
+  writeQuicPacket(
+      *conn,
+      *conn->clientConnectionId,
+      *serverChosenConnId,
+      *sock,
+      *stream,
+      *IOBuf::copyBuffer("0123456789"),
+      true);
+  // Move the sent buffer to the loss buffer, as markPacketLoss does.
+  auto sent = stream->retransmissionBuffer.find(0);
+  ASSERT_NE(sent, stream->retransmissionBuffer.end());
+  ASSERT_TRUE(sent->second->eof);
+  stream->insertIntoLossBuffer(std::move(sent->second));
+  stream->retransmissionBuffer.erase(sent);
+
+  ASSERT_FALSE(
+      sendRstSMHandler(*stream, GenericApplicationErrorCode::UNKNOWN, 5)
+          .hasError());
+  ASSERT_EQ(stream->lossBuffer.size(), 1);
+  EXPECT_EQ(stream->lossBuffer.front().offset, 0);
+  EXPECT_EQ(stream->lossBuffer.front().data.chainLength(), 5);
+  EXPECT_FALSE(stream->lossBuffer.front().eof);
+}
+
+TEST_F(QuicResetSentStateTest, UnifiedAckFrameTruncatedByReliableReset) {
+  ackFramesStraddlingReliableSize(true, {517}, false, 3);
+  ackFramesStraddlingReliableSize(true, {517}, true, 3);
+  ackFramesStraddlingReliableSize(true, {100, 417}, false, 150);
+}
+
 class QuicClosedStateTest : public Test {};
 
 TEST_F(QuicClosedStateTest, RstAck) {

@@ -346,6 +346,14 @@ quic::Expected<void, QuicError> sendAckSMHandler(
       // Clean up the acked buffers from the retransmissionBuffer.
       auto ackedBuffer = stream.retransmissionBuffer.find(ackedFrame.offset);
       if (ackedBuffer != stream.retransmissionBuffer.end()) {
+        uint64_t expectedLen = ackedFrame.len;
+        bool expectedFin = ackedFrame.fin;
+        if (stream.sendState == StreamSendState::ResetSent &&
+            stream.reliableSizeToPeer &&
+            ackedFrame.offset + ackedFrame.len > *stream.reliableSizeToPeer) {
+          expectedLen = *stream.reliableSizeToPeer - ackedFrame.offset;
+          expectedFin = false;
+        }
         PROTO_OOPS_LOG_BUILDER_IF(
             stream.conn.nodeType == QuicNodeType::Server &&
                 ackedFrame.offset != ackedBuffer->second->offset,
@@ -360,7 +368,7 @@ quic::Expected<void, QuicError> sendAckSMHandler(
         MVCHECK_EQ(ackedFrame.offset, ackedBuffer->second->offset);
         PROTO_OOPS_LOG_BUILDER_IF(
             stream.conn.nodeType == QuicNodeType::Server &&
-                ackedFrame.len != ackedBuffer->second->data.chainLength(),
+                expectedLen != ackedBuffer->second->data.chainLength(),
             stream.conn.oopsLogger,
             proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
                 .setStreamId(stream.id)
@@ -369,10 +377,10 @@ quic::Expected<void, QuicError> sendAckSMHandler(
                         TransportErrorCode::STREAM_STATE_ERROR)),
             "quic_stream_send_handlers",
             "acked stream length mismatch");
-        MVCHECK_EQ(ackedFrame.len, ackedBuffer->second->data.chainLength());
+        MVCHECK_EQ(expectedLen, ackedBuffer->second->data.chainLength());
         PROTO_OOPS_LOG_BUILDER_IF(
             stream.conn.nodeType == QuicNodeType::Server &&
-                ackedFrame.fin != ackedBuffer->second->eof,
+                expectedFin != ackedBuffer->second->eof,
             stream.conn.oopsLogger,
             proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
                 .setStreamId(stream.id)
@@ -381,7 +389,7 @@ quic::Expected<void, QuicError> sendAckSMHandler(
                         TransportErrorCode::STREAM_STATE_ERROR)),
             "quic_stream_send_handlers",
             "acked stream fin mismatch");
-        MVCHECK_EQ(ackedFrame.fin, ackedBuffer->second->eof);
+        MVCHECK_EQ(expectedFin, ackedBuffer->second->eof);
         MVVLOG(10) << "Open: acked stream data stream=" << stream.id
                    << " offset=" << ackedBuffer->second->offset
                    << " len=" << ackedBuffer->second->data.chainLength()
