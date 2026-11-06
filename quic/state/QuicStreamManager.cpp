@@ -518,7 +518,8 @@ bool QuicStreamManager::streamExists(StreamId streamId) {
   }
 }
 
-QuicStreamState* QuicStreamManager::findStream(StreamId streamId) {
+QuicStreamState* FOLLY_NULLABLE
+QuicStreamManager::findStream(StreamId streamId) {
   auto lookup = streams_.find(streamId);
   if (lookup == streams_.end()) {
     return nullptr;
@@ -527,7 +528,8 @@ QuicStreamState* QuicStreamManager::findStream(StreamId streamId) {
   }
 }
 
-QuicStreamState* QuicStreamManager::getStreamIfExists(StreamId streamId) {
+QuicStreamState* FOLLY_NULLABLE
+QuicStreamManager::getStreamIfExists(StreamId streamId) {
   // Fast path: state already materialized (common case)
   auto* stream = findStream(streamId);
   if (stream) {
