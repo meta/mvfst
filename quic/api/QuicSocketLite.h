@@ -377,7 +377,8 @@ class QuicSocketLite {
    * unreleased data blocks the peer exactly like leaving it unread.
    *
    * A received reset, stopSending() or stopSendingAndDropIngress() releases
-   * all of the stream's data automatically and ends manual mode. Fails with
+   * all of the stream's data automatically and ends manual mode, even after
+   * the transport has removed the closed stream. Fails with
    * INVALID_OPERATION on a stream without a receive side or one already reset
    * or dropped. Calling it again on a manual stream succeeds.
    */

@@ -516,7 +516,7 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::stopSending(
   }
   auto* stream = conn_->streamManager->getStreamIfExists(id);
   if (!stream) {
-    return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+    return releaseRemovedStreamReadBytes(id);
   }
   if (stream->flowControlState.manualRead) {
     auto releaseResult = endManualReadFlowControl(*stream, Clock::now());
@@ -563,7 +563,7 @@ QuicTransportBaseLite::stopSendingAndDropIngress(
   [[maybe_unused]] auto self = sharedGuard();
   auto* stream = conn_->streamManager->getStreamIfExists(id);
   if (!stream) {
-    return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+    return releaseRemovedStreamReadBytes(id);
   }
   if (stream->ingressRetired) {
     return {};
@@ -1288,6 +1288,15 @@ QuicTransportBaseLite::releaseManualReadFlowControl(
   }
   updateWriteLooper(true);
   return {};
+}
+
+quic::Expected<void, LocalErrorCode>
+QuicTransportBaseLite::releaseRemovedStreamReadBytes(StreamId id) {
+  auto unreleased = conn_->streamManager->removedUnreleasedReadBytes(id);
+  if (!unreleased) {
+    return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+  }
+  return releaseManualReadFlowControl(id, *unreleased);
 }
 
 void QuicTransportBaseLite::setQLogger(std::shared_ptr<QLogger> qLogger) {

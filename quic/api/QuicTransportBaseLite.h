@@ -1152,6 +1152,10 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
    */
   void updatePacketProcessorsPrewriteRequests();
 
+  // Releases the unreleased read bytes held for a removed stream.
+  quic::Expected<void, LocalErrorCode> releaseRemovedStreamReadBytes(
+      StreamId id);
+
   uint64_t qlogRefcnt_{0};
 };
 

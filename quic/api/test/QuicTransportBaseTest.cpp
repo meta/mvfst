@@ -1966,6 +1966,31 @@ TEST_F(QuicTransportImplTestBase, ManualReadReleaseAfterStreamRemoved) {
   transport.reset();
 }
 
+TEST_F(QuicTransportImplTestBase, ManualReadStopSendingAfterStreamRemoved) {
+  auto& conn = *transport->transportConn;
+  auto id = transport->createBidirectionalStream().value();
+  ASSERT_FALSE(transport->setStreamManualRead(id).hasError());
+  auto data = folly::IOBuf::copyBuffer("actual stream data");
+  const auto len = data->computeChainDataLength();
+  transport->addDataToStream(id, StreamBuffer(data->clone(), 0, true));
+
+  const auto sumBefore = conn.flowControlState.sumCurReadOffset;
+  ASSERT_TRUE(transport->read(id, 0).has_value());
+  auto* stream = transport->getStream(id);
+  stream->recvState = StreamRecvState::Closed;
+  stream->sendState = StreamSendState::Closed;
+  ASSERT_FALSE(conn.streamManager->removeClosedStream(id).hasError());
+
+  EXPECT_FALSE(transport->stopSending(id, GenericApplicationErrorCode::UNKNOWN)
+                   .hasError());
+  EXPECT_EQ(conn.flowControlState.sumCurReadOffset, sumBefore + len);
+  EXPECT_FALSE(conn.streamManager->removedUnreleasedReadBytes(id).has_value());
+  EXPECT_EQ(
+      transport->stopSending(id, GenericApplicationErrorCode::UNKNOWN).error(),
+      LocalErrorCode::STREAM_NOT_EXISTS);
+  transport.reset();
+}
+
 // A reset received after the app read FIN still releases the unreleased bytes.
 TEST_F(QuicTransportImplTestBase, ManualReadResetAfterFinReleases) {
   auto& conn = *transport->transportConn;
