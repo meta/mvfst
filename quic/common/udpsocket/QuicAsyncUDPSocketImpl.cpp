@@ -34,19 +34,19 @@ QuicAsyncUDPSocketImpl::recvmmsgNetworkData(
 
   // Check socket options using Expected results
   auto groResult = getGRO();
-  if (FOLLY_UNLIKELY(groResult.hasError())) {
+  if (groResult.hasError()) [[unlikely]] {
     return quic::make_unexpected(groResult.error());
   }
   auto timestampingResult = getTimestamping();
-  if (FOLLY_UNLIKELY(timestampingResult.hasError())) {
+  if (timestampingResult.hasError()) [[unlikely]] {
     return quic::make_unexpected(timestampingResult.error());
   }
   auto recvTosResult = getRecvTos();
-  if (FOLLY_UNLIKELY(recvTosResult.hasError())) {
+  if (recvTosResult.hasError()) [[unlikely]] {
     return quic::make_unexpected(recvTosResult.error());
   }
   auto recvTtlResult = getRecvTtl();
-  if (FOLLY_UNLIKELY(recvTtlResult.hasError())) {
+  if (recvTtlResult.hasError()) [[unlikely]] {
     return quic::make_unexpected(recvTtlResult.error());
   }
 #if defined(FOLLY_HAVE_MSG_ERRQUEUE) || defined(_WIN32)
@@ -64,7 +64,7 @@ QuicAsyncUDPSocketImpl::recvmmsgNetworkData(
   }
 #endif
   auto localAddressFamilyResult = getLocalAddressFamily();
-  if (FOLLY_UNLIKELY(localAddressFamilyResult.hasError())) {
+  if (localAddressFamilyResult.hasError()) [[unlikely]] {
     return quic::make_unexpected(localAddressFamilyResult.error());
   }
   const auto localAddressFamily = localAddressFamilyResult.value();

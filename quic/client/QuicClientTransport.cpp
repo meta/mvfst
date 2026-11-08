@@ -117,7 +117,7 @@ quic::Expected<void, QuicError> QuicClientTransport::readWithRecvmmsgWrapper(
     }
   }
   auto localAddressRes = sock.address();
-  if (FOLLY_UNLIKELY(localAddressRes.hasError())) {
+  if (localAddressRes.hasError()) [[unlikely]] {
     return quic::make_unexpected(localAddressRes.error());
   }
 
@@ -141,7 +141,7 @@ quic::Expected<void, QuicError> QuicClientTransport::readWithRecvmmsg(
   }
 
   auto localAddressRes = sock.address();
-  if (FOLLY_UNLIKELY(localAddressRes.hasError())) {
+  if (localAddressRes.hasError()) [[unlikely]] {
     return quic::make_unexpected(localAddressRes.error());
   }
 
@@ -164,7 +164,7 @@ quic::Expected<void, QuicError> QuicClientTransport::readWithRecvmsg(
   }
 
   auto localAddressRes = sock.address();
-  if (FOLLY_UNLIKELY(localAddressRes.hasError())) {
+  if (localAddressRes.hasError()) [[unlikely]] {
     return quic::make_unexpected(localAddressRes.error());
   }
 

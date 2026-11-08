@@ -51,7 +51,7 @@ class ContiguousReadCursor {
 
   template <class T>
   bool tryReadBE(T& val) noexcept {
-    if (FOLLY_UNLIKELY(!canAdvance(sizeof(T)))) {
+    if (!canAdvance(sizeof(T))) [[unlikely]] {
       return false;
     }
     readBE(val);
@@ -60,7 +60,7 @@ class ContiguousReadCursor {
 
   template <class T>
   bool tryRead(T& val) noexcept {
-    if (FOLLY_UNLIKELY(!canAdvance(sizeof(T)))) {
+    if (!canAdvance(sizeof(T))) [[unlikely]] {
       return false;
     }
     read(val);

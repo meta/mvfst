@@ -11,7 +11,7 @@ namespace quic {
 
 size_t fillIovec(BufPtr& buf, iovec (&vec)[16]) {
   size_t iovec_len = buf->fillIov(vec, sizeof(vec) / sizeof(vec[0])).numIovecs;
-  if (FOLLY_UNLIKELY(iovec_len == 0)) {
+  if (iovec_len == 0) [[unlikely]] {
     buf->coalesce();
     vec[0].iov_base = const_cast<uint8_t*>(buf->data());
     vec[0].iov_len = buf->length();

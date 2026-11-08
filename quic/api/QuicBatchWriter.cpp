@@ -96,7 +96,7 @@ bool SendmmsgPacketBatchWriter::append(
   currSize_ += size;
 
   // reached max buffers
-  if (FOLLY_UNLIKELY(bufs_.size() == maxBufs_)) {
+  if (bufs_.size() == maxBufs_) [[unlikely]] {
     return true;
   }
 
@@ -204,7 +204,7 @@ bool SendmmsgInplacePacketBatchWriter::append(
   currSize_ += size;
 
   // reached max buffers
-  if (FOLLY_UNLIKELY(numPacketsBuffered_ == maxBufs_)) {
+  if (numPacketsBuffered_ == maxBufs_) [[unlikely]] {
     return true;
   }
 

@@ -62,7 +62,7 @@ bool GSOPacketBatchWriter::append(
   }
 
   // reached max buffers
-  if (FOLLY_UNLIKELY(currBufs_ == maxBufs_)) {
+  if (currBufs_ == maxBufs_) [[unlikely]] {
     return true;
   }
 

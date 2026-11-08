@@ -19,7 +19,7 @@ ContiguousReadCursor::ContiguousReadCursor(
     : begin_(data), data_(data), end_(data + size) {}
 
 bool ContiguousReadCursor::skip(size_t bytes) noexcept {
-  if (FOLLY_UNLIKELY(!canAdvance(bytes))) {
+  if (!canAdvance(bytes)) [[unlikely]] {
     return false;
   }
   data_ += bytes;
@@ -29,7 +29,7 @@ bool ContiguousReadCursor::skip(size_t bytes) noexcept {
 bool ContiguousReadCursor::tryReadFixedSizeString(
     std::string& str,
     size_t bytes) noexcept {
-  if (FOLLY_UNLIKELY(!canAdvance(bytes))) {
+  if (!canAdvance(bytes)) [[unlikely]] {
     return false;
   }
   readFixedSizeString(str, bytes);
@@ -37,7 +37,7 @@ bool ContiguousReadCursor::tryReadFixedSizeString(
 }
 
 bool ContiguousReadCursor::tryClone(uint8_t* buf, size_t bytes) noexcept {
-  if (FOLLY_UNLIKELY(!canAdvance(bytes))) {
+  if (!canAdvance(bytes)) [[unlikely]] {
     return false;
   }
   clone(buf, bytes);
@@ -45,7 +45,7 @@ bool ContiguousReadCursor::tryClone(uint8_t* buf, size_t bytes) noexcept {
 }
 
 bool ContiguousReadCursor::tryPull(void* buf, size_t bytes) noexcept {
-  if (FOLLY_UNLIKELY(!canAdvance(bytes))) {
+  if (!canAdvance(bytes)) [[unlikely]] {
     return false;
   }
   pull(buf, bytes);
