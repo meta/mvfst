@@ -420,7 +420,7 @@ continuousMemoryBuildScheduleEncrypt(
         *connection.bufAccessor,
         connection.udpSendPacketLen - sconePacketSize - flowIndSize,
         std::move(header),
-        getAckState(connection, pnSpace).largestAckedByPeer.value_or(0));
+        getPacketNumberEncodingBase(connection, pnSpace, packetNum));
     pktBuilder.accountForCipherOverhead(cipherOverhead);
     PROTO_OOPS_LOG_BUILDER_IF(
         connection.nodeType == QuicNodeType::Server && !scheduler.hasData(),
@@ -594,7 +594,7 @@ iobufChainBasedBuildScheduleEncrypt(
   RegularQuicPacketBuilder pktBuilder(
       adjustedMaxPacketSize,
       std::move(header),
-      getAckState(connection, pnSpace).largestAckedByPeer.value_or(0));
+      getPacketNumberEncodingBase(connection, pnSpace, packetNum));
   MVCHECK_EQ(pktBuilder.remainingSpaceInPkt(), adjustedMaxPacketSize);
   // It's the scheduler's job to invoke encode header
   pktBuilder.accountForCipherOverhead(cipherOverhead);
@@ -1740,7 +1740,7 @@ void writeCloseCommon(
       bufAccessor,
       connection.udpSendPacketLen,
       header,
-      getAckState(connection, pnSpace).largestAckedByPeer.value_or(0));
+      getPacketNumberEncodingBase(connection, pnSpace, packetNum));
   auto encodeResult = packetBuilder.encodePacketHeader();
   if (!encodeResult.has_value()) {
     MVLOG_ERROR << "Error encoding packet header: "

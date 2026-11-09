@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <quic/state/OutstandingPacket.h>
 
+#include <quic/codec/PacketNumber.h>
 #include <quic/codec/Types.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
@@ -1754,6 +1755,37 @@ TEST_P(QuicStateFunctionsTest, CloseTranportStateChange) {
   EXPECT_FALSE(conn.pendingEvents.closeTransport);
   increaseNextPacketNum(conn, GetParam());
   EXPECT_TRUE(conn.pendingEvents.closeTransport);
+}
+
+TEST_P(QuicStateFunctionsTest, PacketNumberEncodingBaseWithoutReordering) {
+  QuicConnectionStateBase conn(QuicNodeType::Server);
+  EXPECT_EQ(getPacketNumberEncodingBase(conn, GetParam(), 100), 0);
+
+  // The default reordering threshold leaves the base at the largest acked.
+  getAckState(conn, GetParam()).largestAckedByPeer = 990;
+  auto base = getPacketNumberEncodingBase(conn, GetParam(), 1000);
+  EXPECT_EQ(base, 990);
+  EXPECT_EQ(encodePacketNumber(1000, base).length, 1);
+}
+
+TEST_P(QuicStateFunctionsTest, PacketNumberEncodingBaseWithReordering) {
+  QuicConnectionStateBase conn(QuicNodeType::Server);
+  getAckState(conn, GetParam()).largestAckedByPeer = 990;
+
+  // A 1-byte packet number covers twice a threshold of up to 63.
+  conn.lossState.reorderingThreshold = 63;
+  auto base = getPacketNumberEncodingBase(conn, GetParam(), 1000);
+  EXPECT_EQ(base, 1000 - 126);
+  EXPECT_EQ(encodePacketNumber(1000, base).length, 1);
+
+  conn.lossState.reorderingThreshold = 64;
+  base = getPacketNumberEncodingBase(conn, GetParam(), 1000);
+  EXPECT_EQ(base, 1000 - 128);
+  EXPECT_EQ(encodePacketNumber(1000, base).length, 2);
+
+  // Packet numbers below the headroom encode against zero.
+  conn.lossState.reorderingThreshold = 1000;
+  EXPECT_EQ(getPacketNumberEncodingBase(conn, GetParam(), 1000), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(

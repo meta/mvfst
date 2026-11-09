@@ -286,6 +286,26 @@ void increaseNextPacketNum(
   }
 }
 
+PacketNum getPacketNumberEncodingBase(
+    const QuicConnectionStateBase& conn,
+    PacketNumberSpace pnSpace,
+    PacketNum packetNum) noexcept {
+  PacketNum largestAcked =
+      getAckState(conn, pnSpace).largestAckedByPeer.value_or(0);
+  // The peer decodes a packet number relative to the largest one it has
+  // received, so a packet that arrives more than half the encoded window late
+  // decodes to the wrong number and fails decryption. Those packets are never
+  // acked, so the adaptive reordering threshold can't learn their depth. Size
+  // for twice the threshold so the length grows before reordering reaches the
+  // window.
+  PacketNum reorderingHeadroom =
+      2 * static_cast<PacketNum>(conn.lossState.reorderingThreshold);
+  if (packetNum <= reorderingHeadroom) {
+    return 0;
+  }
+  return std::min(largestAcked, packetNum - reorderingHeadroom);
+}
+
 std::deque<OutstandingPacketWrapper>::iterator getFirstOutstandingPacket(
     QuicConnectionStateBase& conn,
     PacketNumberSpace packetNumberSpace) {

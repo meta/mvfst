@@ -62,6 +62,16 @@ void increaseNextPacketNum(
     QuicConnectionStateBase& conn,
     PacketNumberSpace pnSpace) noexcept;
 
+/**
+ * The packet number to encode packetNum against: the largest packet number the
+ * peer acked, lowered on connections where the peer sees reordering so the
+ * encoded length also covers the reordering depth.
+ */
+PacketNum getPacketNumberEncodingBase(
+    const QuicConnectionStateBase& conn,
+    PacketNumberSpace pnSpace,
+    PacketNum packetNum) noexcept;
+
 struct AddPacketToAckStateResult {
   uint64_t distanceFromExpected;
   bool isDuplicate;

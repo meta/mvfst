@@ -110,6 +110,7 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gmock",
+        "fbsource//xplat/quic/codec:packet_number",
         "fbsource//xplat/quic/codec:types",
         "fbsource//xplat/quic/common/test:test_utils",
         "fbsource//xplat/quic/fizz/server/handshake:fizz_server_handshake",

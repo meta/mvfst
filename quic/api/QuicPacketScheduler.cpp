@@ -1478,7 +1478,8 @@ CloningScheduler::scheduleFramesForPacket(
       internalBuilder = std::make_unique<RegularQuicPacketBuilder>(
           packetSizeLimit,
           header,
-          getAckState(conn_, builderPnSpace).largestAckedByPeer.value_or(0));
+          getPacketNumberEncodingBase(
+              conn_, builderPnSpace, header.getPacketSequenceNum()));
     } else {
       MVCHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
       if (conn_.bufAccessor->tailroom() < packetSizeLimit) {
@@ -1490,7 +1491,8 @@ CloningScheduler::scheduleFramesForPacket(
           *conn_.bufAccessor,
           packetSizeLimit,
           header,
-          getAckState(conn_, builderPnSpace).largestAckedByPeer.value_or(0));
+          getPacketNumberEncodingBase(
+              conn_, builderPnSpace, header.getPacketSequenceNum()));
     }
     // The packet is already a clone or has a clone outstanding
     if (outstandingPacket.maybeClonedPacketIdentifier) {
