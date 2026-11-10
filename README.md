@@ -92,7 +92,7 @@ By default `getdeps.py` will build the tests for mvfst. You can use it to run th
 
     python3 ./build/fbcode_builder/getdeps.py test mvfst --install-prefix=$(pwd)/_build
 
-### Method 2 \[Deprecated]: Using build.sh script
+### Method 2 \[Deprecated]: Using build_helper.sh script
 
 This method can be used on Ubuntu 18+ and macOS.
 
@@ -156,7 +156,7 @@ For `getdeps.py` build, you can find the echo binary at:
 cd $(python3 ./build/fbcode_builder/getdeps.py show-build-dir mvfst)/quic/samples/echo
 ```
 
-For the deprecated `build.sh` script, it will be at the following location if you used the default build path.
+For the deprecated `build_helper.sh` script, it will be at the following location if you used the default build path.
 ```
 cd ./_build/build/quic/samples/echo
 ```
