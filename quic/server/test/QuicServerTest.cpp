@@ -411,7 +411,7 @@ void QuicServerWorkerTest::testSendReset(
         codec.setOneRttReadCipher(std::move(aead));
         codec.setOneRttHeaderCipher(test::createNoOpHeaderCipher().value());
         StatelessResetToken token = generateStatelessResetToken();
-        codec.setStatelessResetToken(token);
+        codec.setStatelessResetTokens({token});
         FizzCryptoFactory cryptoFactory;
         codec.setCryptoEqual(cryptoFactory.getCryptoEqualFunction());
         overridePacketWithToken(*buf, token);
@@ -3806,7 +3806,7 @@ void QuicServerTest::testReset(BufPtr packet) {
   codec.setOneRttReadCipher(std::move(aead));
   codec.setOneRttHeaderCipher(test::createNoOpHeaderCipher().value());
   StatelessResetToken token = generateStatelessResetToken();
-  codec.setStatelessResetToken(token);
+  codec.setStatelessResetTokens({token});
   FizzCryptoFactory cryptoFactory;
   codec.setCryptoEqual(cryptoFactory.getCryptoEqualFunction());
   AckStates ackStates;

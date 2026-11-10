@@ -123,6 +123,7 @@ QuicConnectionStateBase::getNextAvailablePeerConnectionId() {
       MVCHECK(
           cidData.connId != currentPeerCid, "Current CID not marked in use");
       cidData.inUse = true;
+      updateStatelessResetTokens();
       return cidData.connId;
     }
   }
@@ -152,8 +153,22 @@ void QuicConnectionStateBase::retirePeerConnectionId(ConnectionId peerCid) {
       RetireConnectionIdFrame(cidData->sequenceNumber));
 
   peerConnectionIds.erase(cidData);
+  updateStatelessResetTokens();
 
   return;
+}
+
+void QuicConnectionStateBase::updateStatelessResetTokens() {
+  if (nodeType != QuicNodeType::Client || !readCodec) {
+    return;
+  }
+  std::vector<StatelessResetToken> tokens;
+  for (const auto& cidData : peerConnectionIds) {
+    if (cidData.inUse && cidData.token) {
+      tokens.push_back(*cidData.token);
+    }
+  }
+  readCodec->setStatelessResetTokens(std::move(tokens));
 }
 
 namespace {

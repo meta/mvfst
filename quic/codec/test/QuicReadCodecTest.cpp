@@ -58,7 +58,7 @@ std::unique_ptr<QuicReadCodec> makeEncryptedCodec(
   codec->setOneRttReadCipher(std::move(oneRttAead));
   codec->setOneRttHeaderCipher(test::createNoOpHeaderCipher().value());
   if (sourceToken) {
-    codec->setStatelessResetToken(*sourceToken);
+    codec->setStatelessResetTokens({*sourceToken});
   }
   codec->setCryptoEqual(cryptoFactory.getCryptoEqualFunction());
   return codec;

@@ -667,6 +667,10 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   void retirePeerConnectionId(ConnectionId peerCid);
 
+  // Clients check incoming stateless resets against the tokens of every peer
+  // connection id in use (RFC 9000 Section 10.3.1).
+  void updateStatelessResetTokens();
+
   // SocketObserverContainer
   //
   // Stored as a weak_ptr to ensure that delayed destruction of

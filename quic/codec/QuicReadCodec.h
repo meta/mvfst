@@ -18,6 +18,8 @@
 #include <quic/state/AckStates.h>
 #include <quic/state/QuicTransportStatsCallback.h>
 
+#include <vector>
+
 namespace quic {
 
 /**
@@ -153,8 +155,8 @@ class QuicReadCodec {
   [[nodiscard]] const PacketNumberCipher* getHandshakeHeaderCipher() const;
   [[nodiscard]] const PacketNumberCipher* getZeroRttHeaderCipher() const;
 
-  [[nodiscard]] const Optional<StatelessResetToken>& getStatelessResetToken()
-      const;
+  [[nodiscard]] const std::vector<StatelessResetToken>&
+  getStatelessResetTokens() const;
 
   [[nodiscard]] ProtectionType getCurrentOneRttReadPhase() const;
 
@@ -178,7 +180,8 @@ class QuicReadCodec {
   void setCodecParameters(CodecParameters params);
   void setClientConnectionId(ConnectionId connId);
   void setServerConnectionId(ConnectionId connId);
-  void setStatelessResetToken(StatelessResetToken statelessResetToken);
+  void setStatelessResetTokens(
+      std::vector<StatelessResetToken> statelessResetTokens);
   // Type alias for constant-time comparison function pointer.
   using CryptoEqualFn = bool (*)(ByteRange, ByteRange);
 
@@ -251,7 +254,7 @@ class QuicReadCodec {
   std::unique_ptr<PacketNumberCipher> zeroRttHeaderCipher_;
   std::unique_ptr<PacketNumberCipher> handshakeHeaderCipher_;
 
-  Optional<StatelessResetToken> statelessResetToken_;
+  std::vector<StatelessResetToken> statelessResetTokens_;
   CryptoEqualFn cryptoEqual_{nullptr};
   Optional<TimePoint> handshakeDoneTime_;
 

@@ -462,26 +462,24 @@ CodecResult QuicReadCodec::parsePacket(
   }
 
   auto data = queue.move();
-  Optional<StatelessResetToken> token;
   if (nodeType_ == QuicNodeType::Client &&
       initialByte & ShortHeader::kFixedBitMask) {
     auto dataLength = data->length();
-    if (statelessResetToken_ && dataLength > sizeof(StatelessResetToken)) {
-      const uint8_t* tokenSource =
-          data->data() + (dataLength - sizeof(StatelessResetToken));
+    if (!statelessResetTokens_.empty() &&
+        dataLength > sizeof(StatelessResetToken)) {
       if (!cryptoEqual_) {
         return CodecResult(CodecError(QuicError(
             QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
             "crypto constant time comparison function is not set.")));
       }
-      // Only allocate & copy the token if it matches the token we have
-      if (cryptoEqual_(
-              ByteRange(tokenSource, sizeof(StatelessResetToken)),
-              ByteRange(
-                  statelessResetToken_->data(), sizeof(StatelessResetToken)))) {
-        token = StatelessResetToken();
-        memcpy(token->data(), tokenSource, token->size());
-        return StatelessReset(*token);
+      ByteRange tokenSource(
+          data->data() + (dataLength - sizeof(StatelessResetToken)),
+          sizeof(StatelessResetToken));
+      for (const auto& resetToken : statelessResetTokens_) {
+        if (cryptoEqual_(
+                tokenSource, ByteRange(resetToken.data(), resetToken.size()))) {
+          return StatelessReset(resetToken);
+        }
       }
     }
   }
@@ -528,9 +526,9 @@ const Aead* QuicReadCodec::getHandshakeReadCipher() const {
   return handshakeReadCipher_.get();
 }
 
-const Optional<StatelessResetToken>& QuicReadCodec::getStatelessResetToken()
+const std::vector<StatelessResetToken>& QuicReadCodec::getStatelessResetTokens()
     const {
-  return statelessResetToken_;
+  return statelessResetTokens_;
 }
 
 CodecParameters QuicReadCodec::getCodecParameters() const {
@@ -597,9 +595,9 @@ void QuicReadCodec::setServerConnectionId(ConnectionId connId) {
   serverConnectionId_ = connId;
 }
 
-void QuicReadCodec::setStatelessResetToken(
-    StatelessResetToken statelessResetToken) {
-  statelessResetToken_ = std::move(statelessResetToken);
+void QuicReadCodec::setStatelessResetTokens(
+    std::vector<StatelessResetToken> statelessResetTokens) {
+  statelessResetTokens_ = std::move(statelessResetTokens);
 }
 
 void QuicReadCodec::setCryptoEqual(CryptoEqualFn cryptoEqual) {

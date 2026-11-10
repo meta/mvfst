@@ -706,7 +706,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
     socketWrites.clear();
     performFakeHandshake();
     EXPECT_TRUE(
-        client->getConn().readCodec->getStatelessResetToken().has_value());
+        !client->getConn().readCodec->getStatelessResetTokens().empty());
     EXPECT_TRUE(client->getConn().statelessResetToken.has_value());
   }
 

@@ -4200,6 +4200,125 @@ TEST_F(
   EXPECT_NE(conn.pathManager->getPath(probePathId), nullptr);
 }
 
+TEST_F(
+    QuicClientTransportAfterStartTest,
+    StatelessResetAfterMigrationClosesTransport) {
+  auto& conn = client->getNonConstConn();
+  handshakeConfirmed(conn);
+
+  auto newCidToken = *conn.statelessResetToken;
+  newCidToken[0] = ~newCidToken[0];
+  conn.peerConnectionIds.emplace_back(
+      ConnectionId::createAndMaybeCrash({5, 6, 7, 8}), 1, newCidToken);
+
+  quic::SocketAddress probeLocalAddr("1.2.3.4", 1234);
+  auto probeSock = getMockSocketWithExpectations(qEvb_);
+  ON_CALL(*probeSock, isBound()).WillByDefault(Return(true));
+  ON_CALL(*probeSock, address())
+      .WillByDefault(Return(
+          quic::Expected<quic::SocketAddress, QuicError>{probeLocalAddr}));
+  auto probeRes = client->startPathProbe(std::move(probeSock));
+  ASSERT_TRUE(probeRes.has_value()) << probeRes.error();
+  auto migRes = client->migrateConnection(probeRes.value());
+  ASSERT_TRUE(migRes.has_value()) << migRes.error();
+
+  // A reset that is not recognized falls through to decryption; drop it there.
+  auto aead =
+      dynamic_cast<const MockAead*>(conn.readCodec->getOneRttReadCipher());
+  ASSERT_TRUE(aead);
+  EXPECT_CALL(*aead, _tryDecrypt(_, _, _))
+      .WillRepeatedly(Invoke([&](auto&, auto, auto) { return std::nullopt; }));
+
+  StatelessResetPacketBuilder builder(kDefaultUDPSendPacketLen, newCidToken);
+  auto packet = std::move(builder).buildPacket();
+  EXPECT_CALL(clientConnCallback, onConnectionError(_));
+  deliverDataWithoutErrorCheck(packet->coalesce());
+
+  EXPECT_TRUE(client->isClosed());
+  ASSERT_TRUE(conn.peerConnectionError.has_value());
+  EXPECT_EQ(
+      conn.peerConnectionError->code,
+      QuicErrorCode(LocalErrorCode::CONNECTION_RESET));
+}
+
+class QuicClientTransportMigrationResetTest
+    : public QuicClientTransportAfterStartTest {
+ protected:
+  StatelessResetToken addUnusedPeerConnectionId() {
+    auto& conn = client->getNonConstConn();
+    auto token = *conn.statelessResetToken;
+    token[0] = ~token[0];
+    conn.peerConnectionIds.emplace_back(
+        ConnectionId::createAndMaybeCrash({5, 6, 7, 8}), 1, token);
+    return token;
+  }
+
+  void migrateToNewPath() {
+    handshakeConfirmed(client->getNonConstConn());
+    auto probeSock = getMockSocketWithExpectations(qEvb_);
+    ON_CALL(*probeSock, isBound()).WillByDefault(Return(true));
+    ON_CALL(*probeSock, address())
+        .WillByDefault(Return(
+            quic::Expected<quic::SocketAddress, QuicError>{
+                quic::SocketAddress("1.2.3.4", 1234)}));
+    auto probeRes = client->startPathProbe(std::move(probeSock));
+    ASSERT_TRUE(probeRes.has_value()) << probeRes.error();
+    auto migRes = client->migrateConnection(probeRes.value());
+    ASSERT_TRUE(migRes.has_value()) << migRes.error();
+  }
+
+  // Undecryptable packets are dropped, so a stateless reset the client does not
+  // recognize leaves the connection open.
+  void failOneRttDecryption() {
+    auto& readCodec = *client->getNonConstConn().readCodec;
+    auto currentCipher = std::make_unique<MockAead>();
+    ON_CALL(*currentCipher, _tryDecrypt(_, _, _))
+        .WillByDefault(Invoke([](auto&, auto, auto) { return std::nullopt; }));
+    readCodec.setOneRttReadCipher(std::move(currentCipher));
+    auto nextCipher = std::make_unique<MockAead>();
+    ON_CALL(*nextCipher, _tryDecrypt(_, _, _))
+        .WillByDefault(Invoke([](auto&, auto, auto) { return std::nullopt; }));
+    readCodec.setNextOneRttReadCipher(std::move(nextCipher));
+  }
+};
+
+TEST_F(QuicClientTransportMigrationResetTest, TokensFollowConnectionIdsInUse) {
+  using Tokens = std::vector<StatelessResetToken>;
+  auto& conn = client->getNonConstConn();
+  auto initialPathId = conn.currentPathId;
+  auto handshakeToken = *conn.statelessResetToken;
+  auto newCidToken = addUnusedPeerConnectionId();
+  EXPECT_EQ(conn.readCodec->getStatelessResetTokens(), Tokens{handshakeToken});
+
+  ASSERT_NO_FATAL_FAILURE(migrateToNewPath());
+  EXPECT_EQ(
+      conn.readCodec->getStatelessResetTokens(),
+      (Tokens{handshakeToken, newCidToken}));
+
+  ASSERT_TRUE(client->removePath(initialPathId).has_value());
+  EXPECT_EQ(conn.readCodec->getStatelessResetTokens(), Tokens{newCidToken});
+}
+
+TEST_F(
+    QuicClientTransportMigrationResetTest,
+    ResetForPreviousPathClosesTransport) {
+  auto& conn = client->getNonConstConn();
+  auto handshakeToken = *conn.statelessResetToken;
+  addUnusedPeerConnectionId();
+  ASSERT_NO_FATAL_FAILURE(migrateToNewPath());
+  failOneRttDecryption();
+
+  StatelessResetPacketBuilder builder(kDefaultUDPSendPacketLen, handshakeToken);
+  EXPECT_CALL(clientConnCallback, onConnectionError(_));
+  deliverDataWithoutErrorCheck(std::move(builder).buildPacket()->coalesce());
+
+  EXPECT_TRUE(client->isClosed());
+  ASSERT_TRUE(conn.peerConnectionError.has_value());
+  EXPECT_EQ(
+      conn.peerConnectionError->code,
+      QuicErrorCode(LocalErrorCode::CONNECTION_RESET));
+}
+
 bool verifyFramePresent(
     std::vector<std::unique_ptr<folly::IOBuf>>& socketWrites,
     QuicReadCodec& readCodec,

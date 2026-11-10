@@ -265,18 +265,12 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
   auto* sconePacket = parsedPacket.sconePacket();
   StatelessReset* statelessReset = parsedPacket.statelessReset();
   if (statelessReset) {
-    const auto& token = clientConn_->statelessResetToken;
-    if (statelessReset->token == token) {
-      MVVLOG(4) << "Received Stateless Reset " << *this;
-      conn_->peerConnectionError = QuicError(
-          QuicErrorCode(LocalErrorCode::CONNECTION_RESET),
-          toString(LocalErrorCode::CONNECTION_RESET));
-      return quic::make_unexpected(
-          QuicError(LocalErrorCode::NO_ERROR, "Stateless Reset Received"));
-    }
-    MVVLOG(4) << "Drop StatelessReset for bad connId or token " << *this;
-    // Don't treat this as a fatal error, just ignore the packet.
-    return {};
+    MVVLOG(4) << "Received Stateless Reset " << *this;
+    conn_->peerConnectionError = QuicError(
+        QuicErrorCode(LocalErrorCode::CONNECTION_RESET),
+        toString(LocalErrorCode::CONNECTION_RESET));
+    return quic::make_unexpected(
+        QuicError(LocalErrorCode::NO_ERROR, "Stateless Reset Received"));
   }
 
   RetryPacket* retryPacket = parsedPacket.retryPacket();
@@ -1084,11 +1078,12 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         }
       }
       if (clientConn_->statelessResetToken) {
-        conn_->readCodec->setStatelessResetToken(
-            clientConn_->statelessResetToken.value());
-        auto& cryptoFactory = handshakeLayer->getCryptoFactory();
-        conn_->readCodec->setCryptoEqual(
-            cryptoFactory.getCryptoEqualFunction());
+        for (auto& cidData : conn_->peerConnectionIds) {
+          if (cidData.sequenceNumber == kInitialConnectionIdSequenceNumber) {
+            cidData.token = clientConn_->statelessResetToken;
+          }
+        }
+        conn_->updateStatelessResetTokens();
       }
     }
 
@@ -1332,6 +1327,7 @@ QuicClientTransportLite::startCryptoHandshake() {
 
   auto handshakeLayer = clientConn_->clientHandshakeLayer;
   auto& cryptoFactory = handshakeLayer->getCryptoFactory();
+  conn_->readCodec->setCryptoEqual(cryptoFactory.getCryptoEqualFunction());
 
   auto version = conn_->originalVersion.value();
   auto initialWriteCipherResult = cryptoFactory.getClientInitialCipher(
