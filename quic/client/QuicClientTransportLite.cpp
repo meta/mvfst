@@ -1421,6 +1421,16 @@ bool QuicClientTransportLite::hasZeroRttWriteCipher() const {
   return clientConn_->zeroRttWriteCipher != nullptr;
 }
 
+void QuicClientTransportLite::flushPendingZeroRttData() {
+  if (closeState_ != CloseState::OPEN ||
+      clientConn_->transportSettings.isPriming ||
+      !clientConn_->zeroRttWriteCipher || conn_->oneRttWriteCipher ||
+      !writeLooper_->isLoopCallbackScheduled()) {
+    return;
+  }
+  pacedWriteDataToSocket();
+}
+
 std::shared_ptr<QuicTransportBaseLite> QuicClientTransportLite::sharedGuard() {
   return shared_from_this();
 }

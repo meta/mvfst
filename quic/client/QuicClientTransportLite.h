@@ -160,6 +160,12 @@ class QuicClientTransportLite
 
   bool hasZeroRttWriteCipher() const;
 
+  /**
+   * Runs the scheduled write now, while only 0-RTT application keys are
+   * available. Does nothing on a priming connection.
+   */
+  void flushPendingZeroRttData();
+
   // Called with the failed address when Happy Eyeballs gives up on the first
   // address. It runs synchronously from the transport's write and socket-error
   // paths, so it must not throw or close/destroy the transport.
