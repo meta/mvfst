@@ -218,6 +218,8 @@ class QuicTransportStatsCallback {
 
   virtual void onAckReceiveTimestampsReceived(uint64_t /* count */) {}
 
+  virtual void onTimestampFrameReceived() {}
+
   static const char* toString(SocketErrorType errorType) {
     switch (errorType) {
       case SocketErrorType::AGAIN:

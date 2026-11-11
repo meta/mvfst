@@ -1831,6 +1831,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
         }
         case QuicFrame::Type::TimestampFrame:
           isNonProbingPacket = true;
+          QUIC_STATS(conn.statsCallback, onTimestampFrameReceived);
           break;
         case QuicFrame::Type::DatagramFrame: {
           DatagramFrame& frame = *quicFrame.asDatagramFrame();

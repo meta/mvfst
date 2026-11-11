@@ -188,6 +188,12 @@ TEST_P(QuicServerTransportAllowMigrationTest, TimestampFrameIsNotPathProbing) {
   EXPECT_EQ(conn.peerAddress, newPeer);
 }
 
+TEST_P(QuicServerTransportAllowMigrationTest, TimestampFrameIsCounted) {
+  EXPECT_CALL(*quicStats_, onTimestampFrameReceived()).Times(1);
+
+  deliverData(packetToBuf(makePacketWithTimestampFrame()));
+}
+
 TEST_P(
     QuicServerTransportAllowMigrationTest,
     SendsCorrectNumberOfNewConnectionIdsBasedOnParam) {
