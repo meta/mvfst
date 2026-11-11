@@ -51,6 +51,10 @@ namespace expected_lite = ::nonstd::expected_lite;
 } // namespace detail_expected_lite
 } // namespace quic
 
+// Always use the bundled implementation; with std::expected selected, the
+// vendor header would not define quic::Expected.
+#define nsel_CONFIG_SELECT_EXPECTED nsel_EXPECTED_NONSTD
+
 #include <quic/common/third-party/expected.hpp>
 
 // Expose the vendor implementation in the global namespace symbols that
