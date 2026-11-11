@@ -587,7 +587,8 @@ quic::Expected<AckEvent, QuicError> processAckFrame(
       QUIC_STATS(
           conn.statsCallback,
           onAckReceiveTimestampsReceived,
-          packetReceiveTimeStamps.size());
+          packetReceiveTimeStamps.size(),
+          frame.frameType);
     }
   }
   resolveSameAckCloneArrivals(

@@ -216,7 +216,9 @@ class QuicTransportStatsCallback {
 
   virtual void onSconePacketSent() = 0;
 
-  virtual void onAckReceiveTimestampsReceived(uint64_t /* count */) {}
+  virtual void onAckReceiveTimestampsReceived(
+      uint64_t /* count */,
+      FrameType /* frameType */) {}
 
   virtual void onTimestampFrameReceived() {}
 

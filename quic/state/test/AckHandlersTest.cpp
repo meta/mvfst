@@ -8932,7 +8932,10 @@ TEST_F(AckReceiveTimestampsStatsTest, ReportsTimestampsStoredFromAck) {
         .timestamp_delta_count = 3,
         .deltas = {500, 10, 5}}});
 
-  EXPECT_CALL(quicStats_, onAckReceiveTimestampsReceived(3));
+  EXPECT_CALL(
+      quicStats_,
+      onAckReceiveTimestampsReceived(
+          3, FrameType::ACK_RECEIVE_TIMESTAMPS_DRAFT_02));
   ASSERT_FALSE(processAck(frame).hasError());
 }
 
@@ -8941,7 +8944,7 @@ TEST_F(AckReceiveTimestampsStatsTest, DoesNotReportAckWithoutTimestamps) {
   frame.largestAcked = 9;
   frame.ackBlocks.emplace_back(0, 9);
 
-  EXPECT_CALL(quicStats_, onAckReceiveTimestampsReceived(_)).Times(0);
+  EXPECT_CALL(quicStats_, onAckReceiveTimestampsReceived(_, _)).Times(0);
   ASSERT_FALSE(processAck(frame).hasError());
 }
 
