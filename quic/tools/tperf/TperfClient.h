@@ -22,7 +22,7 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
                     public folly::HHWheelTimer::Callback {
  public:
   TPerfClient(
-      const std::string& host,
+      std::string host,
       uint16_t port,
       std::chrono::milliseconds transportTimerResolution,
       int32_t duration,

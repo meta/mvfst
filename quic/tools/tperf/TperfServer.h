@@ -669,7 +669,7 @@ class TPerfServer {
   };
 
   explicit TPerfServer(
-      const std::string& host,
+      std::string host,
       uint16_t port,
       uint64_t blockSize,
       uint64_t writesPerLoop,

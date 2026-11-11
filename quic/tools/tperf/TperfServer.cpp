@@ -1081,7 +1081,7 @@ class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
 };
 
 TPerfServer::TPerfServer(
-    const std::string& host,
+    std::string host,
     uint16_t port,
     uint64_t blockSize,
     uint64_t writesPerLoop,
@@ -1114,7 +1114,7 @@ TPerfServer::TPerfServer(
     const std::string& pacingObserver,
     DoneCallback* doneCallback,
     StaticCwndConfig staticCwndConfig)
-    : host_(host),
+    : host_(std::move(host)),
       port_(port),
       writeStats_(std::make_shared<TPerfWriteStats>()),
       acceptObserver_(

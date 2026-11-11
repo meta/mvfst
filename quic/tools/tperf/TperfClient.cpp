@@ -6,6 +6,7 @@
  */
 
 #include <sstream>
+#include <utility>
 
 #include <fizz/crypto/Utils.h>
 #include <folly/io/async/AsyncUDPSocket.h>
@@ -18,7 +19,7 @@
 namespace quic::tperf {
 
 TPerfClient::TPerfClient(
-    const std::string& host,
+    std::string host,
     uint16_t port,
     std::chrono::milliseconds transportTimerResolution,
     int32_t duration,
@@ -37,7 +38,7 @@ TPerfClient::TPerfClient(
     bool useL4sEcn,
     bool readEcn,
     uint32_t dscp)
-    : host_(host),
+    : host_(std::move(host)),
       port_(port),
       fEvb_(transportTimerResolution),
       qEvb_(std::make_shared<FollyQuicEventBase>(&fEvb_)),
@@ -48,7 +49,7 @@ TPerfClient::TPerfClient(
       congestionControlType_(congestionControlType),
       maxReceivePacketSize_(maxReceivePacketSize),
       useInplaceWrite_(useInplaceWrite),
-      knobsStr_(knobsStr),
+      knobsStr_(std::move(knobsStr)),
       useAckReceiveTimestamps_(useAckReceiveTimestamps),
       useDraft02AckReceiveTimestamps_(useDraft02AckReceiveTimestamps),
       advertiseLegacyAckReceiveTimestamps_(advertiseLegacyAckReceiveTimestamps),
