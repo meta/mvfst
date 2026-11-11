@@ -681,7 +681,7 @@ int LibevQuicAsyncUDPSocket::recvmmsg(
     struct mmsghdr* msgvec,
     unsigned int vlen,
     unsigned int flags,
-    struct timespec* timeout) {
+    [[maybe_unused]] struct timespec* timeout) {
 // recvmmsg is a Linux-only syscall; it is absent from Darwin's libc, so on
 // macOS (which is not FOLLY_MOBILE) fall through to the recvmsg loop below.
 #if !FOLLY_MOBILE && !defined(__APPLE__)
