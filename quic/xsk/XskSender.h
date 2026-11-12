@@ -23,6 +23,7 @@
 #include <quic/xsk/xsk_lib.h>
 #include <queue>
 #include <stdexcept>
+#include <utility>
 
 namespace facebook::xdpsocket {
 
@@ -97,8 +98,8 @@ struct XskSenderConfig {
 
 class XskSender {
  public:
-  explicit XskSender(const XskSenderConfig& xskSenderConfig)
-      : xskSenderConfig_(xskSenderConfig) {
+  explicit XskSender(XskSenderConfig xskSenderConfig)
+      : xskSenderConfig_(std::move(xskSenderConfig)) {
     MVCHECK(
         xskSenderConfig_.sharedState,
         "You must provide a shared state to the XskSender.");
