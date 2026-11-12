@@ -706,7 +706,7 @@ TEST_F(ClientStateMachineTest, DeserializeLegacyCachedTransportParamsThrows) {
         fizz::detail::write(err, ExtendedAckFeatureMaskType{2}, appender), err);
     // Intentionally no draft-02 trailer.
   }
-  std::string legacyBytes = legacyOut->to<std::string>();
+  auto legacyBytes = legacyOut->to<std::string>();
 
   auto buf = folly::IOBuf::wrapBuffer(legacyBytes.data(), legacyBytes.length());
   folly::io::Cursor cursor(buf.get());
@@ -735,7 +735,7 @@ TEST_F(
     folly::io::Appender appender(out.get(), 512);
     writeCachedServerTransportParameters(in, appender);
   }
-  std::string bytes = out->to<std::string>();
+  auto bytes = out->to<std::string>();
 
   auto buf = folly::IOBuf::wrapBuffer(bytes.data(), bytes.length());
   folly::io::Cursor cursor(buf.get());
