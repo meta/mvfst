@@ -89,6 +89,10 @@ class QuicTransportStatsCallback {
 
   virtual void onForwardedPacketProcessed() = 0;
 
+  // A packet matching none of a server worker's connections was delivered to
+  // a connection of a linked worker (see QuicServer::setPredecessor()).
+  virtual void onPacketRoutedToLinkedWorker() = 0;
+
   virtual void onClientInitialReceived(QuicVersion version) = 0;
 
   virtual void onNewConnectionAttemptRejected() = 0;

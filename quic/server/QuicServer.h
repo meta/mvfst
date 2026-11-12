@@ -177,6 +177,19 @@ class QuicServer {
 
   void stopPacketForwarding(std::chrono::milliseconds delay);
 
+  /**
+   * Link each worker of this server to the worker on the same event base of
+   * `predecessor`, an older server in this process for the same address whose
+   * connections are still draining. See QuicServerWorker::setPredecessor().
+   * Both servers must be bound. Returns false without linking if `predecessor`
+   * is this server, either server is stopping or stopped, they are bound to
+   * different addresses, their workers do not run on the same event bases in
+   * the same order, or any worker cannot be linked; workers linked before such
+   * a failure are unlinked again. Like other control methods, calls must be
+   * externally serialized.
+   */
+  bool setPredecessor(QuicServer& predecessor);
+
   [[nodiscard]] int getListeningSocketFD() const;
 
   [[nodiscard]] std::vector<int> getAllListeningSocketFDs() const noexcept;

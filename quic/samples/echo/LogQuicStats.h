@@ -84,6 +84,10 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
     MVVLOG(2) << prefix_ << __func__;
   }
 
+  void onPacketRoutedToLinkedWorker() override {
+    MVVLOG(2) << prefix_ << __func__;
+  }
+
   void onClientInitialReceived(QuicVersion version) override {
     MVVLOG(2) << prefix_ << __func__ << " version: " << quic::toString(version);
   }

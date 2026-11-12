@@ -32,6 +32,7 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD(void, onPacketForwarded, ());
   MOCK_METHOD(void, onForwardedPacketReceived, ());
   MOCK_METHOD(void, onForwardedPacketProcessed, ());
+  MOCK_METHOD(void, onPacketRoutedToLinkedWorker, ());
   MOCK_METHOD(void, onClientInitialReceived, (QuicVersion));
   MOCK_METHOD(void, onNewConnectionAttemptRejected, ());
   MOCK_METHOD(void, onConnectionRateLimited, ());

@@ -654,6 +654,44 @@ void QuicServer::stopPacketForwarding(std::chrono::milliseconds delay) {
       [delay](auto worker) { worker->stopPacketForwardingAfter(delay); });
 }
 
+bool QuicServer::setPredecessor(QuicServer& predecessor) {
+  if (&predecessor == this || phase_ == State::Stopped ||
+      predecessor.phase_ == State::Stopped || runState_.stopRequested() ||
+      predecessor.runState_.stopRequested() ||
+      workers_.size() != predecessor.workers_.size()) {
+    return false;
+  }
+  MVCHECK(phase_ != State::Created, kQuicServerNotBound << __func__);
+  MVCHECK(
+      predecessor.phase_ != State::Created, kQuicServerNotBound << __func__);
+  if (getAddress() != predecessor.getAddress()) {
+    return false;
+  }
+  for (size_t i = 0; i < predecessor.workers_.size(); ++i) {
+    if (workers_[i]->getEventBase() !=
+        predecessor.workers_[i]->getEventBase()) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < predecessor.workers_.size(); ++i) {
+    auto* worker = workers_[i].get();
+    auto* predecessorWorker = predecessor.workers_[i].get();
+    bool linked = false;
+    worker->getEventBase()->runImmediatelyOrRunInEventBaseThreadAndWait(
+        [&] { linked = worker->setPredecessor(predecessorWorker); });
+    if (!linked) {
+      for (size_t j = 0; j < i; ++j) {
+        auto* linkedWorker = workers_[j].get();
+        linkedWorker->getEventBase()
+            ->runImmediatelyOrRunInEventBaseThreadAndWait(
+                [linkedWorker] { linkedWorker->unlinkFromChain(); });
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 void QuicServer::addTransportFactory(
     folly::EventBase* evb,
     QuicServerTransportFactory* acceptor) {

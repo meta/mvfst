@@ -218,6 +218,25 @@ class QuicServerWorker : public FollyAsyncUDPSocketAlias::ReadCallback,
 
   void resetTakeoverHandler();
 
+  /**
+   * Link this worker to `predecessor`, the same-index worker of an older server
+   * for the same address that still holds connections. Packets matching no
+   * connection of this worker are then delivered to the connection of whichever
+   * worker in the chain owns them, and new connection ids are unique across the
+   * chain. Both workers must run on the same event base. Returns false without
+   * linking if `predecessor` is this worker, either worker has shut down, this
+   * worker is already in a chain, or `predecessor` already has a successor.
+   * A worker leaves the chain when it shuts down. Must be called on the event
+   * base.
+   */
+  bool setPredecessor(QuicServerWorker* predecessor);
+
+  /**
+   * Leave the chain, joining this worker's neighbours. Must be called on the
+   * event base.
+   */
+  void unlinkFromChain() noexcept;
+
   /*
    * Returns the File Descriptor of the listening socket that handles the
    * packets routed from another quic server.
@@ -620,6 +639,19 @@ class QuicServerWorker : public FollyAsyncUDPSocketAlias::ReadCallback,
       const ConnectionId& dstConnId,
       const quic::SocketAddress& client);
 
+  // Delivers the packet to an existing connection of another worker in this
+  // worker's chain. Returns false if no worker in the chain owns it.
+  bool dispatchToLinkedWorker(
+      const quic::SocketAddress& client,
+      const RoutingData& routingData,
+      NetworkData& networkData);
+
+  [[nodiscard]] QuicServerTransport::Ptr findExistingTransport(
+      const quic::SocketAddress& client,
+      const RoutingData& routingData) const;
+
+  [[nodiscard]] const QuicServerWorker* newestLinkedWorker() const noexcept;
+
   // Read handler for the shouldOnlyNotify path. Calls recvmmsgNetworkData,
   // then dispatches each packet to handleNetworkData using its peerAddress.
   void onSocketReadable(QuicAsyncUDPSocket& sock) noexcept;
@@ -690,6 +722,11 @@ class QuicServerWorker : public FollyAsyncUDPSocketAlias::ReadCallback,
 
   TakeoverPacketHandler takeoverPktHandler_;
   bool packetForwardingEnabled_{false};
+
+  // Same-index workers of the older and newer servers in this worker's chain;
+  // see setPredecessor().
+  QuicServerWorker* predecessor_{nullptr};
+  QuicServerWorker* successor_{nullptr};
   QuicTimer::SharedPtr pacingTimer_;
 
   // Used to override certain transport parameters, given the client address

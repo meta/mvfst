@@ -1919,6 +1919,191 @@ TEST_F(QuicServerWorkerTest, OnDataAvailableRecordsPacketTtl) {
   EXPECT_CALL(*transport_, closeNow(_));
 }
 
+// worker_ plays the oldest server's worker; makeSuccessor() adds newer ones.
+class QuicServerWorkerChainTest : public QuicServerWorkerTest {
+ protected:
+  QuicServerWorker* makeSuccessor(QuicServerWorker* predecessor) {
+    auto* worker = makeWorker();
+    EXPECT_TRUE(worker->setPredecessor(predecessor));
+    return worker;
+  }
+
+  QuicServerWorker* makeWorker() {
+    auto sock =
+        std::make_unique<folly::test::MockAsyncUDPSocketT<>>(&eventbase_);
+    EXPECT_CALL(*sock, address()).WillRepeatedly(ReturnRef(fakeAddress_));
+    auto& runState =
+        runStates_.emplace_back(makeSingleWorkerRunState(&eventbase_));
+    TransportSettings settings;
+    settings.statelessResetTokenSecret = getRandSecret();
+    auto& worker = successors_.emplace_back(
+        std::make_unique<QuicServerWorker>(runState.get(), 0, settings));
+    publishSingleWorker(*runState, worker.get());
+    worker->setSupportedVersions({QuicVersion::MVFST});
+    auto stats = std::make_unique<NiceMock<MockQuicStats>>();
+    successorStats_ = stats.get();
+    worker->setTransportStatsCallback(std::move(stats));
+    worker->setSocket(std::move(sock));
+    worker->setWorkerId(42);
+    worker->setProcessId(ProcessId::ONE);
+    worker->setHostId(hostId_);
+    worker->setConnectionIdAlgo(std::make_unique<DefaultConnectionIdAlgo>());
+    worker->setTransportFactory(factory_.get());
+    return worker.get();
+  }
+
+  void addConnectionId(QuicServerWorker* worker, const ConnectionId& connId) {
+    transport_->QuicServerTransport::setRoutingCallback(worker);
+    worker->onConnectionIdAvailable(transport_, connId);
+  }
+
+  void unbindConnection(QuicServerWorker* worker, const ConnectionId& connId) {
+    EXPECT_CALL(*transport_, setRoutingCallback(nullptr)).RetiresOnSaturation();
+    worker->onConnectionUnbound(
+        transport_.get(),
+        std::make_pair(kClientAddr, connId),
+        std::vector<ConnectionIdData>{ConnectionIdData{connId, 0}});
+    // Otherwise transport_'s destructor unbinds it again.
+    transport_->QuicServerTransport::setRoutingCallback(nullptr);
+  }
+
+  static void dispatchShortHeader(
+      QuicServerWorker* worker,
+      const ConnectionId& connId,
+      const folly::IOBuf& data) {
+    worker->dispatchPacketData(
+        kClientAddr,
+        RoutingData(HeaderForm::Short, false, false, connId, std::nullopt),
+        NetworkData(data.clone(), Clock::now(), 0),
+        std::nullopt);
+  }
+
+  // Declared before successors_ so each worker is destroyed before its state.
+  std::vector<std::unique_ptr<RunState>> runStates_;
+  std::vector<std::unique_ptr<QuicServerWorker>> successors_;
+  MockQuicStats* successorStats_{nullptr};
+};
+
+TEST_F(QuicServerWorkerChainTest, ShortHeaderReachesPredecessorConnection) {
+  auto connId = getTestConnectionId(hostId_);
+  addConnectionId(worker_.get(), connId);
+  auto* successor = makeSuccessor(worker_.get());
+
+  auto data = folly::IOBuf::copyBuffer("data");
+  EXPECT_CALL(
+      *transport_,
+      onNetworkData(_, NetworkDataMatchesWithPeer(*data, kClientAddr)));
+  EXPECT_CALL(*successorStats_, onPacketRoutedToLinkedWorker());
+  dispatchShortHeader(successor, connId, *data);
+  unbindConnection(worker_.get(), connId);
+}
+
+TEST_F(QuicServerWorkerChainTest, ShortHeaderReachesOldestOfThreeWorkers) {
+  auto connId = getTestConnectionId(hostId_);
+  addConnectionId(worker_.get(), connId);
+  auto* newest = makeSuccessor(makeSuccessor(worker_.get()));
+
+  auto data = folly::IOBuf::copyBuffer("data");
+  EXPECT_CALL(
+      *transport_,
+      onNetworkData(_, NetworkDataMatchesWithPeer(*data, kClientAddr)));
+  dispatchShortHeader(newest, connId, *data);
+  unbindConnection(worker_.get(), connId);
+}
+
+TEST_F(QuicServerWorkerChainTest, InitialReachesPredecessorHandshake) {
+  auto connId = getTestConnectionId(hostId_);
+  createQuicConnection(kClientAddr, connId);
+  auto* successor = makeSuccessor(worker_.get());
+
+  auto data = createData(kMinInitialPacketSize + 10);
+  EXPECT_CALL(*factory_, _make(_, _, _)).Times(0);
+  EXPECT_CALL(
+      *transport_,
+      onNetworkData(_, NetworkDataMatchesWithPeer(*data, kClientAddr)));
+  successor->dispatchPacketData(
+      kClientAddr,
+      RoutingData(HeaderForm::Long, true, false, connId, connId),
+      NetworkData(data->clone(), Clock::now(), 0),
+      QuicVersion::MVFST);
+  EXPECT_CALL(*transport_, setRoutingCallback(nullptr));
+  EXPECT_CALL(*transport_, setTransportStatsCallback(nullptr));
+  EXPECT_CALL(*transport_, setHandshakeFinishedCallback(nullptr));
+  EXPECT_CALL(*transport_, closeNow(_));
+}
+
+TEST_F(QuicServerWorkerChainTest, UnknownConnectionIdIsStillReset) {
+  auto* successor = makeSuccessor(worker_.get());
+
+  auto data = folly::IOBuf::copyBuffer("data_longer_than_minimum_length");
+  EXPECT_CALL(*transport_, onNetworkData(_, _)).Times(0);
+  PacketDropReason dropReason = PacketDropReason::CANNOT_FORWARD_DATA;
+  EXPECT_CALL(*successorStats_, onPacketDropped(dropReason));
+  EXPECT_CALL(*successorStats_, onStatelessReset());
+  EXPECT_CALL(*successorStats_, onPacketRoutedToLinkedWorker()).Times(0);
+  dispatchShortHeader(successor, getTestConnectionId(hostId_), *data);
+}
+
+TEST_F(QuicServerWorkerChainTest, ConnectionIdsAreUniqueAcrossTheChain) {
+  auto predecessorConnId = getTestConnectionId(hostId_);
+  auto successorConnId = predecessorConnId;
+  successorConnId.data()[7] ^= 0x1;
+  auto unusedConnId = predecessorConnId;
+  unusedConnId.data()[7] ^= 0x2;
+  addConnectionId(worker_.get(), predecessorConnId);
+  auto* successor = makeSuccessor(worker_.get());
+  successor->onConnectionIdAvailable(transport_, successorConnId);
+
+  EXPECT_TRUE(successor->rejectConnectionId(predecessorConnId));
+  EXPECT_TRUE(worker_->rejectConnectionId(successorConnId));
+  EXPECT_FALSE(successor->rejectConnectionId(unusedConnId));
+  EXPECT_FALSE(worker_->rejectConnectionId(unusedConnId));
+
+  unbindConnection(successor, successorConnId);
+  unbindConnection(worker_.get(), predecessorConnId);
+}
+
+TEST_F(QuicServerWorkerChainTest, ShutdownWorkerLeavesTheChain) {
+  auto connId = getTestConnectionId(hostId_);
+  addConnectionId(worker_.get(), connId);
+  auto* middle = makeSuccessor(worker_.get());
+  auto* newest = makeSuccessor(middle);
+
+  middle->shutdownAllConnections(LocalErrorCode::SHUTTING_DOWN);
+
+  auto data = folly::IOBuf::copyBuffer("data");
+  EXPECT_CALL(
+      *transport_,
+      onNetworkData(_, NetworkDataMatchesWithPeer(*data, kClientAddr)));
+  dispatchShortHeader(newest, connId, *data);
+  EXPECT_TRUE(newest->rejectConnectionId(connId));
+  unbindConnection(worker_.get(), connId);
+}
+
+// A cycle would make every chain walk loop forever, so these calls would hang.
+TEST_F(QuicServerWorkerChainTest, SetPredecessorRejectsLinksThatFormACycle) {
+  auto connId = getTestConnectionId(hostId_);
+  auto* unlinked = makeWorker();
+  EXPECT_FALSE(unlinked->setPredecessor(unlinked));
+  EXPECT_FALSE(unlinked->rejectConnectionId(connId));
+
+  auto* successor = makeSuccessor(worker_.get());
+  EXPECT_FALSE(worker_->setPredecessor(successor));
+  EXPECT_FALSE(successor->rejectConnectionId(connId));
+}
+
+TEST_F(
+    QuicServerWorkerChainTest,
+    SetPredecessorRejectsAPredecessorThatHasASuccessor) {
+  makeSuccessor(worker_.get());
+  EXPECT_FALSE(makeWorker()->setPredecessor(worker_.get()));
+}
+
+TEST_F(QuicServerWorkerChainTest, SetPredecessorRejectsAShutDownPredecessor) {
+  worker_->shutdownAllConnections(LocalErrorCode::SHUTTING_DOWN);
+  EXPECT_FALSE(makeWorker()->setPredecessor(worker_.get()));
+}
+
 class QuicServerWorkerRetryTest : public QuicServerWorkerTest {
  public:
   // Helper method to send a client initial that may contain the retry token to
@@ -2932,6 +3117,66 @@ TEST_F(QuicServerTest, OtherEvbs) {
   auto evb = evbThread.getEventBase();
   std::vector<folly::EventBase*> evbs{evb};
   runTest(evbs);
+}
+
+TEST_F(QuicServerTest, SetPredecessorRequiresSameAddressAndEventBases) {
+  folly::ScopedEventBaseThread evbThread;
+  folly::ScopedEventBaseThread otherEvbThread;
+  const auto address = initializeServer({evbThread.getEventBase()});
+  auto makeServer = [&](const quic::SocketAddress& bindAddress,
+                        folly::EventBase* evb) {
+    ServerOptions options;
+    options.transportSettings = transportSettings_;
+    auto server = QuicServer::createQuicServer(std::move(options));
+    server->bind(bindAddress, {evb});
+    return server;
+  };
+  auto successor = makeServer(address, evbThread.getEventBase());
+  auto otherEvb = makeServer(address, otherEvbThread.getEventBase());
+  auto otherAddress =
+      makeServer(quic::SocketAddress("::1", 0), evbThread.getEventBase());
+
+  EXPECT_FALSE(server_->setPredecessor(*server_));
+  EXPECT_FALSE(otherEvb->setPredecessor(*server_));
+  EXPECT_FALSE(otherAddress->setPredecessor(*server_));
+  EXPECT_TRUE(successor->setPredecessor(*server_));
+  EXPECT_FALSE(server_->setPredecessor(*successor));
+
+  server_->shutdown();
+  EXPECT_FALSE(otherEvb->setPredecessor(*server_));
+  EXPECT_FALSE(server_->setPredecessor(*otherEvb));
+  successor->shutdown();
+  otherEvb->shutdown();
+  otherAddress->shutdown();
+}
+
+TEST_F(QuicServerTest, SetPredecessorUnlinksWorkersWhenALaterOneFails) {
+  folly::ScopedEventBaseThread firstEvbThread;
+  folly::ScopedEventBaseThread secondEvbThread;
+  auto* firstEvb = firstEvbThread.getEventBase();
+  auto* secondEvb = secondEvbThread.getEventBase();
+  const auto address = initializeServer({firstEvb, secondEvb});
+  auto makeServer = [&] {
+    ServerOptions options;
+    options.transportSettings = transportSettings_;
+    auto server = QuicServer::createQuicServer(std::move(options));
+    server->bind(address, {firstEvb, secondEvb});
+    return server;
+  };
+  auto successor = makeServer();
+  auto* failingWorker = workerForEvb(secondEvb);
+  secondEvb->runInEventBaseThreadAndWait([failingWorker] {
+    failingWorker->shutdownAllConnections(LocalErrorCode::SHUTTING_DOWN);
+  });
+
+  EXPECT_FALSE(successor->setPredecessor(*server_));
+  // Linking elsewhere only works if the first worker's link was undone.
+  auto other = makeServer();
+  EXPECT_TRUE(successor->setPredecessor(*other));
+
+  server_->shutdown();
+  successor->shutdown();
+  other->shutdown();
 }
 
 TEST_F(QuicServerTest, AddAcceptObserverAttachesOnWorkerEventBaseThread) {

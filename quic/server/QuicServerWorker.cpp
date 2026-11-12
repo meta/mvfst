@@ -1099,6 +1099,11 @@ void QuicServerWorker::dispatchPacketData(
   }
 
   if (routingData.headerForm == HeaderForm::Short) {
+    // Short headers try linked workers here; long headers do below, after
+    // sourceAddressMap_.
+    if (dispatchToLinkedWorker(client, routingData, networkData)) {
+      return;
+    }
     // Drop if short header packet w/ unrecognized dst conn id
     MVVLOG(3) << fmt::format(
         "Dropping short header packet with no connid match routingInfo={}",
@@ -1117,6 +1122,10 @@ void QuicServerWorker::dispatchPacketData(
     MVVLOG(4) << "Found existing connection for client=" << client << " "
               << sit->second.get();
     fwdNetworkDataToTransport(sit->second);
+    return;
+  }
+
+  if (dispatchToLinkedWorker(client, routingData, networkData)) {
     return;
   }
 
@@ -1486,6 +1495,79 @@ void QuicServerWorker::stopPacketForwardingAfter(
   takeoverPktHandler_.stopAfter(delay);
 }
 
+bool QuicServerWorker::setPredecessor(QuicServerWorker* predecessor) {
+  MVCHECK(predecessor);
+  MVCHECK_EQ(predecessor->getEventBase(), getEventBase());
+  MVDCHECK(getEventBase()->isInEventBaseThread());
+  // Only an unlinked worker joins, and only behind the newest worker of a
+  // chain, so a link can never form a cycle.
+  if (predecessor == this || shutdown_ || predecessor->shutdown_ ||
+      predecessor_ || successor_ || predecessor->successor_) {
+    return false;
+  }
+  predecessor_ = predecessor;
+  predecessor->successor_ = this;
+  return true;
+}
+
+void QuicServerWorker::unlinkFromChain() noexcept {
+  if (successor_) {
+    successor_->predecessor_ = predecessor_;
+  }
+  if (predecessor_) {
+    predecessor_->successor_ = successor_;
+  }
+  predecessor_ = nullptr;
+  successor_ = nullptr;
+}
+
+const QuicServerWorker* QuicServerWorker::newestLinkedWorker() const noexcept {
+  const auto* newest = this;
+  while (newest->successor_) {
+    newest = newest->successor_;
+  }
+  return newest;
+}
+
+QuicServerTransport::Ptr QuicServerWorker::findExistingTransport(
+    const quic::SocketAddress& client,
+    const RoutingData& routingData) const {
+  const auto& dstConnId = routingData.destinationConnId;
+  if (auto it = connectionIdMap_.find(dstConnId);
+      it != connectionIdMap_.end()) {
+    return it->second;
+  }
+  if (routingData.headerForm == HeaderForm::Long) {
+    if (auto it = sourceAddressMap_.find(std::make_pair(client, dstConnId));
+        it != sourceAddressMap_.end()) {
+      return it->second;
+    }
+  }
+  return nullptr;
+}
+
+bool QuicServerWorker::dispatchToLinkedWorker(
+    const quic::SocketAddress& client,
+    const RoutingData& routingData,
+    NetworkData& networkData) {
+  for (const auto* worker = newestLinkedWorker(); worker;
+       worker = worker->predecessor_) {
+    if (worker == this) {
+      continue;
+    }
+    if (auto transport = worker->findExistingTransport(client, routingData)) {
+      MVVLOG(4) << fmt::format(
+          "Found connection in linked worker for client={}, routingInfo={}",
+          client.describe(),
+          logRoutingInfo(routingData.destinationConnId));
+      QUIC_STATS(statsCallback_, onPacketRoutedToLinkedWorker);
+      transport->onNetworkData(socket_->address(), std::move(networkData));
+      return true;
+    }
+  }
+  return false;
+}
+
 void QuicServerWorker::onReadError(
     const folly::AsyncSocketException& ex) noexcept {
   MVVLOG(4) << "QuicServer readerr: " << ex.what();
@@ -1770,6 +1852,7 @@ void QuicServerWorker::shutdownAllConnections(LocalErrorCode error) {
   }
   shutdown_ = true;
   stopping_ = true;
+  unlinkFromChain();
   if (runState_ && workerIndex_ < runState_->peers.size()) {
     runState_->peers[workerIndex_].target->worker = nullptr;
   }
@@ -1842,7 +1925,14 @@ QuicServerWorker::~QuicServerWorker() {
 
 bool QuicServerWorker::rejectConnectionId(
     const ConnectionId& candidate) const noexcept {
-  return connectionIdMap_.find(candidate) != connectionIdMap_.end();
+  for (const auto* worker = newestLinkedWorker(); worker;
+       worker = worker->predecessor_) {
+    if (worker->connectionIdMap_.find(candidate) !=
+        worker->connectionIdMap_.end()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string QuicServerWorker::logRoutingInfo(const ConnectionId& connId) const {
