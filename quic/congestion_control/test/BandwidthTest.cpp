@@ -94,5 +94,13 @@ TEST_F(BandwidthTest, Addition) {
   first += second;
   EXPECT_EQ(Bandwidth(45000000, 1s), first);
   EXPECT_TRUE(first.isAppLimited);
+
+  // operator+ takes isAppLimited from either operand and leaves both operands
+  // unchanged.
+  Bandwidth notAppLimited(600, 20us), appLimited(300, 20us, true);
+  EXPECT_TRUE((notAppLimited + appLimited).isAppLimited);
+  EXPECT_FALSE(notAppLimited.isAppLimited);
+  EXPECT_TRUE((appLimited + notAppLimited).isAppLimited);
+  EXPECT_FALSE((notAppLimited + notAppLimited).isAppLimited);
 }
 } // namespace quic::test
