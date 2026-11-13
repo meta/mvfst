@@ -29,6 +29,7 @@
 #include <quic/state/stream/StreamSendHandlers.h>
 #include <quic/state/test/MockQuicStats.h>
 #include <quic/state/test/Mocks.h>
+#include <algorithm>
 #include <chrono>
 
 using namespace folly::test;
@@ -288,9 +289,8 @@ PacketNum QuicLossFunctionsTest::sendPacket(
   if (maybeClonedPacketIdentifier) {
     conn.outstandings.clonedPacketCount[packetNumberSpace]++;
     // Simulates what the real writer does.
-    auto it = std::find_if(
-        conn.outstandings.packets.begin(),
-        conn.outstandings.packets.end(),
+    auto it = std::ranges::find_if(
+        conn.outstandings.packets,
         [&maybeClonedPacketIdentifier](const auto& packet) {
           auto packetNum = packet.packet.header.getPacketSequenceNum();
           auto packetNumSpace = packet.packet.header.getPacketNumberSpace();
