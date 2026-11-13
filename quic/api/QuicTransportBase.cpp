@@ -450,18 +450,14 @@ void QuicTransportBase::schedulePingTimeout(
   scheduleTimeout(&pingTimeout_, timeout);
 }
 
-void QuicTransportBase::setAckRxTimestampsEnabled(bool enableAckRxTimestamps) {
-  if (!enableAckRxTimestamps) {
-    conn_->transportSettings.maybeAckReceiveTimestampsConfigSentToPeer =
-        std::nullopt;
-  }
+void QuicTransportBase::disableAckRxTimestamps() {
+  conn_->transportSettings.maybeAckReceiveTimestampsConfigSentToPeer =
+      std::nullopt;
 }
 
-void QuicTransportBase::setTimestampFrameWritingEnabled(bool enabled) {
-  if (!enabled) {
-    conn_->transportSettings.oneRttTimestampFrameWriteMode =
-        TimestampFrameWriteMode::Disabled;
-  }
+void QuicTransportBase::disableTimestampFrameWriting() {
+  conn_->transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Disabled;
 }
 
 void QuicTransportBase::setEarlyDataAppParamsHandler(

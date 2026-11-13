@@ -109,11 +109,9 @@ class QuicTransportBase : public QuicSocket,
     return conn_.get();
   }
 
-  virtual void setAckRxTimestampsEnabled(bool enableAckRxTimestamps);
+  virtual void disableAckRxTimestamps();
 
-  // Passing false turns off TIMESTAMP frame writing on this connection; passing
-  // true leaves the configured write mode unchanged.
-  virtual void setTimestampFrameWritingEnabled(bool enabled);
+  virtual void disableTimestampFrameWriting();
 
   void setEarlyDataAppParamsHandler(EarlyDataAppParamsHandler* handler) final;
 

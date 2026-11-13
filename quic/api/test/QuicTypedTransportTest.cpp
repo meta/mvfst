@@ -754,7 +754,7 @@ TYPED_TEST(
       TimestampFrameWriteMode::Opportunistic;
   this->getNonConstConn().peerTimestampFrameState.canReceive = true;
 
-  this->getTransport()->setTimestampFrameWritingEnabled(false);
+  this->getTransport()->disableTimestampFrameWriting();
 
   const auto streamId =
       this->getTransport()->createBidirectionalStream().value();
