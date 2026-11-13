@@ -1213,7 +1213,7 @@ struct StreamTypeField {
 
   struct Builder {
    public:
-    Builder() : field_(static_cast<uint8_t>(FrameType::STREAM)) {}
+    Builder() = default;
 
     Builder& setFin();
     Builder& setOffset();
@@ -1222,7 +1222,7 @@ struct StreamTypeField {
     StreamTypeField build();
 
    private:
-    uint8_t field_;
+    uint8_t field_{static_cast<uint8_t>(FrameType::STREAM)};
   };
 
  private:
