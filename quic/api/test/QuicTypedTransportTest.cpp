@@ -748,6 +748,35 @@ TYPED_TEST(
 
 TYPED_TEST(
     QuicTypedTransportAfterStartTest,
+    NoTimestampFrameAfterTimestampFrameWritingDisabled) {
+  this->getNonConstConn().outstandings.reset();
+  this->getNonConstConn().transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Opportunistic;
+  this->getNonConstConn().peerTimestampFrameState.canReceive = true;
+
+  this->getTransport()->setTimestampFrameWritingEnabled(false);
+
+  const auto streamId =
+      this->getTransport()->createBidirectionalStream().value();
+  ASSERT_FALSE(this->getTransport()
+                   ->writeChain(streamId, IOBuf::copyBuffer("hello"), false)
+                   .hasError());
+  const auto maybeWrittenPackets = this->loopForWrites();
+  ASSERT_TRUE(maybeWrittenPackets.has_value());
+  EXPECT_EQ(1, this->getNumPacketsWritten(maybeWrittenPackets));
+
+  const auto* packet = this->getNewestAppDataOutstandingPacket();
+  ASSERT_NE(packet, nullptr);
+  if (packet == nullptr) {
+    return;
+  }
+  EXPECT_EQ(findTimestampFrame(packet->packet.frames), nullptr);
+
+  this->destroyTransport();
+}
+
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
     TimestampFrameWrittenWithStreamDataUsesConnectionClock) {
   this->getNonConstConn().outstandings.reset();
   this->getNonConstConn().transportSettings.oneRttTimestampFrameWriteMode =

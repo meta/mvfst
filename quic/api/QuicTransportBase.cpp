@@ -457,6 +457,13 @@ void QuicTransportBase::setAckRxTimestampsEnabled(bool enableAckRxTimestamps) {
   }
 }
 
+void QuicTransportBase::setTimestampFrameWritingEnabled(bool enabled) {
+  if (!enabled) {
+    conn_->transportSettings.oneRttTimestampFrameWriteMode =
+        TimestampFrameWriteMode::Disabled;
+  }
+}
+
 void QuicTransportBase::setEarlyDataAppParamsHandler(
     EarlyDataAppParamsHandler* handler) {
   conn_->earlyDataAppParamsHandler = handler;
