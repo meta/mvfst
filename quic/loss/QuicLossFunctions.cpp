@@ -13,6 +13,7 @@
 #include <quic/state/ConnectionOopsFields.h>
 #include <quic/state/QuicStreamFunctions.h>
 
+#include <algorithm>
 #include <limits>
 
 namespace quic {
@@ -59,11 +60,10 @@ bool isPersistentCongestion(
     return false;
   }
 
-  auto it = std::find_if(
-      ack.ackedPackets.cbegin(), ack.ackedPackets.cend(), [&](auto& ackPacket) {
-        return ackPacket.outstandingPacketMetadata.time >= lostPeriodStart &&
-            ackPacket.outstandingPacketMetadata.time <= lostPeriodEnd;
-      });
+  auto it = std::ranges::find_if(ack.ackedPackets, [&](auto& ackPacket) {
+    return ackPacket.outstandingPacketMetadata.time >= lostPeriodStart &&
+        ackPacket.outstandingPacketMetadata.time <= lostPeriodEnd;
+  });
 
   return it == ack.ackedPackets.cend();
 }
