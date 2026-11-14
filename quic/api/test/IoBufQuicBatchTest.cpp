@@ -64,64 +64,53 @@ TEST(QuicBatch, TestBatching) {
 }
 
 TEST(QuicBatch, SendmmsgPropagatesSocketErrors) {
-  for (const auto path :
-       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
-    for (const int socketError : {EAGAIN, EWOULDBLOCK, ENOBUFS, EIO}) {
-      SCOPED_TRACE(static_cast<int>(path));
-      SCOPED_TRACE(socketError);
-      folly::EventBase evb;
-      auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
-      quic::test::MockAsyncUDPSocket sock(qEvb);
-      QuicClientConnectionState conn(
-          FizzClientQuicHandshakeContext::Builder().build());
-      BufAccessor accessor(4096);
-      conn.bufAccessor = &accessor;
-      BatchWriterPtr writer;
-      if (path == DataPathType::ContinuousMemory) {
-        writer.reset(new SendmmsgInplacePacketBatchWriter(conn, 2));
+  const std::string packet = "packet";
+  for (const int socketError : {EAGAIN, EWOULDBLOCK, ENOBUFS, EIO}) {
+    SCOPED_TRACE(socketError);
+    folly::EventBase evb;
+    auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+    quic::test::MockAsyncUDPSocket sock(qEvb);
+    QuicClientConnectionState conn(
+        FizzClientQuicHandshakeContext::Builder().build());
+    BufAccessor accessor(4096);
+    conn.bufAccessor = &accessor;
+    SocketAddress peerAddress("127.0.0.1", 1234);
+    IOBufQuicBatch batch(
+        BatchWriterPtr(new SendmmsgInplacePacketBatchWriter(conn, 2)),
+        sock,
+        peerAddress,
+        nullptr,
+        nullptr);
+    EXPECT_CALL(sock, writem(::testing::_, ::testing::_, ::testing::_, 2))
+        .WillOnce(::testing::InvokeWithoutArgs([&]() {
+          errno = socketError;
+          return -1;
+        }));
+    for (size_t i = 0; i < 2; ++i) {
+      memcpy(accessor.writableTail(), packet.data(), packet.size());
+      accessor.append(packet.size());
+      auto result = batch.write(nullptr, packet.size());
+      if (i == 0) {
+        ASSERT_TRUE(result.has_value());
+        EXPECT_TRUE(result.value());
+      } else if (socketError == EIO) {
+        EXPECT_TRUE(result.hasError());
       } else {
-        writer.reset(new SendmmsgPacketBatchWriter(2));
+        ASSERT_TRUE(result.has_value());
+        EXPECT_FALSE(result.value());
       }
-      SocketAddress peerAddress("127.0.0.1", 1234);
-      IOBufQuicBatch batch(
-          std::move(writer), sock, peerAddress, nullptr, nullptr);
-      EXPECT_CALL(sock, writem(::testing::_, ::testing::_, ::testing::_, 2))
-          .WillOnce(::testing::InvokeWithoutArgs([&]() {
-            errno = socketError;
-            return -1;
-          }));
-      for (size_t i = 0; i < 2; ++i) {
-        auto buf = folly::IOBuf::copyBuffer("packet");
-        const auto size = buf->length();
-        if (path == DataPathType::ContinuousMemory) {
-          memcpy(accessor.writableTail(), buf->data(), size);
-          accessor.append(size);
-          buf.reset();
-        }
-        auto result = batch.write(std::move(buf), size);
-        if (i == 0) {
-          ASSERT_TRUE(result.has_value());
-          EXPECT_TRUE(result.value());
-        } else if (socketError == EIO) {
-          EXPECT_TRUE(result.hasError());
-        } else {
-          ASSERT_TRUE(result.has_value());
-          EXPECT_FALSE(result.value());
-        }
-      }
-      EXPECT_EQ(batch.getLastRetryableErrno(), socketError);
-      EXPECT_EQ(accessor.length(), 0);
     }
+    EXPECT_EQ(batch.getLastRetryableErrno(), socketError);
+    EXPECT_EQ(accessor.length(), 0);
   }
 }
 
 class HappyEyeballsBatchTest
-    : public ::testing::TestWithParam<
-          std::tuple<DataPathType, QuicBatchingMode, int>> {};
+    : public ::testing::TestWithParam<std::tuple<QuicBatchingMode, int>> {};
 
 TEST_P(HappyEyeballsBatchTest, PreservesPacketsAcrossSocketAttempts) {
   using namespace ::testing;
-  const auto [path, mode, firstError] = GetParam();
+  const auto [mode, firstError] = GetParam();
   folly::EventBase evb;
   auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
   quic::test::MockAsyncUDPSocket firstSocket(qEvb);
@@ -206,18 +195,15 @@ TEST_P(HappyEyeballsBatchTest, PreservesPacketsAcrossSocketAttempts) {
         return static_cast<int>(count);
       });
   happy.secondSocket = std::move(secondSocket);
-  auto writer = BatchWriterFactory::makeBatchWriter(mode, 2, path, conn, true);
+  auto writer = BatchWriterFactory::makeBatchWriter(
+      mode, 2, DataPathType::ContinuousMemory, conn, true);
   IOBufQuicBatch batch(
       std::move(writer), firstSocket, firstAddress, nullptr, &happy);
   const std::vector<std::string> packets{"first", "a larger second packet"};
   for (const auto& packet : packets) {
-    auto buf = folly::IOBuf::copyBuffer(packet);
-    if (path == DataPathType::ContinuousMemory) {
-      memcpy(accessor.writableTail(), packet.data(), packet.size());
-      accessor.append(packet.size());
-      buf.reset();
-    }
-    auto result = batch.write(std::move(buf), packet.size());
+    memcpy(accessor.writableTail(), packet.data(), packet.size());
+    accessor.append(packet.size());
+    auto result = batch.write(nullptr, packet.size());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result.value());
   }
@@ -266,28 +252,26 @@ TEST(QuicBatch, FirstAddressFailureReportedOnlyBeforeHappyEyeballsFinishes) {
         BatchWriterFactory::makeBatchWriter(
             QuicBatchingMode::BATCHING_MODE_NONE,
             1,
-            DataPathType::ChainedMemory,
+            DataPathType::ContinuousMemory,
             conn,
             true),
         sock,
         address,
         nullptr,
         &happy);
-    auto packet = folly::IOBuf::copyBuffer("packet");
-    const auto size = packet->computeChainDataLength();
-    (void)batch.write(std::move(packet), size);
+    const std::string packet = "packet";
+    memcpy(accessor.writableTail(), packet.data(), packet.size());
+    accessor.append(packet.size());
+    (void)batch.write(nullptr, packet.size());
     (void)batch.flush();
     EXPECT_EQ(failures, finished ? 0 : 1) << "finished=" << finished;
   }
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    MemoryPaths,
+    BatchingModes,
     HappyEyeballsBatchTest,
     ::testing::Combine(
-        ::testing::Values(
-            DataPathType::ChainedMemory,
-            DataPathType::ContinuousMemory),
         ::testing::Values(
             QuicBatchingMode::BATCHING_MODE_NONE,
             QuicBatchingMode::BATCHING_MODE_GSO,

@@ -154,6 +154,13 @@ TEST_F(QuicClientTransportLiteTest, WriteDatagramFailsWhenThePeerTakesNone) {
       quicClient_->getConn()->datagramState.flowManager.hasDatagramsToSend());
 }
 
+TEST_F(QuicClientTransportLiteTest, ChainedMemorySettingAllocatesWriteBuffer) {
+  auto transportSettings = quicClient_->getTransportSettings();
+  transportSettings.dataPathType = DataPathType::ChainedMemory;
+  quicClient_->setTransportSettings(std::move(transportSettings));
+  EXPECT_NE(quicClient_->getConn()->bufAccessor, nullptr);
+}
+
 TEST_F(QuicClientTransportLiteTest, TestPriming) {
   auto transportSettings = quicClient_->getTransportSettings();
   transportSettings.isPriming = true;

@@ -1883,8 +1883,7 @@ void QuicClientTransportLite::start(
   conn_->currentPathId = addPathRes.value();
 
   // Clients that keep the default settings never call setTransportSettings().
-  if (conn_->transportSettings.dataPathType == DataPathType::ContinuousMemory &&
-      !conn_->bufAccessor) {
+  if (!conn_->bufAccessor) {
     size_t capacity = 0;
     MVCHECK(
         folly::checked_mul(

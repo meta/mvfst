@@ -93,15 +93,11 @@ QuicServerWorker::QuicServerWorker(
   pending0RttData_.setPruneHook(
       [&](auto, auto) { QUIC_STATS(statsCallback_, onZeroRttBufferedPruned); });
 
-  if (transportSettings_.dataPathType == DataPathType::ContinuousMemory) {
-    // TODO: maxBatchSize is only a good start value when each transport does
-    // its own socket writing. If we experiment with multiple transports GSO
-    // together, we will need a better value.
-    bufAccessor_ = std::make_unique<BufAccessor>(
-        kDefaultMaxUDPPayload * transportSettings_.maxBatchSize);
-    MVVLOG(10)
-        << "GSO write buf accessor created for ContinuousMemory data path";
-  }
+  // TODO: maxBatchSize is only a good start value when each transport does
+  // its own socket writing. If we experiment with multiple transports GSO
+  // together, we will need a better value.
+  bufAccessor_ = std::make_unique<BufAccessor>(
+      kDefaultMaxUDPPayload * transportSettings_.maxBatchSize);
 }
 
 folly::EventBase* QuicServerWorker::getEventBase() const {
@@ -868,18 +864,6 @@ QuicServerTransport::Ptr QuicServerWorker::makeTransport(
     if (transportSettingsOverrideFn_) {
       transportSettingsOverrideFn_(transportSettingsCopy);
     }
-    // Transports only use the worker's buffer with ContinuousMemory, so falling
-    // back to ChainedMemory per connection is fine, but not the reverse.
-    LOG_IF(
-        ERROR,
-        transportSettingsCopy.dataPathType == DataPathType::ContinuousMemory &&
-            transportSettings_.dataPathType != DataPathType::ContinuousMemory)
-        << "Overriding DataPathType to ContinuousMemory isn't supported";
-
-    BufAccessor* bufAccessor = nullptr;
-    if (transportSettings_.dataPathType == DataPathType::ContinuousMemory) {
-      bufAccessor = bufAccessor_.get();
-    }
     trans->configureForAccept(
         ServerAcceptParams{
             .transportSettings = std::move(transportSettingsCopy),
@@ -895,7 +879,7 @@ QuicServerTransport::Ptr QuicServerWorker::makeTransport(
                 workerId_),
             .connIdAlgo = connIdAlgo_.get(),
             .connIdRejector = this,
-            .bufAccessor = bufAccessor,
+            .bufAccessor = bufAccessor_.get(),
             .pacingTimer = pacingTimer_,
             .statsCallback = statsCallback_.get()});
     trans->setRoutingCallback(this);

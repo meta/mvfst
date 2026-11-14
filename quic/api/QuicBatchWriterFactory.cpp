@@ -65,40 +65,23 @@ BatchWriterPtr BatchWriterFactory::makeBatchWriter(
 
   switch (batchingMode) {
     case quic::QuicBatchingMode::BATCHING_MODE_NONE:
-      if (dataPathType == DataPathType::ContinuousMemory) {
-        return BatchWriterPtr(new SinglePacketInplaceBatchWriter(conn));
-      }
-      return BatchWriterPtr(new SinglePacketBatchWriter());
+      return BatchWriterPtr(new SinglePacketInplaceBatchWriter(conn));
     case quic::QuicBatchingMode::BATCHING_MODE_GSO: {
       if (gsoSupported) {
-        if (dataPathType == DataPathType::ChainedMemory) {
-          return makeGsoBatchWriter(batchSize);
-        }
         return makeGsoInPlaceBatchWriter(batchSize, conn);
       }
       // Fall through to Sendmmsg batching if gso is not supported.
     }
       [[fallthrough]];
     case quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG:
-      if (dataPathType == DataPathType::ContinuousMemory) {
-        return BatchWriterPtr(
-            new SendmmsgInplacePacketBatchWriter(conn, batchSize));
-      }
-      return BatchWriterPtr(new SendmmsgPacketBatchWriter(batchSize));
+      return BatchWriterPtr(
+          new SendmmsgInplacePacketBatchWriter(conn, batchSize));
     case quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO: {
       if (gsoSupported) {
-        if (dataPathType == DataPathType::ChainedMemory) {
-          return makeSendmmsgGsoBatchWriter(batchSize);
-        } else if (dataPathType == DataPathType::ContinuousMemory) {
-          return makeSendmmsgInplaceGsoInplaceBatchWriter(batchSize, conn);
-        }
+        return makeSendmmsgInplaceGsoInplaceBatchWriter(batchSize, conn);
       }
-
-      if (dataPathType == DataPathType::ContinuousMemory) {
-        return BatchWriterPtr(
-            new SendmmsgInplacePacketBatchWriter(conn, batchSize));
-      }
-      return BatchWriterPtr(new SendmmsgPacketBatchWriter(batchSize));
+      return BatchWriterPtr(
+          new SendmmsgInplacePacketBatchWriter(conn, batchSize));
     }
       // no default so we can catch missing case at compile time
   }

@@ -1814,64 +1814,45 @@ TEST_P(
   constexpr uint32_t kReservedDatagramBytes = 2;
   constexpr uint8_t kCipherOverhead = 16;
 
-  for (const auto dataPathType :
-       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
-    SCOPED_TRACE(
-        dataPathType == DataPathType::ChainedMemory ? "chained" : "inplace");
-    QuicClientConnectionState conn(
-        FizzClientQuicHandshakeContext::Builder().build());
-    conn.transportSettings.dataPathType = dataPathType;
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  BufAccessor bufAccessor(conn.udpSendPacketLen);
+  conn.bufAccessor = &bufAccessor;
 
-    std::unique_ptr<BufAccessor> bufAccessor;
-    if (dataPathType == DataPathType::ContinuousMemory) {
-      bufAccessor = std::make_unique<BufAccessor>(conn.udpSendPacketLen);
-      conn.bufAccessor = bufAccessor.get();
-    }
+  FrameScheduler noopScheduler("noopScheduler", conn);
+  CloningScheduler cloningScheduler(
+      noopScheduler, conn, "CopyCat", kCipherOverhead);
+  auto packetNum = addInitialOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.push_back(
+      MaxDataFrame(conn.flowControlState.advertisedMaxOffset));
 
-    FrameScheduler noopScheduler("noopScheduler", conn);
-    CloningScheduler cloningScheduler(
-        noopScheduler, conn, "CopyCat", kCipherOverhead);
-    auto packetNum = addInitialOutstandingPacket(conn);
-    conn.outstandings.packets.back().packet.frames.push_back(
-        MaxDataFrame(conn.flowControlState.advertisedMaxOffset));
+  ConnectionId srcConnId = ConnectionId::createZeroLength();
+  LongHeader header(
+      LongHeader::Types::Initial,
+      srcConnId,
+      conn.clientConnectionId.value_or(getTestConnectionId()),
+      getNextPacketNum(conn, PacketNumberSpace::Initial),
+      QuicVersion::MVFST);
+  const uint32_t packetSizeLimit =
+      conn.udpSendPacketLen - kReservedDatagramBytes;
+  InplaceQuicPacketBuilder builder(
+      bufAccessor,
+      packetSizeLimit,
+      std::move(header),
+      conn.ackStates.initialAckState->largestAckedByPeer.value_or(0));
+  builder.accountForCipherOverhead(kCipherOverhead);
 
-    ConnectionId srcConnId = ConnectionId::createZeroLength();
-    LongHeader header(
-        LongHeader::Types::Initial,
-        srcConnId,
-        conn.clientConnectionId.value_or(getTestConnectionId()),
-        getNextPacketNum(conn, PacketNumberSpace::Initial),
-        QuicVersion::MVFST);
-    const uint32_t packetSizeLimit =
-        conn.udpSendPacketLen - kReservedDatagramBytes;
-    std::unique_ptr<PacketBuilderInterface> builder;
-    if (dataPathType == DataPathType::ChainedMemory) {
-      builder = std::make_unique<RegularQuicPacketBuilder>(
-          packetSizeLimit,
-          std::move(header),
-          conn.ackStates.initialAckState->largestAckedByPeer.value_or(0));
-    } else {
-      builder = std::make_unique<InplaceQuicPacketBuilder>(
-          *bufAccessor,
-          packetSizeLimit,
-          std::move(header),
-          conn.ackStates.initialAckState->largestAckedByPeer.value_or(0));
-    }
-    builder->accountForCipherOverhead(kCipherOverhead);
-
-    auto cloneResult = cloningScheduler.scheduleFramesForPacket(
-        std::move(*builder), conn.udpSendPacketLen - kCipherOverhead);
-    ASSERT_FALSE(cloneResult.hasError());
-    ASSERT_TRUE(
-        cloneResult->clonedPacketIdentifier.has_value() &&
-        cloneResult->packet.has_value());
-    EXPECT_EQ(packetNum, cloneResult->clonedPacketIdentifier->packetNumber);
-    EXPECT_EQ(
-        packetSizeLimit,
-        cloneResult->packet->header.computeChainDataLength() +
-            cloneResult->packet->body.computeChainDataLength() +
-            kCipherOverhead);
-  }
+  auto cloneResult = cloningScheduler.scheduleFramesForPacket(
+      std::move(builder), conn.udpSendPacketLen - kCipherOverhead);
+  ASSERT_FALSE(cloneResult.hasError());
+  ASSERT_TRUE(
+      cloneResult->clonedPacketIdentifier.has_value() &&
+      cloneResult->packet.has_value());
+  EXPECT_EQ(packetNum, cloneResult->clonedPacketIdentifier->packetNumber);
+  EXPECT_EQ(
+      packetSizeLimit,
+      cloneResult->packet->header.computeChainDataLength() +
+          cloneResult->packet->body.computeChainDataLength() + kCipherOverhead);
 }
 
 TEST_P(QuicPacketSchedulerTest, CloneLargerThanOriginalPacket) {

@@ -3580,8 +3580,7 @@ void QuicTransportBaseLite::setTransportSettings(
   if (conn_->transportParametersEncoded) {
     updateCongestionControlSettings(transportSettings);
   } else {
-    if (conn_->nodeType == QuicNodeType::Client &&
-        transportSettings.dataPathType == DataPathType::ContinuousMemory) {
+    if (conn_->nodeType == QuicNodeType::Client) {
       size_t capacity = 0;
       MVCHECK(
           folly::checked_mul(

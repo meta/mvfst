@@ -1457,43 +1457,28 @@ CloningScheduler::scheduleFramesForPacket(
       continue;
     }
     auto opPnSpace = outstandingPacket.packet.header.getPacketNumberSpace();
-    // Reusing the RegularQuicPacketBuilder throughout loop bodies will lead to
-    // frames belong to different original packets being written into the same
-    // clone packet. So re-create a RegularQuicPacketBuilder every time.
     // TODO: We can avoid the copy & rebuild of the header by creating an
     // independent header builder.
     if (opPnSpace != builderPnSpace) {
       continue;
     }
-    size_t prevSize = 0;
-    if (conn_.transportSettings.dataPathType ==
-        DataPathType::ContinuousMemory) {
-      prevSize = conn_.bufAccessor->length();
+    MVCHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
+    if (conn_.bufAccessor->tailroom() < packetSizeLimit) {
+      return quic::make_unexpected(QuicError(
+          TransportErrorCode::INTERNAL_ERROR,
+          "Insufficient ContinuousMemory buffer tailroom"));
     }
+    const size_t prevSize = conn_.bufAccessor->length();
     // Reusing the same builder throughout loop bodies will lead to frames
     // belong to different original packets being written into the same clone
     // packet. So re-create a builder every time.
-    std::unique_ptr<PacketBuilderInterface> internalBuilder;
-    if (conn_.transportSettings.dataPathType == DataPathType::ChainedMemory) {
-      internalBuilder = std::make_unique<RegularQuicPacketBuilder>(
-          packetSizeLimit,
-          header,
-          getPacketNumberEncodingBase(
-              conn_, builderPnSpace, header.getPacketSequenceNum()));
-    } else {
-      MVCHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
-      if (conn_.bufAccessor->tailroom() < packetSizeLimit) {
-        return quic::make_unexpected(QuicError(
-            TransportErrorCode::INTERNAL_ERROR,
-            "Insufficient ContinuousMemory buffer tailroom"));
-      }
-      internalBuilder = std::make_unique<InplaceQuicPacketBuilder>(
-          *conn_.bufAccessor,
-          packetSizeLimit,
-          header,
-          getPacketNumberEncodingBase(
-              conn_, builderPnSpace, header.getPacketSequenceNum()));
-    }
+    std::unique_ptr<PacketBuilderInterface> internalBuilder =
+        std::make_unique<InplaceQuicPacketBuilder>(
+            *conn_.bufAccessor,
+            packetSizeLimit,
+            header,
+            getPacketNumberEncodingBase(
+                conn_, builderPnSpace, header.getPacketSequenceNum()));
     // The packet is already a clone or has a clone outstanding
     if (outstandingPacket.maybeClonedPacketIdentifier) {
       // This packet has already been processed (acked/lost), no need to
@@ -1561,20 +1546,15 @@ CloningScheduler::scheduleFramesForPacket(
           std::move(*internalBuilder).buildPacket(),
           0,
           transmissionReason_);
-    } else if (
-        conn_.transportSettings.dataPathType ==
-        DataPathType::ContinuousMemory) {
-      // When we use Inplace packet building and reuse the write buffer,
-      // even if the packet rebuild has failed, there might be some
-      // bytes already written into the buffer and the buffer tail
-      // pointer has already moved. We need to roll back the tail
-      // pointer to the position before the packet building to exclude
-      // those bytes. Otherwise these bytes will be sitting in between
-      // legit packets inside the buffer and will either cause errors
-      // further down the write path, or be sent out and then dropped at
-      // peer when peer fail to parse them.
+    } else {
+      // Even if the packet rebuild has failed, there might be some bytes
+      // already written into the buffer and the buffer tail pointer has
+      // already moved. We need to roll back the tail pointer to the position
+      // before the packet building to exclude those bytes. Otherwise these
+      // bytes will be sitting in between legit packets inside the buffer and
+      // will either cause errors further down the write path, or be sent out
+      // and then dropped at peer when peer fail to parse them.
       internalBuilder.reset();
-      MVCHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
       conn_.bufAccessor->trimEnd(conn_.bufAccessor->length() - prevSize);
     }
   }

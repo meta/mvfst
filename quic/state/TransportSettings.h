@@ -346,8 +346,7 @@ struct TransportSettings {
   DurationRep timeReorderingThreshDividend{
       kDefaultTimeReorderingThreshDividend};
   DurationRep timeReorderingThreshDivisor{kDefaultTimeReorderingThreshDivisor};
-  // A temporary type to control DataPath write style. Will be gone after we
-  // are done with experiment.
+  // Ignored: ContinuousMemory is the only data path.
   DataPathType dataPathType{DataPathType::ContinuousMemory};
   // Whether or not we should stop writing a packet after writing a single
   // stream frame to it.

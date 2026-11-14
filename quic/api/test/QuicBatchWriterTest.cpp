@@ -7,6 +7,7 @@
 
 #include <quic/api/QuicBatchWriter.h>
 #include <quic/api/QuicBatchWriterFactory.h>
+#include <quic/api/QuicGsoBatchWriters.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
@@ -21,8 +22,6 @@ using namespace testing;
 namespace quic::testing {
 
 constexpr const auto kStrLen = 10;
-constexpr const auto kStrLenGT = 20;
-constexpr const auto kStrLenLT = 5;
 constexpr const auto kBatchNum = 3;
 constexpr const auto kNumLoops = 10;
 
@@ -76,7 +75,7 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverride) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_NONE,
       kBatchNum,
-      DataPathType::ChainedMemory,
+      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
 
@@ -89,7 +88,7 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverride) {
   auto defaultBatchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_NONE,
       kBatchNum,
-      DataPathType::ChainedMemory,
+      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   ASSERT_TRUE(defaultBatchWriter);
@@ -111,55 +110,53 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverrideFallthrough) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_NONE,
       kBatchNum,
-      DataPathType::ChainedMemory,
+      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
 
   EXPECT_TRUE(overrideCalled);
   ASSERT_TRUE(batchWriter);
-  // Default writer for BATCHING_MODE_NONE / ChainedMemory is a single packet
-  // writer whose size is 0, not the override sentinel.
+  // Default writer for BATCHING_MODE_NONE is a single packet writer whose size
+  // is 0, not the override sentinel.
   EXPECT_EQ(batchWriter->size(), 0);
 }
 
-TEST_F(QuicBatchWriterTest, TestBatchingNone) {
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_NONE,
-      kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest('A', kStrLen);
-
-  // run multiple loops
-  for (size_t i = 0; i < kNumLoops; i++) {
-    CHECK(batchWriter->empty());
-    CHECK_EQ(batchWriter->size(), 0);
-    auto buf = folly::IOBuf::copyBuffer(strTest.c_str(), kStrLen);
-
-    CHECK(batchWriter->append(
-        std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-    CHECK_EQ(batchWriter->size(), kStrLen);
-    batchWriter->reset();
-  }
+TEST_F(QuicBatchWriterTest, ChainedMemorySettingGetsInplaceWriters) {
+  BufAccessor accessor(conn_.udpSendPacketLen * kBatchNum);
+  conn_.bufAccessor = &accessor;
+  auto makeWriter = [&](QuicBatchingMode mode, bool gsoSupported) {
+    return BatchWriterFactory::makeBatchWriter(
+        mode, kBatchNum, DataPathType::ChainedMemory, conn_, gsoSupported);
+  };
+  EXPECT_NE(
+      dynamic_cast<SinglePacketInplaceBatchWriter*>(
+          makeWriter(QuicBatchingMode::BATCHING_MODE_NONE, false).get()),
+      nullptr);
+  EXPECT_NE(
+      dynamic_cast<GSOInplacePacketBatchWriter*>(
+          makeWriter(QuicBatchingMode::BATCHING_MODE_GSO, true).get()),
+      nullptr);
+  EXPECT_NE(
+      dynamic_cast<SendmmsgInplacePacketBatchWriter*>(
+          makeWriter(QuicBatchingMode::BATCHING_MODE_SENDMMSG, false).get()),
+      nullptr);
+  EXPECT_NE(
+      dynamic_cast<SendmmsgGSOInplacePacketBatchWriter*>(
+          makeWriter(QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO, true).get()),
+      nullptr);
 }
 
 class BatchWriterFactoryTest
     : public QuicBatchWriterTest,
-      public WithParamInterface<
-          std::tuple<DataPathType, QuicBatchingMode, uint32_t, bool>> {};
+      public WithParamInterface<std::tuple<QuicBatchingMode, uint32_t, bool>> {
+};
 
-TEST_P(BatchWriterFactoryTest, WritesPacketFromSelectedMemoryPath) {
-  const auto [dataPath, mode, batchSize, gsoSupported] = GetParam();
+TEST_P(BatchWriterFactoryTest, WritesPacketFromBuffer) {
+  const auto [mode, batchSize, gsoSupported] = GetParam();
   BufAccessor accessor(conn_.udpSendPacketLen * batchSize);
   conn_.bufAccessor = &accessor;
   auto writer = BatchWriterFactory::makeBatchWriter(
-      mode, batchSize, dataPath, conn_, gsoSupported);
-  if (dataPath == DataPathType::ContinuousMemory) {
-    ASSERT_EQ(dynamic_cast<SinglePacketBatchWriter*>(writer.get()), nullptr);
-    ASSERT_EQ(dynamic_cast<SendmmsgPacketBatchWriter*>(writer.get()), nullptr);
-  }
+      mode, batchSize, DataPathType::ContinuousMemory, conn_, gsoSupported);
 
   folly::EventBase evb;
   auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
@@ -187,34 +184,26 @@ TEST_P(BatchWriterFactoryTest, WritesPacketFromSelectedMemoryPath) {
         return checkPayload(addr, vec, count);
       });
 
-  BufPtr buf;
-  if (dataPath == DataPathType::ContinuousMemory) {
-    memcpy(accessor.writableTail(), payload.data(), payload.size());
-    accessor.append(payload.size());
-  } else {
-    buf = folly::IOBuf::copyBuffer(payload);
-  }
-  writer->append(std::move(buf), payload.size(), SocketAddress(), &sock);
+  memcpy(accessor.writableTail(), payload.data(), payload.size());
+  accessor.append(payload.size());
+  writer->append(nullptr, payload.size(), SocketAddress(), &sock);
   ASSERT_FALSE(writer->empty());
   EXPECT_EQ(writer->write(sock, SocketAddress()), payload.size());
   EXPECT_EQ(writes, 1);
   EXPECT_FALSE(writer->empty());
-  if (dataPath == DataPathType::ContinuousMemory) {
-    EXPECT_EQ(
-        std::string(
-            reinterpret_cast<const char*>(accessor.data()), accessor.length()),
-        payload);
-  }
+  EXPECT_EQ(
+      std::string(
+          reinterpret_cast<const char*>(accessor.data()), accessor.length()),
+      payload);
   writer->reset();
   EXPECT_TRUE(writer->empty());
   EXPECT_EQ(accessor.length(), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    MemoryPaths,
+    BatchingModes,
     BatchWriterFactoryTest,
     Combine(
-        Values(DataPathType::ChainedMemory, DataPathType::ContinuousMemory),
         Values(
             QuicBatchingMode::BATCHING_MODE_NONE,
             QuicBatchingMode::BATCHING_MODE_GSO,
@@ -223,392 +212,40 @@ INSTANTIATE_TEST_SUITE_P(
         Values(1u, 16u, kQuicMaxBatchSizeLimit),
         Bool()));
 
-TEST_F(QuicBatchWriterTest, TestBatchingGSOBase) {
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  FollyQuicAsyncUDPSocket sock(qEvb);
-  auto ret = sock.setReuseAddr(false);
-  ASSERT_FALSE(ret.hasError());
-  ASSERT_FALSE(sock.bind(quic::SocketAddress("127.0.0.1", 0)).hasError());
-  auto gsoResult = sock.getGSO();
-  ASSERT_FALSE(gsoResult.hasError());
-  gsoSupported_ = gsoResult.value();
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_GSO,
-      1,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest(kStrLen, 'A');
-  // if GSO is not available, just test we've got a regular
-  // batch writer
-  if (!gsoSupported_) {
-    CHECK(batchWriter->empty());
-    CHECK_EQ(batchWriter->size(), 0);
-    auto buf = folly::IOBuf::copyBuffer(strTest);
-    CHECK(batchWriter->append(
-        std::move(buf), strTest.size(), quic::SocketAddress(), nullptr));
-    EXPECT_FALSE(batchWriter->needsFlush(kStrLenLT));
-  }
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingGSOLastSmallPacket) {
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  FollyQuicAsyncUDPSocket sock(qEvb);
-  auto ret = sock.setReuseAddr(false);
-  ASSERT_FALSE(ret.hasError());
-  ASSERT_FALSE(sock.bind(quic::SocketAddress("127.0.0.1", 0)).hasError());
-  auto gsoResult = sock.getGSO();
-  ASSERT_FALSE(gsoResult.hasError());
-  gsoSupported_ = gsoResult.value();
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_GSO,
-      1,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest;
-  // only if GSO is available
-  if (gsoSupported_) {
-    // run multiple loops
-    for (size_t i = 0; i < kNumLoops; i++) {
-      // batch kStrLen, kStrLenLT
-      CHECK(batchWriter->empty());
-      CHECK_EQ(batchWriter->size(), 0);
-      strTest = std::string(kStrLen, 'A');
-      auto buf = folly::IOBuf::copyBuffer(strTest);
-      EXPECT_FALSE(batchWriter->needsFlush(kStrLen));
-      EXPECT_FALSE(batchWriter->append(
-          std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-      CHECK_EQ(batchWriter->size(), kStrLen);
-      strTest = std::string(kStrLenLT, 'A');
-      buf = folly::IOBuf::copyBuffer(strTest);
-      EXPECT_FALSE(batchWriter->needsFlush(kStrLenLT));
-      CHECK(batchWriter->append(
-          std::move(buf), kStrLenLT, quic::SocketAddress(), nullptr));
-      CHECK_EQ(batchWriter->size(), kStrLen + kStrLenLT);
-      batchWriter->reset();
-    }
-  }
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingGSOLastBigPacket) {
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  FollyQuicAsyncUDPSocket sock(qEvb);
-  auto ret = sock.setReuseAddr(false);
-  ASSERT_FALSE(ret.hasError());
-  ASSERT_FALSE(sock.bind(quic::SocketAddress("127.0.0.1", 0)).hasError());
-  auto gsoResult = sock.getGSO();
-  ASSERT_FALSE(gsoResult.hasError());
-  gsoSupported_ = gsoResult.value();
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_GSO,
-      1,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest;
-  // only if GSO is available
-  if (gsoSupported_) {
-    // run multiple loops
-    for (size_t i = 0; i < kNumLoops; i++) {
-      // try to batch kStrLen, kStrLenGT
-      CHECK(batchWriter->empty());
-      CHECK_EQ(batchWriter->size(), 0);
-      strTest = std::string(kStrLen, 'A');
-      auto buf = folly::IOBuf::copyBuffer(strTest);
-      EXPECT_FALSE(batchWriter->needsFlush(kStrLen));
-      EXPECT_FALSE(batchWriter->append(
-          std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-      CHECK_EQ(batchWriter->size(), kStrLen);
-      CHECK(batchWriter->needsFlush(kStrLenGT));
-      batchWriter->reset();
-    }
-  }
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingGSOBatchNum) {
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  FollyQuicAsyncUDPSocket sock(qEvb);
-  auto ret = sock.setReuseAddr(false);
-  ASSERT_FALSE(ret.hasError());
-  ASSERT_FALSE(sock.bind(quic::SocketAddress("127.0.0.1", 0)).hasError());
-  auto gsoResult = sock.getGSO();
-  ASSERT_FALSE(gsoResult.hasError());
-  gsoSupported_ = gsoResult.value();
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_GSO,
-      kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest(kStrLen, 'A');
-  // if GSO is not available, just test we've got a regular
-  // batch writer
-  if (gsoSupported_) {
-    // run multiple loops
-    for (size_t i = 0; i < kNumLoops; i++) {
-      // try to batch up to kBatchNum
-      CHECK(batchWriter->empty());
-      CHECK_EQ(batchWriter->size(), 0);
-      size_t size = 0;
-      for (auto j = 0; j < kBatchNum - 1; j++) {
-        auto buf = folly::IOBuf::copyBuffer(strTest);
-        EXPECT_FALSE(batchWriter->append(
-            std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-        size += kStrLen;
-        CHECK_EQ(batchWriter->size(), size);
-      }
-
-      // add the kBatchNum buf
-      auto buf = folly::IOBuf::copyBuffer(strTest.c_str(), kStrLen);
-      CHECK(batchWriter->append(
-          std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-      size += kStrLen;
-      CHECK_EQ(batchWriter->size(), size);
-      batchWriter->reset();
-    }
-  }
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingSendmmsg) {
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG,
-      kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest(kStrLen, 'A');
-
-  // run multiple loops
-  for (size_t i = 0; i < kNumLoops; i++) {
-    // try to batch up to kBatchNum
-    CHECK(batchWriter->empty());
-    CHECK_EQ(batchWriter->size(), 0);
-    size_t size = 0;
-    for (auto j = 0; j < kBatchNum - 1; j++) {
-      auto buf = folly::IOBuf::copyBuffer(strTest);
-      EXPECT_FALSE(batchWriter->append(
-          std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-      size += kStrLen;
-      CHECK_EQ(batchWriter->size(), size);
-    }
-
-    // add the kBatchNum buf
-    auto buf = folly::IOBuf::copyBuffer(strTest.c_str(), kStrLen);
-    CHECK(batchWriter->append(
-        std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-    size += kStrLen;
-    CHECK_EQ(batchWriter->size(), size);
-    batchWriter->reset();
-  }
-}
-
 TEST_F(QuicBatchWriterTest, SendmmsgPreservesSocketResult) {
-  for (const auto path :
-       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
-    for (const bool heapIovecs : {false, true}) {
-      if (path == DataPathType::ContinuousMemory && heapIovecs) {
-        continue;
-      }
-      for (const int socketResult : {3, 1, 0, -EAGAIN, -ENOBUFS, -EIO}) {
-        SCOPED_TRACE(static_cast<int>(path));
-        SCOPED_TRACE(heapIovecs);
-        SCOPED_TRACE(socketResult);
-        BufAccessor accessor(conn_.udpSendPacketLen * 3);
-        conn_.bufAccessor = &accessor;
-        auto writer = BatchWriterFactory::makeBatchWriter(
-            QuicBatchingMode::BATCHING_MODE_SENDMMSG, 3, path, conn_, false);
-        size_t bytes = 0;
-        for (size_t i = 0; i < 3; ++i) {
-          auto buf = folly::IOBuf::copyBuffer("packet");
-          if (heapIovecs) {
-            for (size_t j = 0; j < kNumIovecBufferChains; ++j) {
-              buf->appendToChain(folly::IOBuf::copyBuffer("fragment"));
-            }
-          }
-          const auto size = buf->computeChainDataLength();
-          bytes += size;
-          if (path == DataPathType::ContinuousMemory) {
-            memcpy(accessor.writableTail(), buf->data(), size);
-            accessor.append(size);
-            buf.reset();
-          }
-          writer->append(std::move(buf), size, SocketAddress(), nullptr);
-        }
-        folly::EventBase evb;
-        auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
-        quic::test::MockAsyncUDPSocket sock(qEvb);
-        EXPECT_CALL(sock, writem(_, _, _, 3)).WillOnce(InvokeWithoutArgs([&]() {
-          errno = socketResult < 0 ? -socketResult : 0;
-          return socketResult < 0 ? -1 : socketResult;
-        }));
-        const ssize_t expected = socketResult == 3
-            ? static_cast<ssize_t>(bytes)
-            : (socketResult < 0 ? -1 : 0);
-        EXPECT_EQ(writer->write(sock, SocketAddress()), expected);
-        EXPECT_EQ(errno, socketResult < 0 ? -socketResult : 0);
-        writer->reset();
-        EXPECT_TRUE(writer->empty());
-        EXPECT_EQ(accessor.length(), 0);
-      }
+  const std::string packet = "packet";
+  for (const int socketResult : {3, 1, 0, -EAGAIN, -ENOBUFS, -EIO}) {
+    SCOPED_TRACE(socketResult);
+    BufAccessor accessor(conn_.udpSendPacketLen * 3);
+    conn_.bufAccessor = &accessor;
+    auto writer = BatchWriterFactory::makeBatchWriter(
+        QuicBatchingMode::BATCHING_MODE_SENDMMSG,
+        3,
+        DataPathType::ContinuousMemory,
+        conn_,
+        false);
+    size_t bytes = 0;
+    for (size_t i = 0; i < 3; ++i) {
+      memcpy(accessor.writableTail(), packet.data(), packet.size());
+      accessor.append(packet.size());
+      bytes += packet.size();
+      writer->append(nullptr, packet.size(), SocketAddress(), nullptr);
     }
+    folly::EventBase evb;
+    auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+    quic::test::MockAsyncUDPSocket sock(qEvb);
+    EXPECT_CALL(sock, writem(_, _, _, 3)).WillOnce(InvokeWithoutArgs([&]() {
+      errno = socketResult < 0 ? -socketResult : 0;
+      return socketResult < 0 ? -1 : socketResult;
+    }));
+    const ssize_t expected = socketResult == 3 ? static_cast<ssize_t>(bytes)
+                                               : (socketResult < 0 ? -1 : 0);
+    EXPECT_EQ(writer->write(sock, SocketAddress()), expected);
+    EXPECT_EQ(errno, socketResult < 0 ? -socketResult : 0);
+    writer->reset();
+    EXPECT_TRUE(writer->empty());
+    EXPECT_EQ(accessor.length(), 0);
   }
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgInplaceIovecMatches) {
-  // In this test case, we don't surpass the kNumIovecBufferChains limit
-  // (i.e. the number of contiguous buffers we are sending)
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  quic::test::MockAsyncUDPSocket sock(qEvb);
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG,
-      kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-
-  std::vector<std::string> messages{"It", "is", "sunny!"};
-
-  CHECK(batchWriter->empty());
-  CHECK_EQ(batchWriter->size(), 0);
-  size_t size = 0;
-  for (auto& message : messages) {
-    auto buf = folly::IOBuf::copyBuffer(
-        ByteRange((unsigned char*)message.data(), message.size()));
-    batchWriter->append(
-        std::move(buf), message.size(), quic::SocketAddress(), nullptr);
-    size += message.size();
-    CHECK_EQ(batchWriter->size(), size);
-  }
-
-  EXPECT_CALL(sock, writem(_, _, _, _))
-      .Times(1)
-      .WillOnce(Invoke([&](folly::Range<quic::SocketAddress const*> addrs,
-                           iovec* iovecs,
-                           size_t* messageSizes,
-                           size_t count) {
-        EXPECT_EQ(addrs.size(), 1);
-        EXPECT_EQ(count, messages.size());
-
-        size_t currentIovIndex = 0;
-        for (size_t i = 0; i < count; i++) {
-          auto wrappedIovBuffer =
-              folly::IOBuf::wrapIov(iovecs + currentIovIndex, messageSizes[i]);
-          currentIovIndex += messageSizes[i];
-
-          folly::IOBufEqualTo eq;
-          EXPECT_TRUE(
-              eq(wrappedIovBuffer,
-                 folly::IOBuf::copyBuffer(ByteRange(
-                     (unsigned char*)messages[i].data(), messages[i].size()))));
-        }
-
-        return 0;
-      }));
-
-  batchWriter->write(sock, quic::SocketAddress());
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgNewlyAllocatedIovecMatches) {
-  // In this test case, we surpass the kNumIovecBufferChains limit
-  // (i.e. the number of contiguous buffers we are sending)
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  quic::test::MockAsyncUDPSocket sock(qEvb);
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG,
-      kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-
-  std::vector<std::vector<std::string>> messages{
-      {"It", "is", "sunny!"},
-      {"but", "it", "is", "so", "cold"},
-      {"my",
-       "jacket",
-       "isn't",
-       "warm",
-       "enough",
-       "and",
-       "my",
-       "hands",
-       "are",
-       "freezing"}};
-
-  CHECK(batchWriter->empty());
-  CHECK_EQ(batchWriter->size(), 0);
-
-  std::vector<BufPtr> buffers;
-
-  size_t size = 0;
-  for (auto& message : messages) {
-    auto buf = std::make_unique<folly::IOBuf>();
-    for (size_t j = 0; j < message.size(); j++) {
-      auto partBuf = folly::IOBuf::copyBuffer(
-          ByteRange((unsigned char*)message[j].data(), message[j].size()));
-      buf->appendToChain(std::move(partBuf));
-    }
-    buffers.emplace_back(std::move(buf));
-  }
-
-  for (size_t i = 0; i < messages.size(); i++) {
-    batchWriter->append(
-        buffers[i]->clone(),
-        buffers[i]->computeChainDataLength(),
-        quic::SocketAddress(),
-        nullptr);
-    size += buffers[i]->computeChainDataLength();
-    CHECK_EQ(batchWriter->size(), size);
-  }
-
-  EXPECT_CALL(sock, writem(_, _, _, _))
-      .Times(1)
-      .WillOnce(Invoke([&](folly::Range<quic::SocketAddress const*> addrs,
-                           iovec* iovecs,
-                           size_t* messageSizes,
-                           size_t count) {
-        EXPECT_EQ(addrs.size(), 1);
-        EXPECT_EQ(count, messages.size());
-
-        size_t currentIovIndex = 0;
-        for (size_t i = 0; i < count; i++) {
-          auto wrappedIovBuffer =
-              folly::IOBuf::wrapIov(iovecs + currentIovIndex, messageSizes[i]);
-          currentIovIndex += messageSizes[i];
-
-          folly::IOBufEqualTo eq;
-          EXPECT_TRUE(eq(wrappedIovBuffer, buffers[i]));
-        }
-
-        return 0;
-      }));
-
-  batchWriter->write(sock, quic::SocketAddress());
 }
 
 TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgInplace) {
@@ -690,109 +327,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgInplace) {
   }
 }
 
-TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOBatchNum) {
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  FollyQuicAsyncUDPSocket sock(qEvb);
-  auto ret = sock.setReuseAddr(false);
-  ASSERT_FALSE(ret.hasError());
-  ASSERT_FALSE(sock.bind(quic::SocketAddress("127.0.0.1", 0)).hasError());
-  auto gsoResult = sock.getGSO();
-  ASSERT_FALSE(gsoResult.hasError());
-  gsoSupported_ = gsoResult.value();
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
-      kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest(kStrLen, 'A');
-  // if GSO is not available, just test we've got a regular
-  // batch writer
-  if (gsoSupported_) {
-    // run multiple loops
-    for (size_t i = 0; i < kNumLoops; i++) {
-      // try to batch up to kBatchNum
-      CHECK(batchWriter->empty());
-      CHECK_EQ(batchWriter->size(), 0);
-      size_t size = 0;
-      for (auto j = 0; j < kBatchNum - 1; j++) {
-        auto buf = folly::IOBuf::copyBuffer(strTest);
-        EXPECT_FALSE(batchWriter->append(
-            std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-        size += kStrLen;
-        CHECK_EQ(batchWriter->size(), size);
-      }
-
-      // add the kBatchNum buf
-      auto buf = folly::IOBuf::copyBuffer(strTest.c_str(), kStrLen);
-      CHECK(batchWriter->append(
-          std::move(buf), kStrLen, quic::SocketAddress(), nullptr));
-      size += kStrLen;
-      CHECK_EQ(batchWriter->size(), size);
-      batchWriter->reset();
-    }
-  }
-}
-
-TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOBatcBigSmallPacket) {
-  folly::EventBase evb;
-  std::shared_ptr<FollyQuicEventBase> qEvb =
-      std::make_shared<FollyQuicEventBase>(&evb);
-  FollyQuicAsyncUDPSocket sock(qEvb);
-  auto ret = sock.setReuseAddr(false);
-  ASSERT_FALSE(ret.hasError());
-  ASSERT_FALSE(sock.bind(quic::SocketAddress("127.0.0.1", 0)).hasError());
-  auto gsoResult = sock.getGSO();
-  ASSERT_FALSE(gsoResult.hasError());
-  gsoSupported_ = gsoResult.value();
-
-  auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
-      quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
-      3 * kBatchNum,
-      DataPathType::ChainedMemory,
-      conn_,
-      gsoSupported_);
-  CHECK(batchWriter);
-  std::string strTest(kStrLen, 'A');
-  // if GSO is not available, just test we've got a regular
-  // batch writer
-  if (gsoSupported_) {
-    // run multiple loops
-    for (size_t i = 0; i < kNumLoops; i++) {
-      // try to batch up to kBatchNum
-      CHECK(batchWriter->empty());
-      CHECK_EQ(batchWriter->size(), 0);
-      size_t size = 0;
-      for (auto j = 0; j < 3 * kBatchNum - 1; j++) {
-        strTest = (j % 3 == 0) ? std::string(kStrLen, 'A')
-                               : ((j % 3 == 1) ? std::string(kStrLenLT, 'A')
-                                               : std::string(kStrLenGT, 'A'));
-        auto buf = folly::IOBuf::copyBuffer(strTest);
-        // we can add various sizes without the need to flush until we add
-        // the maxBufs buffer
-        EXPECT_FALSE(batchWriter->append(
-            std::move(buf), strTest.length(), quic::SocketAddress(), nullptr));
-        size += strTest.length();
-        CHECK_EQ(batchWriter->size(), size);
-      }
-
-      // add the kBatchNum buf
-      auto buf = folly::IOBuf::copyBuffer(strTest.c_str(), kStrLen);
-      CHECK(batchWriter->append(
-          std::move(buf), strTest.length(), quic::SocketAddress(), nullptr));
-      size += strTest.length();
-      CHECK_EQ(batchWriter->size(), size);
-      batchWriter->reset();
-    }
-  }
-}
-
-// Test the case where we send 5 packets, all of the same size, to the
-// same address.
 TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceSameSizeAll) {
   gsoSupported_ = true;
   size_t batchSize = 5;
@@ -1466,16 +1000,6 @@ TEST_F(SinglePacketInplaceBatchWriterTest, TestFactorySuccess) {
   auto batchWriter = makeBatchWriter();
   CHECK(batchWriter);
   CHECK(dynamic_cast<quic::SinglePacketInplaceBatchWriter*>(batchWriter.get()));
-}
-
-TEST_F(SinglePacketInplaceBatchWriterTest, TestFactoryNoTransportSetting) {
-  conn_.transportSettings.maxBatchSize = 1;
-  conn_.transportSettings.dataPathType = DataPathType::ChainedMemory;
-  auto batchWriter = makeBatchWriter();
-  CHECK(batchWriter);
-  EXPECT_EQ(
-      dynamic_cast<quic::SinglePacketInplaceBatchWriter*>(batchWriter.get()),
-      nullptr);
 }
 
 TEST_F(SinglePacketInplaceBatchWriterTest, TestFactoryWithLargerBatchSize) {

@@ -51,9 +51,6 @@ BatchWriterPtr BatchWriterFactory::makeBatchWriter(
   switch (batchingMode) {
     case quic::QuicBatchingMode::BATCHING_MODE_GSO:
       if (gsoSupported) {
-        if (dataPathType == DataPathType::ChainedMemory) {
-          return makeGsoBatchWriter(batchSize);
-        }
         return makeGsoInPlaceBatchWriter(batchSize, conn);
       }
       // GSO unavailable on this device, fall through to single packet
@@ -63,10 +60,7 @@ BatchWriterPtr BatchWriterFactory::makeBatchWriter(
     case quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO:
     default:
       // Default to single packet batching, ignoring batch size
-      if (dataPathType == DataPathType::ContinuousMemory) {
-        return BatchWriterPtr(new SinglePacketInplaceBatchWriter(conn));
-      }
-      return BatchWriterPtr(new SinglePacketBatchWriter());
+      return BatchWriterPtr(new SinglePacketInplaceBatchWriter(conn));
   }
 }
 

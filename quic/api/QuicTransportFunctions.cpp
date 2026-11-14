@@ -551,178 +551,6 @@ continuousMemoryBuildScheduleEncrypt(
       encodedBodySize);
 }
 
-[[nodiscard]] quic::Expected<DataPathResult, QuicError>
-iobufChainBasedBuildScheduleEncrypt(
-    QuicConnectionStateBase& connection,
-    PacketHeader header,
-    PacketNumberSpace pnSpace,
-    PacketNum packetNum,
-    uint64_t cipherOverhead,
-    QuicPacketScheduler& scheduler,
-    uint64_t writableBytes,
-    IOBufQuicBatch& ioBufBatch,
-    const Aead& aead,
-    const PacketNumberCipher& headerCipher,
-    TimePoint sendTime) {
-  // SCONE: Pre-build SCONE packet and adjust max packet size to avoid overflow
-  std::unique_ptr<Buf> preBuildSconePacket;
-  uint64_t adjustedMaxPacketSize = connection.udpSendPacketLen;
-  bool needScone = shouldSendSconePacket(connection, pnSpace, sendTime);
-  if (needScone) {
-    ConnectionId sconeDstCid = header.asShort()->getConnectionId();
-    ConnectionId sconeSrcCid = *connection.serverConnectionId;
-    auto scone = buildSconePacket(
-        connection.scone->configuredRateSignal, sconeDstCid, sconeSrcCid);
-    preBuildSconePacket = std::make_unique<Buf>(std::move(scone));
-    uint64_t sconeSize = preBuildSconePacket->computeChainDataLength();
-
-    // SCONE packets are small; there should always be enough space
-    MVCHECK_GT(
-        adjustedMaxPacketSize,
-        sconeSize,
-        "Insufficient space for SCONE packet");
-    adjustedMaxPacketSize -= sconeSize;
-    VLOG(4) << "SCONE: Reserved " << sconeSize
-            << " bytes, adjusted max packet size to " << adjustedMaxPacketSize;
-  }
-
-  // SCONE flow indicator: reserve space for the 2-byte indicator appended
-  // after the encrypted packet (must check header before it's moved)
-  uint64_t flowIndSize = sconeFlowIndicatorSize(connection, header);
-  adjustedMaxPacketSize -= flowIndSize;
-
-  RegularQuicPacketBuilder pktBuilder(
-      adjustedMaxPacketSize,
-      std::move(header),
-      getPacketNumberEncodingBase(connection, pnSpace, packetNum));
-  MVCHECK_EQ(pktBuilder.remainingSpaceInPkt(), adjustedMaxPacketSize);
-  // It's the scheduler's job to invoke encode header
-  pktBuilder.accountForCipherOverhead(cipherOverhead);
-  auto result =
-      scheduler.scheduleFramesForPacket(std::move(pktBuilder), writableBytes);
-  if (!result.has_value()) {
-    return quic::make_unexpected(result.error());
-  }
-  auto& packet = result->packet;
-  if (!packet || packet->packet.frames.empty()) {
-    auto flushResult = ioBufBatch.flush();
-    if (!flushResult.has_value()) {
-      return quic::make_unexpected(flushResult.error());
-    }
-    updateErrnoCount(connection, ioBufBatch);
-    if (connection.loopDetectorCallback) {
-      connection.writeDebugState.noWriteReason = NoWriteReason::NO_FRAME;
-    }
-    return DataPathResult::makeBuildFailure();
-  }
-  if (packet->body.empty()) {
-    // No more space remaining.
-    auto flushResult = ioBufBatch.flush();
-    if (!flushResult.has_value()) {
-      return quic::make_unexpected(flushResult.error());
-    }
-    updateErrnoCount(connection, ioBufBatch);
-    if (connection.loopDetectorCallback) {
-      connection.writeDebugState.noWriteReason = NoWriteReason::NO_BODY;
-    }
-    return DataPathResult::makeBuildFailure();
-  }
-  packet->header.coalesce();
-  packet->body.coalesce();
-  auto headerLen = packet->header.length();
-  auto bodyLen = packet->body.computeChainDataLength();
-  auto unencrypted = BufHelpers::createCombined(
-      headerLen + bodyLen + aead.getCipherOverhead());
-  auto bodyCursor =
-      ContiguousReadCursor(packet->body.data(), packet->body.length());
-  MVCHECK(bodyCursor.tryPull(unencrypted->writableData() + headerLen, bodyLen));
-  unencrypted->advance(headerLen);
-  unencrypted->append(bodyLen);
-  auto encryptResult =
-      aead.inplaceEncrypt(std::move(unencrypted), &packet->header, packetNum);
-  if (!encryptResult.has_value()) {
-    return quic::make_unexpected(encryptResult.error());
-  }
-  auto packetBuf = std::move(encryptResult.value());
-  PROTO_OOPS_LOG_BUILDER_IF(
-      connection.nodeType == QuicNodeType::Server &&
-          packetBuf->headroom() != headerLen,
-      connection.oopsLogger,
-      proto_oops::makeConnectionSpecificOopsFieldsBuilder(connection),
-      "quic_transport_functions",
-      "invariant_violation: packet headroom mismatch after encryption");
-  MVDCHECK(packetBuf->headroom() == headerLen);
-  packetBuf->clear();
-  auto headerCursor =
-      ContiguousReadCursor(packet->header.data(), packet->header.length());
-  MVCHECK(headerCursor.tryPull(packetBuf->writableData(), headerLen));
-  packetBuf->append(headerLen + bodyLen + aead.getCipherOverhead());
-
-  HeaderForm headerForm = packet->packet.header.getHeaderForm();
-  auto headerEncryptResult = encryptPacketHeader(
-      headerForm,
-      packetBuf->writableData(),
-      headerLen,
-      packetBuf->data() + headerLen,
-      packetBuf->length() - headerLen,
-      headerCipher);
-  if (!headerEncryptResult.has_value()) {
-    return quic::make_unexpected(headerEncryptResult.error());
-  }
-  auto encodedSize = packetBuf->computeChainDataLength();
-  auto encodedBodySize = encodedSize - headerLen;
-
-  // SCONE: Prepend pre-built SCONE packet for co-alescing (size already
-  // accounted for)
-  if (needScone && preBuildSconePacket) {
-    preBuildSconePacket->appendChain(std::move(packetBuf));
-    packetBuf = std::move(preBuildSconePacket);
-    encodedSize = packetBuf->computeChainDataLength();
-    connection.scone->lastSconeSentTime = sendTime;
-    QUIC_STATS(connection.statsCallback, onSconePacketSent);
-    VLOG(4) << "SCONE: Prepended SCONE packet, total size=" << encodedSize;
-
-    if (connection.qLogger) {
-      connection.qLogger->addTransportStateUpdate(
-          fmt::format(
-              "scone_sent:rate={}",
-              static_cast<int>(connection.scone->configuredRateSignal)));
-    }
-  }
-
-  if (connection.transportSettings.isPriming && packetBuf) {
-    packetBuf->coalesce();
-    connection.primingData.emplace_back(std::move(packetBuf));
-    return DataPathResult::makeWriteResult(
-        true, std::move(result.value()), encodedSize, encodedBodySize);
-  }
-
-  // Append SCONE flow indicator as the last 2 bytes of the datagram
-  if (flowIndSize > 0) {
-    auto indicator = BufHelpers::create(kSconeFlowIndicatorSize);
-    indicator->writableData()[0] = kSconeFlowIndicatorByte1;
-    indicator->writableData()[1] = kSconeFlowIndicatorByte2;
-    indicator->append(kSconeFlowIndicatorSize);
-    packetBuf->appendChain(std::move(indicator));
-    encodedSize += kSconeFlowIndicatorSize;
-  }
-
-  if (encodedSize > connection.udpSendPacketLen) {
-    MVVLOG(3) << "Quic sending pkt larger than limit, encodedSize="
-              << encodedSize << " encodedBodySize=" << encodedBodySize;
-  }
-  auto writeResult = ioBufBatch.write(std::move(packetBuf), encodedSize);
-  if (!writeResult.has_value()) {
-    return quic::make_unexpected(writeResult.error());
-  }
-  updateErrnoCount(connection, ioBufBatch);
-  return DataPathResult::makeWriteResult(
-      writeResult.value(),
-      std::move(result.value()),
-      encodedSize,
-      encodedBodySize);
-}
-
 } // namespace
 
 namespace quic {
@@ -2015,24 +1843,20 @@ void updatePacketLimitForImminentStreams(
  *   3. The BatchWriter which writes the data from the IOBufQuicBatch to
  *      the socket
  *
- * The IOBufQuicBatch can hold packets either as a chain of IOBufs or as a
- * single contiguous buffer (continuous vs. chained memory datapaths). This also
- * affects the type of BatchWriter used to read the IOBufQuicBatch and write it
- * to the socket.
+ * The IOBufQuicBatch holds the packets in the connection's contiguous write
+ * buffer, and its BatchWriter writes that buffer to the socket.
  *
  * A rough outline of this function is as follows:
- * 1. Make a BatchWriter for the requested batching mode and datapath type.
+ * 1. Make a BatchWriter for the requested batching mode.
  * 2. Make an IOBufQuicBatch to hold the data. This owns the BatchWriter created
  *    above which it will use to write its data to the socket later.
- * 3. Based upon the selected datapathType, the dataplaneFunc is chosen.
- * 4. The dataplaneFunc is responsible for writing the scheduler's data into the
- *    IOBufQuicBatch in the desired format, and calling the IOBufQuicBatch's
- *    write() function which wraps around the BatchWriter it owns.
- * 5. Each dataplaneFunc call writes one packet to the IOBufQuicBatch. It is
- *    called repeatedly until one of the limits described above is hit.
- * 6. After each packet is written, the connection state is updated to reflect a
+ * 3. continuousMemoryBuildScheduleEncrypt writes the scheduler's data for one
+ *    packet into the write buffer and calls the IOBufQuicBatch's write()
+ *    function, which wraps around the BatchWriter it owns. It is called
+ *    repeatedly until one of the limits described above is hit.
+ * 4. After each packet is written, the connection state is updated to reflect a
  *    packet being sent.
- * 7. Once the limit is hit, the IOBufQuicBatch is flushed to give it another
+ * 5. Once the limit is hit, the IOBufQuicBatch is flushed to give it another
  *    chance to write any remaining data to the socket that hasn't already been
  *    written in the loop.
  *
@@ -2042,7 +1866,7 @@ void updatePacketLimitForImminentStreams(
  * - It only guarantees that packets will be scheduled and written to a
  *   IOBufQuicBatch and that the IOBufQuicBatch will get a chance to write to
  *   the socket.
- * - Step 6 above updates the connection state when the packet is written to the
+ * - Step 4 above updates the connection state when the packet is written to the
  *   buffer, but not necessarily when it is written to the socket. This decision
  *   is made by the IOBufQuicBatch and its BatchWriter.
  * - This function attempts to flush the IOBufQuicBatch before returning
@@ -2093,11 +1917,8 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
              << " writing data using scheduler=" << scheduler.name() << " "
              << connection;
 
-  // Reset the shared buffer at the start of each write loop when using
-  // ContinuousMemory data path.
-  if (connection.transportSettings.dataPathType ==
-          DataPathType::ContinuousMemory &&
-      connection.bufAccessor && connection.bufAccessor->ownsBuffer() &&
+  // Reset the shared buffer at the start of each write loop.
+  if (connection.bufAccessor && connection.bufAccessor->ownsBuffer() &&
       connection.bufAccessor->length() > 0) {
     connection.bufAccessor->clear();
   }
@@ -2182,13 +2003,7 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
           std::move(writeQueueTransaction));
     });
 
-    bool useChainedMemory = connection.transportSettings.dataPathType ==
-        DataPathType::ChainedMemory;
-    const auto& dataPlaneFunc = useChainedMemory
-        ? iobufChainBasedBuildScheduleEncrypt
-        : continuousMemoryBuildScheduleEncrypt;
-
-    auto ret = dataPlaneFunc(
+    auto ret = continuousMemoryBuildScheduleEncrypt(
         connection,
         std::move(header),
         pnSpace,
@@ -2266,13 +2081,10 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
   }
   updateErrnoCount(connection, ioBufBatch);
 
-  if (connection.transportSettings.dataPathType ==
-      DataPathType::ContinuousMemory) {
-    MVCHECK(connection.bufAccessor->ownsBuffer());
-    MVCHECK(
-        connection.bufAccessor->length() == 0 &&
-        connection.bufAccessor->headroom() == 0);
-  }
+  MVCHECK(connection.bufAccessor->ownsBuffer());
+  MVCHECK(
+      connection.bufAccessor->length() == 0 &&
+      connection.bufAccessor->headroom() == 0);
   return WriteQuicDataResult{ioBufBatch.getPktSent(), 0, bytesWritten};
 }
 

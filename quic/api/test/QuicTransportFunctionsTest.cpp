@@ -6428,111 +6428,103 @@ TEST_F(QuicTransportFunctionsTest, SCONEWithContinuousMemory) {
 }
 
 TEST_F(QuicTransportFunctionsTest, SconeDatagramSizesMatchWire) {
-  for (auto path :
-       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
-    for (auto mode :
-         {QuicBatchingMode::BATCHING_MODE_NONE,
-          QuicBatchingMode::BATCHING_MODE_GSO,
-          QuicBatchingMode::BATCHING_MODE_SENDMMSG}) {
-      for (uint64_t mtu : {1200, 1452}) {
-        SCOPED_TRACE(
-            testing::Message() << static_cast<int>(path) << ":"
-                               << static_cast<int>(mode) << ":" << mtu);
-        auto conn = createConn();
-        conn->udpSendPacketLen = mtu;
-        conn->transportSettings.dataPathType = path;
-        conn->transportSettings.batchingMode = mode;
-        conn->transportSettings.maxBatchSize =
-            mode == QuicBatchingMode::BATCHING_MODE_NONE ? 1 : 2;
-        conn->transportSettings.enableSconeSend = true;
-        conn->scone.emplace();
-        conn->peerAdvertisedSconeSupport = true;
-        BufAccessor accessor(mtu * 2);
-        conn->bufAccessor = &accessor;
-        auto prefix = buildSconePacket(
-                          conn->scone->configuredRateSignal,
-                          *conn->clientConnectionId,
-                          *conn->serverConnectionId)
-                          .toString();
-        EventBase evb;
-        auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
-        NiceMock<quic::test::MockAsyncUDPSocket> sock(qEvb);
-        ON_CALL(sock, getGSO()).WillByDefault(Return(0));
-        std::vector<std::string> datagrams;
-        auto capture = [&](const iovec* vec, size_t count, size_t segmentSize) {
-          auto bytes = folly::IOBuf::wrapIov(vec, count)->toString();
-          if (!segmentSize) {
-            segmentSize = bytes.size();
-          }
-          for (size_t offset = 0; offset < bytes.size();
-               offset += segmentSize) {
-            datagrams.push_back(bytes.substr(offset, segmentSize));
-          }
-          return bytes.size();
-        };
-        ON_CALL(sock, write(_, _, _))
-            .WillByDefault(
-                [&](const SocketAddress&, const iovec* vec, size_t count) {
-                  return capture(vec, count, 0);
-                });
-        ON_CALL(sock, writeGSO(_, _, _, _))
-            .WillByDefault([&](const SocketAddress&,
-                               const iovec* vec,
-                               size_t count,
-                               QuicAsyncUDPSocket::WriteOptions options) {
-              return capture(vec, count, options.gso);
-            });
-        ON_CALL(sock, writem(_, _, _, _))
-            .WillByDefault([&](folly::Range<SocketAddress const*>,
-                               iovec* vec,
-                               size_t* counts,
-                               size_t count) {
-              for (size_t i = 0; i < count; ++i) {
-                capture(vec, counts[i], 0);
-                vec += counts[i];
-              }
-              return count;
-            });
-        EXPECT_CALL(*quicStats_, onSconePacketSent()).Times(1);
-        auto stream =
-            conn->streamManager->createNextBidirectionalStream().value();
-        ASSERT_FALSE(
-            writeDataToQuicStream(
-                *stream, folly::IOBuf::copyBuffer(std::string(mtu, 's')), true)
-                .hasError());
-        auto result = writeQuicDataToSocket(
-            sock,
-            *conn,
-            *conn->serverConnectionId,
-            *conn->clientConnectionId,
-            *aead,
-            *headerCipher,
-            getVersion(*conn),
-            2);
-        ASSERT_TRUE(result.has_value());
-        ASSERT_EQ(datagrams.size(), 2);
-        EXPECT_EQ(datagrams[0].substr(0, prefix.size()), prefix);
-        EXPECT_NE(datagrams[1].substr(0, prefix.size()), prefix);
-        EXPECT_EQ(
-            result->bytesWritten, datagrams[0].size() + datagrams[1].size());
-        ASSERT_EQ(conn->outstandings.packets.size(), 2);
-        size_t index = 0;
-        for (const auto& packet : conn->outstandings.packets) {
-          EXPECT_EQ(packet.metadata.encodedSize, datagrams[index].size());
-          EXPECT_LE(datagrams[index].size(), mtu);
-          const auto prefixSize = index == 0 ? prefix.size() : 0;
-          const auto headerSize = 1 + conn->clientConnectionId->size() +
-              parsePacketNumberLength(datagrams[index][prefixSize]);
-          EXPECT_EQ(
-              packet.metadata.encodedBodySize,
-              datagrams[index].size() - prefixSize - headerSize);
-          ++index;
+  for (auto mode :
+       {QuicBatchingMode::BATCHING_MODE_NONE,
+        QuicBatchingMode::BATCHING_MODE_GSO,
+        QuicBatchingMode::BATCHING_MODE_SENDMMSG}) {
+    for (uint64_t mtu : {1200, 1452}) {
+      SCOPED_TRACE(testing::Message() << static_cast<int>(mode) << ":" << mtu);
+      auto conn = createConn();
+      conn->udpSendPacketLen = mtu;
+      conn->transportSettings.batchingMode = mode;
+      conn->transportSettings.maxBatchSize =
+          mode == QuicBatchingMode::BATCHING_MODE_NONE ? 1 : 2;
+      conn->transportSettings.enableSconeSend = true;
+      conn->scone.emplace();
+      conn->peerAdvertisedSconeSupport = true;
+      BufAccessor accessor(mtu * 2);
+      conn->bufAccessor = &accessor;
+      auto prefix = buildSconePacket(
+                        conn->scone->configuredRateSignal,
+                        *conn->clientConnectionId,
+                        *conn->serverConnectionId)
+                        .toString();
+      EventBase evb;
+      auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+      NiceMock<quic::test::MockAsyncUDPSocket> sock(qEvb);
+      ON_CALL(sock, getGSO()).WillByDefault(Return(0));
+      std::vector<std::string> datagrams;
+      auto capture = [&](const iovec* vec, size_t count, size_t segmentSize) {
+        auto bytes = folly::IOBuf::wrapIov(vec, count)->toString();
+        if (!segmentSize) {
+          segmentSize = bytes.size();
         }
-        EXPECT_TRUE(conn->scone->lastSconeSentTime.has_value());
-        EXPECT_EQ(accessor.length(), 0);
-        EXPECT_EQ(accessor.headroom(), 0);
-        testing::Mock::VerifyAndClearExpectations(quicStats_.get());
+        for (size_t offset = 0; offset < bytes.size(); offset += segmentSize) {
+          datagrams.push_back(bytes.substr(offset, segmentSize));
+        }
+        return bytes.size();
+      };
+      ON_CALL(sock, write(_, _, _))
+          .WillByDefault([&](const SocketAddress&,
+                             const iovec* vec,
+                             size_t count) { return capture(vec, count, 0); });
+      ON_CALL(sock, writeGSO(_, _, _, _))
+          .WillByDefault([&](const SocketAddress&,
+                             const iovec* vec,
+                             size_t count,
+                             QuicAsyncUDPSocket::WriteOptions options) {
+            return capture(vec, count, options.gso);
+          });
+      ON_CALL(sock, writem(_, _, _, _))
+          .WillByDefault([&](folly::Range<SocketAddress const*>,
+                             iovec* vec,
+                             size_t* counts,
+                             size_t count) {
+            for (size_t i = 0; i < count; ++i) {
+              capture(vec, counts[i], 0);
+              vec += counts[i];
+            }
+            return count;
+          });
+      EXPECT_CALL(*quicStats_, onSconePacketSent()).Times(1);
+      auto stream =
+          conn->streamManager->createNextBidirectionalStream().value();
+      ASSERT_FALSE(
+          writeDataToQuicStream(
+              *stream, folly::IOBuf::copyBuffer(std::string(mtu, 's')), true)
+              .hasError());
+      auto result = writeQuicDataToSocket(
+          sock,
+          *conn,
+          *conn->serverConnectionId,
+          *conn->clientConnectionId,
+          *aead,
+          *headerCipher,
+          getVersion(*conn),
+          2);
+      ASSERT_TRUE(result.has_value());
+      ASSERT_EQ(datagrams.size(), 2);
+      EXPECT_EQ(datagrams[0].substr(0, prefix.size()), prefix);
+      EXPECT_NE(datagrams[1].substr(0, prefix.size()), prefix);
+      EXPECT_EQ(
+          result->bytesWritten, datagrams[0].size() + datagrams[1].size());
+      ASSERT_EQ(conn->outstandings.packets.size(), 2);
+      size_t index = 0;
+      for (const auto& packet : conn->outstandings.packets) {
+        EXPECT_EQ(packet.metadata.encodedSize, datagrams[index].size());
+        EXPECT_LE(datagrams[index].size(), mtu);
+        const auto prefixSize = index == 0 ? prefix.size() : 0;
+        const auto headerSize = 1 + conn->clientConnectionId->size() +
+            parsePacketNumberLength(datagrams[index][prefixSize]);
+        EXPECT_EQ(
+            packet.metadata.encodedBodySize,
+            datagrams[index].size() - prefixSize - headerSize);
+        ++index;
       }
+      EXPECT_TRUE(conn->scone->lastSconeSentTime.has_value());
+      EXPECT_EQ(accessor.length(), 0);
+      EXPECT_EQ(accessor.headroom(), 0);
+      testing::Mock::VerifyAndClearExpectations(quicStats_.get());
     }
   }
 }
@@ -6540,104 +6532,96 @@ TEST_F(QuicTransportFunctionsTest, SconeDatagramSizesMatchWire) {
 TEST_F(QuicTransportFunctionsTest, SconePrefixRolledBackWhenSchedulingFails) {
   enum Failure { NoPacket, NoFrames, NoBody, Error };
 
-  for (auto path :
-       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
-    for (auto failure : {NoPacket, NoFrames, NoBody, Error}) {
-      const bool schedulerError = failure == Error;
-      SCOPED_TRACE(
-          testing::Message() << static_cast<int>(path) << ":" << failure);
-      auto conn = createConn();
-      conn->transportSettings.dataPathType = path;
-      conn->transportSettings.batchingMode =
-          QuicBatchingMode::BATCHING_MODE_NONE;
-      conn->transportSettings.maxBatchSize = 1;
-      conn->transportSettings.enableSconeSend = true;
-      conn->scone.emplace();
-      conn->peerAdvertisedSconeSupport = true;
-      BufAccessor accessor(conn->udpSendPacketLen);
-      conn->bufAccessor = &accessor;
-      EventBase evb;
-      auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
-      NiceMock<quic::test::MockAsyncUDPSocket> sock(qEvb);
-      ON_CALL(sock, getGSO()).WillByDefault(Return(0));
-      EXPECT_CALL(sock, write(_, _, _)).Times(0);
-      EXPECT_CALL(*quicStats_, onSconePacketSent()).Times(0);
-      NiceMock<MockFrameScheduler> scheduler(conn.get());
-      ON_CALL(scheduler, hasData()).WillByDefault(Return(true));
-      EXPECT_CALL(scheduler, _scheduleFramesForPacket(_, _))
-          .WillOnce(
-              [&](PacketBuilderInterface* builder,
-                  uint32_t) -> Expected<SchedulingResult, QuicError> {
-                auto encoded = builder->encodePacketHeader();
-                EXPECT_TRUE(encoded.has_value());
-                builder->writeBE(uint8_t{0x42});
-                if (schedulerError) {
-                  return quic::make_unexpected(QuicError(
-                      TransportErrorCode::INTERNAL_ERROR, "scheduler failure"));
-                }
-                if (failure == NoPacket) {
-                  std::move(*builder).releaseOutputBuffer();
-                  return SchedulingResult(std::nullopt, std::nullopt);
-                }
-                if (failure == NoBody) {
-                  builder->appendFrame(PingFrame());
-                }
-                auto packet = std::move(*builder).buildPacket();
-                if (failure == NoBody) {
-                  packet.body.clear();
-                }
-                return SchedulingResult(std::nullopt, std::move(packet));
-              });
-      auto result = writeConnectionDataToSocket(
-          sock,
-          *conn,
-          conn->currentPathId,
-          *conn->serverConnectionId,
-          *conn->clientConnectionId,
-          ShortHeaderBuilder(conn->oneRttWritePhase),
-          PacketNumberSpace::AppData,
-          scheduler,
-          [](QuicConnectionStateBase& c) { return c.udpSendPacketLen; },
-          1,
-          *aead,
-          *headerCipher,
-          getVersion(*conn),
-          Clock::now());
-      EXPECT_EQ(result.hasError(), schedulerError);
-      EXPECT_TRUE(accessor.ownsBuffer());
-      EXPECT_EQ(accessor.length(), 0);
-      EXPECT_EQ(accessor.headroom(), 0);
-      EXPECT_FALSE(conn->scone->lastSconeSentTime.has_value());
-      EXPECT_TRUE(conn->outstandings.packets.empty());
-      testing::Mock::VerifyAndClearExpectations(quicStats_.get());
-      testing::Mock::VerifyAndClearExpectations(&sock);
-      EXPECT_CALL(*quicStats_, onSconePacketSent()).Times(1);
-      EXPECT_CALL(sock, write(_, _, _))
-          .WillOnce(
-              Invoke([](const SocketAddress&, const iovec* vec, size_t count) {
-                return getTotalIovecLen(vec, count);
-              }));
-      auto stream =
-          conn->streamManager->createNextBidirectionalStream().value();
-      ASSERT_FALSE(
-          writeDataToQuicStream(
-              *stream,
-              folly::IOBuf::copyBuffer("retry after failed scheduling"),
-              true)
-              .hasError());
-      ASSERT_TRUE(writeQuicDataToSocket(
-                      sock,
-                      *conn,
-                      *conn->serverConnectionId,
-                      *conn->clientConnectionId,
-                      *aead,
-                      *headerCipher,
-                      getVersion(*conn),
-                      1)
-                      .has_value());
-      EXPECT_TRUE(conn->scone->lastSconeSentTime.has_value());
-      testing::Mock::VerifyAndClearExpectations(quicStats_.get());
-    }
+  for (auto failure : {NoPacket, NoFrames, NoBody, Error}) {
+    const bool schedulerError = failure == Error;
+    SCOPED_TRACE(testing::Message() << failure);
+    auto conn = createConn();
+    conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_NONE;
+    conn->transportSettings.maxBatchSize = 1;
+    conn->transportSettings.enableSconeSend = true;
+    conn->scone.emplace();
+    conn->peerAdvertisedSconeSupport = true;
+    BufAccessor accessor(conn->udpSendPacketLen);
+    conn->bufAccessor = &accessor;
+    EventBase evb;
+    auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+    NiceMock<quic::test::MockAsyncUDPSocket> sock(qEvb);
+    ON_CALL(sock, getGSO()).WillByDefault(Return(0));
+    EXPECT_CALL(sock, write(_, _, _)).Times(0);
+    EXPECT_CALL(*quicStats_, onSconePacketSent()).Times(0);
+    NiceMock<MockFrameScheduler> scheduler(conn.get());
+    ON_CALL(scheduler, hasData()).WillByDefault(Return(true));
+    EXPECT_CALL(scheduler, _scheduleFramesForPacket(_, _))
+        .WillOnce(
+            [&](PacketBuilderInterface* builder,
+                uint32_t) -> Expected<SchedulingResult, QuicError> {
+              auto encoded = builder->encodePacketHeader();
+              EXPECT_TRUE(encoded.has_value());
+              builder->writeBE(uint8_t{0x42});
+              if (schedulerError) {
+                return quic::make_unexpected(QuicError(
+                    TransportErrorCode::INTERNAL_ERROR, "scheduler failure"));
+              }
+              if (failure == NoPacket) {
+                std::move(*builder).releaseOutputBuffer();
+                return SchedulingResult(std::nullopt, std::nullopt);
+              }
+              if (failure == NoBody) {
+                builder->appendFrame(PingFrame());
+              }
+              auto packet = std::move(*builder).buildPacket();
+              if (failure == NoBody) {
+                packet.body.clear();
+              }
+              return SchedulingResult(std::nullopt, std::move(packet));
+            });
+    auto result = writeConnectionDataToSocket(
+        sock,
+        *conn,
+        conn->currentPathId,
+        *conn->serverConnectionId,
+        *conn->clientConnectionId,
+        ShortHeaderBuilder(conn->oneRttWritePhase),
+        PacketNumberSpace::AppData,
+        scheduler,
+        [](QuicConnectionStateBase& c) { return c.udpSendPacketLen; },
+        1,
+        *aead,
+        *headerCipher,
+        getVersion(*conn),
+        Clock::now());
+    EXPECT_EQ(result.hasError(), schedulerError);
+    EXPECT_TRUE(accessor.ownsBuffer());
+    EXPECT_EQ(accessor.length(), 0);
+    EXPECT_EQ(accessor.headroom(), 0);
+    EXPECT_FALSE(conn->scone->lastSconeSentTime.has_value());
+    EXPECT_TRUE(conn->outstandings.packets.empty());
+    testing::Mock::VerifyAndClearExpectations(quicStats_.get());
+    testing::Mock::VerifyAndClearExpectations(&sock);
+    EXPECT_CALL(*quicStats_, onSconePacketSent()).Times(1);
+    EXPECT_CALL(sock, write(_, _, _))
+        .WillOnce(
+            Invoke([](const SocketAddress&, const iovec* vec, size_t count) {
+              return getTotalIovecLen(vec, count);
+            }));
+    auto stream = conn->streamManager->createNextBidirectionalStream().value();
+    ASSERT_FALSE(writeDataToQuicStream(
+                     *stream,
+                     folly::IOBuf::copyBuffer("retry after failed scheduling"),
+                     true)
+                     .hasError());
+    ASSERT_TRUE(writeQuicDataToSocket(
+                    sock,
+                    *conn,
+                    *conn->serverConnectionId,
+                    *conn->clientConnectionId,
+                    *aead,
+                    *headerCipher,
+                    getVersion(*conn),
+                    1)
+                    .has_value());
+    EXPECT_TRUE(conn->scone->lastSconeSentTime.has_value());
+    testing::Mock::VerifyAndClearExpectations(quicStats_.get());
   }
 }
 
@@ -6692,110 +6676,97 @@ TEST_F(QuicTransportFunctionsTest, SconeFlowIndicatorOnInitialPackets) {
 TEST_F(QuicTransportFunctionsTest, SconeFlowIndicatorOnClonedInitialPackets) {
   constexpr auto kCryptoDataSizeMultiplier = 2;
 
-  for (const auto dataPathType :
-       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
-    SCOPED_TRACE(
-        dataPathType == DataPathType::ChainedMemory ? "chained" : "inplace");
-    auto conn = createClientConn();
-    FizzCryptoFactory cryptoFactory;
-    conn->initialWriteCipher =
-        cryptoFactory
-            .getClientInitialCipher(
-                *conn->serverConnectionId, getVersion(*conn))
-            .value();
-    ASSERT_GT(conn->initialWriteCipher->getCipherOverhead(), 0);
-    conn->transportSettings.dataPathType = dataPathType;
-    conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_NONE;
-    conn->transportSettings.maxBatchSize = 1;
-    conn->transportSettings.advertiseSconeSupport = true;
+  auto conn = createClientConn();
+  FizzCryptoFactory cryptoFactory;
+  conn->initialWriteCipher =
+      cryptoFactory
+          .getClientInitialCipher(*conn->serverConnectionId, getVersion(*conn))
+          .value();
+  ASSERT_GT(conn->initialWriteCipher->getCipherOverhead(), 0);
+  conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_NONE;
+  conn->transportSettings.maxBatchSize = 1;
+  conn->transportSettings.advertiseSconeSupport = true;
 
-    std::unique_ptr<BufAccessor> bufAccessor;
-    if (dataPathType == DataPathType::ContinuousMemory) {
-      bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen);
-      conn->bufAccessor = bufAccessor.get();
-    }
+  auto bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen);
+  conn->bufAccessor = bufAccessor.get();
 
-    EventBase evb;
-    auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
-    quic::test::MockAsyncUDPSocket mockSock(qEvb);
-    ON_CALL(mockSock, getGSO()).WillByDefault(Return(0));
+  EventBase evb;
+  auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+  quic::test::MockAsyncUDPSocket mockSock(qEvb);
+  ON_CALL(mockSock, getGSO()).WillByDefault(Return(0));
 
-    bool captureProbe = false;
-    std::vector<uint8_t> probeData;
-    EXPECT_CALL(mockSock, write(_, _, _))
-        .WillRepeatedly([&](const SocketAddress&,
-                            const struct iovec* vec,
-                            size_t iovecLen) {
-          if (captureProbe) {
-            for (size_t i = 0; i < iovecLen; ++i) {
-              auto* data = static_cast<uint8_t*>(vec[i].iov_base);
-              probeData.insert(probeData.end(), data, data + vec[i].iov_len);
+  bool captureProbe = false;
+  std::vector<uint8_t> probeData;
+  EXPECT_CALL(mockSock, write(_, _, _))
+      .WillRepeatedly(
+          [&](const SocketAddress&, const struct iovec* vec, size_t iovecLen) {
+            if (captureProbe) {
+              for (size_t i = 0; i < iovecLen; ++i) {
+                auto* data = static_cast<uint8_t*>(vec[i].iov_base);
+                probeData.insert(probeData.end(), data, data + vec[i].iov_len);
+              }
             }
-          }
-          return getTotalIovecLen(vec, iovecLen);
-        });
+            return getTotalIovecLen(vec, iovecLen);
+          });
 
-    auto* cryptoStream = &conn->cryptoState->initialStream;
-    writeDataToQuicStream(
-        *cryptoStream,
-        buildRandomInputData(
-            conn->udpSendPacketLen * kCryptoDataSizeMultiplier));
-    auto writeResult = writeCryptoAndAckDataToSocket(
-        mockSock,
-        *conn,
-        *conn->clientConnectionId,
-        *conn->serverConnectionId,
-        LongHeader::Types::Initial,
-        *conn->initialWriteCipher,
-        *conn->initialHeaderCipher,
-        getVersion(*conn),
-        conn->transportSettings.writeConnectionDataPacketsLimit);
-    ASSERT_FALSE(writeResult.hasError());
-    ASSERT_TRUE(cryptoStream->pendingWrites.empty());
-    ASSERT_FALSE(conn->outstandings.packets.empty());
+  auto* cryptoStream = &conn->cryptoState->initialStream;
+  writeDataToQuicStream(
+      *cryptoStream,
+      buildRandomInputData(conn->udpSendPacketLen * kCryptoDataSizeMultiplier));
+  auto writeResult = writeCryptoAndAckDataToSocket(
+      mockSock,
+      *conn,
+      *conn->clientConnectionId,
+      *conn->serverConnectionId,
+      LongHeader::Types::Initial,
+      *conn->initialWriteCipher,
+      *conn->initialHeaderCipher,
+      getVersion(*conn),
+      conn->transportSettings.writeConnectionDataPacketsLimit);
+  ASSERT_FALSE(writeResult.hasError());
+  ASSERT_TRUE(cryptoStream->pendingWrites.empty());
+  ASSERT_FALSE(conn->outstandings.packets.empty());
 
-    const auto outstandingPacketsBeforeProbe =
-        conn->outstandings.packets.size();
-    const auto originalPacketNum =
-        conn->outstandings.packets.front().packet.header.getPacketSequenceNum();
-    std::vector<WriteCryptoFrame> originalCryptoFrames;
-    for (const auto& frame : conn->outstandings.packets.front().packet.frames) {
-      if (const auto* cryptoFrame = frame.asWriteCryptoFrame()) {
-        originalCryptoFrames.push_back(*cryptoFrame);
-      }
+  const auto outstandingPacketsBeforeProbe = conn->outstandings.packets.size();
+  const auto originalPacketNum =
+      conn->outstandings.packets.front().packet.header.getPacketSequenceNum();
+  std::vector<WriteCryptoFrame> originalCryptoFrames;
+  for (const auto& frame : conn->outstandings.packets.front().packet.frames) {
+    if (const auto* cryptoFrame = frame.asWriteCryptoFrame()) {
+      originalCryptoFrames.push_back(*cryptoFrame);
     }
-    ASSERT_FALSE(originalCryptoFrames.empty());
+  }
+  ASSERT_FALSE(originalCryptoFrames.empty());
 
-    captureProbe = true;
-    writeCryptoDataProbesToSocketForTest(
-        mockSock,
-        *conn,
-        1,
-        *conn->initialWriteCipher,
-        *conn->initialHeaderCipher,
-        getVersion(*conn));
+  captureProbe = true;
+  writeCryptoDataProbesToSocketForTest(
+      mockSock,
+      *conn,
+      1,
+      *conn->initialWriteCipher,
+      *conn->initialHeaderCipher,
+      getVersion(*conn));
 
-    ASSERT_EQ(
-        conn->outstandings.packets.size(), outstandingPacketsBeforeProbe + 1);
-    const auto& clonedPacket = conn->outstandings.packets.back();
-    ASSERT_TRUE(clonedPacket.maybeClonedPacketIdentifier.has_value());
-    EXPECT_EQ(
-        originalPacketNum,
-        clonedPacket.maybeClonedPacketIdentifier->packetNumber);
-    std::vector<WriteCryptoFrame> clonedCryptoFrames;
-    for (const auto& frame : clonedPacket.packet.frames) {
-      if (const auto* cryptoFrame = frame.asWriteCryptoFrame()) {
-        clonedCryptoFrames.push_back(*cryptoFrame);
-      }
+  ASSERT_EQ(
+      conn->outstandings.packets.size(), outstandingPacketsBeforeProbe + 1);
+  const auto& clonedPacket = conn->outstandings.packets.back();
+  ASSERT_TRUE(clonedPacket.maybeClonedPacketIdentifier.has_value());
+  EXPECT_EQ(
+      originalPacketNum,
+      clonedPacket.maybeClonedPacketIdentifier->packetNumber);
+  std::vector<WriteCryptoFrame> clonedCryptoFrames;
+  for (const auto& frame : clonedPacket.packet.frames) {
+    if (const auto* cryptoFrame = frame.asWriteCryptoFrame()) {
+      clonedCryptoFrames.push_back(*cryptoFrame);
     }
-    EXPECT_EQ(originalCryptoFrames, clonedCryptoFrames);
+  }
+  EXPECT_EQ(originalCryptoFrames, clonedCryptoFrames);
 
-    ASSERT_EQ(probeData.size(), conn->udpSendPacketLen);
-    EXPECT_EQ(probeData[probeData.size() - 2], kSconeFlowIndicatorByte1);
-    EXPECT_EQ(probeData[probeData.size() - 1], kSconeFlowIndicatorByte2);
-    if (bufAccessor) {
-      EXPECT_EQ(bufAccessor->length(), 0);
-    }
+  ASSERT_EQ(probeData.size(), conn->udpSendPacketLen);
+  EXPECT_EQ(probeData[probeData.size() - 2], kSconeFlowIndicatorByte1);
+  EXPECT_EQ(probeData[probeData.size() - 1], kSconeFlowIndicatorByte2);
+  if (bufAccessor) {
+    EXPECT_EQ(bufAccessor->length(), 0);
   }
 }
 
