@@ -14,18 +14,10 @@ void BatchWriterDeleter::operator()(BatchWriter* batchWriter) {
   delete batchWriter;
 }
 
-BatchWriterPtr makeGsoBatchWriter(uint32_t batchSize) {
-  return BatchWriterPtr(new GSOPacketBatchWriter(batchSize));
-}
-
 BatchWriterPtr makeGsoInPlaceBatchWriter(
     uint32_t batchSize,
     QuicConnectionStateBase& conn) {
   return BatchWriterPtr(new GSOInplacePacketBatchWriter(conn, batchSize));
-}
-
-BatchWriterPtr makeSendmmsgGsoBatchWriter(uint32_t) {
-  return nullptr;
 }
 
 BatchWriterPtr makeSendmmsgInplaceGsoInplaceBatchWriter(

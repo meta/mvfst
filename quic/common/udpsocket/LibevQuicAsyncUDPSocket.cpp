@@ -135,7 +135,7 @@ ssize_t LibevQuicAsyncUDPSocket::write(
 quic::Expected<int, QuicError> LibevQuicAsyncUDPSocket::getGSO() {
 #if defined(UDP_SEGMENT)
   // If runtime fallback in writeGSO() marked GSO as unsupported, return -1
-  // immediately so the transport switches to SinglePacketBatchWriter.
+  // immediately so the transport switches to a single packet batch writer.
   if (gso_ == -1) {
     return gso_;
   }
@@ -209,7 +209,7 @@ ssize_t LibevQuicAsyncUDPSocket::writeGSO(
     // reject UDP GSO with EIO/EINVAL/EMSGSIZE even though
     // getsockopt(UDP_SEGMENT) succeeds. Fall back to sending each QUIC
     // packet individually without GSO and mark GSO as unsupported so the
-    // transport layer switches to SinglePacketBatchWriter.
+    // transport layer switches to a single packet batch writer.
     //
     // We split by options.gso (the segment size) rather than by iovec,
     // because the ContinuousMemory path concatenates all packets into a

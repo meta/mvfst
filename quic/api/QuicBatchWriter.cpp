@@ -14,30 +14,6 @@ bool BatchWriter::needsFlush(size_t /*unused*/) {
   return false;
 }
 
-// SinglePacketBatchWriter
-void SinglePacketBatchWriter::reset() {
-  buf_.reset();
-}
-
-bool SinglePacketBatchWriter::append(
-    BufPtr&& buf,
-    size_t /*unused*/,
-    const quic::SocketAddress& /*unused*/,
-    QuicAsyncUDPSocket* /*unused*/) {
-  buf_ = std::move(buf);
-
-  // needs to be flushed
-  return true;
-}
-
-ssize_t SinglePacketBatchWriter::write(
-    QuicAsyncUDPSocket& sock,
-    const quic::SocketAddress& address) {
-  iovec vec[kNumIovecBufferChains];
-  size_t iovec_len = fillIovec(buf_, vec);
-  return sock.write(address, vec, iovec_len);
-}
-
 // SinglePacketInplaceBatchWriter
 void SinglePacketInplaceBatchWriter::reset() {
   conn_.bufAccessor->clear();
@@ -65,104 +41,6 @@ ssize_t SinglePacketInplaceBatchWriter::write(
 
 bool SinglePacketInplaceBatchWriter::empty() const {
   return conn_.bufAccessor->length() == 0;
-}
-
-// SendmmsgPacketBatchWriter
-SendmmsgPacketBatchWriter::SendmmsgPacketBatchWriter(size_t maxBufs)
-    : maxBufs_(maxBufs) {
-  bufs_.reserve(maxBufs);
-}
-
-bool SendmmsgPacketBatchWriter::empty() const {
-  return !currSize_;
-}
-
-size_t SendmmsgPacketBatchWriter::size() const {
-  return currSize_;
-}
-
-void SendmmsgPacketBatchWriter::reset() {
-  bufs_.clear();
-  currSize_ = 0;
-}
-
-bool SendmmsgPacketBatchWriter::append(
-    BufPtr&& buf,
-    size_t size,
-    const quic::SocketAddress& /*unused*/,
-    QuicAsyncUDPSocket* /*unused*/) {
-  MVCHECK_LT(bufs_.size(), maxBufs_);
-  bufs_.emplace_back(std::move(buf));
-  currSize_ += size;
-
-  // reached max buffers
-  if (bufs_.size() == maxBufs_) [[unlikely]] {
-    return true;
-  }
-
-  // does not need to be flushed yet
-  return false;
-}
-
-ssize_t SendmmsgPacketBatchWriter::write(
-    QuicAsyncUDPSocket& sock,
-    const quic::SocketAddress& address) {
-  MVCHECK_GT(bufs_.size(), 0);
-  if (bufs_.size() == 1) {
-    iovec vec[kNumIovecBufferChains];
-    size_t iovec_len = fillIovec(bufs_.at(0), vec);
-    return sock.write(address, vec, iovec_len);
-  }
-
-  size_t numChainedBuffers = 0;
-  for (auto& buf : bufs_) {
-    numChainedBuffers += buf->countChainElements();
-  }
-
-  int ret = 0;
-  if (numChainedBuffers <= kNumIovecBufferChains &&
-      bufs_.size() < kNumIovecBufferChains) {
-    // We don't allocate arrays on the heap
-    iovec vec[kNumIovecBufferChains];
-    size_t messageSizes[kNumIovecBufferChains];
-    fillIovecAndMessageSizes(vec, messageSizes, kNumIovecBufferChains);
-    ret =
-        sock.writem(AddressRange(&address, 1), vec, messageSizes, bufs_.size());
-  } else {
-    // We allocate the arrays on the heap
-    std::unique_ptr<iovec[]> vec(new iovec[numChainedBuffers]);
-    std::unique_ptr<size_t[]> messageSizes(new size_t[bufs_.size()]);
-    fillIovecAndMessageSizes(vec.get(), messageSizes.get(), numChainedBuffers);
-    ret = sock.writem(
-        AddressRange(&address, 1), vec.get(), messageSizes.get(), bufs_.size());
-  }
-
-  if (ret <= 0) {
-    return ret;
-  }
-
-  if (static_cast<size_t>(ret) == bufs_.size()) {
-    return currSize_;
-  }
-
-  // this is a partial write - we just need to
-  // return a different number than currSize_
-  return 0;
-}
-
-void SendmmsgPacketBatchWriter::fillIovecAndMessageSizes(
-    iovec* vec,
-    size_t* messageSizes,
-    size_t iovecLen) {
-  size_t currentIovecIndex = 0;
-  for (uint32_t i = 0; i < bufs_.size(); i++) {
-    size_t numIovecs =
-        bufs_.at(i)
-            ->fillIov(vec + currentIovecIndex, iovecLen - currentIovecIndex)
-            .numIovecs;
-    messageSizes[i] = numIovecs;
-    currentIovecIndex += numIovecs;
-  }
 }
 
 SendmmsgInplacePacketBatchWriter::SendmmsgInplacePacketBatchWriter(

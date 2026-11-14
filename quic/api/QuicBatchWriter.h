@@ -70,21 +70,6 @@ class IOBufBatchWriter : public BatchWriter {
   BufPtr buf_;
 };
 
-class SinglePacketBatchWriter : public IOBufBatchWriter {
- public:
-  SinglePacketBatchWriter() = default;
-  ~SinglePacketBatchWriter() override = default;
-
-  void reset() override;
-  bool append(
-      BufPtr&& buf,
-      size_t /*unused*/,
-      const quic::SocketAddress& /*unused*/,
-      QuicAsyncUDPSocket* /*unused*/) override;
-  ssize_t write(QuicAsyncUDPSocket& sock, const quic::SocketAddress& address)
-      override;
-};
-
 /**
  * This writer allows for single buf inplace writes.
  * The buffer is owned by the conn/accessor, and every append will trigger a
@@ -109,36 +94,6 @@ class SinglePacketInplaceBatchWriter : public IOBufBatchWriter {
 
  private:
   QuicConnectionStateBase& conn_;
-};
-
-class SendmmsgPacketBatchWriter : public BatchWriter {
- public:
-  explicit SendmmsgPacketBatchWriter(size_t maxBufs);
-  ~SendmmsgPacketBatchWriter() override = default;
-
-  [[nodiscard]] bool empty() const override;
-
-  [[nodiscard]] size_t size() const override;
-
-  void reset() override;
-  bool append(
-      BufPtr&& buf,
-      size_t size,
-      const quic::SocketAddress& /*unused*/,
-      QuicAsyncUDPSocket* /*unused*/) override;
-  ssize_t write(QuicAsyncUDPSocket& sock, const quic::SocketAddress& address)
-      override;
-
- private:
-  void
-  fillIovecAndMessageSizes(iovec* vec, size_t* messageSizes, size_t iovecLen);
-
-  // max number of buffer chains we can accumulate before we need to flush
-  size_t maxBufs_{1};
-  // size of data in all the buffers
-  size_t currSize_{0};
-  // array of IOBufs
-  std::vector<BufPtr> bufs_;
 };
 
 class SendmmsgInplacePacketBatchWriter : public BatchWriter {

@@ -14,36 +14,6 @@
 
 namespace quic {
 
-class GSOPacketBatchWriter : public IOBufBatchWriter {
- public:
-  explicit GSOPacketBatchWriter(size_t maxBufs);
-  ~GSOPacketBatchWriter() override = default;
-
-  void reset() override;
-  bool needsFlush(size_t size) override;
-  bool append(
-      BufPtr&& buf,
-      size_t size,
-      const quic::SocketAddress& /*unused*/,
-      QuicAsyncUDPSocket* /*unused*/) override;
-  ssize_t write(QuicAsyncUDPSocket& sock, const quic::SocketAddress& address)
-      override;
-
-  void setTxTime(std::chrono::microseconds txTime) override {
-    txTime_ = txTime;
-  }
-
- private:
-  // max number of buffer chains we can accumulate before we need to flush
-  size_t maxBufs_{1};
-  // current number of buffer chains  appended the buf_
-  size_t currBufs_{0};
-  // size of the previous buffer chain appended to the buf_
-  size_t prevSize_{0};
-  // tx time to use for the socket write
-  std::chrono::microseconds txTime_{0us};
-};
-
 class GSOInplacePacketBatchWriter : public BatchWriter {
  public:
   explicit GSOInplacePacketBatchWriter(
@@ -83,57 +53,6 @@ class GSOInplacePacketBatchWriter : public BatchWriter {
    * retranmission packets slightly larger than the limit.
    */
   size_t nextPacketSize_{0};
-};
-
-class SendmmsgGSOPacketBatchWriter : public BatchWriter {
- public:
-  explicit SendmmsgGSOPacketBatchWriter(size_t maxBufs);
-  ~SendmmsgGSOPacketBatchWriter() override = default;
-
-  [[nodiscard]] bool empty() const override;
-
-  [[nodiscard]] size_t size() const override;
-
-  void reset() override;
-  bool append(
-      BufPtr&& buf,
-      size_t size,
-      const quic::SocketAddress& address,
-      QuicAsyncUDPSocket* sock) override;
-  ssize_t write(QuicAsyncUDPSocket& sock, const quic::SocketAddress& address)
-      override;
-
- private:
-  // max number of buffer chains we can accumulate before we need to flush
-  size_t maxBufs_{1};
-  // current number of buffer chains appended the buf_
-  size_t currBufs_{0};
-  // size of data in all the buffers
-  size_t currSize_{0};
-  // array of IOBufs
-  std::vector<BufPtr> bufs_;
-  std::vector<QuicAsyncUDPSocket::WriteOptions> options_;
-  std::vector<size_t> prevSize_;
-  std::vector<quic::SocketAddress> addrs_;
-
-  struct Index {
-    Index& operator=(int idx) {
-      idx_ = idx;
-      return *this;
-    }
-
-    operator int() const {
-      return idx_;
-    }
-
-    [[nodiscard]] bool valid() const {
-      return idx_ >= 0;
-    }
-
-    int idx_ = -1;
-  };
-
-  UnorderedMap<quic::SocketAddress, Index> addrMap_;
 };
 
 class SendmmsgGSOInplacePacketBatchWriter : public BatchWriter {

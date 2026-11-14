@@ -26,11 +26,9 @@ using BatchWriterFactoryOverride = std::function<BatchWriterPtr(
     QuicConnectionStateBase& conn,
     bool gsoSupported)>;
 
-BatchWriterPtr makeGsoBatchWriter(uint32_t batchSize);
 BatchWriterPtr makeGsoInPlaceBatchWriter(
     uint32_t batchSize,
     QuicConnectionStateBase& conn);
-BatchWriterPtr makeSendmmsgGsoBatchWriter(uint32_t batchSize);
 BatchWriterPtr makeSendmmsgInplaceGsoInplaceBatchWriter(
     uint32_t batchSize,
     QuicConnectionStateBase& conn);

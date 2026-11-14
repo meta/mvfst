@@ -15,18 +15,8 @@ void BatchWriterDeleter::operator()(BatchWriter* batchWriter) {
   delete batchWriter;
 }
 
-BatchWriterPtr makeGsoBatchWriter(uint32_t) {
-  MVCHECK(false, "GSO batch writer not implemented for mobile");
-  return nullptr;
-}
-
 BatchWriterPtr makeGsoInPlaceBatchWriter(uint32_t, QuicConnectionStateBase&) {
   MVCHECK(false, "GSO inplace batch writer not implemented for mobile");
-  return nullptr;
-}
-
-BatchWriterPtr makeSendmmsgGsoBatchWriter(uint32_t) {
-  MVCHECK(false, "Sendmmsg GSO batch writer not implemented for mobile");
   return nullptr;
 }
 
