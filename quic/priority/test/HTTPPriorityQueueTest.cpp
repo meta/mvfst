@@ -249,6 +249,33 @@ TEST_F(HTTPPriorityQueueTest, Paused) {
   EXPECT_TRUE(queue_.empty());
 }
 
+TEST_F(HTTPPriorityQueueTest, PausedWithDisablePausedPriority) {
+  queue_.setDisablePausedPriority(true);
+  auto id = Identifier::fromStreamID(0);
+  HTTPPriorityQueue::Priority paused(HTTPPriorityQueue::Priority::PAUSED);
+  const HTTPPriorityQueue::Priority lowest(7, true);
+
+  // insert paused -> lowest urgency, incremental
+  queue_.insertOrUpdate(id, paused);
+  ASSERT_TRUE(queue_.contains(id));
+  EXPECT_EQ(queue_.headHTTPPriority(), lowest);
+
+  // update unpaused(seq) -> paused: same as insertOrUpdate
+  queue_.insertOrUpdate(id, HTTPPriorityQueue::Priority(0, false));
+  queue_.updateIfExist(id, paused);
+  ASSERT_TRUE(queue_.contains(id));
+  EXPECT_EQ(queue_.headHTTPPriority(), lowest);
+  EXPECT_EQ(queue_.getRoundRobinElements(), 1);
+
+  // update unpaused(rr) -> paused: same as insertOrUpdate
+  queue_.insertOrUpdate(id, HTTPPriorityQueue::Priority(0, true));
+  queue_.updateIfExist(id, paused);
+  ASSERT_TRUE(queue_.contains(id));
+  EXPECT_EQ(queue_.headHTTPPriority(), lowest);
+  EXPECT_EQ(queue_.getRoundRobinElements(), 1);
+  EXPECT_EQ(queue_.peekNextScheduledID(), id);
+}
+
 TEST_F(HTTPPriorityQueueTest, ComplexOperations) {
   std::vector<HTTPPriorityQueue::Priority> ids;
   auto txn = queue_.beginTransaction();
