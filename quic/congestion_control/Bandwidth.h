@@ -81,10 +81,10 @@ struct Bandwidth {
     return *this;
   }
 
-  Bandwidth operator+(const Bandwidth& other) {
-    Bandwidth result(normalize(), 1s, unitType, isAppLimited);
+  Bandwidth operator+(const Bandwidth& other) const {
+    Bandwidth result(
+        normalize(), 1s, unitType, isAppLimited || other.isAppLimited);
     result.units += other.normalize();
-    isAppLimited |= other.isAppLimited;
     return result;
   }
 
