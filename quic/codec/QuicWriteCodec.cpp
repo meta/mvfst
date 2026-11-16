@@ -955,8 +955,7 @@ quic::Expected<size_t, QuicError> fillFrameWithDraft02PacketReceiveTimestamps(
   // that the contiguity grouping can coalesce. Without it, stable_sort
   // preserves arrival order on equal keys and the pktnum=N+1, N+2... follow-up
   // packets break the expectedNext=N-1 chain.
-  std::stable_sort(
-      sortedView.begin(), sortedView.end(), RecvTimeDescComparator{});
+  std::ranges::stable_sort(sortedView, RecvTimeDescComparator{});
 
   size_t totalTimestamps = 0;
   size_t cumUsedSpace = 0;
