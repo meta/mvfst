@@ -81,10 +81,9 @@ FizzClientHandshake::connectImpl(Optional<std::string> hostname) {
         std::move(follyECHConfigs)));
   } catch (const fizz::FizzException& ex) {
     if (ex.getAlert()) {
-      auto alertNum =
-          static_cast<std::underlying_type<TransportErrorCode>::type>(
-              ex.getAlert().value());
-      alertNum += static_cast<std::underlying_type<TransportErrorCode>::type>(
+      auto alertNum = static_cast<std::underlying_type_t<TransportErrorCode>>(
+          ex.getAlert().value());
+      alertNum += static_cast<std::underlying_type_t<TransportErrorCode>>(
           TransportErrorCode::CRYPTO_ERROR);
       return quic::make_unexpected(
           QuicError(static_cast<TransportErrorCode>(alertNum), ex.what()));
@@ -394,10 +393,9 @@ class FizzClientHandshake::ActionMoveVisitor {
     auto fe = err.error.get_exception<fizz::FizzException>();
 
     if (fe && fe->getAlert()) {
-      auto alertNum =
-          static_cast<std::underlying_type<TransportErrorCode>::type>(
-              fe->getAlert().value());
-      alertNum += static_cast<std::underlying_type<TransportErrorCode>::type>(
+      auto alertNum = static_cast<std::underlying_type_t<TransportErrorCode>>(
+          fe->getAlert().value());
+      alertNum += static_cast<std::underlying_type_t<TransportErrorCode>>(
           TransportErrorCode::CRYPTO_ERROR);
       client_.setError(QuicError(
           static_cast<TransportErrorCode>(alertNum), errMsg.toStdString()));
