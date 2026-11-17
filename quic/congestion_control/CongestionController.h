@@ -37,11 +37,16 @@ struct CubicStats {
   uint64_t lastLossTimeMs;
 };
 
+struct C4Stats {
+  uint8_t state;
+};
+
 union CongestionControllerStats {
   struct BbrStats bbrStats;
   struct Bbr2Stats bbr2Stats;
   struct CopaStats copaStats;
   struct CubicStats cubicStats;
+  struct C4Stats c4Stats;
 };
 
 struct CongestionController {
