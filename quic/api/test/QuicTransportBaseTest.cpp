@@ -16,6 +16,9 @@
 #include <quic/codec/DefaultConnectionIdAlgo.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/test/TestUtils.h>
+#include <quic/congestion_control/Bbr.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/congestion_control/QuicCubic.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/logging/QLoggerConstants.h>
 #include <quic/logging/oops_logger/OopsLogger.h>
@@ -29,6 +32,8 @@
 #include <quic/state/test/Mocks.h>
 
 #include <quic/common/testutil/MockAsyncUDPSocket.h>
+#include <array>
+#include <cstring>
 #include <memory>
 
 using namespace testing;
@@ -5598,6 +5603,139 @@ TEST_F(QuicTransportImplTestBase, GetConnectionStatsSmoke) {
   auto stats = transport->getConnectionsStats();
   EXPECT_EQ(stats.congestionController, CongestionControlType::Cubic);
   EXPECT_EQ(stats.clientConnectionId, "0a090807");
+}
+
+namespace {
+
+// Builds the stats in storage pre-filled with a poison pattern, so under clang
+// a field left uninitialized reads back as that pattern. The producer overload
+// only places the producer's local there through NRVO, and GCC's
+// -flifetime-dse may drop the poison stores.
+class PoisonedConnectionStats {
+ public:
+  PoisonedConnectionStats() {
+    std::memset(storage_, kPoison, sizeof(storage_));
+    stats_ = new (storage_) QuicConnectionStats;
+  }
+
+  template <typename Producer>
+  explicit PoisonedConnectionStats(Producer&& produce) {
+    std::memset(storage_, kPoison, sizeof(storage_));
+    stats_ = new (storage_) QuicConnectionStats(produce());
+  }
+
+  PoisonedConnectionStats(const PoisonedConnectionStats&) = delete;
+  PoisonedConnectionStats& operator=(const PoisonedConnectionStats&) = delete;
+
+  ~PoisonedConnectionStats() {
+    stats_->~QuicConnectionStats();
+  }
+
+  const QuicConnectionStats* operator->() const {
+    return stats_;
+  }
+
+  [[nodiscard]] std::array<uint8_t, sizeof(CongestionControllerStats)>
+  rawCongestionControllerStats() const {
+    std::array<uint8_t, sizeof(CongestionControllerStats)> raw{};
+    std::memcpy(raw.data(), &stats_->congestionControllerStats, sizeof(raw));
+    return raw;
+  }
+
+ private:
+  static constexpr uint8_t kPoison = 0xA5;
+
+  alignas(
+      QuicConnectionStats) unsigned char storage_[sizeof(QuicConnectionStats)];
+  QuicConnectionStats* stats_{nullptr};
+};
+
+} // namespace
+
+TEST(QuicConnectionStatsTest, DefaultConstructedReportsNoCongestionController) {
+  // A default-constructed value is what getConnectionsStats() returns for a
+  // transport without connection state.
+  PoisonedConnectionStats stats;
+  EXPECT_EQ(stats->congestionController, CongestionControlType::None);
+  EXPECT_EQ(stats->cwnd_bytes, 0);
+  EXPECT_THAT(stats.rawCongestionControllerStats(), Each(0));
+}
+
+TEST_F(QuicTransportImplTestBase, GetConnectionStatsAfterCloseReportsNone) {
+  // Closing drops the congestion controller, but the transport keeps its state
+  // (and stays in the server worker's connection map) until draining ends.
+  ASSERT_NE(transport->getState()->congestionController, nullptr);
+  transport->close(std::nullopt);
+  ASSERT_NE(transport->getState(), nullptr);
+  ASSERT_EQ(transport->getState()->congestionController, nullptr);
+
+  PoisonedConnectionStats stats(
+      [&] { return transport->getConnectionsStats(); });
+  EXPECT_EQ(stats->congestionController, CongestionControlType::None);
+  EXPECT_EQ(
+      congestionControlTypeToString(stats->congestionController),
+      kCongestionControlNoneStr);
+  EXPECT_EQ(stats->cwnd_bytes, 0);
+  EXPECT_THAT(stats.rawCongestionControllerStats(), Each(0));
+}
+
+TEST_F(QuicTransportImplTestBase, GetConnectionStatsReportsCopaStats) {
+  auto& conn = transport->getConnectionState();
+  for (bool useRttStanding : {true, false}) {
+    SCOPED_TRACE(useRttStanding);
+    const double deltaParam = useRttStanding ? 0.25 : 0.75;
+    conn.transportSettings.copaDeltaParam = deltaParam;
+    conn.transportSettings.copaUseRttStanding = useRttStanding;
+    // Installing a factory drops the current controller, so each iteration
+    // builds a fresh Copa from the settings above.
+    transport->setCongestionControllerFactory(
+        std::make_shared<DefaultCongestionControllerFactory>());
+    transport->setCongestionControl(CongestionControlType::Copa);
+
+    PoisonedConnectionStats stats(
+        [&] { return transport->getConnectionsStats(); });
+    EXPECT_EQ(stats->congestionController, CongestionControlType::Copa);
+    EXPECT_EQ(
+        stats->cwnd_bytes, conn.congestionController->getCongestionWindow());
+    EXPECT_EQ(
+        stats->congestionControllerStats.copaStats.deltaParam, deltaParam);
+    EXPECT_EQ(
+        stats->congestionControllerStats.copaStats.useRttStanding,
+        useRttStanding);
+  }
+}
+
+TEST_F(QuicTransportImplTestBase, GetConnectionStatsReportsBbrAndCubicStats) {
+  auto& conn = transport->getConnectionState();
+  // Without pacing, BBR silently falls back to Cubic.
+  conn.transportSettings.pacingEnabled = true;
+  transport->setCongestionControllerFactory(
+      std::make_shared<DefaultCongestionControllerFactory>());
+
+  transport->setCongestionControl(CongestionControlType::BBR);
+  {
+    PoisonedConnectionStats stats(
+        [&] { return transport->getConnectionsStats(); });
+    EXPECT_EQ(stats->congestionController, CongestionControlType::BBR);
+    EXPECT_EQ(
+        stats->cwnd_bytes, conn.congestionController->getCongestionWindow());
+    EXPECT_EQ(
+        stats->congestionControllerStats.bbrStats.state,
+        static_cast<uint8_t>(BbrCongestionController::BbrState::Startup));
+  }
+
+  transport->setCongestionControl(CongestionControlType::Cubic);
+  {
+    PoisonedConnectionStats stats(
+        [&] { return transport->getConnectionsStats(); });
+    EXPECT_EQ(stats->congestionController, CongestionControlType::Cubic);
+    EXPECT_EQ(
+        stats->cwnd_bytes, conn.congestionController->getCongestionWindow());
+    const auto& cubicStats = stats->congestionControllerStats.cubicStats;
+    EXPECT_EQ(cubicStats.state, static_cast<uint8_t>(CubicStates::Hystart));
+    EXPECT_EQ(cubicStats.ssthresh, Cubic::INIT_SSTHRESH);
+    EXPECT_EQ(cubicStats.lastLossTimeMs, 0);
+  }
 }
 
 TEST_F(QuicTransportImplTestBase, DatagramCallbackDatagramAvailable) {

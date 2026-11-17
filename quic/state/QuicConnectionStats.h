@@ -23,8 +23,9 @@ struct QuicConnectionStats {
   quic::SocketAddress peerAddress;
   std::chrono::duration<float> duration{0};
   uint64_t cwnd_bytes{0};
-  CongestionControlType congestionController;
-  CongestionControllerStats congestionControllerStats;
+  CongestionControlType congestionController{CongestionControlType::None};
+  CongestionControllerStats congestionControllerStats =
+      CongestionControllerStats();
   uint32_t ptoCount{0};
   std::chrono::microseconds srtt{0};
   std::chrono::microseconds mrtt{0};
