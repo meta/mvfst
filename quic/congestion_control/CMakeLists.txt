@@ -41,6 +41,7 @@ mvfst_add_library(mvfst_congestion_control_congestion_controller_factory
     mvfst_congestion_control_bbr2
     mvfst_congestion_control_bbr_bandwidth_sampler
     mvfst_congestion_control_bbr_rtt_sampler
+    mvfst_congestion_control_c4
     mvfst_congestion_control_copa
     mvfst_congestion_control_cubic
     mvfst_congestion_control_modular_bbr2_startup
@@ -69,6 +70,7 @@ mvfst_add_library(mvfst_congestion_control_server_congestion_controller_factory
     mvfst_congestion_control_bbr2
     mvfst_congestion_control_bbr_bandwidth_sampler
     mvfst_congestion_control_bbr_rtt_sampler
+    mvfst_congestion_control_c4
     mvfst_congestion_control_copa
     mvfst_congestion_control_cubic
     mvfst_congestion_control_modular_bbr2_startup
