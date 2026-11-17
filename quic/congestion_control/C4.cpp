@@ -29,6 +29,8 @@ constexpr float kCruiseGain = 1.0;
 // the send rate under the pacing rate.
 constexpr float kLowRttCruiseBoost = 3.0 / 64;
 constexpr float kProbeGain = 17.0 / 16;
+// After CE marks signal congestion, C4 probes sooner and by less.
+constexpr float kGentleProbeGain = 33.0 / 32;
 constexpr float kPushGain = 5.0 / 4;
 
 constexpr float kMaxBeta = 1.0 / 4;
@@ -49,6 +51,12 @@ constexpr float kLossThresholdSlope = 0.5;
 constexpr float kLossRateGain = 1.0 / 16;
 constexpr PacketNum kLossRateMaxGap = 32;
 
+// The CE threshold is (2 - sensitivity) times kEcnThresholdUnit. A CE fraction
+// of at least kEcnAlphaJump replaces a lower average at once.
+constexpr float kEcnThresholdUnit = 3.0 / 32;
+constexpr float kEcnAlphaGain = 1.0 / 16;
+constexpr float kEcnAlphaJump = 0.5;
+
 constexpr std::chrono::microseconds kMinMaxRtt = 1ms;
 constexpr std::chrono::microseconds kMaxJitter = 250ms;
 constexpr std::chrono::microseconds kMaxCwndMargin = 15ms;
@@ -58,8 +66,10 @@ constexpr uint64_t kInitialMinPacingRate = 131'072; // bytes per second
 constexpr uint64_t kInitialErasWithoutGrowth = 3;
 constexpr uint64_t kInitialEventsBeforeLossExit = 20;
 
+constexpr uint64_t kGentleProbeLevel = 0;
 constexpr uint64_t kDefaultProbeLevel = 1;
 constexpr uint64_t kMaxProbeLevel = 3;
+constexpr uint64_t kCruiseErasBeforeGentleProbe = 1;
 constexpr uint64_t kCruiseErasBeforeProbe = 2;
 
 // Initial is re-entered when the max RTT is far above the min RTT, which can
@@ -124,6 +134,7 @@ void C4CongestionController::onPacketAckOrLoss(
   // itself, so that they can extend Recovery.
   if (ack) {
     maybeExitAppLimited(*ack);
+    onEcnCounts();
     if (ack->rttSample.has_value()) {
       onRttSample(*ack);
     }
@@ -346,6 +357,41 @@ void C4CongestionController::updateLossRate(PacketNum packetNum) {
   lastLostPacketNum_ = packetNum;
 }
 
+void C4CongestionController::onEcnCounts() {
+  if (conn_.ecnState != ECNState::ValidatedL4S ||
+      conn_.ackStates.appDataAckState.ecnCECountEchoed <= ecnCeCount_) {
+    return;
+  }
+  updateEcnAlpha();
+  if (ecnAlpha_ <= ecnThreshold()) {
+    return;
+  }
+  if (state_ != State::Initial) {
+    notifyCongestion(Signal::Ecn);
+  } else if (canExitInitialOnSignal()) {
+    exitInitial(Signal::Ecn);
+  }
+}
+
+void C4CongestionController::updateEcnAlpha() {
+  // The transport keeps running maxima of the echoed counts, so reordered ACKs
+  // do not move them backwards.
+  const auto& ackState = conn_.ackStates.appDataAckState;
+  const uint64_t ect1 = ackState.ecnECT1CountEchoed - ecnEct1Count_;
+  const uint64_t ce = ackState.ecnCECountEchoed - ecnCeCount_;
+  ecnEct1Count_ = ackState.ecnECT1CountEchoed;
+  ecnCeCount_ = ackState.ecnCECountEchoed;
+  if (conn_.ecnState != ECNState::ValidatedL4S || ect1 + ce == 0) {
+    return;
+  }
+  const float fraction = static_cast<float>(ce) / static_cast<float>(ect1 + ce);
+  if (fraction > ecnAlpha_ && fraction >= kEcnAlphaJump) {
+    ecnAlpha_ = fraction;
+  } else {
+    ecnAlpha_ += (fraction - ecnAlpha_) * kEcnAlphaGain;
+  }
+}
+
 void C4CongestionController::updateMaxRtt() {
   eraMaxRtt_ = std::max(eraMaxRtt_, latestRtt_);
   eraMinRtt_ = std::min(eraMinRtt_, latestRtt_);
@@ -373,6 +419,11 @@ void C4CongestionController::notifyCongestion(Signal signal) {
   float beta = kMaxBeta;
   if (signal == Signal::Loss) {
     beta = (1 + sensitivity()) / 8;
+  } else if (signal == Signal::Ecn) {
+    const float threshold = ecnThreshold();
+    beta = std::min(kMaxBeta, (ecnAlpha_ - threshold) / threshold);
+    // The marking rate sets the reduction, so Recovery skips the backlog drain.
+    backlog_ = 0;
   }
   if (signal == Signal::Delay) {
     beta = std::min(
@@ -390,6 +441,9 @@ void C4CongestionController::notifyCongestion(Signal signal) {
       eraStartPacketNum_ = nextPacketNum();
       recoveryStartPacketNum_ = eraStartPacketNum_;
     }
+    if (signal == Signal::Ecn) {
+      excessCe_ = true;
+    }
     return;
   }
   // Probing and Pushing only reach above the nominal rate, which stays valid.
@@ -402,7 +456,7 @@ void C4CongestionController::notifyCongestion(Signal signal) {
               nominalMaxRtt_ * (1 - beta)));
     }
   }
-  enterRecovery(triggerName(signal));
+  enterRecovery(signal, triggerName(signal));
 }
 
 void C4CongestionController::enterInitial() {
@@ -415,6 +469,7 @@ void C4CongestionController::enterInitial() {
   initialEvents_ = 0;
   resetEra();
   erasWithoutGrowth_ = 0;
+  ecnAlpha_ = 0;
   resetGrowth();
 }
 
@@ -437,7 +492,7 @@ void C4CongestionController::exitInitial(Signal signal) {
   erasWithoutGrowth_ = 0;
   probeLevel_ = kDefaultProbeLevel;
   // The signal that ended Initial shows only in the qlog.
-  enterRecovery(triggerName(signal));
+  enterRecovery(Signal::None, triggerName(signal));
 }
 
 bool C4CongestionController::canExitInitialOnSignal() const {
@@ -465,7 +520,9 @@ void C4CongestionController::onInitialAck(uint64_t ackedBytes, bool eraEnded) {
   resetGrowth();
 }
 
-void C4CongestionController::enterRecovery(std::string_view trigger) {
+void C4CongestionController::enterRecovery(
+    Signal signal,
+    std::string_view trigger) {
   if (state_ == State::Initial) {
     resetGrowth();
   }
@@ -479,6 +536,7 @@ void C4CongestionController::enterRecovery(std::string_view trigger) {
   } else {
     pacingGain_ = kDrainGain;
   }
+  excessCe_ = signal == Signal::Ecn;
   setState(State::Recovery, trigger);
   resetEra();
   recoveryStartPacketNum_ = eraStartPacketNum_;
@@ -493,7 +551,9 @@ void C4CongestionController::exitRecovery(TimePoint now) {
   if (growth == Growth::None) {
     updateRatesWithoutGrowth();
   } else {
-    probeLevel_++;
+    if (!excessCe_) {
+      probeLevel_++;
+    }
     recentCongestions_ = 0;
     previousMaxRate_ = recentMaxRate_;
   }
@@ -501,6 +561,7 @@ void C4CongestionController::exitRecovery(TimePoint now) {
   resetGrowth();
   delayExcess_ = 0us;
   smoothedLossRate_ = 0;
+  ecnAlpha_ = 0;
 
   if (probeLevel_ > kMaxProbeLevel) {
     enterInitial();
@@ -513,7 +574,7 @@ void C4CongestionController::exitRecovery(TimePoint now) {
 
 void C4CongestionController::updateRatesWithoutGrowth() {
   if (rateWasNotLimited_) {
-    probeLevel_ = kDefaultProbeLevel;
+    probeLevel_ = excessCe_ ? kGentleProbeLevel : kDefaultProbeLevel;
   }
   if (congestionNotified_) {
     // Two congestion signals in a row mean that the nominal rate is above
@@ -541,7 +602,9 @@ void C4CongestionController::updateRatesWithoutGrowth() {
 void C4CongestionController::enterCruising() {
   resetEra();
   if (cruiseErasLeft_ == 0) {
-    cruiseErasLeft_ = kCruiseErasBeforeProbe;
+    cruiseErasLeft_ = probeLevel_ == kGentleProbeLevel
+        ? kCruiseErasBeforeGentleProbe
+        : kCruiseErasBeforeProbe;
   }
   pacingGain_ = kCruiseGain;
   if (conn_.lossState.srtt < kMinMaxRtt) {
@@ -551,7 +614,8 @@ void C4CongestionController::enterCruising() {
 }
 
 void C4CongestionController::enterProbing() {
-  pacingGain_ = kProbeGain;
+  pacingGain_ =
+      probeLevel_ == kGentleProbeLevel ? kGentleProbeGain : kProbeGain;
   growthGain_ = pacingGain_;
   resetEra();
   setState(State::Probing, kCongestionPacketAck);
@@ -586,7 +650,7 @@ void C4CongestionController::onEraEnd(TimePoint now) {
       }
       break;
     case State::Probing:
-      enterRecovery(kCongestionPacketAck);
+      enterRecovery(Signal::None, kCongestionPacketAck);
       break;
     case State::Pushing:
       // Every era in Pushing starts at the push gain, so a push without fast
@@ -596,7 +660,7 @@ void C4CongestionController::onEraEnd(TimePoint now) {
         resetEra();
       } else {
         backlog_ += pacingGain_ - 1;
-        enterRecovery(kCongestionPacketAck);
+        enterRecovery(Signal::None, kCongestionPacketAck);
       }
       break;
   }
@@ -614,6 +678,7 @@ void C4CongestionController::resetEra() {
   eraMaxRtt_ = 0us;
   eraMinRtt_ = std::chrono::microseconds::max();
   eraPacingGain_ = pacingGain_;
+  updateEcnAlpha();
 }
 
 void C4CongestionController::resetGrowth() {
@@ -667,6 +732,10 @@ std::chrono::microseconds C4CongestionController::delayThreshold() const {
 
 float C4CongestionController::lossThreshold() const {
   return kMinLossThreshold + kLossThresholdSlope * (1 - sensitivity());
+}
+
+float C4CongestionController::ecnThreshold() const {
+  return (2 - sensitivity()) * kEcnThresholdUnit;
 }
 
 PacketNum C4CongestionController::nextPacketNum() const {
@@ -764,6 +833,8 @@ std::string_view C4CongestionController::triggerName(Signal signal) {
       return "delay";
     case Signal::Loss:
       return kCongestionPacketLoss;
+    case Signal::Ecn:
+      return "ecn";
   }
   folly::assume_unreachable();
 }

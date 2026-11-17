@@ -60,7 +60,7 @@ class C4CongestionController : public CongestionController {
   [[nodiscard]] State getState() const noexcept;
 
  private:
-  enum class Signal : uint8_t { None, Delay, Loss };
+  enum class Signal : uint8_t { None, Delay, Loss, Ecn };
   enum class Growth : uint8_t { None, Slow, Fast };
 
   struct DeliveryCheckpoint {
@@ -72,9 +72,11 @@ class C4CongestionController : public CongestionController {
   void onRttSample(const AckEvent& ackEvent);
   void onAck(const AckEvent& ackEvent);
   void onLostPacket(PacketNum packetNum);
+  void onEcnCounts();
   void updateRate(const AckEvent& ackEvent);
   void updatePeakRate(const AckEvent& ackEvent);
   void updateLossRate(PacketNum packetNum);
+  void updateEcnAlpha();
   void updateMaxRtt();
   void maybeExitAppLimited(const AckEvent& ackEvent);
   void notifyCongestion(Signal signal);
@@ -83,7 +85,7 @@ class C4CongestionController : public CongestionController {
   void exitInitial(Signal signal);
   [[nodiscard]] bool canExitInitialOnSignal() const;
   void onInitialAck(uint64_t ackedBytes, bool eraEnded);
-  void enterRecovery(std::string_view trigger);
+  void enterRecovery(Signal signal, std::string_view trigger);
   void exitRecovery(TimePoint now);
   void updateRatesWithoutGrowth();
   void enterCruising();
@@ -99,6 +101,7 @@ class C4CongestionController : public CongestionController {
   [[nodiscard]] float sensitivity() const;
   [[nodiscard]] std::chrono::microseconds delayThreshold() const;
   [[nodiscard]] float lossThreshold() const;
+  [[nodiscard]] float ecnThreshold() const;
   [[nodiscard]] PacketNum nextPacketNum() const;
 
   void setCwndAndPacing(TimePoint eventTime);
@@ -152,9 +155,17 @@ class C4CongestionController : public CongestionController {
   uint64_t probeLevel_{1};
   uint64_t cruiseErasLeft_{0};
   uint64_t recentCongestions_{0};
+  // CE marks started the current Recovery or signaled congestion during it.
+  bool excessCe_{false};
 
   float smoothedLossRate_{0};
   PacketNum lastLostPacketNum_{0};
+
+  // Average fraction of CE among the ECT(1) and CE marks.
+  float ecnAlpha_{0};
+  // Echoed ECT(1) and CE counts at the last alpha update.
+  uint64_t ecnEct1Count_{0};
+  uint64_t ecnCeCount_{0};
 
   bool appLimited_{false};
   PacketNum appLimitedPacketNum_{0};
