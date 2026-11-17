@@ -519,6 +519,7 @@ constexpr std::string_view kCongestionControlNewRenoStr = "newreno";
 constexpr std::string_view kCongestionControlStaticCwndStr = "staticcwnd";
 constexpr std::string_view kCongestionControlCustomStr = "custom";
 constexpr std::string_view kCongestionControlNoneStr = "none";
+constexpr std::string_view kCongestionControlC4Str = "c4";
 
 constexpr DurationRep kPersistentCongestionThreshold = 3;
 enum class CongestionControlType : uint8_t {
@@ -531,6 +532,7 @@ enum class CongestionControlType : uint8_t {
   StaticCwnd,
   Custom,
   None,
+  C4,
   // NOTE: MAX should always be at the end
   MAX
 };
