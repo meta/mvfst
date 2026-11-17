@@ -69,6 +69,11 @@ DefaultCongestionControllerFactory::makeCongestionController(
           "constructed via CongestionControllerFactory.",
           LocalErrorCode::INTERNAL_ERROR);
     }
+    case CongestionControlType::C4: {
+      throw QuicInternalException(
+          "C4 Congestion Controller is not available yet.",
+          LocalErrorCode::INTERNAL_ERROR);
+    }
     case CongestionControlType::None:
       break;
     case CongestionControlType::MAX:
