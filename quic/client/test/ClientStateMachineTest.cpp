@@ -417,6 +417,37 @@ TEST_F(ClientStateMachineTest, TestProcessReliableStreamResetNonEmptyParam) {
   EXPECT_EQ(result.error().code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
 }
 
+TEST_F(ClientStateMachineTest, TestProcessReliableStreamResetLegacyParam) {
+  QuicClientConnectionState clientConn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  std::vector<TransportParameter> transportParams;
+  transportParams.push_back(
+      encodeEmptyParameter(TransportParameterId::reliable_stream_reset_legacy));
+  ServerTransportParameters serverTransportParams = {
+      std::move(transportParams)};
+  ASSERT_FALSE(processServerInitialParams(clientConn, serverTransportParams, 0)
+                   .hasError());
+  EXPECT_TRUE(clientConn.peerAdvertisedReliableStreamResetSupport);
+}
+
+TEST_F(
+    ClientStateMachineTest,
+    TestProcessReliableStreamResetLegacyNonEmptyParam) {
+  QuicClientConnectionState clientConn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  std::vector<TransportParameter> transportParams;
+  auto paramResult = encodeIntegerParameter(
+      TransportParameterId::reliable_stream_reset_legacy, 0);
+  ASSERT_FALSE(paramResult.hasError());
+  transportParams.push_back(std::move(paramResult.value()));
+  ServerTransportParameters serverTransportParams = {
+      std::move(transportParams)};
+  auto result =
+      processServerInitialParams(clientConn, serverTransportParams, 0);
+  EXPECT_TRUE(result.hasError());
+  EXPECT_EQ(result.error().code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+}
+
 TEST_F(
     ClientStateMachineTest,
     TestEncodeReliableStreamResetSupportedParamEnabled) {
@@ -433,6 +464,13 @@ TEST_F(
   auto it = findParameter(
       customTransportParams, TransportParameterId::reliable_stream_reset);
   EXPECT_TRUE(it->value->empty());
+  EXPECT_THAT(
+      customTransportParams,
+      Not(Contains(
+          testing::Field(
+              &TransportParameter::parameter,
+              testing::Eq(
+                  TransportParameterId::reliable_stream_reset_legacy)))));
 }
 
 TEST_F(

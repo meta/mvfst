@@ -390,20 +390,12 @@ quic::Expected<void, QuicError> processServerInitialParams(
   auto timestampFrameTimestampExponent =
       timestampFrameTimestampExponentResult.value();
 
-  auto reliableResetTpIter = findParameter(
-      serverParams.parameters,
-      static_cast<TransportParameterId>(
-          TransportParameterId::reliable_stream_reset));
-  if (reliableResetTpIter != serverParams.parameters.end()) {
-    if (!reliableResetTpIter->value->empty()) {
-      return quic::make_unexpected(QuicError(
-          TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
-          "Reliable reset transport parameter must be empty"));
-    }
-    conn.peerAdvertisedReliableStreamResetSupport = true;
-  } else {
-    conn.peerAdvertisedReliableStreamResetSupport = false;
+  auto reliableResetResult =
+      getReliableStreamResetParameter(serverParams.parameters);
+  if (reliableResetResult.hasError()) {
+    return quic::make_unexpected(reliableResetResult.error());
   }
+  conn.peerAdvertisedReliableStreamResetSupport = reliableResetResult.value();
 
   auto disableActiveMigrationTpIter = findParameter(
       serverParams.parameters,

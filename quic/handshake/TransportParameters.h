@@ -57,7 +57,9 @@ enum class TransportParameterId : uint64_t {
   rtt_hint_ms = 0x00007493,
   client_direct_encap = 0x000042fc,
   server_direct_encap = 0x000042fd,
-  reliable_stream_reset = 0x17f7586d2cb571,
+  reliable_stream_reset = 0x1d,
+  // Codepoint from earlier drafts. Accepted from peers but never sent.
+  reliable_stream_reset_legacy = 0x17f7586d2cb571,
   scone_supported = 0x219e,
   quic_experiment = 0x3a65db
 };
@@ -166,6 +168,10 @@ TransportParameter encodeIPAddressParameter(
     const folly::IPAddress& addr);
 
 bool getSconeSupportedParameter(
+    const std::vector<TransportParameter>& parameters);
+
+// True if the peer sent reset_stream_at under either codepoint.
+quic::Expected<bool, QuicError> getReliableStreamResetParameter(
     const std::vector<TransportParameter>& parameters);
 
 TransportParameter encodeSconeSupportedParameter();

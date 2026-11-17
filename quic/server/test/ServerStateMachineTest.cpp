@@ -548,6 +548,36 @@ TEST(ServerStateMachineTest, TestProcessReliableStreamResetNonEmptyParam) {
   EXPECT_EQ(result.error().code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
 }
 
+TEST(ServerStateMachineTest, TestProcessReliableStreamResetLegacyParam) {
+  QuicServerConnectionState serverConn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  std::vector<TransportParameter> transportParams;
+  transportParams.push_back(
+      encodeEmptyParameter(TransportParameterId::reliable_stream_reset_legacy));
+  ClientTransportParameters clientTransportParams = {
+      std::move(transportParams)};
+  auto result = processClientInitialParams(serverConn, clientTransportParams);
+  ASSERT_FALSE(result.hasError());
+  EXPECT_TRUE(serverConn.peerAdvertisedReliableStreamResetSupport);
+}
+
+TEST(
+    ServerStateMachineTest,
+    TestProcessReliableStreamResetLegacyNonEmptyParam) {
+  QuicServerConnectionState serverConn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  std::vector<TransportParameter> transportParams;
+  auto encodeResult = encodeIntegerParameter(
+      TransportParameterId::reliable_stream_reset_legacy, 0);
+  ASSERT_FALSE(encodeResult.hasError());
+  transportParams.push_back(encodeResult.value());
+  ClientTransportParameters clientTransportParams = {
+      std::move(transportParams)};
+  auto result = processClientInitialParams(serverConn, clientTransportParams);
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(result.error().code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+}
+
 TEST(
     ServerStateMachineTest,
     TestEncodeReliableStreamResetSupportedParamEnabled) {
@@ -564,6 +594,13 @@ TEST(
   auto it = findParameter(
       customTransportParams, TransportParameterId::reliable_stream_reset);
   EXPECT_TRUE(it->value->empty());
+  EXPECT_THAT(
+      customTransportParams,
+      Not(Contains(
+          testing::Field(
+              &TransportParameter::parameter,
+              testing::Eq(
+                  TransportParameterId::reliable_stream_reset_legacy)))));
 }
 
 TEST(

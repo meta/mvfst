@@ -236,6 +236,26 @@ bool getSconeSupportedParameter(
   return it != parameters.end();
 }
 
+quic::Expected<bool, QuicError> getReliableStreamResetParameter(
+    const std::vector<TransportParameter>& parameters) {
+  bool supported = false;
+  for (auto id :
+       {TransportParameterId::reliable_stream_reset,
+        TransportParameterId::reliable_stream_reset_legacy}) {
+    auto it = findParameter(parameters, id);
+    if (it == parameters.end()) {
+      continue;
+    }
+    if (!it->value->empty()) {
+      return quic::make_unexpected(QuicError(
+          TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
+          "Reliable reset transport parameter must be empty"));
+    }
+    supported = true;
+  }
+  return supported;
+}
+
 TransportParameter encodeSconeSupportedParameter() {
   return TransportParameter{
       TransportParameterId::scone_supported,

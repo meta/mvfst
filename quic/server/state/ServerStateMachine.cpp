@@ -378,20 +378,12 @@ quic::Expected<void, QuicError> processClientInitialParams(
   }
   auto quicExperiment = quicExperimentResult.value();
 
-  auto reliableResetTpIter = findParameter(
-      clientParams.parameters,
-      static_cast<TransportParameterId>(
-          TransportParameterId::reliable_stream_reset));
-  if (reliableResetTpIter != clientParams.parameters.end()) {
-    if (!reliableResetTpIter->value->empty()) {
-      return quic::make_unexpected(QuicError(
-          TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
-          "Reliable reset transport parameter must be empty"));
-    }
-    conn.peerAdvertisedReliableStreamResetSupport = true;
-  } else {
-    conn.peerAdvertisedReliableStreamResetSupport = false;
+  auto reliableResetResult =
+      getReliableStreamResetParameter(clientParams.parameters);
+  if (reliableResetResult.hasError()) {
+    return quic::make_unexpected(reliableResetResult.error());
   }
+  conn.peerAdvertisedReliableStreamResetSupport = reliableResetResult.value();
 
   // validate that we didn't receive original connection ID, stateless
   // reset token, or preferred address.
