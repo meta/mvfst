@@ -14,6 +14,7 @@ quic_add_test(TARGET CongestionControllerTests
   BbrRttSamplerTest.cpp
   BbrTest.cpp
   Bbr2Test.cpp
+  C4Test.cpp
   CongestionControlFunctionsTest.cpp
   CopaTest.cpp
   CubicHystartTest.cpp
@@ -28,6 +29,7 @@ quic_add_test(TARGET CongestionControllerTests
   Utils.cpp
   DEPENDS
   Folly::folly
+  mvfst_congestion_control_c4
   mvfst_congestion_control_congestion_controller
   mvfst_congestion_control_simulated_tbf
   mvfst_test_utils

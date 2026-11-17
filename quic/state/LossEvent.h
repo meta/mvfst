@@ -96,6 +96,9 @@ struct LossEvent {
   Optional<TimePoint> smallestLostSentTime;
   // Whether this LossEvent also indicates persistent congestion.
   bool persistentCongestion{false};
+  // Loss detection runs per packet number space, so all the lost packets share
+  // this space.
+  Optional<PacketNumberSpace> packetNumberSpace;
 
   explicit LossEvent(TimePoint time = Clock::now()) : lossTime(time) {}
 
@@ -110,6 +113,7 @@ struct LossEvent {
           "LossEvent: lostBytes overflow", LocalErrorCode::LOST_BYTES_OVERFLOW);
     }
     PacketNum packetNum = packet.packet.header.getPacketSequenceNum();
+    packetNumberSpace = packet.packet.header.getPacketNumberSpace();
     largestLostPacketNum =
         std::max(packetNum, largestLostPacketNum.value_or(packetNum));
     lostPacketDetails.push_back(
