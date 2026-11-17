@@ -3624,15 +3624,13 @@ void QuicTransportBaseLite::setTransportSettings(
       conn_->transportSettings.defaultCongestionController);
   if (conn_->transportSettings.pacingEnabled) {
     writeLooper_->enablePacingCallback();
-    bool usingBbr =
-        (conn_->transportSettings.defaultCongestionController ==
-             CongestionControlType::BBR ||
-         conn_->transportSettings.defaultCongestionController ==
-             CongestionControlType::BBR2 ||
-         conn_->transportSettings.defaultCongestionController ==
-             CongestionControlType::BBR2Modular);
-    auto minCwnd =
-        usingBbr ? kMinCwndInMssForBbr : conn_->transportSettings.minCwndInMss;
+    const auto type = conn_->transportSettings.defaultCongestionController;
+    const bool useBbrMinCwnd = type == CongestionControlType::BBR ||
+        type == CongestionControlType::BBR2 ||
+        type == CongestionControlType::BBR2Modular ||
+        type == CongestionControlType::C4;
+    auto minCwnd = useBbrMinCwnd ? kMinCwndInMssForBbr
+                                 : conn_->transportSettings.minCwndInMss;
     conn_->pacer = createPacer(*conn_, minCwnd);
     // Only set canBePaced during initial setup. After handshake,
     // updatePacingOnKeyEstablished() already set canBePaced = true, and we
@@ -3725,12 +3723,14 @@ bool QuicTransportBaseLite::isKnobSupported() const {
 
 void QuicTransportBaseLite::validateCongestionAndPacing(
     CongestionControlType& type) {
-  // Fallback to Cubic if Pacing isn't enabled with BBR together
+  // Fallback to Cubic if Pacing isn't enabled with BBR or C4
   if ((type == CongestionControlType::BBR ||
        type == CongestionControlType::BBR2 ||
-       type == CongestionControlType::BBR2Modular) &&
+       type == CongestionControlType::BBR2Modular ||
+       type == CongestionControlType::C4) &&
       !conn_->transportSettings.pacingEnabled) {
-    MVLOG_ERROR << "Unpaced BBR isn't supported";
+    MVLOG_ERROR << "Unpaced " << congestionControlTypeToString(type)
+                << " isn't supported";
     type = CongestionControlType::Cubic;
   }
 }
