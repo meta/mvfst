@@ -245,11 +245,14 @@ quic::Expected<bool, QuicError> updateSimpleFrameOnPacketReceived(
       // transport parameter which is the maximum amount of connection ids
       // provided by NEW_CONNECTION_ID frames. We add 1 to represent the initial
       // cid.
-      if (conn.peerConnectionIds.size() ==
+      if (conn.peerConnectionIds.size() >=
           conn.transportSettings.selfActiveConnectionIdLimit + 1) {
-        // Unspec'd as of d-23 if a server doesn't respect the
-        // active_connection_id_limit. Ignore frame.
-        return false;
+        // RFC 9000 Section 5.1.1: an endpoint MUST close the connection
+        // with CONNECTION_ID_LIMIT_ERROR if the peer provides more
+        // connection ids than its advertised active_connection_id_limit.
+        return quic::make_unexpected(QuicError(
+            TransportErrorCode::CONNECTION_ID_LIMIT_ERROR,
+            "Peer exceeded active_connection_id_limit"));
       }
       conn.peerConnectionIds.emplace_back(
           newConnectionId.connectionId,

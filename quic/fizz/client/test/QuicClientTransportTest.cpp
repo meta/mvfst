@@ -3821,8 +3821,12 @@ TEST_F(
   auto data = packetToBuf(packet);
 
   EXPECT_EQ(conn.peerConnectionIds.size(), 1);
-  deliverData(data->coalesce(), false);
+  deliverDataWithoutErrorCheck(data->coalesce(), false);
   EXPECT_EQ(conn.peerConnectionIds.size(), 1);
+  ASSERT_TRUE(client->getConn().localConnectionError.has_value());
+  EXPECT_EQ(
+      client->getConn().localConnectionError->code,
+      QuicErrorCode(TransportErrorCode::CONNECTION_ID_LIMIT_ERROR));
 }
 
 TEST_F(QuicClientTransportAfterStartTest, RecvNewConnectionIdInvalidRetire) {

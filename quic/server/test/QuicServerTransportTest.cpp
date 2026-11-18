@@ -2638,8 +2638,12 @@ TEST_F(QuicServerTransportTest, RecvNewConnectionIdTooManyReceivedIds) {
   auto packet = std::move(builder).buildPacket();
 
   EXPECT_EQ(conn.peerConnectionIds.size(), 1);
-  deliverData(packetToBuf(packet), false);
+  deliverDataWithoutErrorCheck(packetToBuf(packet), false);
   EXPECT_EQ(conn.peerConnectionIds.size(), 1);
+  ASSERT_TRUE(server->getConn().localConnectionError.has_value());
+  EXPECT_EQ(
+      server->getConn().localConnectionError->code,
+      QuicErrorCode(TransportErrorCode::CONNECTION_ID_LIMIT_ERROR));
 }
 
 TEST_F(QuicServerTransportTest, RecvNewConnectionIdInvalidRetire) {
