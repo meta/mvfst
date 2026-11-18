@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -136,8 +137,10 @@ class C4Test : public Test {
     return packetNum;
   }
 
-  // Acks `packetNums` the way the transport does. The same ACK declares lost
-  // every outstanding packet at least three below the largest acked packet.
+  // Acks `packetNums` the way the transport does. The peer echoes CE for the
+  // next `ceMarksLeft_` packets and ECT(1) for the others. The same ACK
+  // declares lost every outstanding packet at least three below the largest
+  // acked packet.
   void ack(
       C4CongestionController& c4,
       const std::vector<PacketNum>& packetNums,
@@ -152,7 +155,14 @@ class C4Test : public Test {
                         .setLargestAckedPacket(largestAcked)
                         .build();
     auto& lossState = conn_->lossState;
+    auto& ackState = conn_->ackStates.appDataAckState;
     for (const auto packetNum : packetNums) {
+      if (ceMarksLeft_ > 0) {
+        ceMarksLeft_--;
+        ackState.ecnCECountEchoed++;
+      } else {
+        ackState.ecnECT1CountEchoed++;
+      }
       auto& packet = outstanding_.at(packetNum);
       ackEvent.ackedBytes += packet.metadata.encodedSize;
       lossState.totalBytesAcked += packet.metadata.encodedSize;
@@ -173,6 +183,8 @@ class C4Test : public Test {
       }
     }
     ackEvent.totalBytesAcked = lossState.totalBytesAcked;
+    ackEvent.ecnECT1Count = ackState.ecnECT1CountEchoed;
+    ackEvent.ecnCECount = ackState.ecnCECountEchoed;
     const auto rttSample = std::chrono::ceil<std::chrono::microseconds>(
         ackTime - ackEvent.largestNewlyAckedPacketSentTime);
     ackEvent.rttSample = rttSample;
@@ -417,6 +429,7 @@ class C4Test : public Test {
   std::map<PacketNum, OutstandingPacketWrapper> outstanding_;
   uint64_t acks_{0};
   uint64_t lostPackets_{0};
+  uint64_t ceMarksLeft_{0};
 
   TimePoint now_;
   uint64_t flowRate_{0};
@@ -1066,6 +1079,104 @@ TEST_F(C4Test, ThirdSuccessfulPushReentersInitial) {
   EXPECT_DOUBLE_EQ(pacingGain(c4), 2.0);
 }
 
+TEST_F(C4Test, CeMarksSignalOnceL4sIsValidated) {
+  conn_->ecnState = ECNState::AttemptingL4S;
+  C4CongestionController c4(*conn_);
+  flowAppLimited_ = true;
+  startFlow(c4, 1'000'000, 20ms);
+  ASSERT_TRUE(runUntilState(c4, State::Cruising));
+  ceMarksLeft_ = std::numeric_limits<uint64_t>::max();
+  runFor(c4, 100ms);
+  EXPECT_EQ(c4.getState(), State::Cruising);
+
+  // Every packet is marked, so the reduction stops at a quarter. The signal
+  // also clears the backlog that Initial left, so Recovery drains gently.
+  conn_->ecnState = ECNState::ValidatedL4S;
+  ackNext(c4);
+  EXPECT_EQ(c4.getState(), State::Recovery);
+  EXPECT_EQ(nominalRate(c4), 750'000);
+  EXPECT_DOUBLE_EQ(pacingGain(c4), 15.0 / 16);
+}
+
+TEST_F(C4Test, ProbesSoonerAndGentlerAfterCeSignal) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+  C4CongestionController c4(*conn_);
+  flowAppLimited_ = true;
+  startFlow(c4, 1'000'000, 20ms);
+  ASSERT_TRUE(runUntilState(c4, State::Cruising));
+  runFor(c4, 100ms);
+  ceMarksLeft_ = std::numeric_limits<uint64_t>::max();
+  ASSERT_TRUE(runUntilState(c4, State::Recovery));
+  ceMarksLeft_ = 0;
+  flowAppLimited_ = false;
+
+  ASSERT_TRUE(runUntilState(c4, State::Cruising));
+  const auto cruiseStart = now_;
+  ASSERT_TRUE(runUntilState(c4, State::Probing));
+  // A single Cruising era, which lasts about one RTT, comes before the probe.
+  EXPECT_LT(now_ - cruiseStart, 30ms);
+  EXPECT_NEAR(pacingGain(c4), 33.0 / 32, 1e-6);
+}
+
+TEST_F(C4Test, CeSignalAfterPushHoldsProbeLevel) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+  C4CongestionController c4(*conn_);
+  startFlow(c4, 1'000'000, 20ms);
+  ASSERT_TRUE(runUntilState(c4, State::Probing));
+
+  // These rate steps lead back to Initial without CE marks. The marks come
+  // once the nominal rate shows the growth of the push, which a congestion
+  // signal freezes.
+  flowRate_ = 1'111'111;
+  ASSERT_TRUE(runUntilState(c4, State::Pushing));
+  flowRate_ = 1'234'567;
+  ASSERT_TRUE(runUntilState(c4, State::Recovery));
+  ASSERT_TRUE(runUntil(c4, [&] {
+    return c4.getState() != State::Recovery || nominalRate(c4) > 1'200'000;
+  }));
+  ASSERT_EQ(c4.getState(), State::Recovery);
+  ceMarksLeft_ = std::numeric_limits<uint64_t>::max();
+  ASSERT_TRUE(runUntil(c4, [&] { return c4.getState() != State::Recovery; }));
+  ceMarksLeft_ = 0;
+  ASSERT_EQ(c4.getState(), State::Pushing);
+
+  flowRate_ = 1'371'742;
+  ASSERT_TRUE(runUntilState(c4, State::Recovery));
+  ASSERT_TRUE(runUntil(c4, [&] { return c4.getState() != State::Recovery; }));
+  EXPECT_EQ(c4.getState(), State::Pushing);
+}
+
+TEST_F(C4Test, CeMarksDoNotCutRateInInitial) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+  C4CongestionController c4(*conn_);
+  ceMarksLeft_ = std::numeric_limits<uint64_t>::max();
+  startFlow(c4, 100'000, 20ms);
+  ASSERT_TRUE(runUntil(c4, [&] { return c4.getState() != State::Initial; }));
+
+  // Initial ends after three eras without growth, as it does without marks.
+  EXPECT_EQ(c4.getState(), State::Recovery);
+  EXPECT_EQ(lastStateTrigger(), kCongestionPacketAck);
+  EXPECT_EQ(nominalRate(c4), 100'000);
+  EXPECT_DOUBLE_EQ(pacingGain(c4), 0.75);
+}
+
+TEST_F(C4Test, CeMarksWithDelayEndInitialAfterTwoErasWithoutGrowth) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+  C4CongestionController c4(*conn_);
+  startFlow(c4, 100'000, 20ms);
+  ASSERT_TRUE(runUntil(c4, [&] {
+    return !cwndChanges_.empty() && cwndChanges_.back() == (1000 >> 3);
+  }));
+
+  // C4 handles the marks of an ACK before its RTT sample, so the marks end
+  // Initial on the first ACK after the second era without growth.
+  delayPendingAcks(50ms);
+  ceMarksLeft_ = std::numeric_limits<uint64_t>::max();
+  ASSERT_TRUE(runUntil(c4, [&] { return c4.getState() != State::Initial; }));
+  EXPECT_EQ(c4.getState(), State::Recovery);
+  EXPECT_EQ(lastStateTrigger(), "ecn");
+}
+
 TEST_F(C4Test, DelaySignalNeedsEraAboveNominalRate) {
   C4CongestionController c4(*conn_);
   flowAppLimited_ = true;
@@ -1379,6 +1490,72 @@ INSTANTIATE_TEST_SUITE_P(
     Sensitivity,
     C4LossTest,
     Values(
+        SensitivityParam{500'000, 20ms, 10},
+        SensitivityParam{1'000'000, 20ms, 10},
+        SensitivityParam{2'000'000, 20ms, 10},
+        SensitivityParam{10'000'000, 20ms, 10}));
+
+class C4EcnTest : public C4Test, public WithParamInterface<SensitivityParam> {
+ protected:
+  // After an idle second, sends 16 packets and acks them together one min RTT
+  // later, with `ceCount` of them marked CE. The idle time keeps the rate
+  // samples far below the nominal rate.
+  void ackMarkedBurst(C4CongestionController& c4, uint64_t ceCount) {
+    now_ += 1s;
+    ceMarksLeft_ = ceCount;
+    const auto burst = sendBurst(c4, 16);
+    c4.setAppLimited();
+    now_ += GetParam().minRtt;
+    ack(c4, burst, now_);
+  }
+};
+
+TEST_P(C4EcnTest, CeSignalFollowsSensitivity) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+  conn_->transportSettings.initCwndInMss = GetParam().initCwndInMss;
+  C4CongestionController c4(*conn_);
+  flowAppLimited_ = true;
+  startFlow(c4, GetParam().rate, GetParam().minRtt);
+  ASSERT_TRUE(runUntilState(c4, State::Cruising));
+  // Cruising brings the max RTT close to the min RTT, so the idle time
+  // between bursts does not look like jitter.
+  runFor(c4, 300ms);
+  drain(c4);
+  // C4 averages the marks since the last era end or CE mark, so an unmarked
+  // burst first ends the current era.
+  ackMarkedBurst(c4, 0);
+
+  // Each burst marks 6 of 16 packets, and the average moves a sixteenth of
+  // the way to that fraction.
+  double threshold = 0;
+  double alpha = 0;
+  auto markUntilAboveThreshold = [&] {
+    threshold = (2 - sensitivity(nominalRate(c4))) * 3.0 / 32;
+    alpha = 0;
+    while (alpha <= threshold) {
+      ASSERT_EQ(c4.getState(), State::Cruising);
+      alpha += (6.0 / 16 - alpha) / 16;
+      ackMarkedBurst(c4, 6);
+    }
+  };
+  markUntilAboveThreshold();
+  EXPECT_EQ(c4.getState(), State::Recovery);
+  const double beta = std::min(0.25, (alpha - threshold) / threshold);
+  EXPECT_NEAR(
+      nominalRate(c4), GetParam().rate * (1 - beta), GetParam().rate * 1e-4);
+
+  // The average starts over after Recovery.
+  ackMarkedBurst(c4, 0);
+  ASSERT_EQ(c4.getState(), State::Cruising);
+  markUntilAboveThreshold();
+  EXPECT_EQ(c4.getState(), State::Recovery);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Sensitivity,
+    C4EcnTest,
+    Values(
+        SensitivityParam{50'000, 20ms, 2},
         SensitivityParam{500'000, 20ms, 10},
         SensitivityParam{1'000'000, 20ms, 10},
         SensitivityParam{2'000'000, 20ms, 10},
