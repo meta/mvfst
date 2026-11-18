@@ -665,14 +665,10 @@ quic::Expected<void, QuicError> FollyQuicAsyncUDPSocket::setSndBuf(int sndBuf) {
 quic::Expected<void, QuicError> FollyQuicAsyncUDPSocket::setFD(
     int fd,
     FDOwnership ownership) {
-  folly::AsyncUDPSocket::FDOwnership follyOwnership;
-  switch (ownership) {
-    case FDOwnership::OWNS:
-      follyOwnership = folly::AsyncUDPSocket::FDOwnership::OWNS;
-      break;
-    case FDOwnership::SHARED:
-      follyOwnership = folly::AsyncUDPSocket::FDOwnership::SHARED;
-      break;
+  folly::AsyncUDPSocket::FDOwnership follyOwnership =
+      folly::AsyncUDPSocket::FDOwnership::SHARED;
+  if (ownership == FDOwnership::OWNS) {
+    follyOwnership = folly::AsyncUDPSocket::FDOwnership::OWNS;
   }
   try {
     follySocket_.setFD(folly::NetworkSocket::fromFd(fd), follyOwnership);
