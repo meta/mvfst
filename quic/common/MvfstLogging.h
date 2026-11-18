@@ -101,18 +101,6 @@
 // mvfst logging disabled. All log output is silently dropped; the macros
 // still return a streamable sink so call-site `<< ...` chains compile.
 
-#include <utility>
-
-namespace quic::logging::detail {
-struct NoopStream {};
-
-template <class T>
-inline NoopStream operator<<(NoopStream stream, T&&) {
-  return stream;
-}
-
-} // namespace quic::logging::detail
-
 #define MVLOG_INFO \
   ::quic::logging::detail::NoopStream {}
 #define MVLOG_WARNING \
