@@ -32,6 +32,8 @@ std::string congestionControlTypeToString(CongestionControlType type) {
       return std::string(kCongestionControlCustomStr);
     case CongestionControlType::None:
       return std::string(kCongestionControlNoneStr);
+    case CongestionControlType::C4:
+      return std::string(kCongestionControlC4Str);
     case CongestionControlType::MAX:
       return "MAX";
     default:
@@ -59,6 +61,8 @@ std::optional<CongestionControlType> congestionControlStrToType(
     return quic::CongestionControlType::Custom;
   } else if (str == kCongestionControlNoneStr) {
     return quic::CongestionControlType::None;
+  } else if (str == kCongestionControlC4Str) {
+    return quic::CongestionControlType::C4;
   }
   return std::nullopt;
 }

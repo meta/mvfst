@@ -4629,13 +4629,17 @@ INSTANTIATE_TEST_SUITE_P(
     Values(
         std::string("none"),
         std::string("staticcwnd"),
-        std::string("custom")),
+        std::string("custom"),
+        std::string("c4")),
     [](const TestParamInfo<std::string>& info) {
       if (info.param == "none") {
         return "None";
       }
       if (info.param == "staticcwnd") {
         return "StaticCwnd";
+      }
+      if (info.param == "c4") {
+        return "C4";
       }
       return "Custom";
     });
