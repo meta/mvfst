@@ -87,11 +87,14 @@ std::unique_ptr<QuicClientConnectionState> undoAllClientStateForRetry(
       : newConn->transportSettings.defaultCongestionController;
   newConn->canBePaced = conn->canBePaced;
   if (newConn->transportSettings.pacingEnabled) {
-    const bool usingBbr = congestionControlType == CongestionControlType::BBR ||
+    const bool useBbrMinCwnd =
+        congestionControlType == CongestionControlType::BBR ||
         congestionControlType == CongestionControlType::BBR2 ||
-        congestionControlType == CongestionControlType::BBR2Modular;
-    const auto minCwnd = usingBbr ? kMinCwndInMssForBbr
-                                  : newConn->transportSettings.minCwndInMss;
+        congestionControlType == CongestionControlType::BBR2Modular ||
+        congestionControlType == CongestionControlType::C4;
+    const auto minCwnd = useBbrMinCwnd
+        ? kMinCwndInMssForBbr
+        : newConn->transportSettings.minCwndInMss;
     newConn->pacer = createPacer(*newConn, minCwnd);
   }
   if (conn->congestionControllerFactory) {
