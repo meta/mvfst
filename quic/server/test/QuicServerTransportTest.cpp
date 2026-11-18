@@ -3501,6 +3501,57 @@ TEST_F(
   EXPECT_TRUE(hasAckFrame);
 }
 
+TEST_F(QuicUnencryptedServerTransportTest, TestPtoNotArmedWhenLimited) {
+  /**
+   * The handshake does not fit in the WritableBytes limit, and neither do the
+   * probes of the next PTO. The PTO timer then stays unarmed until the client
+   * sends more (RFC 9002 Section 6.2.2.1), instead of firing until maxNumPTOs
+   * abandons the connection.
+   */
+  auto transportSettings = server->getTransportSettings();
+  transportSettings.limitedCwndInMss = 3;
+  transportSettings.enableWritableBytesLimit = true;
+  server->setTransportSettings(transportSettings);
+
+  recvClientHello(true, QuicVersion::MVFST, "CHLO_CERT");
+  EXPECT_EQ(serverWrites.size(), 3);
+  EXPECT_TRUE(server->lossTimeout().isTimerCallbackScheduled());
+
+  serverWrites.clear();
+  fireLossTimeout();
+  EXPECT_TRUE(serverWrites.empty());
+  EXPECT_GT(server->getConn().numProbesWritableBytesLimited, 0);
+  EXPECT_FALSE(server->lossTimeout().isTimerCallbackScheduled());
+  EXPECT_FALSE(server->isClosed());
+
+  // A packet from the client raises the limit: the PTO fires again, its probes
+  // go out and the timer is armed again.
+  auto nextPacketNum = clientNextInitialPacketNum++;
+  auto aead = getInitialCipher();
+  auto headerCipher = getInitialHeaderCipher();
+  AckBlocks acks;
+  acks.insert(
+      getFirstOutstandingPacket(
+          server->getNonConstConn(), PacketNumberSpace::Initial)
+          ->packet.header.getPacketSequenceNum(),
+      getLastOutstandingPacket(
+          server->getNonConstConn(), PacketNumberSpace::Initial)
+          ->packet.header.getPacketSequenceNum());
+  deliverData(packetToBufCleartext(
+      createAckPacket(
+          server->getNonConstConn(),
+          nextPacketNum,
+          acks,
+          PacketNumberSpace::Initial,
+          aead.get()),
+      *aead,
+      *headerCipher,
+      nextPacketNum));
+  EXPECT_GE(serverWrites.size(), 1);
+  EXPECT_EQ(server->getConn().numProbesWritableBytesLimited, 0);
+  EXPECT_TRUE(server->lossTimeout().isTimerCallbackScheduled());
+}
+
 TEST_F(
     QuicUnencryptedServerTransportTest,
     TestHandshakeWritableBytesLimitedPartialAck) {
