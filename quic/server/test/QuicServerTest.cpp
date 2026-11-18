@@ -2470,6 +2470,22 @@ TEST_F(QuicServerWorkerRetryTest, TestNewTokenIsNotRetry) {
   testSendInitial(
       srcConnId, dstConnId, kClientAddr, newToken.value()->toString());
   EXPECT_FALSE(getTransportState().retryOriginalDstConnId.has_value());
+  EXPECT_TRUE(getTransportState().isClientAddrVerified);
+}
+
+// Without a token secret the worker cannot check a NEW_TOKEN, so the client
+// address of a new connection is not validated.
+TEST_F(QuicServerWorkerRetryTest, NoTokenSecretDoesNotValidateAddress) {
+  TransportSettings settings;
+  settings.statelessResetTokenSecret = getRandSecret();
+  initializeWorker(settings);
+  EXPECT_CALL(*quicStats_, onNewTokenReceived()).Times(0);
+  auto dstConnId = getTestConnectionId(hostId_);
+  auto srcConnId = getTestConnectionId(0);
+
+  expectRetriedConnectionCreation();
+  testSendInitial(srcConnId, dstConnId, kClientAddr);
+  EXPECT_FALSE(getTransportState().isClientAddrVerified);
 }
 
 class QuicServerWorkerTakeoverTest : public Test {

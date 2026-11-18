@@ -1172,9 +1172,10 @@ void QuicServerWorker::dispatchPacketData(
   bool isValidRetryToken =
       !hasTokenSecret || retryOriginalDstConnId.has_value();
 
-  bool isValidNewToken = !hasTokenSecret ||
-      (maybeEncryptedToken &&
-       validNewToken(*maybeEncryptedToken, client.getIPAddress()));
+  // Only a NEW_TOKEN that decrypts with our secret validates the client
+  // address.
+  bool isValidNewToken = hasTokenSecret && maybeEncryptedToken &&
+      validNewToken(*maybeEncryptedToken, client.getIPAddress());
 
   if (isValidNewToken) {
     QUIC_STATS(statsCallback_, onNewTokenReceived);
