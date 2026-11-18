@@ -41,4 +41,4 @@ before you commit them.
 
 ## License
 By contributing to MVFST, you agree that your contributions will be
-licensed under its BSD license.
+licensed under its MIT license.
