@@ -154,7 +154,6 @@ class QuicClientTransportIntegrationTest : public TestWithParam<TestingParams> {
     auto transportSettings = client->getTransportSettings();
     transportSettings.attemptEarlyData = true;
     transportSettings.removeStreamAfterEomCallbackUnset = true;
-    transportSettings.dataPathType = DataPathType::ContinuousMemory;
     transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
     client->setTransportSettings(transportSettings);
     return client;
@@ -3468,7 +3467,6 @@ class QuicClientTransportRetryCapacityTest
  public:
   void SetUpChild() override {
     auto settings = client->getTransportSettings();
-    settings.dataPathType = DataPathType::ContinuousMemory;
     settings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
     settings.maxRecvPacketSize = 1404;
     client->setTransportSettings(settings);

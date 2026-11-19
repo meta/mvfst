@@ -346,8 +346,6 @@ struct TransportSettings {
   DurationRep timeReorderingThreshDividend{
       kDefaultTimeReorderingThreshDividend};
   DurationRep timeReorderingThreshDivisor{kDefaultTimeReorderingThreshDivisor};
-  // Ignored: ContinuousMemory is the only data path.
-  DataPathType dataPathType{DataPathType::ContinuousMemory};
   // Whether or not we should stop writing a packet after writing a single
   // stream frame to it.
   bool streamFramePerPacket{false};

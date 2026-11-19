@@ -154,13 +154,6 @@ TEST_F(QuicClientTransportLiteTest, WriteDatagramFailsWhenThePeerTakesNone) {
       quicClient_->getConn()->datagramState.flowManager.hasDatagramsToSend());
 }
 
-TEST_F(QuicClientTransportLiteTest, ChainedMemorySettingAllocatesWriteBuffer) {
-  auto transportSettings = quicClient_->getTransportSettings();
-  transportSettings.dataPathType = DataPathType::ChainedMemory;
-  quicClient_->setTransportSettings(std::move(transportSettings));
-  EXPECT_NE(quicClient_->getConn()->bufAccessor, nullptr);
-}
-
 TEST_F(QuicClientTransportLiteTest, TestPriming) {
   auto transportSettings = quicClient_->getTransportSettings();
   transportSettings.isPriming = true;
@@ -266,7 +259,6 @@ TEST_P(
   conn->udpSendPacketLen = testCase.initialPacketSize;
 
   auto transportSettings = quicClient_->getTransportSettings();
-  transportSettings.dataPathType = DataPathType::ContinuousMemory;
   transportSettings.maxBatchSize = testCase.maxBatchSize;
   transportSettings.canIgnorePathMTU = true;
   quicClient_->setTransportSettings(std::move(transportSettings));
@@ -325,7 +317,6 @@ TEST_F(
   conn->udpSendPacketLen = kDefaultV6UDPSendPacketLen;
 
   auto transportSettings = quicClient_->getTransportSettings();
-  transportSettings.dataPathType = DataPathType::ContinuousMemory;
   transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
   transportSettings.maxBatchSize = kDefaultQuicMaxBatchSize;
   transportSettings.writeConnectionDataPacketsLimit = kDefaultQuicMaxBatchSize;

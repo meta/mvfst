@@ -22,7 +22,6 @@ namespace quic {
 using BatchWriterFactoryOverride = std::function<BatchWriterPtr(
     const quic::QuicBatchingMode& batchingMode,
     uint32_t batchSize,
-    DataPathType dataPathType,
     QuicConnectionStateBase& conn,
     bool gsoSupported)>;
 
@@ -38,7 +37,6 @@ class BatchWriterFactory {
   static BatchWriterPtr makeBatchWriter(
       const quic::QuicBatchingMode& batchingMode,
       uint32_t batchSize,
-      DataPathType dataPathType,
       QuicConnectionStateBase& conn,
       bool gsoSupported);
 };

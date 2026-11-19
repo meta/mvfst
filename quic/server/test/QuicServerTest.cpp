@@ -1421,27 +1421,6 @@ TEST_F(QuicServerWorkerTest, DestroyQuicServer) {
 
 TEST_F(QuicServerWorkerTest, AssignBufAccessor) {
   TransportSettings transportSettings;
-  transportSettings.dataPathType = DataPathType::ContinuousMemory;
-  transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
-  initializeWorker(transportSettings);
-
-  EXPECT_CALL(*socketPtr_, address()).WillRepeatedly(ReturnRef(fakeAddress_));
-  auto connId = getTestConnectionId(hostId_);
-
-  EXPECT_CALL(*transport_, setBufAccessor(_))
-      .Times(1)
-      .WillOnce(Invoke(
-          [](BufAccessor* accessor) { EXPECT_TRUE(accessor != nullptr); }));
-  createQuicConnection(kClientAddr, connId);
-
-  // From shutdownAllConnections:
-  EXPECT_CALL(*transport_, setRoutingCallback(nullptr)).Times(1);
-  EXPECT_CALL(*transport_, setTransportStatsCallback(nullptr)).Times(1);
-}
-
-TEST_F(QuicServerWorkerTest, AssignBufAccessorForChainedMemorySetting) {
-  TransportSettings transportSettings;
-  transportSettings.dataPathType = DataPathType::ChainedMemory;
   transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
   initializeWorker(transportSettings);
 

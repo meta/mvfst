@@ -1186,7 +1186,6 @@ TPerfServer::TPerfServer(
          writeStats = writeStats_](
             const quic::QuicBatchingMode& /*batchingMode*/,
             uint32_t batchSize,
-            DataPathType /*dataPathType*/,
             QuicConnectionStateBase& conn,
             bool gsoSupported) -> BatchWriterPtr {
       if (udpGsoZerocopyConfig.enabled && udpGsoZerocopyConfig.inplace &&

@@ -29,12 +29,11 @@ BatchWriterPtr makeSendmmsgInplaceGsoInplaceBatchWriter(
 BatchWriterPtr BatchWriterFactory::makeBatchWriter(
     const quic::QuicBatchingMode& batchingMode,
     uint32_t batchSize,
-    DataPathType dataPathType,
     QuicConnectionStateBase& conn,
     bool gsoSupported) {
   if (conn.batchWriterFactoryOverride) {
     auto batchWriter = conn.batchWriterFactoryOverride(
-        batchingMode, batchSize, dataPathType, conn, gsoSupported);
+        batchingMode, batchSize, conn, gsoSupported);
     if (batchWriter) {
       return batchWriter;
     }

@@ -360,7 +360,6 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   std::function<std::unique_ptr<BatchWriter, BatchWriterDeleter>(
       const quic::QuicBatchingMode& batchingMode,
       uint32_t batchSize,
-      DataPathType dataPathType,
       QuicConnectionStateBase& conn,
       bool gsoSupported)>
       batchWriterFactoryOverride;

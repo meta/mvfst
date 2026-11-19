@@ -861,15 +861,6 @@ enum class EncryptionLevel : uint8_t {
   MAX,
 };
 
-/**
- * This is a temporary type used during our data path experiment. It  may not
- * exist for long time.
- */
-enum class DataPathType : uint8_t {
-  ChainedMemory = 0,
-  ContinuousMemory = 1,
-};
-
 // Stream priority level, can only be in [0, 7]
 using PriorityLevel = uint8_t;
 constexpr uint8_t kDefaultMaxPriority = 7;

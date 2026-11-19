@@ -195,8 +195,7 @@ TEST_P(HappyEyeballsBatchTest, PreservesPacketsAcrossSocketAttempts) {
         return static_cast<int>(count);
       });
   happy.secondSocket = std::move(secondSocket);
-  auto writer = BatchWriterFactory::makeBatchWriter(
-      mode, 2, DataPathType::ContinuousMemory, conn, true);
+  auto writer = BatchWriterFactory::makeBatchWriter(mode, 2, conn, true);
   IOBufQuicBatch batch(
       std::move(writer), firstSocket, firstAddress, nullptr, &happy);
   const std::vector<std::string> packets{"first", "a larger second packet"};
@@ -250,11 +249,7 @@ TEST(QuicBatch, FirstAddressFailureReportedOnlyBeforeHappyEyeballsFinishes) {
     const SocketAddress address("::1", 2345);
     IOBufQuicBatch batch(
         BatchWriterFactory::makeBatchWriter(
-            QuicBatchingMode::BATCHING_MODE_NONE,
-            1,
-            DataPathType::ContinuousMemory,
-            conn,
-            true),
+            QuicBatchingMode::BATCHING_MODE_NONE, 1, conn, true),
         sock,
         address,
         nullptr,

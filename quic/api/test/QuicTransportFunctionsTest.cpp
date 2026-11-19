@@ -5597,7 +5597,6 @@ TEST_F(QuicTransportFunctionsTest, ProbeWriteNewFunctionalFramesAckFreq) {
 
 TEST_F(QuicTransportFunctionsTest, WriteWithInplaceBuilder) {
   auto conn = createConn();
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   auto bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen * 16);
   auto outputBuf = bufAccessor->obtain();
   auto bufPtr = outputBuf.get();
@@ -5644,7 +5643,6 @@ TEST_F(
     QuicTransportFunctionsTest,
     InplaceBuilderRejectsInsufficientPhysicalTailroom) {
   auto conn = createConn();
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
   BufAccessor bufAccessor(256);
   ASSERT_LT(bufAccessor.tailroom(), conn->udpSendPacketLen);
@@ -5684,7 +5682,6 @@ TEST_F(
     ContinuousMemorySendmmsgFillsNegotiatedMaxBatch) {
   auto conn = createConn();
   conn->udpSendPacketLen = kDefaultMaxUDPPayload;
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   conn->transportSettings.batchingMode =
       QuicBatchingMode::BATCHING_MODE_SENDMMSG;
   conn->transportSettings.maxBatchSize = kDefaultQuicMaxBatchSize;
@@ -5750,7 +5747,6 @@ TEST_F(
 
 TEST_F(QuicTransportFunctionsTest, WriteWithInplaceBuilderRollbackBuf) {
   auto conn = createConn();
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   auto bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen * 16);
   auto outputBuf = bufAccessor->obtain();
   auto bufPtr = outputBuf.get();
@@ -5779,7 +5775,6 @@ TEST_F(QuicTransportFunctionsTest, WriteWithInplaceBuilderRollbackBuf) {
 
 TEST_F(QuicTransportFunctionsTest, WriteWithInplaceBuilderGSOMultiplePackets) {
   auto conn = createConn();
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   auto bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen * 16);
   auto outputBuf = bufAccessor->obtain();
   auto bufPtr = outputBuf.get();
@@ -5826,7 +5821,6 @@ TEST_F(QuicTransportFunctionsTest, WriteWithInplaceSinglePacketWriter) {
   for (uint32_t maxBatchSize : {1u, 16u}) {
     SCOPED_TRACE(maxBatchSize);
     auto conn = createConn();
-    conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
     conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_NONE;
     conn->transportSettings.maxBatchSize = maxBatchSize;
     BufAccessor accessor(conn->udpSendPacketLen * maxBatchSize);
@@ -5867,7 +5861,6 @@ TEST_F(QuicTransportFunctionsTest, WriteWithInplaceSinglePacketWriter) {
 
 TEST_F(QuicTransportFunctionsTest, WriteProbingWithInplaceBuilder) {
   auto conn = createConn();
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
   EventBase evb;
   std::shared_ptr<FollyQuicEventBase> qEvb =
@@ -6373,7 +6366,6 @@ TEST_F(QuicTransportFunctionsTest, SconePacketSizeValidation) {
 
 TEST_F(QuicTransportFunctionsTest, SCONEWithContinuousMemory) {
   auto conn = createConn();
-  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
   conn->transportSettings.enableSconeSend = true;
   conn->scone.emplace();
   conn->peerAdvertisedSconeSupport = true;

@@ -65,7 +65,6 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverride) {
   bool overrideCalled = false;
   conn_.batchWriterFactoryOverride = [&](const quic::QuicBatchingMode&,
                                          uint32_t,
-                                         DataPathType,
                                          QuicConnectionStateBase&,
                                          bool) {
     overrideCalled = true;
@@ -75,7 +74,6 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverride) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_NONE,
       kBatchNum,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
 
@@ -88,7 +86,6 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverride) {
   auto defaultBatchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_NONE,
       kBatchNum,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   ASSERT_TRUE(defaultBatchWriter);
@@ -100,7 +97,6 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverrideFallthrough) {
   bool overrideCalled = false;
   conn_.batchWriterFactoryOverride = [&](const quic::QuicBatchingMode&,
                                          uint32_t,
-                                         DataPathType,
                                          QuicConnectionStateBase&,
                                          bool) {
     overrideCalled = true;
@@ -110,7 +106,6 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverrideFallthrough) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_NONE,
       kBatchNum,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
 
@@ -121,12 +116,12 @@ TEST_F(QuicBatchWriterTest, TestPerConnBatchWriterFactoryOverrideFallthrough) {
   EXPECT_EQ(batchWriter->size(), 0);
 }
 
-TEST_F(QuicBatchWriterTest, ChainedMemorySettingGetsInplaceWriters) {
+TEST_F(QuicBatchWriterTest, FactoryMakesInplaceWriters) {
   BufAccessor accessor(conn_.udpSendPacketLen * kBatchNum);
   conn_.bufAccessor = &accessor;
   auto makeWriter = [&](QuicBatchingMode mode, bool gsoSupported) {
     return BatchWriterFactory::makeBatchWriter(
-        mode, kBatchNum, DataPathType::ChainedMemory, conn_, gsoSupported);
+        mode, kBatchNum, conn_, gsoSupported);
   };
   EXPECT_NE(
       dynamic_cast<SinglePacketInplaceBatchWriter*>(
@@ -155,8 +150,8 @@ TEST_P(BatchWriterFactoryTest, WritesPacketFromBuffer) {
   const auto [mode, batchSize, gsoSupported] = GetParam();
   BufAccessor accessor(conn_.udpSendPacketLen * batchSize);
   conn_.bufAccessor = &accessor;
-  auto writer = BatchWriterFactory::makeBatchWriter(
-      mode, batchSize, DataPathType::ContinuousMemory, conn_, gsoSupported);
+  auto writer =
+      BatchWriterFactory::makeBatchWriter(mode, batchSize, conn_, gsoSupported);
 
   folly::EventBase evb;
   auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
@@ -219,11 +214,7 @@ TEST_F(QuicBatchWriterTest, SendmmsgPreservesSocketResult) {
     BufAccessor accessor(conn_.udpSendPacketLen * 3);
     conn_.bufAccessor = &accessor;
     auto writer = BatchWriterFactory::makeBatchWriter(
-        QuicBatchingMode::BATCHING_MODE_SENDMMSG,
-        3,
-        DataPathType::ContinuousMemory,
-        conn_,
-        false);
+        QuicBatchingMode::BATCHING_MODE_SENDMMSG, 3, conn_, false);
     size_t bytes = 0;
     for (size_t i = 0; i < 3; ++i) {
       memcpy(accessor.writableTail(), packet.data(), packet.size());
@@ -263,7 +254,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgInplace) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG,
       kBatchNum,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -344,7 +334,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceSameSizeAll) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -409,7 +398,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceSmallerSizeInMiddle) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -481,7 +469,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceLargerSizeInMiddle) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -554,7 +541,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceDifferentAddrs) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -638,7 +624,6 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceExternalDataWritten) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -709,7 +694,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterNeedsFlush) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -731,7 +715,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterAppendLimit) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -761,7 +744,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterAppendSmaller) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -795,7 +777,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterWriteAll) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -845,7 +826,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterWriteOne) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   CHECK(batchWriter);
@@ -885,7 +865,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterLastOneTooBig) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   for (size_t i = 0; i < 5; i++) {
@@ -934,7 +913,6 @@ TEST_F(QuicBatchWriterTest, InplaceWriterBufResidueCheck) {
   auto batchWriter = quic::BatchWriterFactory::makeBatchWriter(
       quic::QuicBatchingMode::BATCHING_MODE_GSO,
       batchSize,
-      DataPathType::ContinuousMemory,
       conn_,
       gsoSupported_);
   auto buf = bufAccessor->obtain();
@@ -979,14 +957,12 @@ class SinglePacketInplaceBatchWriterTest : public ::testing::Test {
     return quic::BatchWriterFactory::makeBatchWriter(
         batchingMode,
         conn_.transportSettings.maxBatchSize,
-        conn_.transportSettings.dataPathType,
         conn_,
         false /* gsoSupported_ */);
   }
 
   void enableSinglePacketInplaceBatchWriter() {
     conn_.transportSettings.maxBatchSize = 1;
-    conn_.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   }
 
  protected:
@@ -1004,7 +980,6 @@ TEST_F(SinglePacketInplaceBatchWriterTest, TestFactorySuccess) {
 
 TEST_F(SinglePacketInplaceBatchWriterTest, TestFactoryWithLargerBatchSize) {
   conn_.transportSettings.maxBatchSize = 16;
-  conn_.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   auto batchWriter = makeBatchWriter();
   CHECK(batchWriter);
   EXPECT_NE(

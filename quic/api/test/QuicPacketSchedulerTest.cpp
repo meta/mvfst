@@ -1734,7 +1734,6 @@ TEST_P(QuicPacketSchedulerTest, CloneWillGenerateNewWindowUpdate) {
 TEST_P(QuicPacketSchedulerTest, CloningSchedulerWithInplaceBuilder) {
   QuicClientConnectionState conn(
       FizzClientQuicHandshakeContext::Builder().build());
-  conn.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   BufAccessor bufAccessor(2000);
   auto buf = bufAccessor.obtain();
   EXPECT_EQ(buf->length(), 0);
@@ -1782,7 +1781,6 @@ TEST_P(QuicPacketSchedulerTest, CloningSchedulerWithInplaceBuilderFullPacket) {
   ASSERT_FALSE(streamResult.hasError());
   conn.flowControlState.peerAdvertisedMaxOffset = 100000;
   conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
-  conn.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   BufAccessor bufAccessor(conn.udpSendPacketLen);
   auto buf = bufAccessor.obtain();
   EXPECT_EQ(buf->length(), 0);
@@ -3339,7 +3337,6 @@ TEST_P(
     CloningSchedulerWithInplaceBuilderDoNotEncodeHeaderWithoutBuild) {
   QuicClientConnectionState conn(
       FizzClientQuicHandshakeContext::Builder().build());
-  conn.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   BufAccessor bufAccessor(2000);
   auto buf = bufAccessor.obtain();
   EXPECT_EQ(buf->length(), 0);
@@ -3384,7 +3381,6 @@ TEST_P(
     CloningSchedulerWithInplaceBuilderRollbackBufWhenFailToRebuild) {
   QuicClientConnectionState conn(
       FizzClientQuicHandshakeContext::Builder().build());
-  conn.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   BufAccessor bufAccessor(2000);
   auto buf = bufAccessor.obtain();
   EXPECT_EQ(buf->length(), 0);

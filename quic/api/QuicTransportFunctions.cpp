@@ -1943,7 +1943,6 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
   auto batchWriter = BatchWriterFactory::makeBatchWriter(
       connection.transportSettings.batchingMode,
       connection.transportSettings.maxBatchSize,
-      connection.transportSettings.dataPathType,
       connection,
       *connection.gsoSupported);
 
