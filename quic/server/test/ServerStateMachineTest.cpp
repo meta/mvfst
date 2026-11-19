@@ -17,6 +17,7 @@
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/server/test/Mocks.h>
 #include <quic/state/test/MockQuicStats.h>
+#include <array>
 #include <chrono>
 
 using namespace testing;
@@ -925,6 +926,32 @@ TEST(
       serverConn.maybePeerReceiveTimestampsConfig->maxReceiveTimestampsPerAck,
       7);
   EXPECT_EQ(serverConn.maybePeerReceiveTimestampsConfig->exponent, 3);
+}
+
+TEST(ServerStateMachineTest, TestProcessAckDelayExponentUpdatesReadCodec) {
+  QuicServerConnectionState serverConn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  serverConn.readCodec = std::make_unique<QuicReadCodec>(QuicNodeType::Server);
+  std::vector<TransportParameter> transportParams;
+  auto encodeResult =
+      encodeIntegerParameter(TransportParameterId::ack_delay_exponent, 8);
+  ASSERT_FALSE(encodeResult.hasError());
+  transportParams.push_back(encodeResult.value());
+  ClientTransportParameters clientTransportParams = {
+      std::move(transportParams)};
+  auto result = processClientInitialParams(serverConn, clientTransportParams);
+  ASSERT_FALSE(result.hasError());
+  EXPECT_EQ(serverConn.peerAckDelayExponent, 8);
+
+  // A 1-RTT ACK frame: Largest Acknowledged 5, ACK Delay 1, no more ranges.
+  constexpr std::array<uint8_t, 4> ackFrame = {0x05, 0x01, 0x00, 0x00};
+  ContiguousReadCursor cursor(ackFrame.data(), ackFrame.size());
+  PacketHeader header{
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1)};
+  auto ack = decodeAckFrame(
+      cursor, header, serverConn.readCodec->getCodecParameters());
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_EQ(ack->ackDelay.count(), 1 << 8);
 }
 
 } // namespace test

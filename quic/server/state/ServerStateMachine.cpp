@@ -569,6 +569,8 @@ quic::Expected<void, QuicError> processClientInitialParams(
           kDefaultTimestampFrameTimestampExponent));
   if (conn.readCodec) {
     auto codecParams = conn.readCodec->getCodecParameters();
+    codecParams.peerAckDelayExponent =
+        static_cast<uint8_t>(conn.peerAckDelayExponent);
     codecParams.peerTimestampFrameTimestampExponent =
         conn.peerTimestampFrameState.sendExponent;
     conn.readCodec->setCodecParameters(std::move(codecParams));
