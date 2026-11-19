@@ -23,8 +23,8 @@
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/test/MockQuicStats.h>
+#include <algorithm>
 #include <chrono>
-#include <iostream>
 #include <optional>
 
 using namespace quic;
@@ -2508,7 +2508,7 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesAcrossPacketBudgets) {
   const auto buildPacket = [&](TimestampFrameWriteMode mode,
                                uint32_t budget,
                                const std::vector<size_t>& streamLengths) {
-    BuiltPacket built{.conn = createConn(10, 100000, 100000)};
+    BuiltPacket built{.conn = createConn(10, 100000, 100000), .packet = {}};
     auto& conn = *built.conn;
     conn.transportSettings.oneRttTimestampFrameWriteMode = mode;
     conn.peerTimestampFrameState.canReceive = true;
@@ -2621,7 +2621,7 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesAcrossPacketBudgets) {
 // frame, which keeps running to the end of the packet. Opportunistic can only
 // add one where stream data leaves room, so at most on the final packet.
 TEST_P(QuicPacketSchedulerTest, TimestampWriteModesOnBulkUpload) {
-  constexpr size_t kUploadBytes = 200 * 1000;
+  constexpr size_t kUploadBytes = 200'000;
   constexpr uint8_t kCipherOverhead = 16;
   constexpr uint64_t kTimestampFrameSize = 6;
 
@@ -2633,7 +2633,7 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesOnBulkUpload) {
 
   const auto upload = [&](TimestampFrameWriteMode mode, uint32_t packetLen) {
     UploadTotals totals;
-    auto connPtr = createConn(10, 10 * 1000 * 1000, 10 * 1000 * 1000);
+    auto connPtr = createConn(10, 10'000'000, 10'000'000);
     auto& conn = *connPtr;
     // Same packet numbers in every run, so header sizes match across modes.
     conn.ackStates.appDataAckState.nextPacketNum = 0;
@@ -2718,8 +2718,8 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesOnBulkUpload) {
           std::nullopt,
           std::move(packet.packet),
           Clock::now(),
-          wireSize,
-          bodySize);
+          static_cast<uint32_t>(wireSize),
+          static_cast<uint32_t>(bodySize));
       EXPECT_TRUE(updateResult.has_value());
     }
     EXPECT_EQ(totals.streamBytes, kUploadBytes);
@@ -2739,24 +2739,10 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesOnBulkUpload) {
     // Each full packet gives up 6 of roughly packetLen - 30 payload bytes.
     const double perPacketPayload = packetLen - kCipherOverhead - 30;
     EXPECT_LE(
-        prioritized.packets,
-        disabled.packets * perPacketPayload /
+        static_cast<double>(prioritized.packets),
+        static_cast<double>(disabled.packets) * perPacketPayload /
                 (perPacketPayload - kTimestampFrameSize) +
             1);
-    std::cout << fmt::format(
-                     "bulk upload {} B at udpSendPacketLen {}: packets "
-                     "disabled={} opportunistic={} (timestamps={}) "
-                     "prioritized={} (timestamps={}), extra packets {:.2f}%",
-                     kUploadBytes,
-                     packetLen,
-                     disabled.packets,
-                     opportunistic.packets,
-                     opportunistic.timestamps,
-                     prioritized.packets,
-                     prioritized.timestamps,
-                     100.0 * (prioritized.packets - disabled.packets) /
-                         disabled.packets)
-              << std::endl;
   }
 }
 
@@ -2768,7 +2754,7 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesOnBulkUpload) {
 // in the next packet.
 TEST_P(QuicPacketSchedulerTest, TimestampWriteModesWithDatagramsAtPacketLimit) {
   constexpr uint32_t kBudget = 1252;
-  constexpr uint64_t kTimestampFrameSize = 6;
+  constexpr int kTimestampFrameSize = 6;
   // Accounting for the AEAD tag keeps buildPacket() from padding small bodies.
   constexpr uint8_t kCipherOverhead = 16;
   RegularQuicPacketBuilder probe(
@@ -2819,6 +2805,11 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesWithDatagramsAtPacketLimit) {
     EXPECT_TRUE(result.has_value() && result->packet.has_value());
     return result;
   };
+  const auto hasDatagram = [](const RegularQuicWritePacket& packet) {
+    return std::ranges::any_of(packet.frames, [](const auto& frame) {
+      return frame.asDatagramFrame() != nullptr;
+    });
+  };
 
   // Bytes the ACK takes ahead of the datagram.
   uint64_t ackSize = 0;
@@ -2862,16 +2853,11 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesWithDatagramsAtPacketLimit) {
         const bool datagramFits = slack >= 0;
         const bool heldForTimestamp = withAck &&
             mode == TimestampFrameWriteMode::Prioritized &&
-            static_cast<uint64_t>(slack) < kTimestampFrameSize;
+            slack < kTimestampFrameSize;
         const bool expectDatagram = datagramFits && !heldForTimestamp;
-        const bool sentDatagram = std::any_of(
-            packet.packet.frames.begin(),
-            packet.packet.frames.end(),
-            [](const auto& frame) { return frame.asDatagramFrame(); });
-        EXPECT_EQ(sentDatagram, expectDatagram);
-        const bool expectTimestamp = expectDatagram
-            ? static_cast<uint64_t>(slack) >= kTimestampFrameSize
-            : withAck;
+        EXPECT_EQ(hasDatagram(packet.packet), expectDatagram);
+        const bool expectTimestamp =
+            expectDatagram ? slack >= kTimestampFrameSize : withAck;
         EXPECT_EQ(
             countTimestampFrames(packet.packet.frames),
             expectTimestamp ? 1 : 0);
@@ -2887,11 +2873,7 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesWithDatagramsAtPacketLimit) {
           auto next = schedule(*conn, false);
           ASSERT_TRUE(next.has_value() && next->packet.has_value());
           expectPeerDecodesRecordedFrames(*next->packet);
-          EXPECT_TRUE(
-              std::any_of(
-                  next->packet->packet.frames.begin(),
-                  next->packet->packet.frames.end(),
-                  [](const auto& frame) { return frame.asDatagramFrame(); }));
+          EXPECT_TRUE(hasDatagram(next->packet->packet));
           EXPECT_EQ(conn->datagramState.flowManager.getDatagramCount(), 0);
         }
       }
@@ -2910,19 +2892,25 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesKeepAckAndControlFrames) {
     Optional<PacketBuilderInterface::Packet> packet;
   };
 
+  struct PacketCase {
+    size_t ackRanges;
+    uint64_t connFlowControlLimit;
+  };
+
   const auto build = [&](TimestampFrameWriteMode mode,
-                         size_t ackRanges,
-                         uint64_t connFlowControlLimit) {
-    Built built{.conn = createConn(10, connFlowControlLimit, 100000)};
+                         const PacketCase& packetCase) {
+    Built built{
+        .conn = createConn(10, packetCase.connFlowControlLimit, 100000),
+        .packet = {}};
     auto& conn = *built.conn;
     conn.transportSettings.oneRttTimestampFrameWriteMode = mode;
     conn.peerTimestampFrameState.canReceive = true;
     conn.connectionTime = Clock::now() - std::chrono::seconds(5);
     auto& ackState = getAckState(conn, PacketNumberSpace::AppData);
-    for (size_t i = 0; i < ackRanges; ++i) {
+    for (size_t i = 0; i < packetCase.ackRanges; ++i) {
       ackState.acks.insert(i * 10, i * 10 + 3);
     }
-    ackState.largestRecvdPacketNum = ackRanges * 10;
+    ackState.largestRecvdPacketNum = packetCase.ackRanges * 10;
     ackState.largestRecvdPacketTime = Clock::now();
     auto streamId = createStream(conn);
     writeDataToStream(conn, streamId, buildRandomInputData(5000));
@@ -2967,18 +2955,17 @@ TEST_P(QuicPacketSchedulerTest, TimestampWriteModesKeepAckAndControlFrames) {
 
   // A small ACK with room for stream data, an ACK that leaves only a few
   // bytes, and a flow-control limit that leaves the packet part empty.
-  for (const auto& [ackRanges, connFlowControlLimit] :
-       std::vector<std::pair<size_t, uint64_t>>{
-           {1, 100000}, {100, 100000}, {1, 300}}) {
+  for (const auto& packetCase : std::vector<PacketCase>{
+           {.ackRanges = 1, .connFlowControlLimit = 100000},
+           {.ackRanges = 100, .connFlowControlLimit = 100000},
+           {.ackRanges = 1, .connFlowControlLimit = 300}}) {
     SCOPED_TRACE(
         fmt::format(
             "ackRanges={} connFlowControl={}",
-            ackRanges,
-            connFlowControlLimit));
-    auto disabled = build(
-        TimestampFrameWriteMode::Disabled, ackRanges, connFlowControlLimit);
-    auto prioritized = build(
-        TimestampFrameWriteMode::Prioritized, ackRanges, connFlowControlLimit);
+            packetCase.ackRanges,
+            packetCase.connFlowControlLimit));
+    auto disabled = build(TimestampFrameWriteMode::Disabled, packetCase);
+    auto prioritized = build(TimestampFrameWriteMode::Prioritized, packetCase);
     ASSERT_TRUE(disabled.packet.has_value());
     ASSERT_TRUE(prioritized.packet.has_value());
     expectPeerDecodesRecordedFrames(*disabled.packet);

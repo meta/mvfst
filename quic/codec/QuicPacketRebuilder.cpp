@@ -51,6 +51,18 @@ quic::Expected<bool, QuicError> completeStreamFrameFits(
       frame.len <= availableSpace - headerSize;
 }
 
+// Whether the rebuilder wrote a fresh TIMESTAMP ahead of a rebuilt final
+// STREAM frame.
+enum class TimestampAheadResult : uint8_t {
+  // Written: the length-less STREAM frame after it still ends the packet.
+  Written,
+  // Nothing written; the STREAM frame is rebuilt as it would be anyway. The
+  // original packet had no TIMESTAMP right before that frame, the connection
+  // doesn't write TIMESTAMP frames, or the fresh TIMESTAMP and the length-less
+  // STREAM frame don't both fit.
+  Skipped,
+};
+
 } // namespace
 
 PacketRebuilder::PacketRebuilder(
@@ -121,10 +133,14 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
   // A STREAM frame rebuilt without its length extends to the end of the packet,
   // so no TIMESTAMP may follow it.
   bool wroteLengthlessStreamFrame = false;
+  // Whether a fresh TIMESTAMP went ahead of the rebuilt final STREAM frame.
   bool wroteTimestampFrame = false;
   auto& packetBuilder = builder_.builder();
   auto encryptionLevel =
       protectionTypeToEncryptionLevel(packet.packet.header.getProtectionType());
+  // AppData is exactly the short-header protection types, so this is whether
+  // the original packet, the one being rebuilt, is a 1-RTT packet.
+  const bool originalIsOneRtt = encryptionLevel == EncryptionLevel::AppData;
   // First check if there's an ACK in this packet. We do this because we need
   // to know before we rebuild a stream frame whether there is an ACK in this
   // packet. If there is an ACK, we have to always encode the stream frame's
@@ -139,23 +155,31 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
       break;
     }
   }
-  // The original had a TIMESTAMP right before its final STREAM frame so that
-  // frame could omit its length. When the rebuilt frame omits it too, write a
-  // fresh TIMESTAMP ahead of it, as long as both still fit; the STREAM frame
+  // Prioritized writes its TIMESTAMP right before a STREAM frame that fills the
+  // packet, so that frame can omit its length. When a packet like that is
+  // rebuilt and its final STREAM frame again omits its length, write a fresh
+  // TIMESTAMP in the same place, as long as both still fit; the STREAM frame
   // then still ends the packet.
   const auto maybeWriteTimestampAheadOf =
-      [&](auto iter, const WriteStreamFrame& streamFrame)
-      -> quic::Expected<void, QuicError> {
-    if (iter == packet.packet.frames.cbegin() ||
-        std::prev(iter)->asTimestampFrame() == nullptr ||
-        !builder_.isTracking() || encryptionLevel != EncryptionLevel::AppData ||
-        packet.packet.header.getHeaderForm() != HeaderForm::Short ||
-        !shouldWriteOneRttTimestampFrame(conn_, false)) {
-      return {};
+      [&](auto finalFrameInOriginal, const WriteStreamFrame& streamFrame)
+      -> quic::Expected<TimestampAheadResult, QuicError> {
+    // Reads the original packet, the one being rebuilt: did a TIMESTAMP sit
+    // right before its final STREAM frame? The begin() check keeps std::prev()
+    // in bounds when that STREAM frame was the original's only frame.
+    const bool originalHadTimestampAhead =
+        finalFrameInOriginal != packet.packet.frames.cbegin() &&
+        std::prev(finalFrameInOriginal)->asTimestampFrame() != nullptr;
+    // isTracking() means the rebuilt packet is 1-RTT and this connection writes
+    // TIMESTAMP frames (see the constructor). The original had no ACK here, as
+    // an ACK keeps the STREAM length, so no ACK receive timestamps can stand in
+    // for the TIMESTAMP.
+    if (!originalHadTimestampAhead || !originalIsOneRtt ||
+        !builder_.isTracking()) {
+      return TimestampAheadResult::Skipped;
     }
     auto timestampFrame = generateOneRttTimestampFrame(conn_);
     if (!timestampFrame) {
-      return {};
+      return TimestampAheadResult::Skipped;
     }
     auto timestampSize = getTimestampFrameEncodedSize(*timestampFrame);
     if (timestampSize.hasError()) {
@@ -163,22 +187,24 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
     }
     const auto remaining = packetBuilder.remainingSpaceInPkt();
     if (remaining < timestampSize.value()) {
-      return {};
+      return TimestampAheadResult::Skipped;
     }
     auto streamFits = completeStreamFrameFits(
-        streamFrame, true, remaining - timestampSize.value());
+        streamFrame,
+        /*skipLengthField=*/true,
+        remaining - timestampSize.value());
     if (streamFits.hasError()) {
       return quic::make_unexpected(streamFits.error());
     }
     if (!streamFits.value()) {
-      return {};
+      return TimestampAheadResult::Skipped;
     }
     auto writeResult = writeFrame(*timestampFrame, packetBuilder);
     if (writeResult.hasError()) {
       return quic::make_unexpected(writeResult.error());
     }
-    wroteTimestampFrame |= writeResult.value() != 0;
-    return {};
+    return writeResult.value() != 0 ? TimestampAheadResult::Written
+                                    : TimestampAheadResult::Skipped;
   };
   for (auto iter = packet.packet.frames.cbegin();
        iter != packet.packet.frames.cend();
@@ -223,6 +249,8 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
               if (timestampResult.hasError()) {
                 return quic::make_unexpected(timestampResult.error());
               }
+              wroteTimestampFrame =
+                  timestampResult.value() == TimestampAheadResult::Written;
             }
 
             auto frameFits = completeStreamFrameFits(
@@ -279,6 +307,8 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
             if (timestampResult.hasError()) {
               return quic::make_unexpected(timestampResult.error());
             }
+            wroteTimestampFrame =
+                timestampResult.value() == TimestampAheadResult::Written;
           }
           auto res = writeStreamFrameHeader(
               packetBuilder,
@@ -428,13 +458,10 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
         break;
       }
       case QuicWriteFrame::Type::DatagramFrame:
-        // Datagram data is unreliable and not meaningful to clone.
-        writeSuccess = true;
-        break;
       case QuicWriteFrame::Type::TimestampFrame:
-        // TIMESTAMP reflects send time, so the old value is never cloned. If
-        // it sat right before the final STREAM frame, the STREAM case below
-        // writes a fresh one there.
+        // Datagram data is unreliable, and TIMESTAMP reflects send time, so
+        // neither is cloned. A TIMESTAMP that sat right before the final STREAM
+        // frame is replaced by a fresh one when that frame is rebuilt.
         writeSuccess = true;
         break;
       default: {
@@ -477,13 +504,15 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
     return std::nullopt;
   }
 
-  // TIMESTAMP is non-retransmittable telemetry. Preserve rebuilt content first,
-  // then generate a fresh TIMESTAMP from current policy if capacity remains.
-  // Prioritized reserves only before stream/datagram scheduler output; it does
-  // not displace clone contents on this path.
-  if (builder_.isTracking() && !wroteLengthlessStreamFrame &&
-      !wroteTimestampFrame && encryptionLevel == EncryptionLevel::AppData &&
-      packet.packet.header.getHeaderForm() == HeaderForm::Short &&
+  // TIMESTAMP is non-retransmittable telemetry. With the rebuilt content and
+  // any fresh ACK in, add a fresh TIMESTAMP at the end of the packet, from
+  // current policy, if capacity remains. Skip it when one already went ahead of
+  // the final STREAM frame, or when that frame was rebuilt without its length
+  // and so runs to the end of the packet. Prioritized reserves only before
+  // stream/datagram scheduler output; it does not displace clone contents on
+  // this path.
+  if (builder_.isTracking() && originalIsOneRtt &&
+      !wroteLengthlessStreamFrame && !wroteTimestampFrame &&
       timestampPacketObserver_.matchesPacketSelection(
           conn_.transportSettings.oneRttTimestampFramePacketSelection) &&
       shouldWriteOneRttTimestampFrame(
