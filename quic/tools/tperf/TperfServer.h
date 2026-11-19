@@ -680,7 +680,6 @@ class TPerfServer {
       uint32_t numStreams,
       uint64_t maxBytesPerStream,
       uint32_t maxReceivePacketSize,
-      bool useInplaceWrite,
       bool overridePacketSize,
       double latencyFactor,
       bool useAckReceiveTimestamps,

@@ -28,7 +28,6 @@ TPerfClient::TPerfClient(
     bool gso,
     quic::CongestionControlType congestionControlType,
     uint32_t maxReceivePacketSize,
-    bool useInplaceWrite,
     std::string knobsStr,
     bool useAckReceiveTimestamps,
     bool useDraft02AckReceiveTimestamps,
@@ -48,7 +47,6 @@ TPerfClient::TPerfClient(
       gso_(gso),
       congestionControlType_(congestionControlType),
       maxReceivePacketSize_(maxReceivePacketSize),
-      useInplaceWrite_(useInplaceWrite),
       knobsStr_(std::move(knobsStr)),
       useAckReceiveTimestamps_(useAckReceiveTimestamps),
       useDraft02AckReceiveTimestamps_(useDraft02AckReceiveTimestamps),
@@ -208,8 +206,8 @@ void TPerfClient::start() {
   }
   if (gso_) {
     settings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
-    settings.maxBatchSize = 16;
   }
+  settings.maxBatchSize = 1;
   settings.maxRecvPacketSize = maxReceivePacketSize_;
   if (!knobsStr_.empty()) {
     settings.knobs.push_back(
@@ -232,10 +230,6 @@ void TPerfClient::start() {
     settings.advertiseLegacyAckReceiveTimestamps =
         advertiseLegacyAckReceiveTimestamps_;
     settings.sendDraft02AckReceiveTimestamps = sendDraft02AckReceiveTimestamps_;
-  }
-  if (useInplaceWrite_) {
-    settings.maxBatchSize = 1;
-    settings.dataPathType = DataPathType::ContinuousMemory;
   }
   if (useL4sEcn_) {
     settings.enableEcnOnEgress = true;

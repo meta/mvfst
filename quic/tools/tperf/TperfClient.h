@@ -31,7 +31,6 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
       bool gso,
       quic::CongestionControlType congestionControlType,
       uint32_t maxReceivePacketSize,
-      bool useInplaceWrite,
       std::string knobsStr,
       bool useAckReceiveTimestamps,
       bool useDraft02AckReceiveTimestamps,
@@ -87,7 +86,6 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
   bool gso_;
   quic::CongestionControlType congestionControlType_;
   uint32_t maxReceivePacketSize_;
-  bool useInplaceWrite_{false};
   std::string knobsStr_;
   bool useAckReceiveTimestamps_{false};
   bool useDraft02AckReceiveTimestamps_{false};

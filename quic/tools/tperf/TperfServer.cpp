@@ -341,13 +341,13 @@ TperfInplaceZcWriteCallback& threadLocalInplaceZcWriteCallback() {
   return wcb;
 }
 
-// Inplace + MSG_ZEROCOPY batch writer. Hijacks conn.bufAccessor (requires
-// DataPathType::ContinuousMemory) to install a pool-borrowed slab for each
-// write event. mvfst encrypts directly into the slab; we then send via
-// writeChain with the per-write WriteCallback that hands the slab to the
-// per-fd ZeroCopyFdBookkeeping on success. The bookkeeping invokes our
-// release callback once the kernel completion arrives on the listener
-// fd's POLLERR path, returning the slab to the idle list.
+// Inplace + MSG_ZEROCOPY batch writer. Hijacks conn.bufAccessor to install a
+// pool-borrowed slab for each write event. mvfst encrypts directly into the
+// slab; we then send via writeChain with the per-write WriteCallback that
+// hands the slab to the per-fd ZeroCopyFdBookkeeping on success. The
+// bookkeeping invokes our release callback once the kernel completion
+// arrives on the listener fd's POLLERR path, returning the slab to the idle
+// list.
 //
 // Lifetime: mvfst constructs a fresh writer every write event, so all
 // persistent slab state lives in the thread_local pool. This writer's
@@ -1092,7 +1092,6 @@ TPerfServer::TPerfServer(
     uint32_t numStreams,
     uint64_t maxBytesPerStream,
     uint32_t maxReceivePacketSize,
-    bool useInplaceWrite,
     bool overridePacketSize,
     double latencyFactor,
     bool useAckReceiveTimestamps,
@@ -1139,11 +1138,6 @@ TPerfServer::TPerfServer(
   FIZZ_THROW_ON_ERROR(fizz::CryptoUtils::init(err), err);
   eventBase_.setName("tperf_server");
   quic::TransportSettings settings;
-  if (useInplaceWrite && gso) {
-    settings.dataPathType = DataPathType::ContinuousMemory;
-  } else {
-    settings.dataPathType = DataPathType::ChainedMemory;
-  }
   settings.maxCwndInMss = maxCwndInMss;
   settings.writeConnectionDataPacketsLimit = writesPerLoop;
   settings.defaultCongestionController = congestionControlType;
@@ -1192,11 +1186,11 @@ TPerfServer::TPerfServer(
          writeStats = writeStats_](
             const quic::QuicBatchingMode& /*batchingMode*/,
             uint32_t batchSize,
-            DataPathType dataPathType,
+            DataPathType /*dataPathType*/,
             QuicConnectionStateBase& conn,
             bool gsoSupported) -> BatchWriterPtr {
       if (udpGsoZerocopyConfig.enabled && udpGsoZerocopyConfig.inplace &&
-          gsoSupported && dataPathType == DataPathType::ContinuousMemory) {
+          gsoSupported) {
         BatchWriterPtr writer(new UdpGsoZerocopyInplaceBatchWriter(
             conn, batchSize, udpGsoZerocopyConfig, writeStats));
         if (!udpGsoZerocopyConfig.perWriteStats) {

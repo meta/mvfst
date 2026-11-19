@@ -85,7 +85,6 @@ DEFINE_bool(
     override_packet_size,
     true,
     "Sender trusts the peer's advertised max packet size.");
-DEFINE_bool(use_inplace_write, true, "Data path type");
 DEFINE_double(latency_factor, 0.5, "Latency factor (delta) for Copa");
 DEFINE_uint32(
     num_server_worker,
@@ -156,9 +155,9 @@ DEFINE_string(
     "udp",
     "Server-side UDP TX backend: 'udp' (default), 'udp_gso_zerocopy_inplace', "
     "or 'udp_gso_zerocopy_hugepage'. The inplace MSG_ZEROCOPY backend requires "
-    "--use_inplace_write and --gso; mvfst encrypts directly into pool-borrowed "
-    "slabs that the kernel zerocopies, with per-fd completion bookkeeping "
-    "returning slabs to the pool. The hugepage backend is the inplace backend "
+    "--gso; mvfst encrypts directly into pool-borrowed slabs that the kernel "
+    "zerocopies, with per-fd completion bookkeeping returning slabs to the "
+    "pool. The hugepage backend is the inplace backend "
     "with one variable changed: slabs come from a per-worker 2MB-huge-page "
     "arena instead of malloc, so the kernel coalesces each batch into a "
     "single skb frag and one batched folio refcount add.");
@@ -360,17 +359,12 @@ int main(int argc, char* argv[]) {
       // hugepage variant only swaps the slab allocator underneath it, which
       // is what makes the two comparable as adjacent matrix columns.
       const bool hugePages = FLAGS_tx_backend == "udp_gso_zerocopy_hugepage";
-      // The inplace MSG_ZEROCOPY writer hijacks conn.bufAccessor which only
-      // exists when mvfst's ContinuousMemory data path is enabled. That data
-      // path requires both --use_inplace_write and --gso (see TPerfServer
-      // constructor: settings.dataPathType = ContinuousMemory iff
-      // useInplaceWrite && gso). Refuse to start instead of silently falling
-      // back to the default writer and pretending --tx_backend was honored.
-      if (!FLAGS_use_inplace_write || !FLAGS_gso) {
-        MVLOG_ERROR
-            << "--tx_backend=" << FLAGS_tx_backend << " requires both "
-            << "--use_inplace_write=true and --gso=true (got use_inplace_write="
-            << FLAGS_use_inplace_write << ", gso=" << FLAGS_gso << ")";
+      // The inplace MSG_ZEROCOPY writer sends GSO batches. Refuse to start
+      // without --gso instead of silently falling back to the default writer
+      // and pretending --tx_backend was honored.
+      if (!FLAGS_gso) {
+        MVLOG_ERROR << "--tx_backend=" << FLAGS_tx_backend
+                    << " requires --gso=true";
         return 1;
       }
       if (hugePages && FLAGS_udp_zerocopy_hugepage_bytes == 0) {
@@ -415,7 +409,6 @@ int main(int argc, char* argv[]) {
         FLAGS_num_streams,
         FLAGS_bytes_per_stream,
         FLAGS_max_receive_packet_size,
-        FLAGS_use_inplace_write,
         FLAGS_override_packet_size,
         FLAGS_latency_factor,
         FLAGS_use_ack_receive_timestamps,
@@ -468,7 +461,6 @@ int main(int argc, char* argv[]) {
         FLAGS_gso,
         flagsToCongestionControlType(FLAGS_congestion),
         FLAGS_max_receive_packet_size,
-        FLAGS_use_inplace_write,
         FLAGS_transport_knob_params,
         FLAGS_use_ack_receive_timestamps,
         FLAGS_use_draft02_ack_receive_timestamps,
