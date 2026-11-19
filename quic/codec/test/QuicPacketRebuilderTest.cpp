@@ -10,6 +10,7 @@
 
 #include <folly/portability/GTest.h>
 
+#include <quic/codec/Decode.h>
 #include <quic/codec/QuicPacketBuilder.h>
 #include <quic/codec/QuicPacketRebuilder.h>
 #include <quic/codec/QuicWriteCodec.h>
@@ -40,6 +41,59 @@ OutstandingPacketWrapper makeDummyOutstandingPacket(
       0 /* writeCount */,
       OutstandingPacketMetadata::DetailsPerStream());
   return packet;
+}
+
+// Decodes a built packet's body the way the peer would.
+std::vector<QuicFrame> decodeWireFrames(
+    const PacketBuilderInterface::Packet& packet) {
+  // The read path decodes from one contiguous buffer.
+  auto body = packet.body.clone();
+  body->coalesce();
+  BufQueue queue;
+  queue.append(std::move(body));
+  const CodecParameters params(kDefaultAckDelayExponent, QuicVersion::MVFST);
+  std::vector<QuicFrame> frames;
+  while (!queue.empty()) {
+    auto frame = quic::parseFrame(queue, packet.packet.header, params);
+    if (frame.hasError()) {
+      ADD_FAILURE() << "peer cannot decode frame: " << frame.error().message;
+      break;
+    }
+    frames.push_back(std::move(*frame));
+  }
+  return frames;
+}
+
+// The peer must decode the rebuilt STREAM data with its recorded length and
+// every recorded TIMESTAMP as its own frame.
+void expectPeerDecodesStreamAndTimestamps(
+    const PacketBuilderInterface::Packet& packet) {
+  std::vector<const QuicWriteFrame*> recorded;
+  for (const auto& frame : packet.packet.frames) {
+    if (frame.asWriteStreamFrame() || frame.asTimestampFrame()) {
+      recorded.push_back(&frame);
+    }
+  }
+  std::vector<QuicFrame> decoded;
+  for (auto& frame : decodeWireFrames(packet)) {
+    if (frame.asReadStreamFrame() || frame.asTimestampFrame()) {
+      decoded.push_back(std::move(frame));
+    }
+  }
+  ASSERT_EQ(decoded.size(), recorded.size());
+  for (size_t i = 0; i < recorded.size(); ++i) {
+    if (const auto* written = recorded[i]->asWriteStreamFrame()) {
+      const auto* read = decoded[i].asReadStreamFrame();
+      ASSERT_NE(read, nullptr);
+      EXPECT_EQ(read->offset, written->offset);
+      EXPECT_EQ(
+          read->data ? read->data->computeChainDataLength() : 0, written->len);
+    } else {
+      const auto* read = decoded[i].asTimestampFrame();
+      ASSERT_NE(read, nullptr);
+      EXPECT_EQ(read->timestamp, recorded[i]->asTimestampFrame()->timestamp);
+    }
+  }
 }
 
 PacketBuilderInterface::Packet buildSingleStreamPacket(
@@ -673,10 +727,14 @@ TEST_P(TimestampRebuildPolicyTest, PreservesRebuiltStreamBeforeFreshTimestamp) {
     return;
   }
 
+  // Like CloningScheduler, account for the AEAD tag so that buildPacket() does
+  // not pad these small bodies for header protection.
+  constexpr uint8_t kCipherOverhead = 16;
   RegularQuicPacketBuilder originalBuilder(
       kPacketCapacity,
       ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
       0);
+  originalBuilder.accountForCipherOverhead(kCipherOverhead);
   ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
 
   PacketBuilderInterface* streamBuilder = &originalBuilder;
@@ -754,6 +812,7 @@ TEST_P(TimestampRebuildPolicyTest, PreservesRebuiltStreamBeforeFreshTimestamp) {
       kPacketCapacity,
       ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
       0);
+  rebuiltBuilder.accountForCipherOverhead(kCipherOverhead);
   ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
   PacketRebuilder rebuilder(rebuiltBuilder, conn);
   auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
@@ -783,18 +842,22 @@ TEST_P(TimestampRebuildPolicyTest, PreservesRebuiltStreamBeforeFreshTimestamp) {
   }
   EXPECT_EQ(streamLength, rebuiltStream->len);
   EXPECT_EQ(testCase.expectFreshTimestamp ? 1 : 0, timestampCount);
+  expectPeerDecodesStreamAndTimestamps(rebuiltPacket);
 }
 
 INSTANTIATE_TEST_SUITE_P(
     WriteModeAndCapacity,
     TimestampRebuildPolicyTest,
     Values(
+        // The original's last frame is a STREAM frame without a length, so the
+        // rebuilt one also extends to the end of the packet and no TIMESTAMP
+        // can follow it.
         TimestampRebuildPolicyCase{
             "OpportunisticRoomWithoutOriginal",
             TimestampFrameWriteMode::Opportunistic,
             false,
             false,
-            true},
+            false},
         TimestampRebuildPolicyCase{
             "OpportunisticRoomWithOriginal",
             TimestampFrameWriteMode::Opportunistic,
@@ -818,7 +881,7 @@ INSTANTIATE_TEST_SUITE_P(
             TimestampFrameWriteMode::Prioritized,
             false,
             false,
-            true},
+            false},
         TimestampRebuildPolicyCase{
             "PrioritizedRoomWithOriginal",
             TimestampFrameWriteMode::Prioritized,
@@ -840,6 +903,253 @@ INSTANTIATE_TEST_SUITE_P(
     [](const TestParamInfo<TimestampRebuildPolicyCase>& info) {
       return info.param.name;
     });
+
+class TimestampAfterLengthlessStreamTest
+    : public QuicPacketRebuilderTest,
+      public WithParamInterface<TimestampFrameWriteMode> {};
+
+// Rebuilding drops the DATAGRAM ahead of a packet-filling STREAM frame, which
+// leaves room for a TIMESTAMP. The rebuilt STREAM frame still has no length,
+// so a TIMESTAMP after it would be decoded as stream data.
+TEST_P(TimestampAfterLengthlessStreamTest, RoomLeftByDroppedFrame) {
+  constexpr uint64_t kPacketCapacity = 128;
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  RegularQuicPacketBuilder originalBuilder(
+      kPacketCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
+      0);
+  ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
+  constexpr size_t kDatagramLength = 20;
+  ASSERT_FALSE(
+      writeFrame(
+          DatagramFrame(
+              kDatagramLength,
+              folly::IOBuf::copyBuffer(std::string(kDatagramLength, 'd'))),
+          originalBuilder)
+          .hasError());
+  auto streamResult = writeStreamFrameHeader(
+      originalBuilder,
+      stream->id,
+      0,
+      kPacketCapacity,
+      kPacketCapacity,
+      false,
+      std::nullopt);
+  ASSERT_FALSE(streamResult.hasError());
+  ASSERT_TRUE(streamResult.value().has_value());
+  const auto streamLength = *streamResult.value();
+  auto streamData = folly::IOBuf::copyBuffer(std::string(streamLength, 'x'));
+  writeStreamFrameData(originalBuilder, streamData->clone(), streamLength);
+  ASSERT_EQ(0, originalBuilder.remainingSpaceInPkt());
+  auto originalPacket = std::move(originalBuilder).buildPacket();
+  ASSERT_EQ(2, originalPacket.packet.frames.size());
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 50);
+  stream->retransmissionBuffer.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(0),
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(streamData), 0, false)));
+
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.transportSettings.oneRttTimestampFrameWriteMode = GetParam();
+  conn.connectionTime = Clock::now() - 1s;
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kPacketCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+  ASSERT_GT(rebuiltBuilder.remainingSpaceInPkt(), kDatagramLength);
+
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  ASSERT_EQ(1, rebuiltPacket.packet.frames.size());
+  const auto* rebuiltStream =
+      rebuiltPacket.packet.frames[0].asWriteStreamFrame();
+  ASSERT_NE(rebuiltStream, nullptr);
+  EXPECT_EQ(streamLength, rebuiltStream->len);
+  expectPeerDecodesStreamAndTimestamps(rebuiltPacket);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    WriteModes,
+    TimestampAfterLengthlessStreamTest,
+    Values(
+        TimestampFrameWriteMode::Opportunistic,
+        TimestampFrameWriteMode::Prioritized));
+
+struct TimestampAheadOfStreamCase {
+  std::string name;
+  TimestampFrameWriteMode mode;
+  // The original TIMESTAMP value. The fresh one is about 5 seconds in
+  // microseconds, a 4-byte varint.
+  uint64_t originalTimestamp;
+  bool expectFreshTimestamp;
+};
+
+class TimestampAheadOfStreamTest
+    : public QuicPacketRebuilderTest,
+      public WithParamInterface<TimestampAheadOfStreamCase> {};
+
+// Prioritized writes its TIMESTAMP ahead of a STREAM frame that fills the
+// packet, so the STREAM frame omits its length. The clone puts a fresh
+// TIMESTAMP in the same place when it and the STREAM frame both fit, and
+// otherwise drops it; either way the rebuilt STREAM frame still ends the
+// packet.
+TEST_P(TimestampAheadOfStreamTest, FreshTimestampKeepsStreamFrameLast) {
+  constexpr uint64_t kPacketCapacity = 128;
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  RegularQuicPacketBuilder originalBuilder(
+      kPacketCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
+      0);
+  ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
+  ASSERT_FALSE(
+      writeFrame(TimestampFrame(GetParam().originalTimestamp), originalBuilder)
+          .hasError());
+  auto streamResult = writeStreamFrameHeader(
+      originalBuilder,
+      stream->id,
+      0,
+      kPacketCapacity,
+      kPacketCapacity,
+      false,
+      std::nullopt);
+  ASSERT_FALSE(streamResult.hasError());
+  ASSERT_TRUE(streamResult.value().has_value());
+  const auto streamLength = *streamResult.value();
+  auto streamData = folly::IOBuf::copyBuffer(std::string(streamLength, 'x'));
+  writeStreamFrameData(originalBuilder, streamData->clone(), streamLength);
+  ASSERT_EQ(0, originalBuilder.remainingSpaceInPkt());
+  auto originalPacket = std::move(originalBuilder).buildPacket();
+  ASSERT_EQ(2, originalPacket.packet.frames.size());
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 50);
+  stream->retransmissionBuffer.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(0),
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(streamData), 0, false)));
+
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.transportSettings.oneRttTimestampFrameWriteMode = GetParam().mode;
+  conn.connectionTime = Clock::now() - 5s;
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kPacketCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  const auto& frames = rebuiltPacket.packet.frames;
+  ASSERT_EQ(frames.size(), GetParam().expectFreshTimestamp ? 2 : 1);
+  if (GetParam().expectFreshTimestamp) {
+    const auto* timestamp = frames[0].asTimestampFrame();
+    ASSERT_NE(timestamp, nullptr);
+    EXPECT_GT(timestamp->timestamp, GetParam().originalTimestamp);
+  }
+  const auto* rebuiltStream = frames.back().asWriteStreamFrame();
+  ASSERT_NE(rebuiltStream, nullptr);
+  EXPECT_EQ(streamLength, rebuiltStream->len);
+  expectPeerDecodesStreamAndTimestamps(rebuiltPacket);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    TimestampAheadOfStreamTests,
+    TimestampAheadOfStreamTest,
+    Values(
+        TimestampAheadOfStreamCase{
+            "PrioritizedSameSize",
+            TimestampFrameWriteMode::Prioritized,
+            1000000,
+            true},
+        TimestampAheadOfStreamCase{
+            "OpportunisticSameSize",
+            TimestampFrameWriteMode::Opportunistic,
+            1000000,
+            true},
+        TimestampAheadOfStreamCase{
+            "PrioritizedFreshWouldGrow",
+            TimestampFrameWriteMode::Prioritized,
+            1000,
+            false}),
+    [](const TestParamInfo<TimestampAheadOfStreamCase>& info) {
+      return info.param.name;
+    });
+
+// A TIMESTAMP ahead of a FIN-only final STREAM frame: the rebuilt frame keeps
+// its length field, so no fresh TIMESTAMP goes ahead of it.
+TEST_F(QuicPacketRebuilderTest, NoTimestampAheadOfStreamFrameWithLength) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  RegularQuicPacketBuilder originalBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
+      0);
+  ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
+  ASSERT_FALSE(writeFrame(TimestampFrame(1000000), originalBuilder).hasError());
+  auto streamResult = writeStreamFrameHeader(
+      originalBuilder, stream->id, 0, 0, 0, true, std::nullopt);
+  ASSERT_FALSE(streamResult.hasError());
+  ASSERT_TRUE(streamResult.value().has_value());
+  ASSERT_EQ(*streamResult.value(), 0);
+  auto originalPacket = std::move(originalBuilder).buildPacket();
+  ASSERT_EQ(2, originalPacket.packet.frames.size());
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 50);
+  stream->retransmissionBuffer.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(0),
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(), 0, true)));
+
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Prioritized;
+  conn.connectionTime = Clock::now() - 5s;
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  const auto& frames = rebuiltPacket.packet.frames;
+  ASSERT_FALSE(frames.empty());
+  const auto* rebuiltStream = frames[0].asWriteStreamFrame();
+  ASSERT_NE(rebuiltStream, nullptr);
+  EXPECT_EQ(rebuiltStream->len, 0);
+  EXPECT_TRUE(rebuiltStream->fin);
+  expectPeerDecodesStreamAndTimestamps(rebuiltPacket);
+}
 
 TEST_F(QuicPacketRebuilderTest, TimestampOnlyPacketDoesNotRebuild) {
   RegularQuicPacketBuilder originalBuilder(

@@ -484,7 +484,7 @@ FrameScheduler::scheduleFramesForPacket(
   }
 
   PacketBuilderInterface* bulkBuilder = &wrapper;
-  Optional<PacketBuilderWrapper> prioritizedWrapper;
+  Optional<TrailingReservationPacketBuilder> prioritizedWrapper;
   const auto timestampPacketSelection =
       conn_.transportSettings.oneRttTimestampFramePacketSelection;
   const bool hadSelectedFrameBeforeBulk =
@@ -496,9 +496,17 @@ FrameScheduler::scheduleFramesForPacket(
     if (timestampSize.hasError()) {
       return quic::make_unexpected(timestampSize.error());
     }
-    const auto remaining = wrapper.remainingSpaceInPkt();
-    if (remaining >= timestampSize.value()) {
-      prioritizedWrapper.emplace(wrapper, remaining - timestampSize.value());
+    if (wrapper.remainingSpaceInPkt() >= timestampSize.value()) {
+      // A STREAM frame that fills the rest of the packet has this TIMESTAMP
+      // written ahead of it, so it can still omit its length.
+      prioritizedWrapper.emplace(
+          wrapper,
+          timestampSize.value(),
+          [this, &timestampFrame](PacketBuilderInterface& target) {
+            auto result = timestampFrameScheduler_->writeTimestampFrame(
+                *timestampFrame, target);
+            return result.has_value() && result.value();
+          });
       bulkBuilder = &*prioritizedWrapper;
     }
   }
@@ -537,7 +545,9 @@ FrameScheduler::scheduleFramesForPacket(
     }
   }
 
-  if (timestampFrame &&
+  const bool timestampWrittenFirst =
+      prioritizedWrapper && prioritizedWrapper->reservedFrameWritten();
+  if (timestampFrame && !timestampWrittenFirst &&
       timestampPacketObserver.matchesPacketSelection(
           timestampPacketSelection)) {
     // TIMESTAMP does not make an ACK-only packet ACK-eliciting, so it can use

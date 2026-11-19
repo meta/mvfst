@@ -142,9 +142,11 @@ mvfst_cpp_test(
     ],
     supports_static_listing = False,
     deps = [
+        "fbsource//third-party/fmt:fmt",
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/quic/api:transport_helpers",
         "fbsource//xplat/quic/client:state_and_handshake",
+        "fbsource//xplat/quic/codec:decode",
         "fbsource//xplat/quic/codec:pktbuilder",
         "fbsource//xplat/quic/codec/test:mocks",
         "fbsource//xplat/quic/common:mvfst_logging",

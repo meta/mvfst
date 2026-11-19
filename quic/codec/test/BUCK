@@ -172,6 +172,7 @@ mvfst_cpp_test(
     deps = [
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/quic/codec:codec",
+        "fbsource//xplat/quic/codec:decode",
         "fbsource//xplat/quic/codec:pktbuilder",
         "fbsource//xplat/quic/codec:pktrebuilder",
         "fbsource//xplat/quic/common/test:test_utils",

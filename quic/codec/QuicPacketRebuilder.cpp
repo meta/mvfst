@@ -118,6 +118,10 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
   bool shouldWriteWindowUpdate = false;
   bool notPureAck = false;
   bool shouldRebuildWriteAckFrame = false;
+  // A STREAM frame rebuilt without its length extends to the end of the packet,
+  // so no TIMESTAMP may follow it.
+  bool wroteLengthlessStreamFrame = false;
+  bool wroteTimestampFrame = false;
   auto& packetBuilder = builder_.builder();
   auto encryptionLevel =
       protectionTypeToEncryptionLevel(packet.packet.header.getProtectionType());
@@ -135,6 +139,47 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
       break;
     }
   }
+  // The original had a TIMESTAMP right before its final STREAM frame so that
+  // frame could omit its length. When the rebuilt frame omits it too, write a
+  // fresh TIMESTAMP ahead of it, as long as both still fit; the STREAM frame
+  // then still ends the packet.
+  const auto maybeWriteTimestampAheadOf =
+      [&](auto iter, const WriteStreamFrame& streamFrame)
+      -> quic::Expected<void, QuicError> {
+    if (iter == packet.packet.frames.cbegin() ||
+        std::prev(iter)->asTimestampFrame() == nullptr ||
+        !builder_.isTracking() || encryptionLevel != EncryptionLevel::AppData ||
+        packet.packet.header.getHeaderForm() != HeaderForm::Short ||
+        !shouldWriteOneRttTimestampFrame(conn_, false)) {
+      return {};
+    }
+    auto timestampFrame = generateOneRttTimestampFrame(conn_);
+    if (!timestampFrame) {
+      return {};
+    }
+    auto timestampSize = getTimestampFrameEncodedSize(*timestampFrame);
+    if (timestampSize.hasError()) {
+      return quic::make_unexpected(timestampSize.error());
+    }
+    const auto remaining = packetBuilder.remainingSpaceInPkt();
+    if (remaining < timestampSize.value()) {
+      return {};
+    }
+    auto streamFits = completeStreamFrameFits(
+        streamFrame, true, remaining - timestampSize.value());
+    if (streamFits.hasError()) {
+      return quic::make_unexpected(streamFits.error());
+    }
+    if (!streamFits.value()) {
+      return {};
+    }
+    auto writeResult = writeFrame(*timestampFrame, packetBuilder);
+    if (writeResult.hasError()) {
+      return quic::make_unexpected(writeResult.error());
+    }
+    wroteTimestampFrame |= writeResult.value() != 0;
+    return {};
+  };
   for (auto iter = packet.packet.frames.cbegin();
        iter != packet.packet.frames.cend();
        iter++) {
@@ -171,6 +216,13 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
             if (!stream->streamSendBuffer->isOutstanding(sendRange)) {
               writeSuccess = false;
               break;
+            }
+            if (skipLengthField) {
+              auto timestampResult =
+                  maybeWriteTimestampAheadOf(iter, streamFrame);
+              if (timestampResult.hasError()) {
+                return quic::make_unexpected(timestampResult.error());
+              }
             }
 
             auto frameFits = completeStreamFrameFits(
@@ -209,6 +261,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
                   return true;
                 });
             MVCHECK(dataWritten);
+            wroteLengthlessStreamFrame |= skipLengthField;
             notPureAck = true;
             writeSuccess = true;
             break;
@@ -216,6 +269,17 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
 
           auto streamData = cloneRetransmissionBuffer(streamFrame, stream);
           auto bufferLen = streamData ? streamData->chainLength() : 0;
+          // It's safe to skip the length if it was the last frame in the
+          // original packet and there's no ACK frame. Since we put the ACK
+          // frame last we need to end the stream frame in that case.
+          const bool skipLengthField = lastFrame && bufferLen && !hasAckFrame;
+          if (skipLengthField && bufferLen == streamFrame.len) {
+            auto timestampResult =
+                maybeWriteTimestampAheadOf(iter, streamFrame);
+            if (timestampResult.hasError()) {
+              return quic::make_unexpected(timestampResult.error());
+            }
+          }
           auto res = writeStreamFrameHeader(
               packetBuilder,
               streamFrame.streamId,
@@ -223,10 +287,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
               bufferLen,
               bufferLen,
               streamFrame.fin,
-              // It's safe to skip the length if it was the last frame in the
-              // original packet and there's no ACK frame. Since we put the ACK
-              // frame last we need to end the stream frame in that case.
-              lastFrame && bufferLen && !hasAckFrame);
+              skipLengthField);
           if (res.hasError()) {
             MVVLOG(4) << "Failed to write stream frame header for cloning: "
                       << res.error().message;
@@ -250,6 +311,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
             if (streamData) {
               writeStreamFrameData(packetBuilder, *streamData, *dataLen);
             }
+            wroteLengthlessStreamFrame |= skipLengthField;
             notPureAck = true;
             writeSuccess = true;
             break;
@@ -366,9 +428,13 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
         break;
       }
       case QuicWriteFrame::Type::DatagramFrame:
+        // Datagram data is unreliable and not meaningful to clone.
+        writeSuccess = true;
+        break;
       case QuicWriteFrame::Type::TimestampFrame:
-        // Datagram data is unreliable, and TIMESTAMP reflects send time.
-        // Neither frame is meaningful to clone.
+        // TIMESTAMP reflects send time, so the old value is never cloned. If
+        // it sat right before the final STREAM frame, the STREAM case below
+        // writes a fresh one there.
         writeSuccess = true;
         break;
       default: {
@@ -415,7 +481,8 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
   // then generate a fresh TIMESTAMP from current policy if capacity remains.
   // Prioritized reserves only before stream/datagram scheduler output; it does
   // not displace clone contents on this path.
-  if (builder_.isTracking() && encryptionLevel == EncryptionLevel::AppData &&
+  if (builder_.isTracking() && !wroteLengthlessStreamFrame &&
+      !wroteTimestampFrame && encryptionLevel == EncryptionLevel::AppData &&
       packet.packet.header.getHeaderForm() == HeaderForm::Short &&
       timestampPacketObserver_.matchesPacketSelection(
           conn_.transportSettings.oneRttTimestampFramePacketSelection) &&

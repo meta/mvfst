@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <fmt/format.h>
 #include <folly/portability/GTest.h>
 #include <quic/common/MvfstLogging.h>
 
@@ -12,6 +13,7 @@
 #include <quic/api/QuicTransportFunctions.h>
 #include <quic/api/test/Mocks.h>
 #include <quic/client/state/ClientStateMachine.h>
+#include <quic/codec/Decode.h>
 #include <quic/codec/QuicPacketBuilder.h>
 #include <quic/codec/test/Mocks.h>
 #include <quic/common/test/TestUtils.h>
@@ -22,6 +24,7 @@
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/test/MockQuicStats.h>
 #include <chrono>
+#include <iostream>
 #include <optional>
 
 using namespace quic;
@@ -237,6 +240,81 @@ void addPlainAckState(QuicConnectionStateBase& conn) {
   ackState.acks.insert(10);
   ackState.largestRecvdPacketNum = 10;
   ackState.largestRecvdPacketTime = Clock::now();
+}
+
+// Decodes a built packet's body the way the peer would.
+std::vector<QuicFrame> decodeWireFrames(
+    const PacketBuilderInterface::Packet& packet) {
+  // The read path decodes from one contiguous buffer.
+  auto body = packet.body.clone();
+  body->coalesce();
+  BufQueue queue;
+  queue.append(std::move(body));
+  const CodecParameters params(kDefaultAckDelayExponent, QuicVersion::MVFST);
+  std::vector<QuicFrame> frames;
+  while (!queue.empty()) {
+    auto frame = quic::parseFrame(queue, packet.packet.header, params);
+    if (frame.hasError()) {
+      ADD_FAILURE() << "peer cannot decode frame: " << frame.error().message;
+      break;
+    }
+    frames.push_back(std::move(*frame));
+  }
+  return frames;
+}
+
+// The peer must decode the recorded non-padding frames one for one: every
+// STREAM frame with its recorded length and every TIMESTAMP as its own frame.
+void expectPeerDecodesRecordedFrames(
+    const PacketBuilderInterface::Packet& packet) {
+  std::vector<const QuicWriteFrame*> recorded;
+  for (const auto& frame : packet.packet.frames) {
+    if (!frame.asPaddingFrame()) {
+      recorded.push_back(&frame);
+    }
+  }
+  std::vector<QuicFrame> decoded;
+  for (auto& frame : decodeWireFrames(packet)) {
+    if (!frame.asPaddingFrame()) {
+      decoded.push_back(std::move(frame));
+    }
+  }
+  ASSERT_EQ(decoded.size(), recorded.size());
+  for (size_t i = 0; i < recorded.size(); ++i) {
+    SCOPED_TRACE(fmt::format("frame {}", i));
+    if (const auto* written = recorded[i]->asWriteStreamFrame()) {
+      const auto* read = decoded[i].asReadStreamFrame();
+      ASSERT_NE(read, nullptr);
+      EXPECT_EQ(read->streamId, written->streamId);
+      EXPECT_EQ(read->offset, written->offset);
+      EXPECT_EQ(
+          read->data ? read->data->computeChainDataLength() : 0, written->len);
+      EXPECT_EQ(read->fin, written->fin);
+    } else if (const auto* writtenTimestamp = recorded[i]->asTimestampFrame()) {
+      const auto* read = decoded[i].asTimestampFrame();
+      ASSERT_NE(read, nullptr);
+      EXPECT_EQ(read->timestamp, writtenTimestamp->timestamp);
+    } else if (recorded[i]->asDatagramFrame()) {
+      EXPECT_NE(decoded[i].asDatagramFrame(), nullptr);
+    } else if (recorded[i]->asWriteAckFrame()) {
+      EXPECT_NE(decoded[i].asReadAckFrame(), nullptr);
+    }
+  }
+}
+
+uint64_t packetWireSize(const PacketBuilderInterface::Packet& packet) {
+  return packet.header.computeChainDataLength() +
+      packet.body.computeChainDataLength();
+}
+
+uint64_t streamBytesInPacket(const RegularQuicWritePacket& packet) {
+  uint64_t bytes = 0;
+  for (const auto& frame : packet.frames) {
+    if (const auto* streamFrame = frame.asWriteStreamFrame()) {
+      bytes += streamFrame->len;
+    }
+  }
+  return bytes;
 }
 } // namespace
 
@@ -2351,6 +2429,659 @@ TEST_P(
   ASSERT_EQ(result->packet->packet.frames.size(), 1);
   EXPECT_NE(result->packet->packet.frames[0].asDatagramFrame(), nullptr);
   EXPECT_EQ(conn.datagramState.flowManager.getDatagramCount(), 0);
+}
+
+// Stream data fills the packet, so Prioritized writes its TIMESTAMP first and
+// the STREAM frame after it runs to the end of the packet without a length.
+TEST_P(
+    QuicPacketSchedulerTest,
+    PrioritizedTimestampPrecedesPacketFillingStream) {
+  auto connPtr = createConn(10, 100000, 100000);
+  ASSERT_NE(connPtr, nullptr);
+  auto& conn = *connPtr;
+  conn.transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Prioritized;
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.connectionTime = Clock::now() - std::chrono::seconds(5);
+  auto stream = createStream(conn);
+  writeDataToStream(
+      conn, stream, buildRandomInputData(conn.udpSendPacketLen * 2));
+  FrameScheduler scheduler = std::move(
+                                 FrameScheduler::Builder(
+                                     conn,
+                                     EncryptionLevel::AppData,
+                                     PacketNumberSpace::AppData,
+                                     "prioritizedFullStream")
+                                     .streamFrames()
+                                     .timestampFrames())
+                                 .build();
+  const auto writableBytes = static_cast<uint32_t>(conn.udpSendPacketLen);
+  RegularQuicPacketBuilder builder(
+      writableBytes,
+      ShortHeader(
+          ProtectionType::KeyPhaseOne,
+          conn.clientConnectionId.value_or(getTestConnectionId()),
+          getNextPacketNum(conn, PacketNumberSpace::AppData)),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result =
+      scheduler.scheduleFramesForPacket(std::move(builder), writableBytes);
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  const auto& packet = *result->packet;
+  ASSERT_EQ(packet.packet.frames.size(), 2);
+  const auto* timestampFrame = packet.packet.frames[0].asTimestampFrame();
+  ASSERT_NE(timestampFrame, nullptr);
+  const auto* streamFrame = packet.packet.frames[1].asWriteStreamFrame();
+  ASSERT_NE(streamFrame, nullptr);
+  EXPECT_EQ(packetWireSize(packet), writableBytes);
+  // TIMESTAMP, then the STREAM type, the 1-byte stream ID and the data: no
+  // length field.
+  EXPECT_EQ(
+      packet.body.computeChainDataLength(),
+      getTimestampFrameEncodedSize(*timestampFrame).value() + 2 +
+          streamFrame->len);
+  expectPeerDecodesRecordedFrames(packet);
+}
+
+// Sweeps packet budgets across the STREAM length-field size boundaries, with
+// one and two streams. Every write mode must stay within budget and decode as
+// recorded. Opportunistic must leave stream output unchanged. Prioritized may
+// give up only the TIMESTAMP's bytes, must send stream data whenever Disabled
+// does, and must carry a TIMESTAMP whenever a minimal STREAM frame and a
+// TIMESTAMP both fit.
+TEST_P(QuicPacketSchedulerTest, TimestampWriteModesAcrossPacketBudgets) {
+  // Five seconds into the connection the TIMESTAMP value takes a 4-byte
+  // varint, so the frame is 6 bytes.
+  constexpr uint64_t kTimestampFrameSize = 6;
+  // Type, 1-byte stream ID, 1-byte length and one byte of data.
+  constexpr uint64_t kMinStreamFrameSize = 4;
+
+  // The packet body references the stream's send buffer, so it is kept with
+  // the connection that owns it.
+  struct BuiltPacket {
+    std::unique_ptr<QuicClientConnectionState> conn;
+    Optional<PacketBuilderInterface::Packet> packet;
+  };
+
+  const auto buildPacket = [&](TimestampFrameWriteMode mode,
+                               uint32_t budget,
+                               const std::vector<size_t>& streamLengths) {
+    BuiltPacket built{.conn = createConn(10, 100000, 100000)};
+    auto& conn = *built.conn;
+    conn.transportSettings.oneRttTimestampFrameWriteMode = mode;
+    conn.peerTimestampFrameState.canReceive = true;
+    conn.connectionTime = Clock::now() - std::chrono::seconds(5);
+    for (auto length : streamLengths) {
+      writeDataToStream(conn, createStream(conn), buildRandomInputData(length));
+    }
+    FrameScheduler scheduler = std::move(
+                                   FrameScheduler::Builder(
+                                       conn,
+                                       EncryptionLevel::AppData,
+                                       PacketNumberSpace::AppData,
+                                       "timestampBudgetSweep")
+                                       .streamFrames()
+                                       .timestampFrames())
+                                   .build();
+    // A fixed packet number keeps the header size identical across builds.
+    RegularQuicPacketBuilder builder(
+        budget,
+        ShortHeader(ProtectionType::KeyPhaseOne, getTestConnectionId(), 1),
+        0);
+    auto result = scheduler.scheduleFramesForPacket(std::move(builder), budget);
+    EXPECT_TRUE(result.has_value());
+    if (result.has_value() && result->packet) {
+      built.packet = std::move(result->packet);
+    }
+    return built;
+  };
+
+  // Header bytes of the packets built above.
+  RegularQuicPacketBuilder probe(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseOne, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(probe.encodePacketHeader().hasError());
+  const uint32_t headerSize =
+      kDefaultUDPSendPacketLen - probe.remainingSpaceInPkt();
+
+  std::vector<uint32_t> budgets;
+  for (uint32_t space = 1; space <= 100; ++space) {
+    budgets.push_back(headerSize + space);
+  }
+  for (uint32_t budget : {300, 600, 1200, 1252, 1452, 1500}) {
+    budgets.push_back(budget);
+  }
+  const std::vector<std::vector<size_t>> streamLengthCases = {
+      {1},
+      {20},
+      {60},
+      {61},
+      {62},
+      {63},
+      {64},
+      {65},
+      {100},
+      {1000},
+      {3000},
+      {30, 3000},
+  };
+
+  for (const auto& streamLengths : streamLengthCases) {
+    for (auto budget : budgets) {
+      std::string streams;
+      for (auto length : streamLengths) {
+        streams += fmt::format("{} ", length);
+      }
+      SCOPED_TRACE(fmt::format("streams=[{}] budget={}", streams, budget));
+      auto disabled =
+          buildPacket(TimestampFrameWriteMode::Disabled, budget, streamLengths);
+      auto opportunistic = buildPacket(
+          TimestampFrameWriteMode::Opportunistic, budget, streamLengths);
+      auto prioritized = buildPacket(
+          TimestampFrameWriteMode::Prioritized, budget, streamLengths);
+      ASSERT_TRUE(disabled.packet.has_value());
+      ASSERT_TRUE(opportunistic.packet.has_value());
+      ASSERT_TRUE(prioritized.packet.has_value());
+      for (const auto* packet :
+           {&*disabled.packet, &*opportunistic.packet, &*prioritized.packet}) {
+        expectPeerDecodesRecordedFrames(*packet);
+        EXPECT_LE(packetWireSize(*packet), budget);
+      }
+      EXPECT_EQ(countTimestampFrames(disabled.packet->packet.frames), 0);
+
+      const auto disabledBytes = streamBytesInPacket(disabled.packet->packet);
+      EXPECT_EQ(
+          streamBytesInPacket(opportunistic.packet->packet), disabledBytes);
+
+      const auto prioritizedBytes =
+          streamBytesInPacket(prioritized.packet->packet);
+      const bool prioritizedHasTimestamp =
+          countTimestampFrames(prioritized.packet->packet.frames) == 1;
+      if (disabledBytes > 0) {
+        EXPECT_GT(prioritizedBytes, 0);
+      }
+      if (prioritizedHasTimestamp) {
+        EXPECT_GE(prioritizedBytes + kTimestampFrameSize, disabledBytes);
+      } else {
+        EXPECT_EQ(prioritizedBytes, disabledBytes);
+      }
+      if (budget - headerSize >= kMinStreamFrameSize + kTimestampFrameSize) {
+        EXPECT_TRUE(prioritizedHasTimestamp);
+      }
+    }
+  }
+}
+
+// Uploads one large stream packet by packet at common path MTUs. Prioritized
+// must put a TIMESTAMP on every packet, fill every packet but the last, and
+// cost each full packet exactly the TIMESTAMP: it goes ahead of the STREAM
+// frame, which keeps running to the end of the packet. Opportunistic can only
+// add one where stream data leaves room, so at most on the final packet.
+TEST_P(QuicPacketSchedulerTest, TimestampWriteModesOnBulkUpload) {
+  constexpr size_t kUploadBytes = 200 * 1000;
+  constexpr uint8_t kCipherOverhead = 16;
+  constexpr uint64_t kTimestampFrameSize = 6;
+
+  struct UploadTotals {
+    size_t packets{0};
+    size_t timestamps{0};
+    uint64_t streamBytes{0};
+  };
+
+  const auto upload = [&](TimestampFrameWriteMode mode, uint32_t packetLen) {
+    UploadTotals totals;
+    auto connPtr = createConn(10, 10 * 1000 * 1000, 10 * 1000 * 1000);
+    auto& conn = *connPtr;
+    // Same packet numbers in every run, so header sizes match across modes.
+    conn.ackStates.appDataAckState.nextPacketNum = 0;
+    conn.transportSettings.skipOneInNPacketSequenceNumber =
+        std::numeric_limits<uint16_t>::max();
+    conn.udpSendPacketLen = packetLen;
+    conn.transportSettings.oneRttTimestampFrameWriteMode = mode;
+    conn.peerTimestampFrameState.canReceive = true;
+    conn.connectionTime = Clock::now() - std::chrono::seconds(5);
+    writeDataToStream(
+        conn, createStream(conn), buildRandomInputData(kUploadBytes));
+    FrameScheduler scheduler = std::move(
+                                   FrameScheduler::Builder(
+                                       conn,
+                                       EncryptionLevel::AppData,
+                                       PacketNumberSpace::AppData,
+                                       "bulkUpload")
+                                       .streamFrames()
+                                       .timestampFrames())
+                                   .build();
+    while (scheduler.hasData() && totals.packets < 1000) {
+      SCOPED_TRACE(fmt::format("packet {}", totals.packets));
+      RegularQuicPacketBuilder builder(
+          packetLen,
+          ShortHeader(
+              ProtectionType::KeyPhaseZero,
+              getTestConnectionId(),
+              getNextPacketNum(conn, PacketNumberSpace::AppData)),
+          conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+      builder.accountForCipherOverhead(kCipherOverhead);
+      auto result = scheduler.scheduleFramesForPacket(
+          std::move(builder), packetLen - kCipherOverhead);
+      EXPECT_TRUE(result.has_value());
+      if (!result.has_value() || !result->packet ||
+          result->packet->packet.frames.empty()) {
+        ADD_FAILURE() << "stream data pending but no packet was built";
+        break;
+      }
+      auto& packet = *result->packet;
+      expectPeerDecodesRecordedFrames(packet);
+      const auto wireSize = packetWireSize(packet);
+      EXPECT_LE(wireSize + kCipherOverhead, packetLen);
+      const auto streamBytes = streamBytesInPacket(packet.packet);
+      const auto timestamps = countTimestampFrames(packet.packet.frames);
+      totals.streamBytes += streamBytes;
+      totals.timestamps += timestamps;
+      ++totals.packets;
+      const bool lastPacket = totals.streamBytes == kUploadBytes;
+      if (!lastPacket) {
+        EXPECT_EQ(wireSize + kCipherOverhead, packetLen);
+      }
+      if (mode == TimestampFrameWriteMode::Prioritized) {
+        EXPECT_EQ(timestamps, 1);
+        const auto* streamFrame = packet.packet.frames.size() == 2 &&
+                packet.packet.frames[0].asTimestampFrame()
+            ? packet.packet.frames[1].asWriteStreamFrame()
+            : nullptr;
+        if (!lastPacket) {
+          EXPECT_NE(streamFrame, nullptr);
+        }
+        if (!lastPacket && streamFrame) {
+          // The TIMESTAMP, then the STREAM type, the 1-byte stream ID and the
+          // offset varint take everything the data does not: no length field.
+          const auto offsetSize = streamFrame->offset == 0
+              ? 0
+              : getQuicIntegerSize(streamFrame->offset).value();
+          EXPECT_EQ(
+              kTimestampFrameSize + 2 + offsetSize + streamBytes,
+              wireSize - packet.header.computeChainDataLength());
+        }
+      } else if (mode == TimestampFrameWriteMode::Opportunistic) {
+        if (!lastPacket) {
+          EXPECT_EQ(timestamps, 0);
+        }
+      } else {
+        EXPECT_EQ(timestamps, 0);
+      }
+      const auto bodySize = packet.body.computeChainDataLength();
+      auto updateResult = updateConnection(
+          conn,
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          std::nullopt,
+          std::move(packet.packet),
+          Clock::now(),
+          wireSize,
+          bodySize);
+      EXPECT_TRUE(updateResult.has_value());
+    }
+    EXPECT_EQ(totals.streamBytes, kUploadBytes);
+    return totals;
+  };
+
+  for (uint32_t packetLen : {1200, 1252, 1350, 1452, 1500}) {
+    SCOPED_TRACE(fmt::format("udpSendPacketLen={}", packetLen));
+    const auto disabled = upload(TimestampFrameWriteMode::Disabled, packetLen);
+    const auto opportunistic =
+        upload(TimestampFrameWriteMode::Opportunistic, packetLen);
+    const auto prioritized =
+        upload(TimestampFrameWriteMode::Prioritized, packetLen);
+    EXPECT_EQ(opportunistic.packets, disabled.packets);
+    EXPECT_LE(opportunistic.timestamps, 1);
+    EXPECT_EQ(prioritized.timestamps, prioritized.packets);
+    // Each full packet gives up 6 of roughly packetLen - 30 payload bytes.
+    const double perPacketPayload = packetLen - kCipherOverhead - 30;
+    EXPECT_LE(
+        prioritized.packets,
+        disabled.packets * perPacketPayload /
+                (perPacketPayload - kTimestampFrameSize) +
+            1);
+    std::cout << fmt::format(
+                     "bulk upload {} B at udpSendPacketLen {}: packets "
+                     "disabled={} opportunistic={} (timestamps={}) "
+                     "prioritized={} (timestamps={}), extra packets {:.2f}%",
+                     kUploadBytes,
+                     packetLen,
+                     disabled.packets,
+                     opportunistic.packets,
+                     opportunistic.timestamps,
+                     prioritized.packets,
+                     prioritized.timestamps,
+                     100.0 * (prioritized.packets - disabled.packets) /
+                         disabled.packets)
+              << std::endl;
+  }
+}
+
+// DATAGRAM frames whose size lands at or just under the packet limit, with and
+// without an ACK already in the packet. A datagram must never be dropped or
+// overflow the packet. Prioritized releases the TIMESTAMP reservation for a
+// datagram that is the packet's only carrier; behind an ACK, which already
+// carries the TIMESTAMP, it holds the reservation and the datagram goes out
+// in the next packet.
+TEST_P(QuicPacketSchedulerTest, TimestampWriteModesWithDatagramsAtPacketLimit) {
+  constexpr uint32_t kBudget = 1252;
+  constexpr uint64_t kTimestampFrameSize = 6;
+  // Accounting for the AEAD tag keeps buildPacket() from padding small bodies.
+  constexpr uint8_t kCipherOverhead = 16;
+  RegularQuicPacketBuilder probe(
+      kBudget,
+      ShortHeader(ProtectionType::KeyPhaseOne, getTestConnectionId(), 1),
+      0);
+  probe.accountForCipherOverhead(kCipherOverhead);
+  ASSERT_FALSE(probe.encodePacketHeader().hasError());
+  const uint64_t emptySpace = probe.remainingSpaceInPkt();
+
+  const auto makeConn = [&](TimestampFrameWriteMode mode, bool withAck) {
+    auto conn = std::make_unique<QuicClientConnectionState>(
+        FizzClientQuicHandshakeContext::Builder().build());
+    conn->transportSettings.oneRttTimestampFrameWriteMode = mode;
+    conn->peerTimestampFrameState.canReceive = true;
+    conn->connectionTime = Clock::now() - std::chrono::seconds(5);
+    conn->datagramState.maxWriteFrameSize =
+        std::numeric_limits<uint16_t>::max();
+    // No modulo padding, so the probe below measures only the ACK.
+    conn->transportSettings.paddingModulo = 0;
+    if (withAck) {
+      addPlainAckState(*conn);
+      // A 10 ms ACK delay keeps the ACK frame the same size in every run.
+      getAckState(*conn, PacketNumberSpace::AppData).largestRecvdPacketTime =
+          Clock::now() - std::chrono::milliseconds(10);
+    }
+    return conn;
+  };
+  const auto schedule = [&](QuicClientConnectionState& conn, bool withAck) {
+    auto builder = FrameScheduler::Builder(
+        conn,
+        EncryptionLevel::AppData,
+        PacketNumberSpace::AppData,
+        "datagramLimit");
+    builder.datagramFrames().timestampFrames();
+    if (withAck) {
+      builder.ackFrames();
+    }
+    FrameScheduler scheduler = std::move(builder).build();
+    RegularQuicPacketBuilder packetBuilder(
+        kBudget,
+        ShortHeader(ProtectionType::KeyPhaseOne, getTestConnectionId(), 1),
+        0);
+    packetBuilder.accountForCipherOverhead(kCipherOverhead);
+    auto result =
+        scheduler.scheduleFramesForPacket(std::move(packetBuilder), kBudget);
+    EXPECT_TRUE(result.has_value());
+    EXPECT_TRUE(result.has_value() && result->packet.has_value());
+    return result;
+  };
+
+  // Bytes the ACK takes ahead of the datagram.
+  uint64_t ackSize = 0;
+  {
+    auto conn = makeConn(TimestampFrameWriteMode::Disabled, true);
+    auto result = schedule(*conn, true);
+    ASSERT_TRUE(result.has_value() && result->packet.has_value());
+    ackSize = result->packet->body.computeChainDataLength();
+    ASSERT_GT(ackSize, 0);
+  }
+
+  for (auto mode :
+       {TimestampFrameWriteMode::Opportunistic,
+        TimestampFrameWriteMode::Prioritized}) {
+    for (bool withAck : {false, true}) {
+      const uint64_t space = emptySpace - (withAck ? ackSize : 0);
+      for (int slack = -1; slack <= 8; ++slack) {
+        SCOPED_TRACE(
+            fmt::format(
+                "mode={} ack={} slack={}",
+                static_cast<int>(mode),
+                withAck,
+                slack));
+        // DATAGRAM_LEN type, 2-byte length and payload fill all but `slack`
+        // bytes.
+        const uint64_t frameSize = space - slack;
+        const size_t payload = frameSize - kDatagramFrameTypeSize - 2;
+        auto conn = makeConn(mode, withAck);
+        ASSERT_FALSE(
+            conn->datagramState.flowManager
+                .addDatagram(
+                    folly::IOBuf::copyBuffer(std::string(payload, 'd')),
+                    kDefaultDatagramFlowId)
+                .hasError());
+        auto result = schedule(*conn, withAck);
+        ASSERT_TRUE(result.has_value() && result->packet.has_value());
+        const auto& packet = *result->packet;
+        expectPeerDecodesRecordedFrames(packet);
+        EXPECT_LE(packetWireSize(packet) + kCipherOverhead, kBudget);
+
+        const bool datagramFits = slack >= 0;
+        const bool heldForTimestamp = withAck &&
+            mode == TimestampFrameWriteMode::Prioritized &&
+            static_cast<uint64_t>(slack) < kTimestampFrameSize;
+        const bool expectDatagram = datagramFits && !heldForTimestamp;
+        const bool sentDatagram = std::any_of(
+            packet.packet.frames.begin(),
+            packet.packet.frames.end(),
+            [](const auto& frame) { return frame.asDatagramFrame(); });
+        EXPECT_EQ(sentDatagram, expectDatagram);
+        const bool expectTimestamp = expectDatagram
+            ? static_cast<uint64_t>(slack) >= kTimestampFrameSize
+            : withAck;
+        EXPECT_EQ(
+            countTimestampFrames(packet.packet.frames),
+            expectTimestamp ? 1 : 0);
+        if (!datagramFits) {
+          continue;
+        }
+        // Nothing is dropped: a held datagram is still queued and fills the
+        // next packet, which has no ACK.
+        EXPECT_EQ(
+            conn->datagramState.flowManager.getDatagramCount(),
+            expectDatagram ? 0 : 1);
+        if (!expectDatagram) {
+          auto next = schedule(*conn, false);
+          ASSERT_TRUE(next.has_value() && next->packet.has_value());
+          expectPeerDecodesRecordedFrames(*next->packet);
+          EXPECT_TRUE(
+              std::any_of(
+                  next->packet->packet.frames.begin(),
+                  next->packet->packet.frames.end(),
+                  [](const auto& frame) { return frame.asDatagramFrame(); }));
+          EXPECT_EQ(conn->datagramState.flowManager.getDatagramCount(), 0);
+        }
+      }
+    }
+  }
+}
+
+// A large ACK, window updates and blocked frames are written before bulk data
+// and must come out the same in every write mode; only the stream data after
+// them makes room for the TIMESTAMP.
+TEST_P(QuicPacketSchedulerTest, TimestampWriteModesKeepAckAndControlFrames) {
+  constexpr uint32_t kBudget = 1252;
+
+  struct Built {
+    std::unique_ptr<QuicClientConnectionState> conn;
+    Optional<PacketBuilderInterface::Packet> packet;
+  };
+
+  const auto build = [&](TimestampFrameWriteMode mode,
+                         size_t ackRanges,
+                         uint64_t connFlowControlLimit) {
+    Built built{.conn = createConn(10, connFlowControlLimit, 100000)};
+    auto& conn = *built.conn;
+    conn.transportSettings.oneRttTimestampFrameWriteMode = mode;
+    conn.peerTimestampFrameState.canReceive = true;
+    conn.connectionTime = Clock::now() - std::chrono::seconds(5);
+    auto& ackState = getAckState(conn, PacketNumberSpace::AppData);
+    for (size_t i = 0; i < ackRanges; ++i) {
+      ackState.acks.insert(i * 10, i * 10 + 3);
+    }
+    ackState.largestRecvdPacketNum = ackRanges * 10;
+    ackState.largestRecvdPacketTime = Clock::now();
+    auto streamId = createStream(conn);
+    writeDataToStream(conn, streamId, buildRandomInputData(5000));
+    conn.pendingEvents.connWindowUpdate = true;
+    conn.streamManager->queueWindowUpdate(streamId);
+    conn.pendingEvents.sendDataBlocked = true;
+    conn.streamManager->queueBlocked(streamId, 0);
+    FrameScheduler scheduler = std::move(
+                                   FrameScheduler::Builder(
+                                       conn,
+                                       EncryptionLevel::AppData,
+                                       PacketNumberSpace::AppData,
+                                       "ackAndControl")
+                                       .ackFrames()
+                                       .windowUpdateFrames()
+                                       .blockedFrames()
+                                       .streamFrames()
+                                       .timestampFrames())
+                                   .build();
+    RegularQuicPacketBuilder builder(
+        kBudget,
+        ShortHeader(ProtectionType::KeyPhaseOne, getTestConnectionId(), 1),
+        0);
+    auto result =
+        scheduler.scheduleFramesForPacket(std::move(builder), kBudget);
+    EXPECT_TRUE(result.has_value());
+    if (result.has_value()) {
+      built.packet = std::move(result->packet);
+    }
+    return built;
+  };
+  const auto nonBulkFrames = [](const RegularQuicWritePacket& packet) {
+    std::vector<QuicWriteFrame> frames;
+    for (const auto& frame : packet.frames) {
+      if (!frame.asWriteStreamFrame() && !frame.asTimestampFrame() &&
+          !frame.asPaddingFrame()) {
+        frames.push_back(frame);
+      }
+    }
+    return frames;
+  };
+
+  // A small ACK with room for stream data, an ACK that leaves only a few
+  // bytes, and a flow-control limit that leaves the packet part empty.
+  for (const auto& [ackRanges, connFlowControlLimit] :
+       std::vector<std::pair<size_t, uint64_t>>{
+           {1, 100000}, {100, 100000}, {1, 300}}) {
+    SCOPED_TRACE(
+        fmt::format(
+            "ackRanges={} connFlowControl={}",
+            ackRanges,
+            connFlowControlLimit));
+    auto disabled = build(
+        TimestampFrameWriteMode::Disabled, ackRanges, connFlowControlLimit);
+    auto prioritized = build(
+        TimestampFrameWriteMode::Prioritized, ackRanges, connFlowControlLimit);
+    ASSERT_TRUE(disabled.packet.has_value());
+    ASSERT_TRUE(prioritized.packet.has_value());
+    expectPeerDecodesRecordedFrames(*disabled.packet);
+    expectPeerDecodesRecordedFrames(*prioritized.packet);
+    EXPECT_LE(packetWireSize(*prioritized.packet), kBudget);
+    const auto disabledControl = nonBulkFrames(disabled.packet->packet);
+    const auto prioritizedControl = nonBulkFrames(prioritized.packet->packet);
+    ASSERT_FALSE(disabledControl.empty());
+    ASSERT_EQ(prioritizedControl.size(), disabledControl.size());
+    for (size_t i = 0; i < disabledControl.size(); ++i) {
+      EXPECT_EQ(prioritizedControl[i].type(), disabledControl[i].type());
+      if (const auto* ack = disabledControl[i].asWriteAckFrame()) {
+        EXPECT_EQ(
+            prioritizedControl[i].asWriteAckFrame()->ackBlocks.size(),
+            ack->ackBlocks.size());
+      }
+    }
+    EXPECT_EQ(countTimestampFrames(prioritized.packet->packet.frames), 1);
+  }
+}
+
+// PTO probes. A clone of a full Prioritized packet gets a fresh TIMESTAMP
+// where the old one was, ahead of its STREAM frame, which still ends the
+// packet. A non-cloning stream probe carries no TIMESTAMP.
+TEST_P(QuicPacketSchedulerTest, TimestampOnPtoProbes) {
+  for (bool unifiedSendBuffer : {false, true}) {
+    SCOPED_TRACE(fmt::format("unifiedSendBuffer={}", unifiedSendBuffer));
+    transportSettings.useUnifiedAppStreamSendBuffer = unifiedSendBuffer;
+    auto connPtr = createConn(10, 100000, 100000);
+    auto& conn = *connPtr;
+    conn.bufAccessor = bufAccessor_.get();
+    conn.transportSettings.useUnifiedAppStreamSendBuffer = unifiedSendBuffer;
+    conn.transportSettings.oneRttTimestampFrameWriteMode =
+        TimestampFrameWriteMode::Prioritized;
+    conn.peerTimestampFrameState.canReceive = true;
+    conn.connectionTime = Clock::now() - std::chrono::seconds(5);
+    writeDataToStream(
+        conn, createStream(conn), buildRandomInputData(conn.udpSendPacketLen));
+    FrameScheduler scheduler = std::move(
+                                   FrameScheduler::Builder(
+                                       conn,
+                                       EncryptionLevel::AppData,
+                                       PacketNumberSpace::AppData,
+                                       "ptoOriginal")
+                                       .streamFrames()
+                                       .timestampFrames())
+                                   .build();
+    const auto packetLen = static_cast<uint32_t>(conn.udpSendPacketLen);
+    const auto newBuilder = [&]() {
+      return RegularQuicPacketBuilder(
+          packetLen,
+          ShortHeader(
+              ProtectionType::KeyPhaseZero,
+              getTestConnectionId(),
+              getNextPacketNum(conn, PacketNumberSpace::AppData)),
+          conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+    };
+    auto original = scheduler.scheduleFramesForPacket(newBuilder(), packetLen);
+    ASSERT_TRUE(original.has_value() && original->packet.has_value());
+    ASSERT_EQ(countTimestampFrames(original->packet->packet.frames), 1);
+    const auto* originalStreamFrame =
+        original->packet->packet.frames.back().asWriteStreamFrame();
+    ASSERT_NE(originalStreamFrame, nullptr);
+    const auto originalStream = *originalStreamFrame;
+    const auto originalSize = packetWireSize(*original->packet);
+    ASSERT_TRUE(
+        updateConnection(
+            conn,
+            *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+            std::nullopt,
+            std::move(original->packet->packet),
+            Clock::now(),
+            originalSize,
+            original->packet->body.computeChainDataLength())
+            .has_value());
+
+    FrameScheduler noopScheduler("noop", conn);
+    if (!unifiedSendBuffer) {
+      CloningScheduler cloningScheduler(noopScheduler, conn, "ptoClone", 0);
+      auto clone =
+          cloningScheduler.scheduleFramesForPacket(newBuilder(), packetLen);
+      ASSERT_TRUE(clone.has_value() && clone->packet.has_value());
+      ASSERT_TRUE(clone->clonedPacketIdentifier.has_value());
+      expectPeerDecodesRecordedFrames(*clone->packet);
+      EXPECT_LE(packetWireSize(*clone->packet), packetLen);
+      ASSERT_NE(
+          clone->packet->packet.frames.back().asWriteStreamFrame(), nullptr);
+      EXPECT_EQ(
+          *clone->packet->packet.frames.back().asWriteStreamFrame(),
+          originalStream);
+      EXPECT_EQ(countTimestampFrames(clone->packet->packet.frames), 1);
+      EXPECT_NE(clone->packet->packet.frames[0].asTimestampFrame(), nullptr);
+    } else {
+      AppDataPtoScheduler ptoScheduler(noopScheduler, conn, "ptoProbe");
+      auto probe =
+          ptoScheduler.scheduleFramesForPacket(newBuilder(), packetLen);
+      ASSERT_TRUE(probe.has_value() && probe->packet.has_value());
+      expectPeerDecodesRecordedFrames(*probe->packet);
+      EXPECT_LE(packetWireSize(*probe->packet), packetLen);
+      EXPECT_EQ(countTimestampFrames(probe->packet->packet.frames), 0);
+      EXPECT_EQ(streamBytesInPacket(probe->packet->packet), originalStream.len);
+    }
+  }
 }
 
 TEST_P(QuicPacketSchedulerTest, LargestAckToSend) {

@@ -114,9 +114,17 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
   if (skipLenHint) {
     shouldSkipLengthField = *skipLenHint;
   } else {
-    // Check if we can fill the entire packet with the rest of this stream frame
+    // Check if we can fill the entire packet with the rest of this stream
+    // frame.
     shouldSkipLengthField =
         dataLen > 0 && dataLen >= builder.remainingSpaceInPkt() - headerSize;
+    // Space the builder holds back for a later frame is not the end of the
+    // packet. If this frame will carry data, have the builder write that frame
+    // first so this one still ends the packet; otherwise keep the length.
+    if (shouldSkipLengthField && builder.reservesTrailingSpace()) {
+      shouldSkipLengthField = builder.remainingSpaceInPkt() > headerSize &&
+          builder.writeReservedFrameFirst();
+    }
   }
   // At most we can write the minimal between data length and what the packet
   // builder allows us to write.

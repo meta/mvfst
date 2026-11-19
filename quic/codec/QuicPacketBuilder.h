@@ -117,6 +117,25 @@ class PacketBuilderInterface {
 
   [[nodiscard]] virtual bool hasFramesPending() const = 0;
 
+  /**
+   * Whether the end of the packet is held back for a frame written later. A
+   * frame that fills remainingSpaceInPkt() is then not the last frame in the
+   * packet, so it must not rely on extending to the end of the packet.
+   */
+  [[nodiscard]] virtual bool reservesTrailingSpace() const {
+    return false;
+  }
+
+  /**
+   * Writes the frame the trailing space is held for now, ahead of the frame
+   * the caller is about to write, so that the caller's frame can end the
+   * packet. The reserved frame uses exactly the held-back bytes, so
+   * remainingSpaceInPkt() does not change. Returns whether it was written.
+   */
+  [[nodiscard]] virtual bool writeReservedFrameFirst() {
+    return false;
+  }
+
   virtual Packet buildPacket() && = 0;
 
   virtual void releaseOutputBuffer() && = 0;
@@ -586,6 +605,14 @@ class PacketBuilderWrapper : public PacketBuilderInterface {
     return builder.hasFramesPending();
   }
 
+  [[nodiscard]] bool reservesTrailingSpace() const override {
+    return builder.reservesTrailingSpace();
+  }
+
+  [[nodiscard]] bool writeReservedFrameFirst() override {
+    return builder.writeReservedFrameFirst();
+  }
+
   void releaseOutputBuffer() && override {
     std::move(builder).releaseOutputBuffer();
   }
@@ -593,6 +620,58 @@ class PacketBuilderWrapper : public PacketBuilderInterface {
  private:
   PacketBuilderInterface& builder;
   uint32_t diff;
+};
+
+/**
+ * Holds back the space for one frame that normally follows the frames written
+ * through this builder: the Prioritized TIMESTAMP, which the scheduler writes
+ * after stream and datagram output. When a STREAM frame would fill the space
+ * that is left, it calls writeReservedFrameFirst(), which writes the reserved
+ * frame into the wrapped builder right away. The STREAM frame then follows it
+ * and runs to the end of the packet without a length field, and the builder
+ * stops reserving.
+ */
+class TrailingReservationPacketBuilder final : public PacketBuilderWrapper {
+ public:
+  using ReservedFrameWriter = std::function<bool(PacketBuilderInterface&)>;
+
+  TrailingReservationPacketBuilder(
+      PacketBuilderInterface& builderIn,
+      uint32_t reservedBytes,
+      ReservedFrameWriter writeReservedFrame)
+      : PacketBuilderWrapper(
+            builderIn,
+            builderIn.remainingSpaceInPkt() > reservedBytes
+                ? builderIn.remainingSpaceInPkt() - reservedBytes
+                : 0),
+        inner_(builderIn),
+        writeReservedFrame_(std::move(writeReservedFrame)) {}
+
+  [[nodiscard]] uint32_t remainingSpaceInPkt() const override {
+    return reservedFrameWritten_ ? inner_.remainingSpaceInPkt()
+                                 : PacketBuilderWrapper::remainingSpaceInPkt();
+  }
+
+  [[nodiscard]] bool reservesTrailingSpace() const override {
+    return !reservedFrameWritten_;
+  }
+
+  [[nodiscard]] bool writeReservedFrameFirst() override {
+    if (reservedFrameWritten_ || !writeReservedFrame_) {
+      return false;
+    }
+    reservedFrameWritten_ = writeReservedFrame_(inner_);
+    return reservedFrameWritten_;
+  }
+
+  [[nodiscard]] bool reservedFrameWritten() const {
+    return reservedFrameWritten_;
+  }
+
+ private:
+  PacketBuilderInterface& inner_;
+  ReservedFrameWriter writeReservedFrame_;
+  bool reservedFrameWritten_{false};
 };
 
 /** Notifies a caller-provided observer when frames are appended. */

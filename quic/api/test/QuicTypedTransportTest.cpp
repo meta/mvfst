@@ -818,6 +818,105 @@ TYPED_TEST(
   this->destroyTransport();
 }
 
+// With Prioritized, stream data fills each packet up to the space reserved
+// for the TIMESTAMP. The bytes on the socket must decode at the peer into the
+// stream data the app wrote plus one TIMESTAMP per packet; a STREAM frame that
+// drops its length field swallows the TIMESTAMP. PTO probes must decode too.
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
+    PrioritizedTimestampFramesKeepStreamDataIntactOnWire) {
+  auto& conn = this->getNonConstConn();
+  conn.outstandings.reset();
+  conn.transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Prioritized;
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.connectionTime = Clock::now() - 5s;
+
+  // Decodes what the transport wrote to its socket since the last call, the
+  // way the peer decodes it.
+  const auto takeDecodedWrites = [this]() {
+    std::vector<RegularQuicPacket> decoded;
+    const auto decode = [&decoded](auto& writes, auto codec) {
+      AckStates ackStates;
+      for (const auto& write : writes) {
+        auto queue = bufToQueue(write->clone());
+        auto result = codec->parsePacket(queue, ackStates);
+        auto* packet = result.regularPacket();
+        EXPECT_NE(packet, nullptr);
+        if (packet != nullptr && packet->header.asShort()) {
+          decoded.push_back(std::move(*packet));
+        }
+      }
+      writes.clear();
+    };
+    if constexpr (std::is_base_of_v<TypeParam, QuicClientTransportTestBase>) {
+      decode(this->socketWrites, this->makeEncryptedCodec(true));
+    } else {
+      decode(this->serverWrites, this->makeClientEncryptedCodec());
+    }
+    return decoded;
+  };
+  takeDecodedWrites();
+
+  const auto streamId =
+      this->getTransport()->createBidirectionalStream().value();
+  auto data = buildRandomInputData(5000);
+  data->coalesce();
+  const std::string expected(
+      reinterpret_cast<const char*>(data->data()), data->length());
+  ASSERT_FALSE(this->getTransport()
+                   ->writeChain(streamId, data->clone(), false)
+                   .hasError());
+
+  struct Decoded {
+    uint64_t streamBytes{0};
+    size_t timestamps{0};
+  };
+
+  // Every decoded STREAM frame must carry the app's bytes at its offset.
+  const auto check = [&](const std::vector<RegularQuicPacket>& packets) {
+    Decoded result;
+    for (const auto& packet : packets) {
+      for (const auto& frame : packet.frames) {
+        if (frame.asTimestampFrame()) {
+          ++result.timestamps;
+          continue;
+        }
+        const auto* stream = frame.asReadStreamFrame();
+        if (stream == nullptr || stream->streamId != streamId) {
+          continue;
+        }
+        auto bytes = stream->data ? stream->data->clone() : IOBuf::create(0);
+        bytes->coalesce();
+        const std::string received(
+            reinterpret_cast<const char*>(bytes->data()), bytes->length());
+        EXPECT_LE(stream->offset + received.size(), expected.size());
+        if (stream->offset + received.size() <= expected.size()) {
+          EXPECT_EQ(received, expected.substr(stream->offset, received.size()));
+        }
+        result.streamBytes += received.size();
+      }
+    }
+    return result;
+  };
+
+  ASSERT_TRUE(this->loopForWrites().has_value());
+  const auto packets = takeDecodedWrites();
+  ASSERT_GE(packets.size(), 2);
+  const auto sent = check(packets);
+  EXPECT_EQ(sent.streamBytes, expected.size());
+  EXPECT_EQ(sent.timestamps, packets.size());
+
+  ASSERT_TRUE(this->fireLossTimeout().has_value());
+  const auto probes = takeDecodedWrites();
+  EXPECT_FALSE(probes.empty());
+  const auto probed = check(probes);
+  EXPECT_GT(probed.streamBytes, 0);
+  EXPECT_LE(probed.timestamps, probes.size());
+
+  this->destroyTransport();
+}
+
 TYPED_TEST(
     TimestampRetransmissionTypedTest,
     ReappliesCurrentPolicyForCloneAndLoss) {
