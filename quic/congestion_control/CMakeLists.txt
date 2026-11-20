@@ -174,6 +174,24 @@ mvfst_add_library(mvfst_congestion_control_bbr2
     mvfst_state_transport_settings
 )
 
+mvfst_add_library(mvfst_congestion_control_bbr3
+  SRCS
+    Bbr3.cpp
+  DEPS
+    mvfst_common_mvfst_logging
+    mvfst_congestion_control_congestion_control_functions
+    mvfst_logging_qlogger_constants
+    mvfst_logging_qlogger_macros
+    Folly::folly_lang_assume
+    Folly::folly_random
+  EXPORTED_DEPS
+    mvfst_congestion_control_bandwidth
+    mvfst_congestion_control_bbr3_rate_sampler
+    mvfst_congestion_control_congestion_controller
+    mvfst_congestion_control_third_party_chromium_windowed_filter
+    mvfst_state_quic_state_machine
+)
+
 mvfst_add_library(mvfst_congestion_control_bbr3_rate_sampler
   SRCS
     Bbr3RateSampler.cpp

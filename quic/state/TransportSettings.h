@@ -52,7 +52,7 @@ struct CongestionControlConfig {
   // limited.
   bool leaveHeadroomForCwndLimited{false};
 
-  // Used by: Cubic, BBR2, and BBR2Modular
+  // Used by: Cubic, BBR2, BBR2Modular, and BBR3
   // Allow a congestion controller to undo its congestion response when every
   // packet in a loss episode is explicitly acknowledged as spurious.
   bool enableSpuriousLossRecovery{true};
@@ -74,17 +74,17 @@ struct CongestionControlConfig {
   // Used by: BBR1
   Optional<AckFrequencyConfig> ackFrequencyConfig;
 
-  // Used by: BBR2
-  // Whether BBR2 should ignore inflightLongTerm when setting its cwnd.
+  // Used by: BBR2 and BBR3
+  // Whether to ignore inflightLongTerm when setting the cwnd.
   bool ignoreInflightLongTerm{false};
 
-  // Used by: BBR2
-  // Whether BBR2 should ignore its short term model
+  // Used by: BBR2 and BBR3
+  // Whether to ignore the short term model
   // (inflight/bandwidth ShortTerm).
   bool ignoreShortTerm{false};
 
-  // Used by: BBR2
-  // Whether BBR2 should check packet loss to exit startup
+  // Used by: BBR2 and BBR3
+  // Whether to check packet loss to exit startup
   bool exitStartupOnLoss{true};
 
   // Used by: BBR2
@@ -95,16 +95,16 @@ struct CongestionControlConfig {
   // Enabled cwnd modulation using loss recovery in ProbeBW/ProbeRTT states
   bool enableRecoveryInProbeStates{true};
 
-  // Used by: BBR2
-  // Whether BBR2 should enable reno coexistence.
+  // Used by: BBR2 and BBR3
+  // Whether to enable reno coexistence.
   bool enableRenoCoexistence{false};
 
-  // Used by: BBR2Modular
-  // Whether BBR2 should use precautionary bandwidth probing.
+  // Used by: BBR2Modular and BBR3
+  // Whether to use precautionary bandwidth probing.
   bool enablePrecautionaryBandwidthProbing{false};
 
-  // Used by: BBR2
-  // Whether BBR2 paces the initial congestion window.
+  // Used by: BBR2 and BBR3
+  // Whether to pace the initial congestion window.
   bool paceInitCwnd{false};
 
   // Used by: BBR2

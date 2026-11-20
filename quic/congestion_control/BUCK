@@ -260,6 +260,31 @@ mvfst_cpp_library(
 )
 
 mvfst_cpp_library(
+    name = "bbr3",
+    srcs = [
+        "Bbr3.cpp",
+    ],
+    headers = [
+        "Bbr3.h",
+    ],
+    deps = [
+        "fbsource//xplat/folly:random",
+        "fbsource//xplat/folly/lang:assume",
+        "fbsource//xplat/quic/common:mvfst_logging",
+        "fbsource//xplat/quic/logging:qlogger_constants",
+        "fbsource//xplat/quic/logging:qlogger_macros",
+        ":congestion_control_functions",
+    ],
+    exported_deps = [
+        "fbsource//xplat/quic/congestion_control/third_party:chromium_windowed_filter",
+        "fbsource//xplat/quic/state:quic_state_machine",
+        ":bandwidth",
+        ":bbr3_rate_sampler",
+        ":congestion_controller",
+    ],
+)
+
+mvfst_cpp_library(
     name = "bbr3_rate_sampler",
     srcs = [
         "Bbr3RateSampler.cpp",
