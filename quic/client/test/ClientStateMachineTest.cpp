@@ -135,20 +135,23 @@ TEST_F(ClientStateMachineTest, PreserveHappyeyabllsDuringUndo) {
   EXPECT_NE(nullptr, newConn->happyEyeballsState.secondSocket);
 }
 
-TEST_F(ClientStateMachineTest, PreservePacingStateDuringUndo) {
+class ClientStateMachinePacingTest
+    : public ClientStateMachineTest,
+      public WithParamInterface<CongestionControlType> {};
+
+TEST_P(ClientStateMachinePacingTest, PreservePacingStateDuringUndo) {
   auto randomCid = ConnectionId::createRandom(8);
   ASSERT_TRUE(randomCid.has_value());
   client_->clientConnectionId = randomCid.value();
   client_->transportSettings.pacingEnabled = true;
-  client_->transportSettings.defaultCongestionController =
-      CongestionControlType::BBR2Modular;
+  client_->transportSettings.defaultCongestionController = GetParam();
   client_->canBePaced = true;
   client_->pacer = createPacer(*client_, kMinCwndInMssForBbr);
   client_->congestionControllerFactory =
       std::make_shared<DefaultCongestionControllerFactory>();
   client_->congestionController =
       client_->congestionControllerFactory->makeCongestionController(
-          *client_, CongestionControlType::BBR2Modular);
+          *client_, GetParam());
   const auto* originalPacer = client_->pacer.get();
 
   auto newConn = undoAllClientStateForRetry(std::move(client_));
@@ -157,10 +160,13 @@ TEST_F(ClientStateMachineTest, PreservePacingStateDuringUndo) {
   EXPECT_NE(originalPacer, newConn->pacer.get());
   EXPECT_TRUE(newConn->canBePaced);
   ASSERT_NE(nullptr, newConn->congestionController);
-  EXPECT_EQ(
-      CongestionControlType::BBR2Modular,
-      newConn->congestionController->type());
+  EXPECT_EQ(GetParam(), newConn->congestionController->type());
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    BbrVersions,
+    ClientStateMachinePacingTest,
+    Values(CongestionControlType::BBR2Modular, CongestionControlType::BBR3));
 
 TEST_F(ClientStateMachineTest, PreserveSconeReceiveStateDuringUndo) {
   auto randomCid = ConnectionId::createRandom(8);

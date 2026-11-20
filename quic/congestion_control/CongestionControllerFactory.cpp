@@ -10,6 +10,7 @@
 
 #include <quic/congestion_control/Bbr.h>
 #include <quic/congestion_control/Bbr2.h>
+#include <quic/congestion_control/Bbr3.h>
 #include <quic/congestion_control/BbrBandwidthSampler.h>
 #include <quic/congestion_control/BbrRttSampler.h>
 #include <quic/congestion_control/C4.h>
@@ -73,11 +74,9 @@ DefaultCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::C4:
       congestionController = std::make_unique<C4CongestionController>(conn);
       break;
-    case CongestionControlType::BBR3: {
-      throw QuicInternalException(
-          "BBR3 Congestion Controller is not available yet.",
-          LocalErrorCode::INTERNAL_ERROR);
-    }
+    case CongestionControlType::BBR3:
+      congestionController = std::make_unique<Bbr3CongestionController>(conn);
+      break;
     case CongestionControlType::None:
       break;
     case CongestionControlType::MAX:

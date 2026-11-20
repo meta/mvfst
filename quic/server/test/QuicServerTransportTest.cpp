@@ -4629,17 +4629,13 @@ INSTANTIATE_TEST_SUITE_P(
     Values(
         std::string("none"),
         std::string("staticcwnd"),
-        std::string("custom"),
-        std::string("bbr3")),
+        std::string("custom")),
     [](const TestParamInfo<std::string>& info) {
       if (info.param == "none") {
         return "None";
       }
       if (info.param == "staticcwnd") {
         return "StaticCwnd";
-      }
-      if (info.param == "bbr3") {
-        return "Bbr3";
       }
       return "Custom";
     });
@@ -4678,6 +4674,35 @@ TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobC4) {
   EXPECT_EQ(
       server->getConn().congestionController->type(),
       CongestionControlType::C4);
+}
+
+TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobBbr3) {
+  const auto ccKnobId =
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB);
+  server->getNonConstConn().transportSettings.pacingEnabled = true;
+  server->getNonConstConn().pacer = std::make_unique<NiceMock<MockPacer>>();
+
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("bbr3")}});
+  ASSERT_NE(server->getConn().congestionController.get(), nullptr);
+  EXPECT_EQ(
+      server->getConn().congestionController->type(),
+      CongestionControlType::BBR3);
+}
+
+TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobBbr3WithoutPacing) {
+  const auto ccKnobId =
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB);
+  server->getNonConstConn().transportSettings.pacingEnabled = false;
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(2);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("newreno")}});
+
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("bbr3")}});
+
+  ASSERT_NE(server->getConn().congestionController.get(), nullptr);
+  EXPECT_EQ(
+      server->getConn().congestionController->type(),
+      CongestionControlType::Cubic);
 }
 
 TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobInvalidString) {

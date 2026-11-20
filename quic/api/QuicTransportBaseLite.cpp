@@ -3628,7 +3628,8 @@ void QuicTransportBaseLite::setTransportSettings(
     const bool useBbrMinCwnd = type == CongestionControlType::BBR ||
         type == CongestionControlType::BBR2 ||
         type == CongestionControlType::BBR2Modular ||
-        type == CongestionControlType::C4;
+        type == CongestionControlType::C4 ||
+        type == CongestionControlType::BBR3;
     auto minCwnd = useBbrMinCwnd ? kMinCwndInMssForBbr
                                  : conn_->transportSettings.minCwndInMss;
     conn_->pacer = createPacer(*conn_, minCwnd);
@@ -3727,7 +3728,8 @@ void QuicTransportBaseLite::validateCongestionAndPacing(
   if ((type == CongestionControlType::BBR ||
        type == CongestionControlType::BBR2 ||
        type == CongestionControlType::BBR2Modular ||
-       type == CongestionControlType::C4) &&
+       type == CongestionControlType::C4 ||
+       type == CongestionControlType::BBR3) &&
       !conn_->transportSettings.pacingEnabled) {
     MVLOG_ERROR << "Unpaced " << congestionControlTypeToString(type)
                 << " isn't supported";
