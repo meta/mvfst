@@ -7,9 +7,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
 #include <iterator>
+#include <memory>
 
 #include <quic/common/MvfstCheck.h>
 

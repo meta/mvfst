@@ -291,6 +291,19 @@ mvfst_cpp_test(
 )
 
 mvfst_cpp_test(
+    name = "Bbr3RateSamplerTest",
+    srcs = [
+        "Bbr3RateSamplerTest.cpp",
+    ],
+    network_access = network_access_utils.none(),
+    deps = [
+        "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:bbr3_rate_sampler",
+    ],
+)
+
+mvfst_cpp_test(
     name = "Bbr2ModularSpuriousLossTest",
     srcs = [
         "Bbr2ModularSpuriousLossTest.cpp",

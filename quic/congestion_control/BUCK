@@ -260,6 +260,23 @@ mvfst_cpp_library(
 )
 
 mvfst_cpp_library(
+    name = "bbr3_rate_sampler",
+    srcs = [
+        "Bbr3RateSampler.cpp",
+    ],
+    headers = [
+        "Bbr3RateSampler.h",
+    ],
+    exported_deps = [
+        "fbsource//xplat/quic/common:circular_deque",
+        "fbsource//xplat/quic/state:ack_event",
+        "fbsource//xplat/quic/state:loss_event",
+        "fbsource//xplat/quic/state:quic_state_machine",
+        ":bandwidth",
+    ],
+)
+
+mvfst_cpp_library(
     name = "c4",
     srcs = [
         "C4.cpp",

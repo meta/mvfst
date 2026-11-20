@@ -174,6 +174,17 @@ mvfst_add_library(mvfst_congestion_control_bbr2
     mvfst_state_transport_settings
 )
 
+mvfst_add_library(mvfst_congestion_control_bbr3_rate_sampler
+  SRCS
+    Bbr3RateSampler.cpp
+  EXPORTED_DEPS
+    mvfst_common_circular_deque
+    mvfst_congestion_control_bandwidth
+    mvfst_state_ack_event
+    mvfst_state_loss_event
+    mvfst_state_quic_state_machine
+)
+
 mvfst_add_library(mvfst_congestion_control_c4
   SRCS
     C4.cpp
