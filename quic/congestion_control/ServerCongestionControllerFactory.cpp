@@ -72,6 +72,11 @@ ServerCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::C4:
       congestionController = std::make_unique<C4CongestionController>(conn);
       break;
+    case CongestionControlType::BBR3: {
+      throw QuicInternalException(
+          "BBR3 Congestion Controller is not available yet.",
+          LocalErrorCode::INTERNAL_ERROR);
+    }
     case CongestionControlType::None:
       break;
     case CongestionControlType::MAX:
