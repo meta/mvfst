@@ -9,6 +9,7 @@
 #include <quic/common/CircularDeque.h>
 #include <quic/common/test/TestUtils.h>
 #include <deque>
+#include <utility>
 
 namespace {
 constexpr size_t kLen = 50;
@@ -22,7 +23,7 @@ struct NoexceptString {
 
   explicit NoexceptString(const char* s) : data(s) {}
 
-  explicit NoexceptString(const std::string& s) : data(s) {}
+  explicit NoexceptString(std::string s) : data(std::move(s)) {}
 
   NoexceptString(const NoexceptString& other) noexcept = default;
 

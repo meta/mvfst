@@ -42,7 +42,7 @@ bool verifyStorageContent(
 struct TestObject {
   TestObject() : val(0) {}
 
-  TestObject(int v, const std::string& w) : val(v), words(w) {}
+  TestObject(int v, std::string w) : val(v), words(std::move(w)) {}
 
   ~TestObject() = default;
 
@@ -96,7 +96,7 @@ struct NoexceptString {
 
   explicit NoexceptString(const char* s) : data(s) {}
 
-  explicit NoexceptString(const std::string& s) : data(s) {}
+  explicit NoexceptString(std::string s) : data(std::move(s)) {}
 
   NoexceptString(const NoexceptString& other) noexcept = default;
 
