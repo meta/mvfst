@@ -90,7 +90,6 @@ std::unique_ptr<QuicClientConnectionState> undoAllClientStateForRetry(
     const bool useBbrMinCwnd =
         congestionControlType == CongestionControlType::BBR ||
         congestionControlType == CongestionControlType::BBR2 ||
-        congestionControlType == CongestionControlType::BBR2Modular ||
         congestionControlType == CongestionControlType::C4 ||
         congestionControlType == CongestionControlType::BBR3;
     const auto minCwnd = useBbrMinCwnd

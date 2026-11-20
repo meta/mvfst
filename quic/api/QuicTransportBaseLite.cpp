@@ -3627,7 +3627,6 @@ void QuicTransportBaseLite::setTransportSettings(
     const auto type = conn_->transportSettings.defaultCongestionController;
     const bool useBbrMinCwnd = type == CongestionControlType::BBR ||
         type == CongestionControlType::BBR2 ||
-        type == CongestionControlType::BBR2Modular ||
         type == CongestionControlType::C4 ||
         type == CongestionControlType::BBR3;
     auto minCwnd = useBbrMinCwnd ? kMinCwndInMssForBbr
@@ -3727,7 +3726,6 @@ void QuicTransportBaseLite::validateCongestionAndPacing(
   // Fallback to Cubic if Pacing isn't enabled with BBR or C4
   if ((type == CongestionControlType::BBR ||
        type == CongestionControlType::BBR2 ||
-       type == CongestionControlType::BBR2Modular ||
        type == CongestionControlType::C4 ||
        type == CongestionControlType::BBR3) &&
       !conn_->transportSettings.pacingEnabled) {

@@ -320,58 +320,6 @@ mvfst_cpp_test(
 )
 
 mvfst_cpp_test(
-    name = "Bbr2ModularSpuriousLossTest",
-    srcs = [
-        "Bbr2ModularSpuriousLossTest.cpp",
-    ],
-    network_access = network_access_utils.none(),
-    deps = [
-        "fbsource//xplat/folly/portability:gmock",
-        "fbsource//xplat/folly/portability:gtest",
-        "fbsource//xplat/quic/common/test:test_utils",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_bw",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_rtt",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
-        "fbsource//xplat/quic/state/test:mocks",
-        ":test_utils",
-    ],
-)
-
-mvfst_cpp_test(
-    name = "Bbr2ModularProbeRttTest",
-    srcs = [
-        "Bbr2ModularProbeRttTest.cpp",
-    ],
-    network_access = network_access_utils.none(),
-    deps = [
-        "fbsource//xplat/folly/portability:gmock",
-        "fbsource//xplat/folly/portability:gtest",
-        "fbsource//xplat/quic/common/test:test_utils",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_rtt",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
-        "fbsource//xplat/quic/state/test:mocks",
-        ":test_utils",
-    ],
-)
-
-mvfst_cpp_test(
-    name = "Bbr2ModularProbeBwTest",
-    srcs = [
-        "Bbr2ModularProbeBwTest.cpp",
-    ],
-    network_access = network_access_utils.none(),
-    deps = [
-        "fbsource//xplat/folly/portability:gmock",
-        "fbsource//xplat/folly/portability:gtest",
-        "fbsource//xplat/quic/common/test:test_utils",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_probe_bw",
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
-        "fbsource//xplat/quic/state/test:mocks",
-        ":test_utils",
-    ],
-)
-
-mvfst_cpp_test(
     name = "EcnL4sTrackerTest",
     srcs = [
         "EcnL4sTrackerTest.cpp",

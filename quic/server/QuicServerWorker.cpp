@@ -848,15 +848,8 @@ QuicServerTransport::Ptr QuicServerWorker::makeTransport(
 
     auto transportSettingsCopy = transportSettings_;
     if (quicVersion == QuicVersion::QUIC_V1_ALIAS ||
+        quicVersion == QuicVersion::QUIC_V1_ALIAS2 ||
         quicVersion == QuicVersion::MVFST_EXPERIMENTAL) {
-      transportSettingsCopy.includeCwndHintsInSessionTicket = true;
-      transportSettingsCopy.useCwndHintsInSessionTicket = true;
-      if (transportSettingsCopy.defaultCongestionController ==
-          CongestionControlType::BBR2) {
-        transportSettingsCopy.defaultCongestionController =
-            CongestionControlType::BBR2Modular;
-      }
-    } else if (quicVersion == QuicVersion::QUIC_V1_ALIAS2) {
       transportSettingsCopy.includeCwndHintsInSessionTicket = true;
     }
 

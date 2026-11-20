@@ -59,7 +59,6 @@ mvfst_cpp_library(
     ],
     deps = select({
         "DEFAULT": [
-            "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
             ":bbr",
             ":bbr2",
             ":bbr3",
@@ -115,7 +114,6 @@ mvfst_cpp_library(
         "ServerCongestionControllerFactory.h",
     ],
     deps = [
-        "fbsource//xplat/quic/congestion_control/modular:bbr2_startup",
         ":bbr",
         ":bbr2",
         ":bbr3",

@@ -52,7 +52,7 @@ struct CongestionControlConfig {
   // limited.
   bool leaveHeadroomForCwndLimited{false};
 
-  // Used by: Cubic, BBR2, BBR2Modular, and BBR3
+  // Used by: Cubic, BBR2, and BBR3
   // Allow a congestion controller to undo its congestion response when every
   // packet in a loss episode is explicitly acknowledged as spurious.
   bool enableSpuriousLossRecovery{true};
@@ -99,7 +99,7 @@ struct CongestionControlConfig {
   // Whether to enable reno coexistence.
   bool enableRenoCoexistence{false};
 
-  // Used by: BBR2Modular and BBR3
+  // Used by: BBR3
   // Whether to use precautionary bandwidth probing.
   bool enablePrecautionaryBandwidthProbing{false};
 
@@ -442,8 +442,6 @@ struct TransportSettings {
   bool removeStreamAfterEomCallbackUnset{false};
   // Whether to include cwnd hint in new session tickets for 0-rtt
   bool includeCwndHintsInSessionTicket{false};
-  // Whether to use cwnd hints received in resumption tickets for 0-rtt
-  bool useCwndHintsInSessionTicket{false};
 
   // The default priority to instantiate streams with.
   PriorityQueue::Priority defaultPriority;

@@ -420,12 +420,14 @@ enum class QuicVersion : uint32_t {
   // broken.
   MVFST = 0xfaceb002,
   QUIC_V1 = 0x00000001,
-  // QUIC_V1_ALIAS is is used to enable careful resume for bbr2modular.
+  // QUIC_V1_ALIAS is used to enable sending the cwnd hint in the session
+  // ticket.
   QUIC_V1_ALIAS = 0xfaceb003,
   // QUIC_V1_ALIAS2 is used to enable sending the cwnd hint in the session
   // ticket.
   QUIC_V1_ALIAS2 = 0xfaceb004,
-  // MVFST_EXPERIMENTAL is used to enable careful resume for bbr2modular
+  // MVFST_EXPERIMENTAL is used to enable sending the cwnd hint in the session
+  // ticket.
   MVFST_EXPERIMENTAL = 0xfaceb00e, // Experimental alias for MVFST
   MVFST_ALIAS = 0xfaceb010,
   MVFST_INVALID = 0xfaceb00f,
@@ -513,7 +515,6 @@ constexpr DurationRep kDefaultWriteLimitRttFraction = 25;
 constexpr std::string_view kCongestionControlCubicStr = "cubic";
 constexpr std::string_view kCongestionControlBbrStr = "bbr";
 constexpr std::string_view kCongestionControlBbr2Str = "bbr2";
-constexpr std::string_view kCongestionControlBbr2ModularStr = "bbr2modular";
 constexpr std::string_view kCongestionControlCopaStr = "copa";
 constexpr std::string_view kCongestionControlNewRenoStr = "newreno";
 constexpr std::string_view kCongestionControlStaticCwndStr = "staticcwnd";
@@ -523,14 +524,15 @@ constexpr std::string_view kCongestionControlC4Str = "c4";
 constexpr std::string_view kCongestionControlBbr3Str = "bbr3";
 
 constexpr DurationRep kPersistentCongestionThreshold = 3;
+// Mobile builds log these values as numbers, so existing values must not
+// change.
 enum class CongestionControlType : uint8_t {
   Cubic,
   NewReno,
   Copa,
   BBR,
   BBR2,
-  BBR2Modular,
-  StaticCwnd,
+  StaticCwnd = 6,
   Custom,
   None,
   C4,

@@ -16,7 +16,6 @@
 #include <quic/congestion_control/Copa.h>
 #include <quic/congestion_control/NewReno.h>
 #include <quic/congestion_control/QuicCubic.h>
-#include <quic/congestion_control/modular/Bbr2Startup.h>
 
 #include <memory>
 
@@ -51,11 +50,6 @@ ServerCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::BBR2: {
       auto bbr2 = std::make_unique<Bbr2CongestionController>(conn);
       congestionController = std::move(bbr2);
-      break;
-    }
-    case CongestionControlType::BBR2Modular: {
-      auto bbr2Modular = std::make_unique<Bbr2Startup>(conn);
-      congestionController = std::move(bbr2Modular);
       break;
     }
     case CongestionControlType::StaticCwnd: {

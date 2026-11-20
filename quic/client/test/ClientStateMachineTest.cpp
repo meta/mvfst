@@ -166,7 +166,7 @@ TEST_P(ClientStateMachinePacingTest, PreservePacingStateDuringUndo) {
 INSTANTIATE_TEST_SUITE_P(
     BbrVersions,
     ClientStateMachinePacingTest,
-    Values(CongestionControlType::BBR2Modular, CongestionControlType::BBR3));
+    Values(CongestionControlType::BBR2, CongestionControlType::BBR3));
 
 TEST_F(ClientStateMachineTest, PreserveSconeReceiveStateDuringUndo) {
   auto randomCid = ConnectionId::createRandom(8);
