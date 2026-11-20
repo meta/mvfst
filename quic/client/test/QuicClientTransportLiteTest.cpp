@@ -17,6 +17,7 @@
 #include <quic/common/udpsocket/test/QuicAsyncUDPSocketMock.h>
 #include <quic/handshake/TransportParameters.h>
 
+#include <algorithm>
 #include <chrono>
 
 using namespace ::testing;
@@ -702,10 +703,8 @@ TEST_F(QuicClientTransportLiteTest, RetirePeerConnectionId_Success) {
   EXPECT_TRUE(foundRetireFrame);
 
   // Verify CID was removed from peerConnectionIds
-  auto cidIt = std::find_if(
-      conn->peerConnectionIds.begin(),
-      conn->peerConnectionIds.end(),
-      [&cidToRetire](const auto& cidData) {
+  auto cidIt = std::ranges::find_if(
+      conn->peerConnectionIds, [&cidToRetire](const auto& cidData) {
         return cidData.connId == cidToRetire;
       });
   EXPECT_EQ(cidIt, conn->peerConnectionIds.end());
