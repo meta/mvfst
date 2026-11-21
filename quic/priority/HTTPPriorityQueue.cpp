@@ -142,6 +142,10 @@ void HTTPPriorityQueue::updateIfExist(
     Identifier id,
     PriorityQueue::Priority basePriority) {
   Priority priority(basePriority);
+  // Same mapping as insertOrUpdate().
+  if (priority->paused && disablePausedPriority_) {
+    priority = Priority(7, true);
+  }
   auto findResult = find(id);
   if (!findResult) {
     return;
