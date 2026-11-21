@@ -370,6 +370,22 @@ TEST_F(TokenlessPacerTest, SetMaxPacingRateOnUnlimitedPacer) {
   EXPECT_NEAR(5 * 1000 * 1000u, pacerRate, 1000); // To accommodate rounding
 }
 
+TEST_F(TokenlessPacerTest, MaxPacingRateAboveOneBurstPerTick) {
+  conn.transportSettings.pacingTickInterval = 1ms;
+  // 100 Mbps needs more than the default burst every tick.
+  const uint64_t maxRateBytesPerSec = 12500 * 1000;
+  pacer.setMaxPacingRate(maxRateBytesPerSec);
+  // The controller asks for twice the max rate.
+  pacer.refreshPacingRate(maxRateBytesPerSec / 5, 100ms);
+
+  const auto timestamp = Clock::now();
+  const auto burst = pacer.updateAndGetWriteBatchSize(timestamp);
+  const auto interval = pacer.getTimeUntilNextWrite(timestamp);
+  const uint64_t pacerRate =
+      burst * conn.udpSendPacketLen * std::chrono::seconds{1} / interval;
+  EXPECT_NEAR(maxRateBytesPerSec, pacerRate, maxRateBytesPerSec / 100);
+}
+
 TEST_F(TokenlessPacerTest, SetZeroPacingRate) {
   auto timestamp = Clock::now();
   // A Zero pacing rate should not result in a divide-by-zero

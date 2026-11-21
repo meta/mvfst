@@ -57,12 +57,17 @@ void TokenlessPacer::setPacingRate(uint64_t rateBps) {
     batchSize_ = 0;
     writeInterval_ = conn_.transportSettings.pacingTickInterval;
   } else {
-    batchSize_ = conn_.transportSettings.writeConnectionDataPacketsLimit;
+    // The pacing timer fires at most once per tick, so faster rates need
+    // larger bursts.
+    const auto tick = conn_.transportSettings.pacingTickInterval;
+    const uint64_t bytesPerTick =
+        rateBps * static_cast<uint64_t>(tick.count()) / 1000000;
+    batchSize_ = std::max(
+        conn_.transportSettings.writeConnectionDataPacketsLimit,
+        (bytesPerTick + conn_.udpSendPacketLen - 1) / conn_.udpSendPacketLen);
     uint64_t interval =
         (batchSize_ * conn_.udpSendPacketLen * 1000000) / rateBps;
-    writeInterval_ = std::max(
-        std::chrono::microseconds(interval),
-        conn_.transportSettings.pacingTickInterval);
+    writeInterval_ = std::max(std::chrono::microseconds(interval), tick);
   }
 
   maybeNotifyObservers();
