@@ -107,6 +107,20 @@ calculateAlarmDuration(const QuicConnectionStateBase& conn) {
  */
 template <class Timeout, class ClockType = Clock>
 void setLossDetectionAlarm(QuicConnectionStateBase& conn, Timeout& timeout) {
+  if (conn.numProbesWritableBytesLimited) {
+    /*
+     * The writableBytesLimit blocked our last probes. Until datagrams from the
+     * client raise it, which fires the PTO again (see
+     * QuicServerTransport::onReadData()), the PTO timer must not be armed
+     * (RFC 9002 Section 6.2.2.1): PTOs that cannot send anything would count
+     * towards maxNumPTOs and abandon the connection.
+     */
+    MVVLOG(10) << __func__ << " unset alarm, probes are writable bytes limited "
+               << conn;
+    conn.pendingEvents.setLossDetectionAlarm = false;
+    timeout.cancelLossTimeout();
+    return;
+  }
   /*
    * We might have new data or lost data to send even if we don't have any
    * outstanding packets. When we get a PTO event, it is possible that only
