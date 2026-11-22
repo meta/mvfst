@@ -16,8 +16,29 @@ We actively welcome your pull requests.
 1. If you've added code that should be tested, add tests
 1. If you've changed APIs, update the documentation.
 1. Ensure the test suite passes.
-1. Make sure your code lints.
+1. Run the local validation steps described below.
 1. If you haven't already, complete the Contributor License Agreement ("CLA").
+
+## Local Validation
+
+Run the build and test commands from the repository root before opening a pull
+request:
+
+```sh
+python3 ./build/fbcode_builder/getdeps.py build mvfst --install-prefix="$(pwd)/_build"
+python3 ./build/fbcode_builder/getdeps.py test mvfst --install-prefix="$(pwd)/_build"
+```
+
+On Windows, use the PowerShell build setup and command documented in the
+[README](README.md#building-mvfst). The equivalent commands use `python` and
+an absolute install prefix.
+
+For C++ changes, format each modified file with `clang-format` before
+committing:
+
+```sh
+clang-format -i path/to/changed_file.cpp path/to/changed_file.h
+```
 
 ## Contributor License Agreement ("CLA")
 In order to accept your pull request, we need you to submit a CLA. You
@@ -36,8 +57,7 @@ the process outlined on that page and do not file a public issue.
 
 ## Coding Style
 We use clang-format tool for coding style.
-Please run `clang-format -i <filename>` on file, where changes has been made
-before you commit them.
+Please run it on each C++ file where changes were made before committing.
 
 ## License
 By contributing to MVFST, you agree that your contributions will be
