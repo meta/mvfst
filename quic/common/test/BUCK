@@ -3,6 +3,16 @@ load("@fbsource//xplat/quic:defs.bzl", "mvfst_cpp_benchmark", "mvfst_cpp_library
 oncall("traffic_protocols")
 
 mvfst_cpp_test(
+    name = "MvfstLoggingTest",
+    srcs = [
+        "MvfstLoggingTest.cpp",
+    ],
+    deps = [
+        "//quic/common:mvfst_logging",
+    ],
+)
+
+mvfst_cpp_test(
     name = "IntervalSetTest",
     srcs = [
         "IntervalSetTest.cpp",
