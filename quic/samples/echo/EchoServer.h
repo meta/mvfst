@@ -19,6 +19,8 @@
 #include <quic/server/QuicSharedUDPSocketFactory.h>
 #include <quic/server/ThreadedQuicServer.h>
 
+#include <utility>
+
 namespace quic::samples {
 
 class EchoServerTransportFactory : public quic::QuicServerTransportFactory {
@@ -83,12 +85,12 @@ class EchoServer {
  public:
   explicit EchoServer(
       std::vector<std::string> alpns,
-      const std::string& host = "::1",
+      std::string host = "::1",
       uint16_t port = 6666,
       bool useDatagrams = false,
       uint64_t activeConnIdLimit = 10,
       bool enableMigration = true)
-      : host_(host), port_(port), alpns_(std::move(alpns)) {
+      : host_(std::move(host)), port_(port), alpns_(std::move(alpns)) {
     quic::ServerOptions options;
     options.transportSettings.datagramConfig.enabled = useDatagrams;
     options.transportSettings.selfActiveConnectionIdLimit = activeConnIdLimit;

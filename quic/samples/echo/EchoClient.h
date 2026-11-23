@@ -10,6 +10,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <quic/common/MvfstLogging.h>
 
@@ -41,24 +42,24 @@ class EchoClient : public quic::QuicSocket::ConnectionSetupCallback,
                    public quic::QuicSocket::DatagramCallback {
  public:
   EchoClient(
-      const std::string& host,
+      std::string host,
       uint16_t port,
       bool useDatagrams,
       uint64_t activeConnIdLimit,
       bool enableMigration,
       std::vector<std::string> alpns,
       bool connectOnly,
-      const std::string& clientCertPath,
-      const std::string& clientKeyPath)
-      : host_(host),
+      std::string clientCertPath,
+      std::string clientKeyPath)
+      : host_(std::move(host)),
         port_(port),
         useDatagrams_(useDatagrams),
         activeConnIdLimit_(activeConnIdLimit),
         enableMigration_(enableMigration),
         alpns_(std::move(alpns)),
         connectOnly_(connectOnly),
-        clientCertPath_(clientCertPath),
-        clientKeyPath_(clientKeyPath) {}
+        clientCertPath_(std::move(clientCertPath)),
+        clientKeyPath_(std::move(clientKeyPath)) {}
 
   void readAvailable(quic::StreamId streamId) noexcept override {
     auto readData = quicClient_->read(streamId, 0);
