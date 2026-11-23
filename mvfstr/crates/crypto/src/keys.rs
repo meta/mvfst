@@ -222,6 +222,7 @@ mod tests {
     use super::*;
     use crate::algorithm::AES_128_GCM;
     use crate::algorithm::CHACHA20_POLY1305;
+    use crate::backend::cipher_suite as rustls_suite;
     use crate::header::unprotect_header;
     use crate::packet::TAG_LEN;
     use crate::seal::InlineSealer;
@@ -240,9 +241,7 @@ mod tests {
     fn rustls_keys_become_a_key_set_with_the_same_directions() {
         let keys = rustls::quic::Keys::initial(
             rustls::quic::Version::V1,
-            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
-                .tls13()
-                .unwrap(),
+            rustls_suite::TLS13_AES_128_GCM_SHA256.tls13().unwrap(),
             &AES_128_GCM,
             &RFC9001_DCID,
             rustls::Side::Server,

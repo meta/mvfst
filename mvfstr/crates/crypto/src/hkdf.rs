@@ -13,21 +13,22 @@
 
 use std::fmt;
 
-use aws_lc_rs::digest;
-use aws_lc_rs::hkdf;
-use aws_lc_rs::hmac;
+use crate::backend::digest;
+use crate::backend::hkdf;
+use crate::backend::hmac;
 
 /// The SHA-256 output length, which is the length of an Initial secret.
 pub const SHA256_LEN: usize = 32;
 
-/// The longest secret aws-lc-rs accepts as an HKDF pseudorandom key; `Prk::new_less_safe`
-/// panics on a longer one.
+/// The longest secret taken as an HKDF pseudorandom key, the longest digest output. aws-lc-rs's
+/// `Prk::new_less_safe` panics on a longer one and ring's takes any length; refusing a longer
+/// secret on both keeps the backends alike.
 const MAX_SECRET_LEN: usize = digest::MAX_OUTPUT_LEN;
 
 /// Returns the HKDF-Extract pseudorandom key for `ikm` under `salt`, with SHA-256.
 pub fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; SHA256_LEN] {
-    // HKDF-Extract is HMAC(salt, ikm). Computing it eagerly gives plain PRK bytes; aws-lc-rs's
-    // `Salt::extract` allocates and repeats the extract on every expand.
+    // HKDF-Extract is HMAC(salt, ikm). Computing it as an HMAC gives plain PRK bytes, which
+    // `Salt::extract` does not return.
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, salt), ikm);
     let mut prk = [0; SHA256_LEN];
     prk.copy_from_slice(tag.as_ref());
@@ -40,7 +41,7 @@ pub enum ExpandLabelError {
     /// The label (with its "tls13 " prefix) or the context is longer than 255 bytes, or the
     /// output is longer than 255 hash lengths.
     TooLong,
-    /// The secret is longer than 64 bytes, the longest pseudorandom key aws-lc-rs's HKDF takes.
+    /// The secret is longer than 64 bytes, the longest digest output.
     SecretTooLong,
 }
 
@@ -72,7 +73,7 @@ pub fn hkdf_expand_label(
         u8::try_from(PREFIX.len() + label.len()).map_err(|_| ExpandLabelError::TooLong)?;
     let context_len = u8::try_from(context.len()).map_err(|_| ExpandLabelError::TooLong)?;
     let out_len = u16::try_from(out.len()).map_err(|_| ExpandLabelError::TooLong)?;
-    // The HkdfLabel structure, in pieces that aws-lc-rs concatenates.
+    // The HkdfLabel structure, in pieces that HKDF-Expand concatenates.
     let out_len_bytes = out_len.to_be_bytes();
     let info: [&[u8]; 6] = [
         &out_len_bytes,
@@ -173,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_label_refuses_a_secret_longer_than_aws_lc_rs_takes() {
+    fn expand_label_refuses_a_secret_longer_than_64_bytes() {
         let mut out = [0; 16];
         assert_eq!(
             hkdf_expand_label(&[7; 64], b"quic key", &[], &mut out),

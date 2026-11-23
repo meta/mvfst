@@ -9,12 +9,12 @@
 
 use std::fmt;
 
-use aws_lc_rs::aead;
 use rustls::quic::PacketKey;
 use rustls::quic::Tag;
 
 use crate::algorithm::KeyLengthError;
 use crate::algorithm::QuicAlgorithm;
+use crate::backend::aead;
 
 /// The AEAD nonce and IV length of every QUIC AEAD.
 pub const NONCE_LEN: usize = 12;
@@ -22,8 +22,8 @@ pub const NONCE_LEN: usize = 12;
 /// The AEAD tag length of every QUIC AEAD.
 pub const TAG_LEN: usize = 16;
 
-/// A packet-protection key over aws-lc-rs: the AEAD key and IV of one key generation in one
-/// direction, with the algorithm's usage limits.
+/// A packet-protection key: the AEAD key and IV of one key generation in one direction, with
+/// the algorithm's usage limits.
 pub struct AeadPacketKey {
     key: aead::LessSafeKey,
     iv: [u8; NONCE_LEN],
@@ -114,7 +114,11 @@ impl fmt::Debug for AeadPacketKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithm::AES_256_GCM;
     use crate::algorithm::CHACHA20_POLY1305;
+    use crate::header::AeadHeaderKey;
+    use crate::header::protect_header;
+    use crate::header::unprotect_header;
     use crate::testdata::hex;
     use crate::testdata::unhex;
 
@@ -152,5 +156,43 @@ mod tests {
                 Err(rustls::Error::DecryptError)
             ));
         }
+    }
+
+    /// RFC 9001 has no AES-256-GCM example, so this packet was computed apart from both
+    /// backends: OpenSSL's AES block cipher, with GCM and the header mask done by hand.
+    #[test]
+    fn aes_256_gcm_packet_and_header_protection_match_a_pinned_vector() {
+        let key = AeadPacketKey::new(
+            &AES_256_GCM,
+            b"mvfstr aes-256-gcm packet key !!",
+            *b"mvfstr nonce",
+        )
+        .unwrap();
+        let hp = AeadHeaderKey::new(&AES_256_GCM, b"mvfstr aes-256 header protection").unwrap();
+        // A short header with an 8-byte connection ID and a 2-byte packet number field, which
+        // holds the low bits of packet number 0x12345.
+        let (pn, pn_offset) = (0x12345, 9);
+        let header = unhex("418394c8f03e5157082345");
+        let payload = b"\x01\x0b\x00\x0cAES-256-GCM!";
+        let mut packet = [&header[..], payload].concat();
+        let tag = key
+            .encrypt_in_place(pn, &header, &mut packet[header.len()..])
+            .unwrap();
+        packet.extend_from_slice(tag.as_ref());
+        protect_header(&hp, &mut packet, pn_offset).unwrap();
+        assert_eq!(
+            hex(&packet),
+            concat!(
+                "558394c8f03e5157085835",
+                "2868b40c3c61931f8f8675973b6029e1",
+                "786f8fbda6afb0a5d0c71a286f45c28d",
+            )
+        );
+
+        assert_eq!(unprotect_header(&hp, &mut packet, pn_offset), Ok(2));
+        let (protected_header, sealed) = packet.split_at_mut(header.len());
+        assert_eq!(protected_header, &header[..]);
+        let plain = key.decrypt_in_place(pn, protected_header, sealed).unwrap();
+        assert_eq!(plain, payload);
     }
 }

@@ -79,27 +79,30 @@ const fn derive_tls13(base: &Tls13CipherSuite, alg: &'static QuicAlgorithm) -> T
     }
 }
 
-/// The TLS 1.3 suites of rustls's aws-lc-rs provider with mvfstr's QUIC algorithms.
+/// The TLS 1.3 suites of [`default_provider`](crate::default_provider) with mvfstr's QUIC
+/// algorithms.
 pub mod cipher_suite {
     use rustls::Tls13CipherSuite;
-    use rustls::crypto::aws_lc_rs::cipher_suite as aws_lc;
 
     use super::derive_suite;
     use crate::algorithm::AES_128_GCM;
     use crate::algorithm::AES_256_GCM;
     use crate::algorithm::CHACHA20_POLY1305;
+    use crate::backend::cipher_suite as rustls_suite;
 
     /// TLS_AES_128_GCM_SHA256 with mvfstr AES-128-GCM packet protection.
     pub static TLS13_AES_128_GCM_SHA256: Tls13CipherSuite =
-        derive_suite(aws_lc::TLS13_AES_128_GCM_SHA256, &AES_128_GCM);
+        derive_suite(rustls_suite::TLS13_AES_128_GCM_SHA256, &AES_128_GCM);
 
     /// TLS_AES_256_GCM_SHA384 with mvfstr AES-256-GCM packet protection.
     pub static TLS13_AES_256_GCM_SHA384: Tls13CipherSuite =
-        derive_suite(aws_lc::TLS13_AES_256_GCM_SHA384, &AES_256_GCM);
+        derive_suite(rustls_suite::TLS13_AES_256_GCM_SHA384, &AES_256_GCM);
 
     /// TLS_CHACHA20_POLY1305_SHA256 with mvfstr ChaCha20-Poly1305 packet protection.
-    pub static TLS13_CHACHA20_POLY1305_SHA256: Tls13CipherSuite =
-        derive_suite(aws_lc::TLS13_CHACHA20_POLY1305_SHA256, &CHACHA20_POLY1305);
+    pub static TLS13_CHACHA20_POLY1305_SHA256: Tls13CipherSuite = derive_suite(
+        rustls_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        &CHACHA20_POLY1305,
+    );
 }
 
 /// Rewrites a provider so that every QUIC connection built from it protects packets with
@@ -178,6 +181,8 @@ mod tests {
     use mvfstr_wire::Version;
 
     use super::*;
+    use crate::backend::cipher_suite as rustls_suite;
+    use crate::default_provider;
     use crate::initial::initial_keys;
     use crate::testdata::RFC9001_DCID;
 
@@ -195,9 +200,7 @@ mod tests {
 
     #[test]
     fn rustls_builds_mvfstr_keys_that_match_mvfstr_initial_keys() {
-        let suite = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
-            .tls13()
-            .unwrap();
+        let suite = rustls_suite::TLS13_AES_128_GCM_SHA256.tls13().unwrap();
         let rustls_keys = quic::Keys::initial(
             quic::Version::V1,
             suite,
@@ -229,12 +232,21 @@ mod tests {
 
     #[test]
     fn every_algorithm_reports_the_rfc9001_limits_on_its_keys() {
-        use rustls::crypto::aws_lc_rs::cipher_suite as lc;
         let cases = [
-            (lc::TLS13_AES_128_GCM_SHA256, &AES_128_GCM, 1 << 23, 1 << 52),
-            (lc::TLS13_AES_256_GCM_SHA384, &AES_256_GCM, 1 << 23, 1 << 52),
             (
-                lc::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls_suite::TLS13_AES_128_GCM_SHA256,
+                &AES_128_GCM,
+                1 << 23,
+                1 << 52,
+            ),
+            (
+                rustls_suite::TLS13_AES_256_GCM_SHA384,
+                &AES_256_GCM,
+                1 << 23,
+                1 << 52,
+            ),
+            (
+                rustls_suite::TLS13_CHACHA20_POLY1305_SHA256,
                 &CHACHA20_POLY1305,
                 u64::MAX,
                 1 << 36,
@@ -255,13 +267,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_static_suites_are_built_on_the_default_providers_suites() {
+        let cases = [
+            (
+                &cipher_suite::TLS13_AES_128_GCM_SHA256,
+                rustls_suite::TLS13_AES_128_GCM_SHA256,
+                &AES_128_GCM,
+            ),
+            (
+                &cipher_suite::TLS13_AES_256_GCM_SHA384,
+                rustls_suite::TLS13_AES_256_GCM_SHA384,
+                &AES_256_GCM,
+            ),
+            (
+                &cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                &CHACHA20_POLY1305,
+            ),
+        ];
+        // Only the hash is compared by address. It is a static of the provider, while the HKDF
+        // and record AEAD objects of a suite copied at compile time may be duplicated elsewhere.
+        for (ours, theirs, alg) in cases {
+            let theirs = theirs.tls13().unwrap();
+            assert_eq!(ours.common.suite, theirs.common.suite);
+            assert!(
+                std::ptr::addr_eq(ours.common.hash_provider, theirs.common.hash_provider),
+                "{alg:?} hash"
+            );
+            assert!(quic_algorithm(ours).is_some_and(|quic| std::ptr::eq(quic, alg)));
+        }
+    }
+
     fn mvfstr_algorithm(suite: &Tls13CipherSuite) -> Option<&'static str> {
         quic_algorithm(suite).map(QuicAlgorithm::name)
     }
 
     #[test]
-    fn the_aws_lc_provider_is_rewritten_to_mvfstr_suites_in_its_order() {
-        let base = rustls::crypto::aws_lc_rs::default_provider();
+    fn the_default_provider_is_rewritten_to_mvfstr_suites_in_its_order() {
+        let base = default_provider();
         let base_suites: Vec<&'static Tls13CipherSuite> = base
             .cipher_suites
             .iter()
@@ -311,7 +355,7 @@ mod tests {
                 .into_iter()
                 .map(SupportedCipherSuite::Tls13)
                 .collect(),
-            ..rustls::crypto::aws_lc_rs::default_provider()
+            ..default_provider()
         };
         let kept = with_quic_suites(provider);
         for (suite, expected) in kept.cipher_suites.iter().zip(statics) {
@@ -321,21 +365,19 @@ mod tests {
 
     #[test]
     fn other_providers_suites_keep_their_tls_parts_and_are_derived_once() {
-        let aws_lc_suite = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
-            .tls13()
-            .unwrap();
+        let base_suite = rustls_suite::TLS13_AES_128_GCM_SHA256.tls13().unwrap();
         // A suite of some other provider: its own static, without a QUIC algorithm.
         let foreign: &'static Tls13CipherSuite = Box::leak(Box::new(Tls13CipherSuite {
             common: CipherSuiteCommon {
                 confidentiality_limit: 12_345,
-                ..aws_lc_suite.common
+                ..base_suite.common
             },
             quic: None,
-            ..*aws_lc_suite
+            ..*base_suite
         }));
         let provider = || CryptoProvider {
             cipher_suites: vec![SupportedCipherSuite::Tls13(foreign)],
-            ..rustls::crypto::aws_lc_rs::default_provider()
+            ..default_provider()
         };
         let first = with_quic_suites(provider());
         let derived = first.cipher_suites[0].tls13().unwrap();

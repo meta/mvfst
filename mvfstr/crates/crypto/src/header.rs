@@ -9,11 +9,11 @@
 
 use std::fmt;
 
-use aws_lc_rs::aead;
 use rustls::quic::HeaderProtectionKey;
 
 use crate::algorithm::KeyLengthError;
 use crate::algorithm::QuicAlgorithm;
+use crate::backend::aead;
 
 /// The ciphertext sample length of every QUIC header-protection cipher.
 pub const SAMPLE_LEN: usize = 16;
@@ -25,8 +25,8 @@ pub const MASK_LEN: usize = 5;
 /// The longest packet number field, in bytes (RFC 9000).
 const MAX_PN_LEN: usize = 4;
 
-/// A header-protection key over aws-lc-rs: AES-ECB for the AES suites, raw ChaCha20 for
-/// ChaCha20-Poly1305 (RFC 9001).
+/// A header-protection key: AES-ECB for the AES suites, raw ChaCha20 for ChaCha20-Poly1305
+/// (RFC 9001).
 pub struct AeadHeaderKey {
     key: aead::quic::HeaderProtectionKey,
 }

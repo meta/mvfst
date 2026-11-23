@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use aws_lc_rs::aead;
+use crate::backend::aead;
 
 /// The largest AEAD or header-protection key mvfstr uses, in bytes.
 pub const MAX_KEY_LEN: usize = 32;

@@ -9,7 +9,7 @@
 //!
 //! The crate derives the Initial keys of v1 and of MVFST 0xfaceb002 ([`initial_keys`]),
 //! computes v1 Retry integrity tags, and implements AES-128-GCM, AES-256-GCM and
-//! ChaCha20-Poly1305 packet and header protection over aws-lc-rs as rustls `PacketKey`s and
+//! ChaCha20-Poly1305 packet and header protection as rustls `PacketKey`s and
 //! `HeaderProtectionKey`s, with the usage limits of RFC 9001 on every packet key.
 //! [`QuicAlgorithm`] is the `rustls::quic::Algorithm` through which rustls's TLS 1.3 key schedule
 //! builds every Handshake, 1-RTT and key-update key as an mvfstr key; [`with_quic_suites`]
@@ -19,8 +19,16 @@
 //! [`InlineSealer`] seals it at once.
 //!
 //! The crate does not perform I/O or read a clock.
+//!
+//! # Crypto backend
+//!
+//! Packet protection, header protection, HKDF and [`default_provider`] run on aws-lc-rs or ring,
+//! chosen by Cargo feature. The `aws-lc-rs` feature is on by default, and aws-lc-rs is used
+//! whenever it is on, even with `ring` on too. With only `ring` on, ring is used. At least one of
+//! the two must be on. The default provider offers post-quantum key exchange only with aws-lc-rs.
 
 mod algorithm;
+mod backend;
 mod header;
 mod hkdf;
 mod initial;
@@ -38,6 +46,7 @@ pub use algorithm::CHACHA20_POLY1305;
 pub use algorithm::KeyLengthError;
 pub use algorithm::MAX_KEY_LEN;
 pub use algorithm::QuicAlgorithm;
+pub use backend::default_provider;
 pub use header::AeadHeaderKey;
 pub use header::HeaderProtectionError;
 pub use header::MASK_LEN;
