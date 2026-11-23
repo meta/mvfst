@@ -1,0 +1,93 @@
+[workspace]
+members = [
+  "crates/crypto",
+  "crates/driver",
+  "crates/io",
+  "crates/proto",
+  "crates/tls",
+  "crates/tperf",
+  "crates/wire",
+]
+resolver = "2"
+
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/meta/mvfst"
+
+[workspace.lints.clippy]
+almost_swapped = { level = "allow" }
+approx_constant = { level = "allow" }
+bool_to_int_with_if = { level = "allow" }
+clone_on_copy = { level = "allow" }
+cognitive_complexity = { level = "allow" }
+collapsible_if = { level = "allow" }
+dbg_macro = { level = "deny" }
+derive_partial_eq_without_eq = { level = "allow" }
+disallowed_methods = { level = "deny" }
+disallowed_names = { level = "allow" }
+disallowed_types = { level = "deny" }
+doc_markdown = { level = "allow" }
+elidable_lifetime_names = { level = "allow" }
+enum_variant_names = { level = "allow" }
+filter_map_identity = { level = "allow" }
+implicit_hasher = { level = "allow" }
+inefficient_to_string = { level = "allow" }
+large_enum_variant = { level = "allow" }
+let_underscore_untyped = { level = "allow" }
+let_unit_value = { level = "allow" }
+manual_flatten = { level = "allow" }
+manual_range_contains = { level = "allow" }
+manual_slice_size_calculation = { level = "allow" }
+match_bool = { level = "allow" }
+match_like_matches_macro = { level = "allow" }
+missing_safety_doc = { level = "allow" }
+module_inception = { level = "allow" }
+must_use_candidate = { level = "allow" }
+mutable_key_type = { level = "allow" }
+needless_collect = { level = "allow" }
+needless_lifetimes = { level = "allow" }
+needless_update = { level = "allow" }
+new_ret_no_self = { level = "allow" }
+new_without_default = { level = "allow" }
+not_unsafe_ptr_arg_deref = { level = "allow" }
+option_option = { level = "allow" }
+single_match = { level = "allow" }
+string_lit_as_bytes = { level = "allow" }
+todo = { level = "deny" }
+too_many_arguments = { level = "allow" }
+trivially_copy_pass_by_ref = { level = "allow" }
+type_complexity = { level = "allow" }
+undocumented_unsafe_blocks = { level = "deny" }
+uninlined_format_args = { level = "allow" }
+unit_arg = { level = "allow" }
+unnecessary_wraps = { level = "allow" }
+unneeded_field_pattern = { level = "allow" }
+unreadable_literal = { level = "allow" }
+unwrap_or_default = { level = "allow" }
+useless_let_if_seq = { level = "allow" }
+vec_init_then_push = { level = "allow" }
+write_with_newline = { level = "allow" }
+wrong_self_convention = { level = "allow" }
+
+[workspace.lints.rust]
+bare_trait_objects = { level = "warn" }
+dangling_pointers_from_temporaries = { level = "deny" }
+dependency_on_unit_never_type_fallback = { level = "deny" }
+ellipsis_inclusive_range_patterns = { level = "warn" }
+incomplete_features = { level = "deny" }
+mismatched_lifetime_syntaxes = { level = "allow" }
+missing_docs = { level = "warn" }
+named_arguments_used_positionally = { level = "deny" }
+non_fmt_panics = { level = "deny" }
+noop_method_call = { level = "deny" }
+special_module_name = { level = "deny" }
+stable_features = { level = "deny" }
+suspicious_double_ref_op = { level = "allow" }
+unconditional_recursion = { level = "deny" }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"]}
+unreachable_code = { level = "warn" }
+unsafe_op_in_unsafe_fn = { level = "deny" }
+unstable_name_collisions = { level = "deny" }
+unused_braces = { level = "allow" }
+unused_doc_comments = { level = "deny" }
+unused_must_use = { level = "warn" }
