@@ -156,10 +156,10 @@ class QuicEventBase {
   [[nodiscard]] virtual std::chrono::milliseconds getTimerTickInterval()
       const = 0;
 
-  template <
-      typename T,
-      typename = std::enable_if_t<std::is_base_of_v<QuicEventBase, T>>>
-  T* getTypedEventBase() {
+  template <typename T>
+  T* getTypedEventBase()
+    requires(std::is_base_of_v<QuicEventBase, T>)
+  {
     auto evb = dynamic_cast<T*>(this);
     if (evb) {
       return evb;
