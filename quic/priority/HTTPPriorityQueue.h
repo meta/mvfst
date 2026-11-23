@@ -112,7 +112,7 @@ class HTTPPriorityQueue : public quic::PriorityQueue {
     return heap_.empty() && roundRobinElements_ == 0;
   }
 
-  uint32_t getRoundRobinElements() const {
+  [[nodiscard]] uint32_t getRoundRobinElements() const {
     return roundRobinElements_;
   }
 
