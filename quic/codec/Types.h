@@ -22,6 +22,8 @@
 #include <quic/folly_utils/Utils.h>
 #include <quic/mvfst-config.h>
 
+#include <utility>
+
 /**
  * This details the types of objects that can be serialized or deserialized
  * over the wire.
@@ -358,7 +360,7 @@ struct RstStreamFrame {
       : streamId(streamIdIn),
         errorCode(errorCodeIn),
         finalSize(finalSizeIn),
-        reliableSize(reliableSizeIn) {}
+        reliableSize(std::move(reliableSizeIn)) {}
 
   bool operator==(const RstStreamFrame& rhs) const {
     return streamId == rhs.streamId && errorCode == rhs.errorCode &&
