@@ -183,7 +183,7 @@ mod tests {
         let time = Arc::new(ManualTimeProvider::new(now));
         let (chain, key) = self_signed();
         let server = server_config(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            mvfstr_crypto::default_provider(),
             time.clone(),
             chain,
             key,
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(server.max_early_data_size, 0);
 
         let client = client_config(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            mvfstr_crypto::default_provider(),
             time.clone(),
             ServerVerification::AcceptAnyCertificate,
             &[],

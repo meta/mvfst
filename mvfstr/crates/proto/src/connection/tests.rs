@@ -40,7 +40,6 @@ use crate::CloseReason;
 use crate::ConnEvent;
 use crate::ConnKey;
 use crate::ConnOptions;
-use crate::DatagramSize;
 use crate::DropReason;
 use crate::Ecn;
 use crate::Endpoint;
@@ -469,6 +468,7 @@ fn the_handshake_survives_losing_each_of_its_datagrams_once() {
     }
 }
 
+#[cfg(feature = "aws-lc-rs")]
 #[test]
 fn the_handshake_completes_over_a_1200_byte_mtu() {
     // A post-quantum ClientHello and a large certificate take several datagrams each way.
@@ -492,8 +492,11 @@ fn the_handshake_completes_over_a_1200_byte_mtu() {
     }
 }
 
+#[cfg(feature = "aws-lc-rs")]
 #[test]
 fn peer_maximum_datagrams_fill_a_1452_byte_mtu() {
+    use crate::DatagramSize;
+
     let transport = TransportConfig::builder()
         .datagram_size(DatagramSize::PeerMaximum)
         .build()
@@ -521,6 +524,7 @@ fn peer_maximum_datagrams_fill_a_1452_byte_mtu() {
     assert_eq!(largest, Some(1452));
 }
 
+#[cfg(feature = "aws-lc-rs")]
 #[test]
 fn the_minimum_policy_keeps_datagrams_at_1200_bytes_whatever_the_peer_allows() {
     let mut config = Setup {
@@ -539,6 +543,7 @@ fn the_minimum_policy_keeps_datagrams_at_1200_bytes_whatever_the_peer_allows() {
     assert_eq!(largest, Some(1200));
 }
 
+#[cfg(feature = "aws-lc-rs")]
 #[test]
 fn a_client_hello_in_two_datagrams_completes() {
     let setup = Setup {

@@ -29,7 +29,6 @@ use super::stream_tests::config;
 use super::stream_tests::pattern;
 use super::stream_tests::run_apps;
 use super::tests::Forge;
-use super::tests::LIMIT;
 use super::tests::deliver;
 use super::tests::handshake;
 use super::tests::limits;
@@ -983,6 +982,7 @@ fn probe_datagrams_take_no_pacing_tokens() {
     assert_eq!(outcome.datagrams, 5, "{outcome:?}");
 }
 
+#[cfg(feature = "aws-lc-rs")]
 #[test]
 fn a_handshake_flight_is_not_paced_before_the_first_rtt_sample() {
     let paced = config(|c| c.pacing(true));
@@ -999,8 +999,11 @@ fn a_handshake_flight_is_not_paced_before_the_first_rtt_sample() {
     assert!(flight.len() >= 4, "a first flight of {flight:?}");
 }
 
+#[cfg(feature = "aws-lc-rs")]
 #[test]
 fn initial_and_handshake_packets_are_not_paced_before_the_one_rtt_keys() {
+    use super::tests::LIMIT;
+
     let setup = Setup {
         pq: true,
         ..Setup::default()

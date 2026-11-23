@@ -940,12 +940,13 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    use mvfstr_crypto::default_provider;
+    use rustls::CipherSuite;
     use rustls::NamedGroup;
     use rustls::client::ClientSessionStore;
     use rustls::client::Resumption;
     use rustls::client::Tls12ClientSessionValue;
     use rustls::client::Tls13ClientSessionValue;
-    use rustls::crypto::aws_lc_rs;
     use rustls::server::ClientHello;
     use rustls::server::ResolvesServerCert;
     use rustls::sign::CertifiedKey;
@@ -1320,33 +1321,32 @@ mod tests {
     }
 
     fn server_tls(alpn: &[&[u8]]) -> rustls::ServerConfig {
-        let mut tls =
-            rustls::ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(NoCertificate));
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoCertificate));
         tls.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
         tls
     }
 
     fn client_tls(alpn: &[&[u8]]) -> rustls::ClientConfig {
-        let mut tls =
-            rustls::ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
         tls.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
         tls
     }
 
     /// Builds a provider with only TLS 1.2 suites, which QUIC cannot use.
     fn tls12_only_provider() -> Arc<rustls::crypto::CryptoProvider> {
-        Arc::new(rustls::crypto::CryptoProvider {
-            cipher_suites: vec![aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
-            ..aws_lc_rs::default_provider()
-        })
+        let mut provider = default_provider();
+        provider
+            .cipher_suites
+            .retain(|suite| suite.suite() == CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
+        Arc::new(provider)
     }
 
     #[test]
@@ -1417,12 +1417,11 @@ mod tests {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(NoCertificate));
         assert_eq!(build(tls12).unwrap_err(), ConfigError::NoQuicCipherSuite);
-        let no_tls13 =
-            rustls::ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS12])
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(NoCertificate));
+        let no_tls13 = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoCertificate));
         assert_tls13_refused(build(no_tls13).unwrap_err());
         assert!(build(server_tls(&[])).is_ok());
     }
@@ -1512,12 +1511,11 @@ mod tests {
     #[test]
     fn server_needs_tls13_enabled() {
         // The provider keeps its QUIC-capable TLS 1.3 suites; only the version list drops them.
-        let tls =
-            rustls::ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS12])
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(NoCertificate));
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoCertificate));
         let config = ServerConfig::builder(Arc::new(tls))
             .alpn(AlpnPolicy::AllowMissing)
             .build();
@@ -1588,12 +1586,11 @@ mod tests {
 
     #[test]
     fn client_needs_tls13_enabled() {
-        let tls =
-            rustls::ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS12])
-                .unwrap()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth();
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
         let config = ClientConfig::builder(Arc::new(tls))
             .alpn(AlpnPolicy::AllowMissing)
             .build();

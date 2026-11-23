@@ -775,8 +775,8 @@ pub(crate) mod fixtures {
     use mvfstr_tls::ManualTimeProvider;
     use mvfstr_tls::ServerVerification;
     use mvfstr_wire::Version;
+    use rustls::NamedGroup;
     use rustls::crypto::CryptoProvider;
-    use rustls::crypto::aws_lc_rs;
     use rustls::pki_types::PrivatePkcs8KeyDer;
     use rustls::pki_types::UnixTime;
 
@@ -805,12 +805,22 @@ pub(crate) mod fixtures {
         UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000))
     }
 
-    /// Returns the aws-lc-rs provider. Its first default key exchange group is X25519MLKEM768,
-    /// whose ClientHello takes two Initial packets; with `pq` false it keeps X25519 only.
+    /// Returns mvfstr_crypto's provider with the key exchange groups of [`with_groups`].
     fn provider(pq: bool) -> CryptoProvider {
-        let mut provider = aws_lc_rs::default_provider();
-        if !pq {
-            provider.kx_groups = vec![aws_lc_rs::kx_group::X25519];
+        with_groups(mvfstr_crypto::default_provider(), pq)
+    }
+
+    /// Puts X25519MLKEM768 first with `pq`, so that the ClientHello takes two Initial packets,
+    /// and otherwise keeps X25519 only. Only aws-lc-rs has X25519MLKEM768.
+    fn with_groups(mut provider: CryptoProvider, pq: bool) -> CryptoProvider {
+        if pq {
+            provider
+                .kx_groups
+                .sort_by_key(|group| group.name() != NamedGroup::X25519MLKEM768);
+        } else {
+            provider
+                .kx_groups
+                .retain(|group| group.name() == NamedGroup::X25519);
         }
         provider
     }
@@ -901,6 +911,39 @@ pub(crate) mod fixtures {
                 .build()
                 .expect("an endpoint config");
             PairConfig::new(client, server, endpoint)
+        }
+    }
+
+    #[cfg(feature = "aws-lc-rs")]
+    mod tests {
+        use super::*;
+
+        fn group_names(provider: &CryptoProvider) -> Vec<NamedGroup> {
+            provider
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect()
+        }
+
+        #[test]
+        fn post_quantum_pairs_put_x25519mlkem768_first_whatever_the_providers_order() {
+            // rustls's aws-lc-rs provider puts it last when its prefer-post-quantum feature is off.
+            let mut provider = mvfstr_crypto::default_provider();
+            provider
+                .kx_groups
+                .sort_by_key(|group| group.name() == NamedGroup::X25519MLKEM768);
+            assert_eq!(
+                group_names(&provider).last(),
+                Some(&NamedGroup::X25519MLKEM768)
+            );
+
+            let pq = group_names(&with_groups(provider.clone(), true));
+            assert_eq!(pq.first(), Some(&NamedGroup::X25519MLKEM768), "{pq:?}");
+            assert_eq!(
+                group_names(&with_groups(provider, false)),
+                [NamedGroup::X25519]
+            );
         }
     }
 }

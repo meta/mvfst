@@ -22,7 +22,6 @@ use mvfstr_proto::Version;
 use mvfstr_tls::ServerVerification;
 use rustls::CipherSuite;
 use rustls::crypto::CryptoProvider;
-use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -135,9 +134,9 @@ pub(crate) fn endpoint_config() -> Result<Arc<EndpointConfig>, SetupError> {
     Ok(EndpointConfig::builder(reset_key).build()?)
 }
 
-/// Returns rustls's aws-lc-rs provider, preferring AES-128-GCM as mvfst's tperf peers do.
+/// Returns mvfstr_crypto's default provider, preferring AES-128-GCM as mvfst's tperf peers do.
 fn provider() -> CryptoProvider {
-    let mut provider = aws_lc_rs::default_provider();
+    let mut provider = mvfstr_crypto::default_provider();
     provider
         .cipher_suites
         .sort_by_key(|suite| suite.suite() != CipherSuite::TLS13_AES_128_GCM_SHA256);
@@ -309,7 +308,11 @@ mod tests {
     fn the_server_certificate_is_a_fresh_self_signed_p256_one() {
         let (cert, key) = self_signed().unwrap();
         // The mvfst tperf client offers only ECDSA and RSA-PSS signature schemes.
-        let signer = aws_lc_rs::sign::any_ecdsa_type(&key).expect("an ECDSA key");
+        let provider = mvfstr_crypto::default_provider();
+        let signer = provider
+            .key_provider
+            .load_private_key(key.clone_key())
+            .expect("a key the provider loads");
         assert_eq!(signer.algorithm(), SignatureAlgorithm::ECDSA);
         assert!(
             signer
@@ -322,7 +325,7 @@ mod tests {
                 .is_none(),
             "a P-256 key"
         );
-        CertifiedKey::from_der(vec![cert.clone()], key, &aws_lc_rs::default_provider())
+        CertifiedKey::from_der(vec![cert.clone()], key, &provider)
             .expect("the certificate holds the key's public half");
         let (other, _) = self_signed().unwrap();
         assert_ne!(cert, other, "every run makes its own");

@@ -53,13 +53,18 @@ fn self_signed(name: &str) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stat
 fn server_config(alpn: &[&[u8]]) -> Arc<rustls::ServerConfig> {
     let (chain, key) = self_signed("localhost");
     let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = mvfstr_crypto::default_provider();
     Arc::new(mvfstr_tls::server_config(provider, time, chain, key, alpn).unwrap())
 }
 
+/// Returns a client config with the provider's groups but P-384 last, so that a P-384-only server
+/// answers its first ClientHello with a HelloRetryRequest.
 fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut provider = mvfstr_crypto::default_provider();
+    provider
+        .kx_groups
+        .sort_by_key(|group| group.name() == rustls::NamedGroup::secp384r1);
     let verification = ServerVerification::AcceptAnyCertificate;
     Arc::new(mvfstr_tls::client_config(provider, time, verification, alpn).unwrap())
 }
@@ -554,7 +559,7 @@ fn sealed(key: &dyn PacketKey) -> Vec<u8> {
 #[test]
 fn key_updates_follow_the_rfc9001_quic_ku_derivation() {
     // TLS_CHACHA20_POLY1305_SHA256, the suite of RFC 9001's ChaCha20-Poly1305 example.
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut provider = mvfstr_crypto::default_provider();
     let chacha20 = rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256;
     provider
         .cipher_suites
@@ -692,11 +697,13 @@ fn the_server_chooses_once_the_whole_client_hello_has_arrived() {
     assert_eq!(server.tls.alpn(), None);
 }
 
-/// Returns a server config whose only group is P-384, for which the client does not send a key
-/// share at first, so the server answers with a HelloRetryRequest.
+/// Returns a server config whose only group is P-384, which `client_config` lists last, so the
+/// server answers the first ClientHello with a HelloRetryRequest.
 fn p384_server_config(alpn: &[&[u8]]) -> Arc<rustls::ServerConfig> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::SECP384R1];
+    let mut provider = mvfstr_crypto::default_provider();
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::secp384r1);
     let (chain, key) = self_signed("localhost");
     let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
     Arc::new(mvfstr_tls::server_config(provider, time, chain, key, alpn).unwrap())
@@ -876,7 +883,7 @@ fn accepting_any_certificate_still_checks_the_servers_signature() {
     // A certificate for another name is accepted.
     let (chain, key) = self_signed("example.org");
     let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = mvfstr_crypto::default_provider();
     let config =
         mvfstr_tls::server_config(provider.clone(), time, chain.clone(), key, &[b"h3"]).unwrap();
     let mut client = Peer::new(
@@ -946,7 +953,7 @@ fn ca_and_leaf() -> (
 #[test]
 fn webpki_verification_checks_the_name_and_expiry_at_the_callers_time() {
     let (ca, chain, key) = ca_and_leaf();
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = mvfstr_crypto::default_provider();
     let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
     let server_config = Arc::new(
         mvfstr_tls::server_config(provider.clone(), time.clone(), chain, key, &[b"h3"]).unwrap(),

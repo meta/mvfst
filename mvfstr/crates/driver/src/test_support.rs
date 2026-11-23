@@ -19,7 +19,7 @@ use mvfstr_proto::testing::Pair;
 use mvfstr_proto::testing::PairConfig;
 use mvfstr_tls::ManualTimeProvider;
 use mvfstr_tls::ServerVerification;
-use rustls::crypto::aws_lc_rs;
+use rustls::NamedGroup;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::pki_types::UnixTime;
 
@@ -39,8 +39,10 @@ pub(crate) fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointCo
         .and_then(|params| params.self_signed(&key))
         .expect("rcgen makes a certificate");
     let provider = || {
-        let mut provider = aws_lc_rs::default_provider();
-        provider.kx_groups = vec![aws_lc_rs::kx_group::X25519];
+        let mut provider = mvfstr_crypto::default_provider();
+        provider
+            .kx_groups
+            .retain(|group| group.name() == NamedGroup::X25519);
         provider
     };
     let time = Arc::new(ManualTimeProvider::new(UnixTime::now()));
