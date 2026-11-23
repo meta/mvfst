@@ -19,6 +19,7 @@
 #include <quic/state/test/MockQuicStats.h>
 #include <array>
 #include <chrono>
+#include <limits>
 
 using namespace testing;
 
@@ -301,6 +302,29 @@ TEST(ServerStateMachineTest, TestProcessMaxDatagramSizeZeroOk) {
   auto result = processClientInitialParams(serverConn, clientTransportParams);
   ASSERT_FALSE(result.hasError());
   EXPECT_EQ(serverConn.datagramState.maxWriteFrameSize, 0);
+}
+
+TEST(ServerStateMachineTest, TestProcessMaxDatagramSizeAboveUint32Max) {
+  for (uint64_t maxDatagramFrameSize :
+       {1ULL << 32,
+        (1ULL << 32) + 1,
+        (1ULL << 32) + kMaxDatagramPacketOverhead}) {
+    SCOPED_TRACE(maxDatagramFrameSize);
+    QuicServerConnectionState serverConn(
+        FizzServerQuicHandshakeContext::Builder().build());
+    std::vector<TransportParameter> transportParams;
+    auto encodeResult = encodeIntegerParameter(
+        TransportParameterId::max_datagram_frame_size, maxDatagramFrameSize);
+    ASSERT_FALSE(encodeResult.hasError());
+    transportParams.push_back(encodeResult.value());
+    ClientTransportParameters clientTransportParams = {
+        std::move(transportParams)};
+    auto result = processClientInitialParams(serverConn, clientTransportParams);
+    ASSERT_FALSE(result.hasError());
+    EXPECT_EQ(
+        serverConn.datagramState.maxWriteFrameSize,
+        std::numeric_limits<uint32_t>::max());
+  }
 }
 
 TEST(ServerStateMachineTest, TestProcessMinAckDelayNotSet) {

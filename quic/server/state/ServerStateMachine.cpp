@@ -29,6 +29,7 @@
 #include <quic/state/stream/StreamSendHandlers.h>
 
 #include <algorithm>
+#include <limits>
 
 namespace quic {
 using namespace std::chrono_literals;
@@ -490,7 +491,10 @@ quic::Expected<void, QuicError> processClientInitialParams(
           TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
           "max_datagram_frame_size too small"));
     }
-    conn.datagramState.maxWriteFrameSize = maxDatagramFrameSize.value();
+    conn.datagramState.maxWriteFrameSize =
+        static_cast<uint32_t>(std::min<uint64_t>(
+            maxDatagramFrameSize.value(),
+            std::numeric_limits<uint32_t>::max()));
   }
 
   // Default to max because we can probe PMTU now, and this will be the upper

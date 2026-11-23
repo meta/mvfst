@@ -22,6 +22,8 @@
 #include <quic/state/QuicStreamUtilities.h>
 #include <quic/state/StateData.h>
 
+#include <limits>
+
 namespace quic {
 
 std::unique_ptr<QuicClientConnectionState> undoAllClientStateForRetry(
@@ -543,7 +545,10 @@ quic::Expected<void, QuicError> processServerInitialParams(
           TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
           "max_datagram_frame_size too small"));
     }
-    conn.datagramState.maxWriteFrameSize = maxDatagramFrameSize.value();
+    conn.datagramState.maxWriteFrameSize =
+        static_cast<uint32_t>(std::min<uint64_t>(
+            maxDatagramFrameSize.value(),
+            std::numeric_limits<uint32_t>::max()));
   }
 
   conn.peerAdvertisedKnobFrameSupport = knobFrameSupported.value_or(0) > 0;

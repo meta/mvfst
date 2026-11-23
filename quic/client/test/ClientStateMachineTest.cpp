@@ -22,6 +22,8 @@
 #include <quic/handshake/TransportParameters.h>
 #include <array>
 
+#include <limits>
+
 using namespace ::testing;
 
 namespace quic::test {
@@ -274,6 +276,30 @@ TEST_F(ClientStateMachineTest, TestProcessMaxDatagramSizeZeroOk) {
   ASSERT_FALSE(processServerInitialParams(clientConn, serverTransportParams, 0)
                    .hasError());
   EXPECT_EQ(clientConn.datagramState.maxWriteFrameSize, 0);
+}
+
+TEST_F(ClientStateMachineTest, TestProcessMaxDatagramSizeAboveUint32Max) {
+  for (uint64_t maxDatagramFrameSize :
+       {1ULL << 32,
+        (1ULL << 32) + 1,
+        (1ULL << 32) + kMaxDatagramPacketOverhead}) {
+    SCOPED_TRACE(maxDatagramFrameSize);
+    QuicClientConnectionState clientConn(
+        FizzClientQuicHandshakeContext::Builder().build());
+    std::vector<TransportParameter> transportParams;
+    auto paramResult = encodeIntegerParameter(
+        TransportParameterId::max_datagram_frame_size, maxDatagramFrameSize);
+    ASSERT_FALSE(paramResult.hasError());
+    transportParams.push_back(std::move(paramResult.value()));
+    ServerTransportParameters serverTransportParams = {
+        std::move(transportParams)};
+    ASSERT_FALSE(
+        processServerInitialParams(clientConn, serverTransportParams, 0)
+            .hasError());
+    EXPECT_EQ(
+        clientConn.datagramState.maxWriteFrameSize,
+        std::numeric_limits<uint32_t>::max());
+  }
 }
 
 TEST_F(ClientStateMachineTest, TestProcessMaxDatagramSizeOk) {
