@@ -1,0 +1,130 @@
+name: mvfstr
+
+on:
+  push:
+    paths:
+      - "mvfstr/**"
+      - ".github/workflows/mvfstr*.yml"
+      - ".github/scripts/mvfstr_*"
+  pull_request:
+    paths:
+      - "mvfstr/**"
+      - ".github/workflows/mvfstr*.yml"
+      - ".github/scripts/mvfstr_*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: mvfstr
+
+# mvfstr runs on Linux only, so every job runs on Linux.
+# Commands run without --locked because the checked-in Cargo.lock holds the
+# versions of Meta's internal build, which takes Roxygen's crates by path
+# rather than from Git.
+# The pinned Rust version tracks the toolchain the project is developed against.
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace --no-fail-fast
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check that mvfstr_proto stays free of I/O crates
+        run: |
+          set -euo pipefail
+          # Lists the crates in a package's normal dependency graph that the
+          # sans-IO crates must not reach: tokio, mio, socket2, cxx, and Roxygen
+          # crates other than ferroxygen_bufqueue. Features only add
+          # dependencies, so the graph with every feature on holds every other.
+          io_crates() {
+            cargo tree -p "$1" --all-features -e normal --prefix none |
+              awk '/^(tokio|mio|socket2|cxx|ferroxygen_[a-z0-9_]+) / && !/^ferroxygen_bufqueue / { print $1 }' |
+              sort -u
+          }
+          found=$(io_crates mvfstr_proto)
+          if [[ -n $found ]]; then
+            echo "mvfstr_proto depends on I/O crates: $(paste -sd' ' <<<"$found")" >&2
+            exit 1
+          fi
+          # mvfstr_driver reaches tokio through ferroxygen_runtime, which shows
+          # that the patterns still match.
+          found=$(io_crates mvfstr_driver)
+          if ! grep -qx tokio <<<"$found" || ! grep -qx ferroxygen_runtime <<<"$found"; then
+            echo "mvfstr_driver no longer reaches tokio and ferroxygen_runtime, so the patterns may not match" >&2
+            exit 1
+          fi
+
+  all-features:
+    name: Linux (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - run: cargo test --workspace --no-fail-fast --all-features
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  ring:
+    name: Linux (ring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - run: cargo test --workspace --no-fail-fast --no-default-features --features ring
+      - run: cargo clippy --workspace --all-targets --no-default-features --features ring
+      - name: Check that aws-lc-rs is not built
+        run: |
+          tree=$(cargo tree --workspace --no-default-features --features ring -e all --prefix none)
+          if grep -E '^aws-lc-(rs|sys) ' <<<"$tree"; then
+            echo "the ring build depends on aws-lc-rs" >&2
+            exit 1
+          fi
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.95"
+      - run: cargo build --workspace --lib --bins

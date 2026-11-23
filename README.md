@@ -176,6 +176,9 @@ For more options, see
 ## HTTP/3
 This repo implements the QUIC transport. For an HTTP/3 implementation that uses Mvfst, please check out [Proxygen](https://github.com/facebook/proxygen).
 
+## Rust
+The [`mvfstr`](mvfstr) directory holds mvfstr, a separate QUIC implementation in Rust for clients and servers on Linux. It does not use mvfst's code, but it speaks mvfst's QUIC version, and its `mvfstr-tperf` tool and mvfst's `tperf` can measure each other. mvfstr is a Cargo workspace that is built, tested and released apart from the build above, with its own CI workflow; see [mvfstr/README.md](mvfstr/README.md).
+
 ## Contributing
 
 We'd love to have your help in making `mvfst` better. If you're interested, please

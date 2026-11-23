@@ -1,0 +1,182 @@
+name: mvfstr release
+
+# Publishes the crates of the mvfstr workspace to crates.io. Pushes to main and
+# pull requests that change mvfstr's files run it as a dry run. Running it by
+# hand on main with "publish" checked uploads each publishable crate whose
+# version is not on crates.io yet, in dependency order. A run that stops part way
+# can be run again. All crates share one version, and a release bumps it in every
+# manifest first.
+#
+# Crates named in the MVFSTR_RELEASE_HOLD repository variable or in the hold
+# input of a run by hand are left out of the dry run and the upload, for example
+# while their dependencies are not on crates.io. Names are separated by spaces or
+# commas, and a name that is not a publishable crate fails the run.
+#
+# Uploads use crates.io trusted publishing when the CRATES_IO_TRUSTED_PUBLISHING
+# repository variable is "true", and the CARGO_REGISTRY_TOKEN secret of the
+# crates-io environment otherwise. Trusted publishing cannot create a crate, so
+# a release that adds one uses the token. crates.io accepts five new crates from
+# an account at once and then one every ten minutes, so the upload waits and
+# retries when it hits that limit.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mvfstr/**"
+      - ".github/workflows/mvfstr*.yml"
+      - ".github/scripts/mvfstr_*"
+  pull_request:
+    paths:
+      - "mvfstr/**"
+      - ".github/workflows/mvfstr*.yml"
+      - ".github/scripts/mvfstr_*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload to crates.io (unchecked runs a dry run)
+        type: boolean
+        default: false
+      hold:
+        description: Crates to leave out, separated by spaces or commas
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mvfstr-release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: mvfstr
+
+jobs:
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      packages: ${{ steps.plan.outputs.packages }}
+      new: ${{ steps.plan.outputs.new }}
+      held: ${{ steps.plan.outputs.held }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.98.1"
+      - name: Find versions not on crates.io
+        id: plan
+        env:
+          HOLD: ${{ inputs.hold }}
+          MVFSTR_RELEASE_HOLD: ${{ vars.MVFSTR_RELEASE_HOLD }}
+        run: |
+          set -euo pipefail
+          status=$(bash ../.github/scripts/mvfstr_crates_io_status.sh)
+          echo "$status"
+          if [[ $(cut -d' ' -f2 <<<"$status" | sort -u | wc -l) -ne 1 ]]; then
+            echo "::error::The publishable crates do not share one version"
+            exit 1
+          fi
+          held=$(tr ',' ' ' <<<"$HOLD $MVFSTR_RELEASE_HOLD" | awk '{ for (i = 1; i <= NF; i++) print $i }' | sort -u | paste -sd' ')
+          unknown=$(awk -v held="$held" '{ known[$1] } END { n = split(held, names, " "); for (i = 1; i <= n; i++) if (!(names[i] in known)) print names[i] }' <<<"$status" | paste -sd' ')
+          if [[ -n "$unknown" ]]; then
+            echo "::error::These held names are not publishable crates of the workspace: $unknown"
+            exit 1
+          fi
+          if [[ -n "$held" ]]; then
+            echo "::notice::Holding back $held"
+          fi
+          status=$(awk -v held="$held" 'BEGIN { split(held, names, " "); for (i in names) skip[names[i]] } !($1 in skip)' <<<"$status")
+          packages=$(awk '$3 != "published" { print $1 }' <<<"$status" | paste -sd' ')
+          new=$(awk '$3 == "new" { print $1 }' <<<"$status" | paste -sd' ')
+          {
+            echo "packages=$packages"
+            echo "new=$new"
+            echo "held=$held"
+          } >> "$GITHUB_OUTPUT"
+      - name: Dry run
+        env:
+          PACKAGES: ${{ steps.plan.outputs.packages }}
+          HELD: ${{ steps.plan.outputs.held }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$PACKAGES" ]]; then
+            read -ra crates <<<"$PACKAGES"
+            cargo publish --dry-run "${crates[@]/#/--package=}"
+          else
+            echo "Every version that is not held back is on crates.io"
+            read -ra excluded <<<"$HELD"
+            cargo publish --dry-run --workspace "${excluded[@]/#/--exclude=}"
+          fi
+
+  publish:
+    name: Publish
+    needs: package
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.publish &&
+      github.ref == 'refs/heads/main' && needs.package.outputs.packages != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: crates-io
+    concurrency:
+      group: crates-io-publish-mvfstr
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.98.1"
+      - name: Check that trusted publishing can upload every crate
+        if: vars.CRATES_IO_TRUSTED_PUBLISHING == 'true' && needs.package.outputs.new != ''
+        env:
+          NEW: ${{ needs.package.outputs.new }}
+        run: |
+          echo "::error::Trusted publishing cannot create crates; publish $NEW with the token first"
+          exit 1
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+        if: vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'
+      # The package job verified these crates at this commit, so the upload
+      # skips verification and the token never reaches a dependency's build
+      # script or procedural macro.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+          HELD: ${{ needs.package.outputs.held }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::error::Neither trusted publishing nor the CARGO_REGISTRY_TOKEN secret is set up"
+            exit 1
+          fi
+          log=$RUNNER_TEMP/publish.log
+          while :; do
+            packages=$(bash ../.github/scripts/mvfstr_crates_io_status.sh \
+              | awk -v held="$HELD" 'BEGIN { split(held, names, " "); for (i in names) skip[names[i]] } $3 != "published" && !($1 in skip) { print $1 }')
+            if [[ -z "$packages" ]]; then
+              echo "Every version that is not held back is on crates.io"
+              exit 0
+            fi
+            mapfile -t crates <<<"$packages"
+            if cargo publish --no-verify "${crates[@]/#/--package=}" 2>&1 | tee "$log"; then
+              exit 0
+            fi
+            if ! grep -qE 'status 429|timeout while waiting for published dependencies' "$log"; then
+              exit 1
+            fi
+            echo "crates.io is limiting uploads; retrying in ten minutes"
+            sleep 600
+          done
