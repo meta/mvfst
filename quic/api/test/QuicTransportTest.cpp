@@ -4718,6 +4718,34 @@ TEST_F(QuicTransportTest, PacedBbr3) {
       transport_->getTransportInfo().congestionControlType);
 }
 
+TEST_F(QuicTransportTest, NoPacingCuback) {
+  TransportSettings transportSettings;
+  transportSettings.defaultCongestionController = CongestionControlType::Cuback;
+  transportSettings.pacingEnabled = false;
+  auto ccFactory = std::make_shared<DefaultCongestionControllerFactory>();
+  transport_->setCongestionControllerFactory(ccFactory);
+  transport_->setTransportSettings(transportSettings);
+  EXPECT_EQ(
+      CongestionControlType::Cuback,
+      transport_->getTransportInfo().congestionControlType);
+}
+
+TEST_F(QuicTransportTest, PacedCuback) {
+  TransportSettings transportSettings;
+  transportSettings.defaultCongestionController = CongestionControlType::Cuback;
+  transportSettings.pacingEnabled = true;
+  auto ccFactory = std::make_shared<DefaultCongestionControllerFactory>();
+  transport_->setCongestionControllerFactory(ccFactory);
+  transport_->setPacingTimer(
+      std::make_shared<HighResQuicTimer>(
+          &evb_, transportSettings.pacingTimerResolution));
+  transport_->setTransportSettings(transportSettings);
+  EXPECT_NE(transport_->getConnectionState().pacer, nullptr);
+  EXPECT_EQ(
+      CongestionControlType::Cuback,
+      transport_->getTransportInfo().congestionControlType);
+}
+
 TEST_F(QuicTransportTest, NotifyPendingWriteConnBufferUseTotalSpace) {
   TransportSettings transportSettings;
   transportSettings.totalBufferSpaceAvailable = 100;

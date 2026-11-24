@@ -15,6 +15,7 @@
 #include <quic/congestion_control/C4.h>
 #include <quic/congestion_control/Copa.h>
 #include <quic/congestion_control/NewReno.h>
+#include <quic/congestion_control/QuicCuback.h>
 #include <quic/congestion_control/QuicCubic.h>
 
 #include <memory>
@@ -70,11 +71,9 @@ ServerCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::BBR3:
       congestionController = std::make_unique<Bbr3CongestionController>(conn);
       break;
-    case CongestionControlType::Cuback: {
-      throw QuicInternalException(
-          "Cuback Congestion Controller is not available yet.",
-          LocalErrorCode::INTERNAL_ERROR);
-    }
+    case CongestionControlType::Cuback:
+      congestionController = std::make_unique<Cuback>(conn);
+      break;
     case CongestionControlType::None:
       break;
     case CongestionControlType::MAX:

@@ -4629,17 +4629,13 @@ INSTANTIATE_TEST_SUITE_P(
     Values(
         std::string("none"),
         std::string("staticcwnd"),
-        std::string("custom"),
-        std::string("cuback")),
+        std::string("custom")),
     [](const TestParamInfo<std::string>& info) {
       if (info.param == "none") {
         return "None";
       }
       if (info.param == "staticcwnd") {
         return "StaticCwnd";
-      }
-      if (info.param == "cuback") {
-        return "Cuback";
       }
       return "Custom";
     });
@@ -4707,6 +4703,18 @@ TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobBbr3WithoutPacing) {
   EXPECT_EQ(
       server->getConn().congestionController->type(),
       CongestionControlType::Cubic);
+}
+
+TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobCuback) {
+  const auto ccKnobId =
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB);
+
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("cuback")}});
+  ASSERT_NE(server->getConn().congestionController.get(), nullptr);
+  EXPECT_EQ(
+      server->getConn().congestionController->type(),
+      CongestionControlType::Cuback);
 }
 
 TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobInvalidString) {

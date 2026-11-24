@@ -1035,8 +1035,7 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         auto cctype = *maybeCctype;
         if (cctype == CongestionControlType::None ||
             cctype == CongestionControlType::StaticCwnd ||
-            cctype == CongestionControlType::Custom ||
-            cctype == CongestionControlType::Cuback) {
+            cctype == CongestionControlType::Custom) {
           return quic::make_unexpected(QuicError(
               TransportErrorCode::INTERNAL_ERROR,
               fmt::format(
