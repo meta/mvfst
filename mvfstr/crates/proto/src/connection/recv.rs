@@ -42,6 +42,7 @@ use super::State;
 use super::key_update::KeyPhases;
 use super::key_update::ReadKey;
 use super::level_space;
+use super::on_ack_or_loss;
 use super::on_losses;
 use super::params;
 use crate::AlpnPolicy;
@@ -53,6 +54,7 @@ use crate::RecvSummary;
 use crate::RxDatagram;
 use crate::RxMeta;
 use crate::cc::AckEvent;
+use crate::cc::AckPart;
 use crate::endpoint::MIN_RESET;
 use crate::recovery::Space;
 use crate::recovery::sent::PacketEvent;
@@ -747,6 +749,22 @@ impl Connection {
         }
         if let Some(start) = outcome.spurious_congestion {
             cc.on_spurious_loss(start);
+        }
+        if recovery.takes_rate_samples() {
+            let part = AckPart {
+                acked_bytes: outcome.ack.acked_bytes,
+                largest_acked_sent: outcome.largest_in_flight_sent,
+                rtt_sample: outcome.ack.rtt_sample,
+                rate: outcome.rate,
+            };
+            on_ack_or_loss(
+                cc,
+                recovery,
+                ack_time,
+                Some(part),
+                &outcome.loss,
+                outcome.ack.spurious,
+            );
         }
         if space == Space::Data
             && let (Some(phases), Some(largest)) = (

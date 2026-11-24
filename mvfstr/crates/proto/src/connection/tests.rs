@@ -235,6 +235,8 @@ pub(super) struct Forge<'a> {
     pn: u64,
     /// An ACK frame of one range, written first.
     pub(super) ack: Option<RangeInclusive<u64>>,
+    /// The ACK Delay field of that frame.
+    pub(super) ack_delay: VarInt,
     frames: &'a [Frame<'a>],
     /// PADDING up to this packet length.
     len: usize,
@@ -270,6 +272,7 @@ impl<'a> Forge<'a> {
             header,
             pn,
             ack: None,
+            ack_delay: VarInt::ZERO,
             frames,
             len: 0,
             first_bits: 0,
@@ -282,7 +285,7 @@ impl<'a> Forge<'a> {
         let mut buf = vec![0; 1500];
         let mut w = PacketWriter::new(&mut buf, self.header, self.pn, 4, TAG_LEN).unwrap();
         if let Some(range) = self.ack.clone() {
-            w.ack(range, std::iter::empty(), VarInt::ZERO, None)
+            w.ack(range, std::iter::empty(), self.ack_delay, None)
                 .unwrap();
         }
         for frame in self.frames {

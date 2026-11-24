@@ -20,7 +20,9 @@ use super::sent::AckError;
 use super::sent::AckSummary;
 use super::sent::LossParams;
 use super::sent::LossSummary;
+use super::sent::LostSample;
 use super::sent::PacketEvent;
+use super::sent::SendSnapshot;
 use super::sent::SentError;
 use super::sent::SentFlags;
 use super::sent::SentFrame;
@@ -45,6 +47,10 @@ pub struct RecoveryConfig {
     pub persistent_congestion_threshold: u32,
     /// The probe datagrams due in the space whose PTO expired, 1 or 2 (RFC 9002).
     pub pto_probes: u8,
+    /// Whether to keep the per-packet send snapshots and the connection's delivery state that
+    /// delivery-rate samples and per-packet losses are built from, for a controller that takes
+    /// them ([`crate::cc::takes_rate_samples`]). Off by default.
+    pub rate_samples: bool,
 }
 
 impl RecoveryConfig {
@@ -89,6 +95,7 @@ impl Default for RecoveryConfig {
             granularity: Duration::from_millis(1),
             persistent_congestion_threshold: 3,
             pto_probes: 2,
+            rate_samples: false,
         }
     }
 }
@@ -106,6 +113,36 @@ pub struct AckOutcome {
     /// congestion controller may undo the reduction of the recovery period that began then
     /// ([`crate::cc::Cc::on_spurious_loss`], RFC 9438).
     pub spurious_congestion: Option<Instant>,
+    /// The send time of the frame's largest newly acknowledged packet that is in flight and went
+    /// on the current path; kept only when [`RecoveryConfig::rate_samples`] is on.
+    pub largest_in_flight_sent: Option<Instant>,
+    /// The frame's delivery-rate sample, when [`RecoveryConfig::rate_samples`] is on and it newly
+    /// acknowledged an in-flight packet sent on the current path.
+    pub rate: Option<RateSample>,
+}
+
+/// One delivery-rate sample of the BBR draft (draft-ietf-ccwg-bbr-07), built per ACK frame from the
+/// newest on-path in-flight packet the frame newly acknowledged, as mvfst's BBR3 builds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateSample {
+    /// RS.prior_delivered: C.delivered when the newest packet was sent.
+    pub prior_delivered: u64,
+    /// RS.delivered: the bytes delivered since then, the frame's included.
+    pub delivered: u64,
+    /// RS.interval: the larger of the send and ACK elapsed times, in whole microseconds.
+    pub interval: Duration,
+    /// RS.delivery_rate in bytes per second; 0 when the interval is.
+    pub delivery_rate: u64,
+    /// RS.is_app_limited: whether the sample is application-limited.
+    pub is_app_limited: bool,
+    /// RS.tx_in_flight: the bytes in flight, the newest packet included, right after it was
+    /// sent.
+    pub tx_in_flight: u64,
+    /// RS.lost: the bytes declared lost since the newest packet was sent, this frame's losses
+    /// included.
+    pub lost: u64,
+    /// The bytes sent on the connection through the newest packet.
+    pub total_sent: u64,
 }
 
 /// The event the loss detection timer is set for.
@@ -126,6 +163,19 @@ pub enum TimeoutOutcome {
     Lost(Space, LossSummary),
     /// The PTO of the space expired: probes are due (see [`LossRecovery::probes_due`]).
     Probe(Space),
+}
+
+/// Returns an ACK frame's adjusted ACK time for rate samples: its receive time `now` less its
+/// decoded ACK Delay, in every space and without clamping to max_ack_delay. As in mvfst, a delay
+/// above 1,000 s counts as 0. mvfst rejects a field whose scaled value overflows with
+/// FRAME_ENCODING_ERROR, where mvfstr's ACK decoding gives `u64::MAX` µs, so such a delay counts
+/// as 0 too, as does one that would reach back before the clock's origin.
+fn adjusted_ack_time(now: Instant, ack_delay: Duration) -> Instant {
+    const LONGEST: Duration = Duration::from_secs(1000);
+    if ack_delay > LONGEST {
+        return now;
+    }
+    now.checked_sub(ack_delay).unwrap_or(now)
 }
 
 /// Loss detection state for one connection and its current path (RFC 9002).
@@ -150,6 +200,101 @@ pub struct LossRecovery {
     /// Whether a packet declared lost since the current episode began was forgotten unacknowledged,
     /// when old or with its space; if so, the episode's losses cannot all prove spurious.
     loss_confirmed: bool,
+    /// The delivery state rate samples are built from, kept while
+    /// [`RecoveryConfig::rate_samples`] is on.
+    delivery: Delivery,
+    /// The per-packet losses of the last ACK frame or loss timeout, reused.
+    lost_samples: Vec<LostSample>,
+}
+
+/// The connection's delivery state across the spaces, as the BBR draft defines it, with the
+/// app-limited state of [`LossRecovery::mark_app_limited`] in place of C.app_limited.
+#[derive(Clone, Debug)]
+struct Delivery {
+    /// C.delivered: bytes of on-path in-flight packets acknowledged before being declared lost.
+    delivered: u64,
+    /// C.total_sent: bytes of every packet sent on the current path or an earlier one, in flight
+    /// or not.
+    total_sent: u64,
+    /// C.lost: bytes of on-path in-flight packets declared lost by loss detection since the
+    /// current path began.
+    lost: u64,
+    /// The last frame's largest acknowledged packet: its send time (C.first_send_time) and the
+    /// frame's adjusted ACK time (C.delivered_time).
+    last_ack: Option<(Instant, Instant)>,
+    /// The send time of the last packet sent into an empty pipe, which restarts the interval.
+    restart: Option<Instant>,
+    /// Whether packets sent now are stamped application-limited.
+    app_limited: bool,
+    /// The mark that [`LossRecovery::mark_app_limited`] sets, kept after the flag clears.
+    app_limited_mark: Option<Instant>,
+    /// The send time of the latest on-path in-flight packet, kept across a path change.
+    last_send: Option<Instant>,
+    /// The connection's start, where an interval starts when it does not follow an ACK or restart.
+    epoch: Instant,
+}
+
+impl Delivery {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            delivered: 0,
+            total_sent: 0,
+            lost: 0,
+            last_ack: None,
+            restart: None,
+            app_limited: false,
+            app_limited_mark: None,
+            last_send: None,
+            epoch,
+        }
+    }
+
+    /// Returns the send time, ACK time and kind of the start of the delivery interval of a
+    /// packet sent now: the last restart if it came after the last ACK, else the last ACK, else
+    /// the connection's start.
+    fn interval_start(&self) -> (Instant, Instant, bool) {
+        match (self.restart, self.last_ack) {
+            (Some(restart), Some((_, acked))) if restart > acked => (restart, restart, true),
+            (_, Some((sent, acked))) => (sent, acked, false),
+            (Some(restart), None) => (restart, restart, true),
+            (None, None) => (self.epoch, self.epoch, true),
+        }
+    }
+
+    /// Builds the rate sample of an ACK frame received at `now` whose newest packet was sent at
+    /// `sent` with `snapshot`; `adjusted` is the frame's receive time less its ACK Delay.
+    fn sample(
+        &self,
+        sent: Instant,
+        snapshot: &SendSnapshot,
+        now: Instant,
+        adjusted: Instant,
+    ) -> RateSample {
+        let delivered = self.delivered.saturating_sub(snapshot.delivered);
+        let send_elapsed = sent.saturating_duration_since(snapshot.first_send_time);
+        let ack_time = if snapshot.from_send { now } else { adjusted };
+        let ack_elapsed = ack_time.saturating_duration_since(snapshot.delivered_time);
+        let interval = send_elapsed.max(ack_elapsed);
+        let interval =
+            Duration::from_micros(u64::try_from(interval.as_micros()).unwrap_or(u64::MAX));
+        // Samples shorter than min_rtt are kept, and a zero interval has a rate of 0.
+        let rate = (u128::from(delivered) * 1_000_000)
+            .checked_div(interval.as_micros())
+            .unwrap_or(0);
+        RateSample {
+            prior_delivered: snapshot.delivered,
+            delivered,
+            interval,
+            delivery_rate: u64::try_from(rate).unwrap_or(u64::MAX),
+            is_app_limited: snapshot.app_limited
+                || self
+                    .app_limited_mark
+                    .is_some_and(|mark| snapshot.first_send_time < mark),
+            tx_in_flight: snapshot.tx_in_flight,
+            lost: self.lost.saturating_sub(snapshot.lost),
+            total_sent: snapshot.total_sent,
+        }
+    }
 }
 
 impl LossRecovery {
@@ -181,7 +326,62 @@ impl LossRecovery {
             timer_base: epoch,
             episode_start: None,
             loss_confirmed: false,
+            delivery: Delivery::new(epoch),
+            lost_samples: Vec::new(),
         })
+    }
+
+    /// Returns whether the delivery state and send snapshots are kept
+    /// ([`RecoveryConfig::rate_samples`]).
+    pub fn takes_rate_samples(&self) -> bool {
+        self.config.rate_samples
+    }
+
+    /// Turns rate sampling on for a connection whose controller a test replaced with one that
+    /// takes samples; packets already sent do not have a snapshot.
+    #[cfg(test)]
+    pub(crate) fn enable_rate_samples(&mut self) {
+        self.config.rate_samples = true;
+    }
+
+    /// Returns C.delivered: bytes of on-path in-flight packets acknowledged before being declared
+    /// lost, over the connection's life; 0 while [`RecoveryConfig::rate_samples`] is off.
+    pub fn delivered(&self) -> u64 {
+        self.delivery.delivered
+    }
+
+    /// Returns C.total_sent: bytes of every packet sent over the connection's life, off-path
+    /// packets excepted; 0 while [`RecoveryConfig::rate_samples`] is off.
+    pub fn total_sent(&self) -> u64 {
+        self.delivery.total_sent
+    }
+
+    /// Returns C.lost: bytes of on-path in-flight packets declared lost by loss detection since
+    /// the current path began; 0 while [`RecoveryConfig::rate_samples`] is off.
+    pub fn lost(&self) -> u64 {
+        self.delivery.lost
+    }
+
+    /// Returns whether packets sent now are stamped application-limited.
+    pub fn is_app_limited(&self) -> bool {
+        self.delivery.app_limited
+    }
+
+    /// Marks the connection application-limited, as mvfst's BBR3 does: packets sent from now on are
+    /// stamped so. The mark is one microsecond after the latest on-path in-flight send, if any, and
+    /// a sample whose interval starts before it, at that send included, is application-limited. The
+    /// flag clears once the largest in-flight packet that an ACK frame newly acknowledges on the
+    /// current path was sent at or after the mark.
+    pub fn mark_app_limited(&mut self) {
+        let d = &mut self.delivery;
+        d.app_limited = true;
+        d.app_limited_mark = d.last_send.map(|sent| sent + Duration::from_micros(1));
+    }
+
+    /// Returns the per-packet losses of the last ACK frame or loss timeout, in send order: the
+    /// on-path in-flight packets loss detection declared lost, not those in dropped datagrams.
+    pub fn lost_samples(&self) -> &[LostSample] {
+        &self.lost_samples
     }
 
     /// Returns the RTT estimator.
@@ -198,6 +398,15 @@ impl LossRecovery {
     pub fn reset_for_new_path(&mut self) {
         self.rtt = RttEstimator::new(self.config.initial_rtt);
         self.spaces[Space::Data.index()].start_path();
+        // C.delivered and C.total_sent count over the connection's life, as mvfst's
+        // totalBytesAcked and totalBytesSent do; the newest send time is the connection's too.
+        let d = &self.delivery;
+        self.delivery = Delivery {
+            delivered: d.delivered,
+            total_sent: d.total_sent,
+            last_send: d.last_send,
+            ..Delivery::new(d.epoch)
+        };
     }
 
     /// Returns the sent packets of `space`.
@@ -279,6 +488,9 @@ impl LossRecovery {
         tx_seq: u64,
     ) -> Result<(), SentError> {
         self.spaces[space.index()].on_sent(pn, now, size, flags, tx_seq)?;
+        if self.config.rate_samples {
+            self.snapshot_send(space, now, size, flags);
+        }
         if flags.contains(SentFlags::ACK_ELICITING) {
             let due = &mut self.probes_due[space.index()];
             *due = due.saturating_sub(1);
@@ -288,6 +500,47 @@ impl LossRecovery {
         }
         self.prune(space, now);
         Ok(())
+    }
+
+    /// Updates the delivery state for a packet of `size` bytes with `flags` just recorded in
+    /// `space` at `now`, and records the send snapshot of an on-path in-flight one. Off-path
+    /// packets do not feed any of it, since RFC 9000 keeps one path's packets out of another's
+    /// congestion control. Every on-path packet counts toward C.total_sent, as toward mvfst's
+    /// totalBytesSent; only in-flight ones take part in the samples, as only they are in mvfst's
+    /// outstanding packets.
+    fn snapshot_send(&mut self, space: Space, now: Instant, size: u16, flags: SentFlags) {
+        if flags.contains(SentFlags::OFF_PATH) {
+            return;
+        }
+        self.delivery.total_sent += u64::from(size);
+        if !flags.contains(SentFlags::IN_FLIGHT) {
+            return;
+        }
+        let tx_in_flight = self.bytes_in_flight();
+        let d = &mut self.delivery;
+        // A packet sent into an empty pipe restarts the interval, as in the BBR draft.
+        if tx_in_flight == u64::from(size) {
+            d.restart = Some(now);
+        }
+        d.last_send = Some(now);
+        let (first_send_time, delivered_time, from_send) = d.interval_start();
+        let snapshot = SendSnapshot {
+            delivered: d.delivered,
+            first_send_time,
+            delivered_time,
+            from_send,
+            app_limited: d.app_limited,
+            tx_in_flight,
+            lost: d.lost,
+            total_sent: d.total_sent,
+        };
+        let sent = &mut self.spaces[space.index()];
+        sent.set_last_snapshot(snapshot);
+        // One ACK frame or loss timeout may declare every packet of the space lost; growing the
+        // buffer here keeps the ACK pass free of allocation.
+        let records = sent.tracked();
+        self.lost_samples
+            .reserve(records.saturating_sub(self.lost_samples.len()));
     }
 
     /// Processes one ACK frame received in `space` (RFC 9002): newly acknowledged packets, the
@@ -306,12 +559,34 @@ impl LossRecovery {
     where
         I: IntoIterator<Item = RangeInclusive<u64>>,
     {
+        self.lost_samples.clear();
         let largest_before = self.spaces[space.index()].largest_acked();
-        let ack = self.spaces[space.index()].on_ack(ranges, now, &mut on_event)?;
+        // Of the newly acknowledged on-path in-flight packets, the only ones with snapshots: the
+        // newest (latest send, then largest number) with its snapshot, and the largest with its
+        // send time.
+        let mut newest: Option<(Instant, u64, SendSnapshot)> = None;
+        let mut largest: Option<(u64, Instant)> = None;
+        let ack = self.spaces[space.index()].on_ack(ranges, now, |event| {
+            if let PacketEvent::Acked(p) = &event
+                && let Some(snapshot) = p.snapshot
+                && p.on_path
+            {
+                if newest.is_none_or(|(sent, pn, _)| (p.time_sent, p.pn) > (sent, pn)) {
+                    newest = Some((p.time_sent, p.pn, *snapshot));
+                }
+                if largest.is_none_or(|(pn, _)| p.pn > pn) {
+                    largest = Some((p.pn, p.time_sent));
+                }
+            }
+            on_event(event);
+        })?;
         let mut outcome = AckOutcome {
             ack,
             ..AckOutcome::default()
         };
+        if self.config.rate_samples {
+            self.delivery.delivered += ack.acked_bytes;
+        }
         if let Some(latest) = ack.rtt_sample {
             // Initial acknowledgments are not delayed, so their ACK Delay is ignored, as RFC 9002
             // allows; the peer's max_ack_delay applies only once the handshake is confirmed.
@@ -330,6 +605,21 @@ impl LossRecovery {
         if ack.newly_acked > 0 || self.spaces[space.index()].largest_acked() != largest_before {
             outcome.loss = self.detect_lost(space, now, on_event);
         }
+        if self.config.rate_samples {
+            let adjusted = adjusted_ack_time(now, ack_delay);
+            outcome.largest_in_flight_sent = largest.map(|(_, sent)| sent);
+            let d = &mut self.delivery;
+            if let Some(sent) = outcome.largest_in_flight_sent
+                && d.app_limited_mark.is_none_or(|mark| mark <= sent)
+            {
+                d.app_limited = false;
+            }
+            outcome.rate = newest
+                .map(|(sent, _, snapshot)| self.delivery.sample(sent, &snapshot, now, adjusted));
+            if let Some(sent) = outcome.largest_in_flight_sent {
+                self.delivery.last_ack = Some((sent, adjusted));
+            }
+        }
         if space == Space::Handshake {
             self.handshake_acked = true;
         }
@@ -344,7 +634,7 @@ impl LossRecovery {
         self.prune(space, now);
         // RFC 9438 allows the undo only once the losses are known to be spurious: every packet
         // declared lost has been acknowledged, not merely one of them.
-        if ack.spurious > 0 && self.pending_losses() == 0 && !self.loss_confirmed {
+        if ack.spurious > 0 && self.declared_lost() == 0 && !self.loss_confirmed {
             outcome.spurious_congestion = self.episode_start;
         }
         Ok(outcome)
@@ -352,7 +642,7 @@ impl LossRecovery {
 
     /// Counts the in-flight packets declared lost, in every space, that may still be acknowledged
     /// late.
-    fn pending_losses(&self) -> u32 {
+    pub fn declared_lost(&self) -> u32 {
         self.spaces.iter().map(SentPackets::declared_lost).sum()
     }
 
@@ -431,6 +721,7 @@ impl LossRecovery {
         if at > now {
             return TimeoutOutcome::None;
         }
+        self.lost_samples.clear();
         // RFC 9002's pseudocode rearms the timer either way, which restarts the anti-deadlock PTO.
         self.timer_base = now;
         match timer {
@@ -484,14 +775,36 @@ impl LossRecovery {
     }
 
     /// Runs loss detection in `space`; persistent congestion also resets min_rtt (RFC 9002).
+    /// Each loss with a send snapshot adds a [`LostSample`] and grows C.lost.
     fn detect_lost(
         &mut self,
         space: Space,
         now: Instant,
-        on_event: impl FnMut(PacketEvent<'_>),
+        mut on_event: impl FnMut(PacketEvent<'_>),
     ) -> LossSummary {
         let params = self.loss_params();
-        let loss = self.spaces[space.index()].detect_lost(now, &params, on_event);
+        let Self {
+            spaces,
+            delivery,
+            lost_samples,
+            ..
+        } = self;
+        let loss = spaces[space.index()].detect_lost(now, &params, |event| {
+            if let PacketEvent::Lost(p) = &event
+                && let Some(snapshot) = p.snapshot
+                && p.on_path
+            {
+                delivery.lost += u64::from(p.size);
+                lost_samples.push(LostSample {
+                    size: p.size,
+                    pn: p.pn,
+                    space,
+                    tx_in_flight: snapshot.tx_in_flight,
+                    is_app_limited: snapshot.app_limited,
+                });
+            }
+            on_event(event);
+        });
         // As in RFC 9002, the controller ignores a loss of a packet sent before its recovery
         // period began and keeps that period's reduction, so the loss stays in the episode; only
         // a later packet's loss starts a new reduction and a new episode.
@@ -528,6 +841,9 @@ impl LossRecovery {
 }
 
 #[cfg(test)]
+mod rate_tests;
+
+#[cfg(test)]
 #[expect(
     clippy::single_range_in_vec_init,
     reason = "a one-element array of ranges is an ACK frame with one range"
@@ -538,6 +854,7 @@ mod tests {
     use crate::cc::Cc;
     use crate::cc::CcConfig;
     use crate::cc::CongestionSignal;
+    use crate::cc::SentEvent;
     use crate::config::CongestionControl;
 
     const MS: Duration = Duration::from_millis(1);
@@ -860,7 +1177,12 @@ mod tests {
 
     /// Sends a Data packet at `at`, reporting the send to `cc` first.
     fn send_at(r: &mut LossRecovery, cc: &mut Cc, at: Instant) {
-        cc.on_sent(at, r.bytes_in_flight());
+        cc.on_sent(&SentEvent {
+            time_sent: at,
+            bytes_in_flight: r.bytes_in_flight(),
+            size: 1200,
+            total_sent: 0,
+        });
         send_one(r, Space::Data, at);
     }
 

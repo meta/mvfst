@@ -281,10 +281,15 @@ impl SendBuffer {
         (self.fin != FinState::Open).then_some(self.end)
     }
 
+    /// Returns whether lost bytes or a lost FIN wait for retransmission.
+    pub fn has_lost(&self) -> bool {
+        !self.lost.is_empty() || self.fin == FinState::Lost
+    }
+
     /// Returns what the next [`emit`](Self::emit) would send with new bytes allowed up to
     /// `credit_end`, or `None` if it would not send anything. It does not change the buffer.
     pub fn pending(&self, credit_end: u64) -> Option<Pending> {
-        if !self.lost.is_empty() || self.fin == FinState::Lost {
+        if self.has_lost() {
             return Some(Pending::Retransmit);
         }
         let bytes = self.end.min(credit_end).saturating_sub(self.sent);

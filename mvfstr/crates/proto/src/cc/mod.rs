@@ -18,6 +18,8 @@
 
 pub mod cubic;
 pub mod new_reno;
+#[cfg(test)]
+pub(crate) mod recording;
 
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -28,6 +30,8 @@ pub use new_reno::NewReno;
 
 use crate::config::ConfigError;
 use crate::config::CongestionControl;
+use crate::recovery::loss::RateSample;
+use crate::recovery::sent::LostSample;
 
 /// Congestion controller settings shared by the algorithms.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,6 +160,73 @@ pub struct AckEvent {
     pub app_limited: bool,
 }
 
+/// The send of a packet counted in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentEvent {
+    /// Its recorded send time.
+    pub time_sent: Instant,
+    /// Bytes in flight before it.
+    pub bytes_in_flight: u64,
+    /// Its size in bytes.
+    pub size: u16,
+    /// C.total_sent: bytes of every packet sent on the connection, off-path packets excepted,
+    /// this one included if on the path. Kept only for a controller that takes rate samples
+    /// ([`takes_rate_samples`]); 0 otherwise.
+    pub total_sent: u64,
+}
+
+/// The ACK frame part of an [`AckOrLoss`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckPart {
+    /// Bytes of in-flight packets sent on the current path that it newly acknowledged.
+    pub acked_bytes: u64,
+    /// The send time of its largest newly acknowledged packet that is in flight and went on the
+    /// current path, if any.
+    pub largest_acked_sent: Option<Instant>,
+    /// Its RTT sample, RFC 9002's latest_rtt, if it produced one.
+    pub rtt_sample: Option<Duration>,
+    /// Its delivery-rate sample, if it newly acknowledged an on-path in-flight packet.
+    pub rate: Option<RateSample>,
+}
+
+/// One ACK frame or loss timeout as given to a controller that takes rate samples, with its
+/// losses and acknowledgments together so the controller can handle them in mvfst's order:
+/// resolving the loss episode, the loss response with each lost packet in send order, then the
+/// acknowledgment, whose sample already counts these losses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckOrLoss<'a> {
+    /// The frame's receive time, or the timeout's time.
+    pub now: Instant,
+    /// The ACK frame's part; `None` for a loss timeout.
+    pub ack: Option<AckPart>,
+    /// C.delivered, the bytes delivered on the connection, after the event.
+    pub delivered: u64,
+    /// C.total_sent, the bytes sent on the connection, after the event.
+    pub total_sent: u64,
+    /// Bytes in flight after the event.
+    pub bytes_in_flight: u64,
+    /// The on-path in-flight packets loss detection declared lost, in send order.
+    pub lost: &'a [LostSample],
+    /// The send time of the newest packet declared lost that went on the current path.
+    pub largest_lost_sent: Option<Instant>,
+    /// Whether the losses establish persistent congestion, as RFC 9002 defines it.
+    pub persistent_congestion: bool,
+    /// In-flight packets the frame acknowledged after they were declared lost.
+    pub spurious: u32,
+    /// In-flight packets the event newly declared lost, on any path.
+    pub newly_lost: u32,
+    /// In-flight packets declared lost and still tracked after the event, in every space.
+    pub declared_lost: u32,
+}
+
+/// Returns whether a controller of `kind` takes delivery-rate samples and per-packet losses
+/// ([`Cc::on_ack_or_loss`]). NewReno and CUBIC do not.
+pub fn takes_rate_samples(kind: CongestionControl) -> bool {
+    match kind {
+        CongestionControl::NewReno | CongestionControl::Cubic => false,
+    }
+}
+
 /// A congestion controller.
 #[derive(Clone, Debug)]
 pub enum Cc {
@@ -163,6 +234,10 @@ pub enum Cc {
     NewReno(NewReno),
     /// CUBIC (RFC 9438).
     Cubic(Cubic),
+    /// A test controller that keeps NewReno's window, takes rate samples and records its
+    /// inputs.
+    #[cfg(test)]
+    Recording(Box<recording::Recording>),
 }
 
 impl Cc {
@@ -181,11 +256,22 @@ impl Cc {
         })
     }
 
-    /// Records a packet counted in flight, sent at `now`; `bytes_in_flight` is the count before it.
-    pub fn on_sent(&mut self, now: Instant, bytes_in_flight: u64) {
+    /// Returns a test controller that keeps this one's window, takes rate samples and records
+    /// its inputs.
+    #[cfg(test)]
+    pub(crate) fn recording(&self) -> Self {
+        Self::Recording(Box::new(recording::Recording::new(NewReno::new(
+            self.window().clone(),
+        ))))
+    }
+
+    /// Records the send of a packet counted in flight.
+    pub fn on_sent(&mut self, sent: &SentEvent) {
         match self {
             Self::NewReno(_) => {}
-            Self::Cubic(c) => c.on_sent(now, bytes_in_flight),
+            Self::Cubic(c) => c.on_sent(sent.time_sent, sent.bytes_in_flight),
+            #[cfg(test)]
+            Self::Recording(c) => c.on_sent(sent),
         }
     }
 
@@ -194,6 +280,23 @@ impl Cc {
         match self {
             Self::NewReno(c) => c.on_ack(ack),
             Self::Cubic(c) => c.on_ack(ack),
+            #[cfg(test)]
+            Self::Recording(c) => c.inner.on_ack(ack),
+        }
+    }
+
+    /// Handles an ACK frame or loss timeout for a controller that takes rate samples
+    /// ([`takes_rate_samples`]); it is not called for NewReno or CUBIC. Returns whether to mark
+    /// the connection application-limited
+    /// ([`crate::recovery::loss::LossRecovery::mark_app_limited`]).
+    pub fn on_ack_or_loss(&mut self, event: &AckOrLoss<'_>) -> bool {
+        match self {
+            Self::NewReno(_) | Self::Cubic(_) => {
+                let _ = event;
+                false
+            }
+            #[cfg(test)]
+            Self::Recording(c) => c.on_ack_or_loss(event),
         }
     }
 
@@ -207,6 +310,8 @@ impl Cc {
         match self {
             Self::NewReno(c) => c.on_congestion_event(now, sent),
             Self::Cubic(c) => c.on_congestion_event(now, sent, signal),
+            #[cfg(test)]
+            Self::Recording(c) => c.inner.on_congestion_event(now, sent),
         }
     }
 
@@ -216,6 +321,8 @@ impl Cc {
         match self {
             Self::NewReno(c) => c.on_persistent_congestion(),
             Self::Cubic(c) => c.on_persistent_congestion(),
+            #[cfg(test)]
+            Self::Recording(c) => c.inner.on_persistent_congestion(),
         }
     }
 
@@ -227,6 +334,8 @@ impl Cc {
         match self {
             Self::NewReno(_) => {}
             Self::Cubic(c) => c.on_spurious_loss(recovery_start),
+            #[cfg(test)]
+            Self::Recording(_) => {}
         }
     }
 
@@ -245,6 +354,8 @@ impl Cc {
                 c.forget_undo();
                 &mut c.window
             }
+            #[cfg(test)]
+            Self::Recording(c) => &mut c.inner.window,
         };
         let untouched = w.cwnd == w.initial;
         let smaller = u64::from(max_datagram_size) < w.mss;
@@ -288,6 +399,8 @@ impl Cc {
         match self {
             Self::NewReno(c) => &c.window,
             Self::Cubic(c) => &c.window,
+            #[cfg(test)]
+            Self::Recording(c) => &c.inner.window,
         }
     }
 }

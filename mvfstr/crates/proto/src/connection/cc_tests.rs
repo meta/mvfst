@@ -58,7 +58,7 @@ use crate::testing::fixtures::Setup;
 const CONTROLLERS: [CongestionControl; 2] = [CongestionControl::NewReno, CongestionControl::Cubic];
 
 /// Sets up a pair whose client sends with `client` into flow-control windows too wide to limit it.
-fn setup(client: Arc<TransportConfig>) -> Setup {
+pub(super) fn setup(client: Arc<TransportConfig>) -> Setup {
     Setup {
         client_transport: client,
         server_transport: config(|c| c.max_data(1 << 40).max_stream_data_uni(1 << 30)),
@@ -68,14 +68,14 @@ fn setup(client: Arc<TransportConfig>) -> Setup {
 
 /// A client sending `len` bytes on a unidirectional stream, ended with the FIN, to a server
 /// that reads everything.
-struct Bulk {
+pub(super) struct Bulk {
     id: StreamId,
     client: App,
     server: App,
 }
 
 impl Bulk {
-    fn start(pair: &mut Pair, len: usize) -> Self {
+    pub(super) fn start(pair: &mut Pair, len: usize) -> Self {
         let id = pair.client.conn_mut().open_stream(Dir::Uni, ORDER).unwrap();
         let mut client = App::default();
         client.write(id, pattern(len), true);
@@ -87,12 +87,17 @@ impl Bulk {
     }
 
     /// Runs the pair until `until`.
-    fn run(&mut self, pair: &mut Pair, until: Instant) {
+    pub(super) fn run(&mut self, pair: &mut Pair, until: Instant) {
         self.run_with(pair, until, |_| {});
     }
 
     /// Runs the pair until `until`, calling `each` once everything due at an instant has run.
-    fn run_with(&mut self, pair: &mut Pair, until: Instant, mut each: impl FnMut(&Pair)) {
+    pub(super) fn run_with(
+        &mut self,
+        pair: &mut Pair,
+        until: Instant,
+        mut each: impl FnMut(&Pair),
+    ) {
         loop {
             // The application tops its stream up for as long as the client sends, so the stream's
             // staging cap does not limit the client.
@@ -115,7 +120,7 @@ impl Bulk {
     }
 
     /// Returns how many bytes the server has read.
-    fn received(&self) -> usize {
+    pub(super) fn received(&self) -> usize {
         self.server.data.get(&self.id).map_or(0, Vec::len)
     }
 }

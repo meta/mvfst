@@ -230,6 +230,13 @@ pub struct LinkConfig {
     pub loss: Loss,
     /// Up to this much extra delay per datagram, seeded, which reorders datagrams.
     pub jitter: Duration,
+    /// The bottleneck rate in bytes per second: datagrams leave one after another, each after
+    /// its serialization time, before the delay. `None`, the default, means instant serialization.
+    pub rate: Option<u64>,
+    /// With a rate, the most bytes the bottleneck queue holds, the datagram being serialized
+    /// included; a datagram that does not fit is lost (drop-tail). `None`, the default, means an
+    /// unbounded queue.
+    pub buffer: Option<usize>,
 }
 
 impl Default for LinkConfig {
@@ -239,6 +246,8 @@ impl Default for LinkConfig {
             mtu: 1500,
             loss: Loss::None,
             jitter: Duration::ZERO,
+            rate: None,
+            buffer: None,
         }
     }
 }
@@ -254,6 +263,8 @@ pub struct Link {
     /// The highest send index delivered so far.
     newest_delivered: Option<usize>,
     in_flight: Vec<(Instant, usize, Vec<u8>)>,
+    /// When the bottleneck finishes serializing the datagrams it has taken.
+    busy_until: Option<Instant>,
 }
 
 impl Link {
@@ -271,6 +282,7 @@ impl Link {
             reordered: 0,
             newest_delivered: None,
             in_flight: Vec::new(),
+            busy_until: None,
         }
     }
 
@@ -290,6 +302,24 @@ impl Link {
             self.lost += 1;
             return;
         }
+        let mut leaves = now;
+        if let Some(rate) = self.config.rate {
+            let queued = self
+                .busy_until
+                .map_or(0, |busy| busy.saturating_duration_since(now).as_nanos())
+                * u128::from(rate)
+                / 1_000_000_000;
+            if let Some(buffer) = self.config.buffer
+                && queued + data.len() as u128 > buffer as u128
+            {
+                self.lost += 1;
+                return;
+            }
+            let start = self.busy_until.map_or(now, |busy| busy.max(now));
+            let nanos = data.len() as u128 * 1_000_000_000 / u128::from(rate);
+            leaves = start + Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+            self.busy_until = Some(leaves);
+        }
         let jitter_nanos = u64::try_from(self.config.jitter.as_nanos()).unwrap_or(u64::MAX);
         let jitter = if jitter_nanos == 0 {
             Duration::ZERO
@@ -297,7 +327,7 @@ impl Link {
             Duration::from_nanos(self.rng.next_u64() % jitter_nanos)
         };
         self.in_flight
-            .push((now + self.config.delay + jitter, index, data));
+            .push((leaves + self.config.delay + jitter, index, data));
     }
 
     /// Changes which datagrams the link loses from now on; [`Loss::Drop`] indices still count
@@ -945,5 +975,59 @@ pub(crate) mod fixtures {
                 [NamedGroup::X25519]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recovery::test_epoch;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_link_with_a_rate_serializes_datagrams_one_after_another() {
+        let t0 = test_epoch();
+        let config = LinkConfig {
+            rate: Some(1_000_000),
+            ..LinkConfig::default()
+        };
+        let mut link = Link::new(config, 1);
+        for _ in 0..3 {
+            link.send(t0, vec![0; 1000]);
+        }
+        // 1 ms each at 1,000,000 bytes per second, then the 10 ms delay.
+        assert_eq!(link.next_arrival(), Some(t0 + 11 * MS));
+        assert_eq!(link.deliver(t0 + 12 * MS).len(), 2);
+        assert_eq!(link.next_arrival(), Some(t0 + 13 * MS));
+        // An idle bottleneck starts the next datagram at once.
+        link.send(t0 + 20 * MS, vec![0; 500]);
+        assert_eq!(link.deliver(t0 + 13 * MS).len(), 1);
+        assert_eq!(
+            link.next_arrival(),
+            Some(t0 + 30 * MS + Duration::from_micros(500))
+        );
+    }
+
+    #[test]
+    fn a_full_bottleneck_buffer_drops_the_datagrams_that_do_not_fit() {
+        let t0 = test_epoch();
+        let config = LinkConfig {
+            rate: Some(1_000_000),
+            buffer: Some(2_500),
+            ..LinkConfig::default()
+        };
+        let mut link = Link::new(config, 1);
+        for _ in 0..4 {
+            link.send(t0, vec![0; 1000]);
+        }
+        // Two fit; the third would make 3,000 bytes.
+        assert_eq!(link.lost(), 2);
+        // Half a millisecond later 1,500 bytes are left, and another 1,000 fit.
+        link.send(t0 + Duration::from_micros(500), vec![0; 1000]);
+        assert_eq!(link.lost(), 2);
+        link.send(t0 + Duration::from_micros(500), vec![0; 1]);
+        assert_eq!(link.lost(), 3);
+        assert_eq!(link.deliver(t0 + 20 * MS).len(), 3);
     }
 }

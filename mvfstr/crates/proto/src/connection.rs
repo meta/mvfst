@@ -27,6 +27,8 @@ mod key_update;
 mod manage_tests;
 mod params;
 mod path;
+#[cfg(test)]
+mod rate_tests;
 mod recv;
 mod send;
 #[cfg(test)]
@@ -86,6 +88,8 @@ use crate::TxExplain;
 use crate::TxLimits;
 use crate::TxOutcome;
 use crate::TxReport;
+use crate::cc::AckOrLoss;
+use crate::cc::AckPart;
 use crate::cc::Cc;
 use crate::cc::CcConfig;
 use crate::cc::CongestionSignal;
@@ -371,6 +375,7 @@ impl Connection {
         let config = setup.transport;
         let recovery_config = RecoveryConfig {
             initial_rtt: config.initial_rtt(),
+            rate_samples: crate::cc::takes_rate_samples(config.congestion_control()),
             ..RecoveryConfig::default()
         };
         let recovery = LossRecovery::new(recovery_config, side, setup.now, [0; 3])
@@ -564,6 +569,9 @@ impl Connection {
             TimeoutOutcome::Lost(_, lost) => {
                 stats.lost_packets += u64::from(lost.lost_packets);
                 on_losses(cc, now, &lost);
+                if recovery.takes_rate_samples() {
+                    on_ack_or_loss(cc, recovery, now, None, &lost, 0);
+                }
             }
             TimeoutOutcome::Probe(_) => {
                 // A probe in a handshake space carries the unacknowledged CRYPTO bytes, so one
@@ -1037,6 +1045,41 @@ fn on_losses(cc: &mut Cc, now: Instant, loss: &LossSummary) {
     }
     if loss.persistent_congestion {
         cc.on_persistent_congestion();
+    }
+}
+
+/// Gives a controller that takes rate samples one ACK frame, with its `ack` part, or one loss
+/// timeout, without, as of `now`: `loss` is what loss detection declared and `spurious` the
+/// in-flight packets acknowledged after being declared lost. As in mvfst, only an event that
+/// newly acknowledged an on-path in-flight packet, declared an in-flight packet lost or
+/// acknowledged a spurious loss reaches it. Marks the connection app-limited when the controller
+/// returns true.
+fn on_ack_or_loss(
+    cc: &mut Cc,
+    recovery: &mut LossRecovery,
+    now: Instant,
+    ack: Option<AckPart>,
+    loss: &LossSummary,
+    spurious: u32,
+) {
+    if ack.and_then(|a| a.largest_acked_sent).is_none() && loss.newly_lost == 0 && spurious == 0 {
+        return;
+    }
+    let event = AckOrLoss {
+        now,
+        ack,
+        delivered: recovery.delivered(),
+        total_sent: recovery.total_sent(),
+        bytes_in_flight: recovery.bytes_in_flight(),
+        lost: recovery.lost_samples(),
+        largest_lost_sent: loss.largest_lost_sent,
+        persistent_congestion: loss.persistent_congestion,
+        spurious,
+        newly_lost: loss.newly_lost,
+        declared_lost: recovery.declared_lost(),
+    };
+    if cc.on_ack_or_loss(&event) {
+        recovery.mark_app_limited();
     }
 }
 

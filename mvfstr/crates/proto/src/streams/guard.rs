@@ -78,6 +78,9 @@ pub(crate) trait StreamData {
     /// Returns what the stream holds of the staging budget's split while it has demand: its room
     /// and staged bytes.
     fn holding(&self) -> Holding;
+
+    /// Returns whether lost bytes or a lost FIN wait for retransmission.
+    fn has_lost(&self) -> bool;
 }
 
 /// A readiness edge the connection marks after updating the data parts.
@@ -178,6 +181,8 @@ struct Entry<D> {
     links: [Link; LISTS],
     /// One bit per [`List`] the stream is on.
     member: u8,
+    /// Whether the stream is counted in [`Streams::lost`].
+    lost: bool,
     /// Whether the shares record the stream as the only peer of its order's bucket; cleared when
     /// the order changes, until the next reindex checks again.
     alone: bool,
@@ -213,6 +218,8 @@ struct Membership {
     lists: u8,
     scheduled: Option<SendOrder>,
     reap: bool,
+    /// Whether the stream counts among the streams with lost data.
+    lost: bool,
 }
 
 impl List {
@@ -271,10 +278,14 @@ impl<D: StreamData> Stream<D> {
             lists |= List::Control.bit();
         }
         let scheduled = send.is_some_and(|s| s.may_send_stream()) && self.data.has_wire_data();
+        let reap = self.halves.is_closed() && self.closed_delivered && self.edges.0 == 0;
         Membership {
             lists,
             scheduled: scheduled.then_some(self.order),
-            reap: self.halves.is_closed() && self.closed_delivered && self.edges.0 == 0,
+            reap,
+            // Lost data makes a sendable stream's wire data, so only a scheduled stream can
+            // have lost data waiting.
+            lost: scheduled && self.data.has_lost(),
         }
     }
 }
@@ -286,6 +297,10 @@ pub(crate) struct Streams<D> {
     scheduler: Scheduler,
     /// The streams on the demand list, by bucket of the split.
     shares: Shares,
+    /// How many streams have lost bytes or a lost FIN in their send buffers, kept by the reindex
+    /// that every guard runs when dropped, so every change to a send buffer's lost state is
+    /// counted: a loss, a retransmission, an acknowledgment of lost bytes or a reset.
+    lost: u32,
 }
 
 /// Exclusive access to one stream; dropping it reindexes the stream.
@@ -316,7 +331,13 @@ impl<D: StreamData> Streams<D> {
             lists: [EMPTY_LIST; LISTS],
             scheduler: Scheduler::new(quantum),
             shares: Shares::new(),
+            lost: 0,
         }
+    }
+
+    /// Returns how many streams have lost bytes or a lost FIN in their send buffers.
+    pub(crate) fn lost(&self) -> u32 {
+        self.lost
     }
 
     /// Opens a local stream at `order` with data parts `data`.
@@ -554,7 +575,16 @@ impl<D: StreamData> Streams<D> {
                 _ => {}
             }
         }
-        self.entry_mut(slot).member = want.lists;
+        let entry = self.entry_mut(slot);
+        entry.member = want.lists;
+        if entry.lost != want.lost {
+            entry.lost = want.lost;
+            if want.lost {
+                self.lost += 1;
+            } else {
+                self.lost -= 1;
+            }
+        }
         let moved = match want.scheduled {
             Some(order) => self.scheduler.insert(slot, id, order),
             None => self.scheduler.remove(slot),
@@ -710,6 +740,7 @@ impl<D> Entry<D> {
             },
             links: [UNLINKED; LISTS],
             member: 0,
+            lost: false,
             alone: false,
         }
     }
@@ -1039,6 +1070,7 @@ impl<D: StreamData> Streams<D> {
                 "scheduling of stream {id}"
             );
             assert!(!want.reap, "stream {id} should have been reaped");
+            assert_eq!(entry.lost, want.lost, "stream {id} counted with lost data");
             assert_eq!(
                 entry.alone,
                 self.shares.alone(key.slot()),
@@ -1092,6 +1124,8 @@ impl<D: StreamData> Streams<D> {
                 .filter(|(_, _, e)| e.stream.membership().scheduled.is_some())
                 .count()
         );
+        let lost = self.table.map().iter().filter(|(_, _, e)| e.lost).count();
+        assert_eq!(self.lost as usize, lost, "streams with lost data");
     }
 }
 
@@ -1121,6 +1155,10 @@ mod tests {
 
         fn holding(&self) -> Holding {
             Holding::default()
+        }
+
+        fn has_lost(&self) -> bool {
+            false
         }
     }
 

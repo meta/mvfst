@@ -49,6 +49,7 @@ use crate::TxLimits;
 use crate::TxMeta;
 use crate::TxOutcome;
 use crate::TxSeqRange;
+use crate::cc::SentEvent;
 use crate::recovery::SentFlags;
 use crate::recovery::Space;
 use crate::sources::Candidate;
@@ -233,6 +234,9 @@ impl Connection {
             out.stop = Stop::Inconsistent;
         }
         self.app_limited = self.is_app_limited(out.stop);
+        if self.recovery.takes_rate_samples() && self.limited_by_app() {
+            self.recovery.mark_app_limited();
+        }
         // Unless sealing failed, an attempt that did not send a datagram must not change the
         // state a later attempt reads.
         #[cfg(debug_assertions)]
@@ -356,6 +360,21 @@ impl Connection {
             Stop::ConnFlowControl => true,
             _ => false,
         }
+    }
+
+    /// Returns whether the connection is application-limited at the end of an attempt, whatever
+    /// its stop, by the rules of mvfst's BBR3: less than a datagram of stream bytes is staged,
+    /// those connection flow control holds back included; push senders are not waiting for
+    /// `Writable` and producers are not pull-ready; lost stream and CRYPTO data are not waiting
+    /// for retransmission; and the window has room, even less than a datagram.
+    pub(super) fn limited_by_app(&self) -> bool {
+        let backlog = self.sources.streams.backlog();
+        backlog.staged < u64::from(self.mtu)
+            && !backlog.push_blocked
+            && !backlog.pull_ready
+            && !backlog.lost
+            && !self.sources.crypto.iter().any(|crypto| crypto.has_lost())
+            && self.cc.cwnd() > self.recovery.bytes_in_flight()
     }
 
     /// Returns whether source `id` may write into a packet on `path` holding `packet` in the
@@ -688,19 +707,21 @@ impl Connection {
             for frame in self.sent_frames[packet.space.index()].drain(..) {
                 self.recovery.push_frame(packet.space, frame);
             }
-            if flags.contains(SentFlags::IN_FLIGHT) {
-                self.cc.on_sent(now, self.recovery.bytes_in_flight());
-            }
+            let size = packet.layout.len as u16;
+            let in_flight_before = flags
+                .contains(SentFlags::IN_FLIGHT)
+                .then(|| self.recovery.bytes_in_flight());
             self.recovery
-                .on_packet_sent(
-                    packet.space,
-                    packet.pn,
-                    now,
-                    packet.layout.len as u16,
-                    flags,
-                    tx,
-                )
+                .on_packet_sent(packet.space, packet.pn, now, size, flags, tx)
                 .expect("should record the packet number it peeked");
+            if let Some(bytes_in_flight) = in_flight_before {
+                self.cc.on_sent(&SentEvent {
+                    time_sent: now,
+                    bytes_in_flight,
+                    size,
+                    total_sent: self.recovery.total_sent(),
+                });
+            }
             self.sources.on_sealed(packet.space, &packet.packet);
             if packet.space == Space::Data
                 && let Some(phases) = &mut self.key_phases

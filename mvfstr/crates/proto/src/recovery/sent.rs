@@ -290,6 +290,14 @@ pub struct LossSummary {
     pub lost_packets: u32,
     /// Bytes of in-flight packets declared lost.
     pub lost_bytes: u64,
+    /// Of `lost_bytes`, those of packets that went on the current path and were declared lost
+    /// by loss detection, not dropped by the backend: the bytes a rate-sampling controller's
+    /// C.lost grows by.
+    pub on_path_lost_bytes: u64,
+    /// In-flight packets loss detection newly declared lost, on any path; dropped datagrams'
+    /// packets do not count. This is the population [`AckSummary::spurious`] and
+    /// [`SentPackets::declared_lost`] count.
+    pub newly_lost: u32,
     /// The send time of the last in-flight packet declared lost that went on the current path,
     /// which starts a congestion event (RFC 9002); losses on another path do not.
     pub largest_lost_sent: Option<Instant>,
@@ -303,9 +311,52 @@ impl LossSummary {
     pub fn merge(&mut self, other: LossSummary) {
         self.lost_packets += other.lost_packets;
         self.lost_bytes += other.lost_bytes;
+        self.on_path_lost_bytes += other.on_path_lost_bytes;
+        self.newly_lost += other.newly_lost;
         self.largest_lost_sent = self.largest_lost_sent.max(other.largest_lost_sent);
         self.persistent_congestion |= other.persistent_congestion;
     }
+}
+
+/// What a packet's send recorded for the BBR draft's delivery-rate sampling: the connection's
+/// delivery state when an on-path in-flight packet was sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendSnapshot {
+    /// P.delivered: the bytes delivered on the connection when the packet was sent.
+    pub delivered: u64,
+    /// P.first_send_time: the send time that starts the packet's delivery interval.
+    pub first_send_time: Instant,
+    /// P.delivered_time: the ACK time that starts the packet's delivery interval, with the ACK
+    /// Delay taken off, or the send time when the interval starts at a send.
+    pub delivered_time: Instant,
+    /// Whether the interval starts at a send, a restart or the connection's start rather than at
+    /// an ACK; if so, its ACK elapsed time ends at the raw receive time.
+    pub from_send: bool,
+    /// P.is_app_limited: whether the connection was marked application-limited when it was sent.
+    pub app_limited: bool,
+    /// P.tx_in_flight: the bytes in flight, the packet included, right after it was sent.
+    pub tx_in_flight: u64,
+    /// P.lost: the bytes declared lost on the connection when it was sent.
+    pub lost: u64,
+    /// The bytes sent on the connection through this packet, packets not in flight included and
+    /// off-path packets excepted.
+    pub total_sent: u64,
+}
+
+/// An on-path in-flight packet loss detection declared lost, for the BBR draft's per-packet loss
+/// response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LostSample {
+    /// Its size in bytes.
+    pub size: u16,
+    /// Its packet number.
+    pub pn: u64,
+    /// Its packet number space.
+    pub space: Space,
+    /// P.tx_in_flight: the bytes in flight, the packet included, right after it was sent.
+    pub tx_in_flight: u64,
+    /// P.is_app_limited: whether the connection was marked application-limited when it was sent.
+    pub is_app_limited: bool,
 }
 
 /// A sent packet as recovery reports it, with the frames it carried.
@@ -324,6 +375,9 @@ pub struct SentPacket<'a> {
     /// Whether it went on the current path (see [`SentPackets::start_path`] and
     /// [`SentFlags::OFF_PATH`]); only such packets count for its congestion controller.
     pub on_path: bool,
+    /// What its send recorded for delivery-rate sampling, for an on-path in-flight packet sent
+    /// while the controller takes rate samples.
+    pub snapshot: Option<&'a SendSnapshot>,
     frames: vec_deque::Iter<'a, SentFrame>,
 }
 
@@ -368,6 +422,8 @@ pub struct SentPackets {
     holes: VecDeque<u64>,
     /// The packet number where loss detection starts; the holes below it are not outstanding.
     loss_scan_from: u64,
+    /// The send snapshot of each record, in step with `pkts`.
+    snapshots: VecDeque<Option<SendSnapshot>>,
     /// Records visited by ACK processing and loss detection, for tests of their cost.
     #[cfg(test)]
     examined: u64,
@@ -397,6 +453,7 @@ impl SentPackets {
             declared_lost: 0,
             holes: VecDeque::new(),
             loss_scan_from: 0,
+            snapshots: VecDeque::new(),
             #[cfg(test)]
             examined: 0,
         }
@@ -416,6 +473,16 @@ impl SentPackets {
     pub fn abandon_frames(&mut self) {
         let committed = self.frames_end.wrapping_sub(self.frames_front) as usize;
         self.frames.truncate(committed);
+    }
+
+    /// Records `snapshot` as the send snapshot of the packet just recorded by
+    /// [`SentPackets::on_sent`]. A packet recorded without this call does not get one.
+    pub fn set_last_snapshot(&mut self, snapshot: SendSnapshot) {
+        // `snapshots[i]` belongs to `pkts[i]`; records past its end do not have one.
+        self.snapshots.resize(self.pkts.len(), None);
+        if let Some(last) = self.snapshots.back_mut() {
+            *last = Some(snapshot);
+        }
     }
 
     /// Records a sealed packet carrying the frames pushed since the previous one. A `pn` above
@@ -723,11 +790,15 @@ impl SentPackets {
         if pkt.flags.contains(SentFlags::IN_FLIGHT) {
             if state == PktState::Lost {
                 self.declared_lost += 1;
+                summary.newly_lost += 1;
             }
             summary.lost_bytes += u64::from(pkt.size);
             if self.on_path(&pkt) {
                 let sent = self.instant(pkt.time_sent);
                 summary.largest_lost_sent = summary.largest_lost_sent.max(Some(sent));
+                if state == PktState::Lost {
+                    summary.on_path_lost_bytes += u64::from(pkt.size);
+                }
             }
         }
     }
@@ -757,6 +828,7 @@ impl SentPackets {
                 forgotten_lost += 1;
             }
             self.pkts.pop_front();
+            self.snapshots.pop_front();
             let next_frames = self.pkts.front().map_or(self.frames_end, |p| p.frames);
             let n = next_frames.wrapping_sub(self.frames_front) as usize;
             self.frames.drain(..n);
@@ -775,6 +847,7 @@ impl SentPackets {
     pub fn discard(&mut self) -> u64 {
         let removed = self.bytes_in_flight;
         self.pkts.clear();
+        self.snapshots.clear();
         self.frames.clear();
         self.frames_front = 0;
         self.frames_end = 0;
@@ -786,6 +859,12 @@ impl SentPackets {
         self.declared_lost = 0;
         self.holes.clear();
         removed
+    }
+
+    /// Returns the capacity of the send snapshot ring, for tests that check snapshots are not kept.
+    #[cfg(test)]
+    pub(crate) fn snapshot_capacity(&self) -> usize {
+        self.snapshots.capacity()
     }
 
     /// Returns how many records the ring holds, resolved or not.
@@ -832,6 +911,7 @@ impl SentPackets {
             flags: pkt.flags,
             tx_seq: pkt.tx_seq,
             on_path: self.on_path(pkt),
+            snapshot: self.snapshots.get(i).and_then(Option::as_ref),
             frames: frames_of(
                 &self.pkts,
                 &self.frames,

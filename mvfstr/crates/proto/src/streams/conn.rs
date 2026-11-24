@@ -194,6 +194,25 @@ impl StreamData for StreamParts {
             .as_ref()
             .map_or_else(Holding::default, |send| send.figures().holding())
     }
+
+    fn has_lost(&self) -> bool {
+        self.send.as_ref().is_some_and(|send| send.buf.has_lost())
+    }
+}
+
+/// What the streams hold back from the wire, for the app-limited test of a controller that
+/// takes rate samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendBacklog {
+    /// Bytes staged on every stream and not yet sent, those connection flow control holds back
+    /// included.
+    pub(crate) staged: u64,
+    /// Whether a push sender was refused bytes and waits for `Writable`.
+    pub(crate) push_blocked: bool,
+    /// Whether a producer is pull-ready.
+    pub(crate) pull_ready: bool,
+    /// Whether a stream's lost bytes or lost FIN wait for retransmission.
+    pub(crate) lost: bool,
 }
 
 /// A stream with demand and its allowance, from [`StreamState::rank`].
@@ -670,6 +689,17 @@ impl StreamState {
             }
         }
         self.ranked.clear();
+    }
+
+    /// Returns what the streams hold back from the wire, read from counters without visiting a
+    /// stream.
+    pub(crate) fn backlog(&self) -> SendBacklog {
+        SendBacklog {
+            staged: self.staged,
+            push_blocked: self.push_blocked > 0,
+            pull_ready: self.has_pull_ready(),
+            lost: self.streams.lost() > 0,
+        }
     }
 
     /// Returns whether any stream's producer should be polled for data.
