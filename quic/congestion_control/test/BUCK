@@ -284,6 +284,7 @@ mvfst_cpp_test(
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/quic/common/test:test_utils",
         "fbsource//xplat/quic/congestion_control:cuback",
+        "fbsource//xplat/quic/congestion_control:ecn_l4s_tracker",
         "fbsource//xplat/quic/logging:qlogger_constants",
         "fbsource//xplat/quic/state:state_functions",
         "fbsource//xplat/quic/state/test:mocks",

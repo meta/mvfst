@@ -338,6 +338,7 @@ mvfst_cpp_library(
         "fbsource//xplat/quic/logging:qlogger_constants",
         "fbsource//xplat/quic/logging:qlogger_macros",
         ":congestion_control_functions",
+        ":ecn_l4s_tracker",
     ],
     exported_deps = [
         "fbsource//xplat/quic/state:quic_state_machine",

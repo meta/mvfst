@@ -263,6 +263,83 @@ TEST_F(EcnL4sTrackerTest, NoUpdateWithNoNewMarks) {
   }
 }
 
+TEST_F(EcnL4sTrackerTest, RestartStartsTheWeightFromTheNextFraction) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+
+  conn_->lossState.srtt = 30ms;
+
+  auto nextAckTime = Clock::now() + 30ms;
+  {
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 9 /*ECT1*/, 1 /*CE*/);
+    ack.rttSample = 30ms;
+
+    l4sTracker_->onPacketAck(&ack);
+  }
+  const auto weight = l4sTracker_->getL4sWeight();
+
+  {
+    // These marks arrive before the restart, so the next weight leaves them
+    // out.
+    nextAckTime += 10ms;
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 10 /*ECT1*/, 5 /*CE*/);
+    ack.rttSample = 30ms;
+
+    l4sTracker_->onPacketAck(&ack);
+  }
+  l4sTracker_->restart(nextAckTime);
+  EXPECT_TRUE(l4sTracker_->isRestarting());
+  EXPECT_EQ(l4sTracker_->getL4sWeight(), weight);
+
+  {
+    nextAckTime += 30ms;
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 13 /*ECT1*/, 6 /*CE*/);
+    ack.rttSample = 30ms;
+
+    l4sTracker_->onPacketAck(&ack);
+    EXPECT_FALSE(l4sTracker_->isRestarting());
+    EXPECT_EQ(l4sTracker_->getL4sWeight(), 0.25); // 1 CE/(3 ECT1 + 1 CE)
+  }
+
+  {
+    // Later updates keep the moving average.
+    nextAckTime += 30ms;
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 17 /*ECT1*/, 6 /*CE*/);
+    ack.rttSample = 30ms;
+
+    l4sTracker_->onPacketAck(&ack);
+    EXPECT_EQ(
+        l4sTracker_->getL4sWeight(), 0.25 + kL4sWeightEwmaGain * (0 - 0.25));
+  }
+}
+
+TEST_F(EcnL4sTrackerTest, FirstCeAfterRestartDoesNotSetTheWeightToOne) {
+  conn_->ecnState = ECNState::ValidatedL4S;
+
+  conn_->lossState.srtt = 30ms;
+
+  auto nextAckTime = Clock::now() + 30ms;
+  l4sTracker_->restart(nextAckTime);
+  {
+    // The first CE mark does not update the weight before a virtual RTT.
+    nextAckTime += 10ms;
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 3 /*ECT1*/, 1 /*CE*/);
+    ack.rttSample = 30ms;
+
+    l4sTracker_->onPacketAck(&ack);
+    EXPECT_TRUE(l4sTracker_->isRestarting());
+    EXPECT_EQ(l4sTracker_->getL4sWeight(), 0.0);
+  }
+
+  {
+    nextAckTime += 20ms;
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 9 /*ECT1*/, 1 /*CE*/);
+    ack.rttSample = 30ms;
+
+    l4sTracker_->onPacketAck(&ack);
+    EXPECT_EQ(l4sTracker_->getL4sWeight(), 0.1); // 1 CE/(9 ECT1 + 1 CE)
+  }
+}
+
 TEST_F(EcnL4sTrackerTest, NewMarksNotifyObserver) {
   MockQuicSocket mockSocket;
   const auto observerContainer =

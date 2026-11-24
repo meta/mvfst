@@ -37,8 +37,8 @@ void EcnL4sTracker::onPacketAck(const AckEvent* ackEvent) {
   const uint64_t ect1Echoed =
       conn_.ackStates.appDataAckState.ecnECT1CountEchoed;
   const uint64_t ceEchoed = conn_.ackStates.appDataAckState.ecnCECountEchoed;
-  if (ackEvent->ackTime - lastUpdateTime_ >= rttVirt_ ||
-      (ceEchoed > 0 && lastCEEchoed_ == 0)) {
+  const bool firstCE = !restarted_ && ceEchoed > 0 && lastCEEchoed_ == 0;
+  if (ackEvent->ackTime - lastUpdateTime_ >= rttVirt_ || firstCE) {
     // It's time to update the l4s weight.
     const auto newECT1Echoed =
         static_cast<double>(ect1Echoed - lastECT1Echoed_);
@@ -49,14 +49,20 @@ void EcnL4sTracker::onPacketAck(const AckEvent* ackEvent) {
       return;
     }
 
-    // Update the l4s weight if we have seen any CE marks on this connection.
-    if (ceEchoed > 0) {
-      if (lastCEEchoed_ == 0) {
-        // First CE mark is seen. Initialize the weight to 1.0
-        l4sWeight_ = 1.0;
-      }
+    // Update the l4s weight if we have seen any CE marks on this connection,
+    // or if this is the first update after a restart.
+    if (ceEchoed > 0 || restarting_) {
       auto frac = newCEEchoed / (newCEEchoed + newECT1Echoed);
-      l4sWeight_ += kL4sWeightEwmaGain * (frac - l4sWeight_);
+      if (restarting_) {
+        l4sWeight_ = frac;
+        restarting_ = false;
+      } else {
+        if (firstCE) {
+          // First CE mark is seen. Initialize the weight to 1.0
+          l4sWeight_ = 1.0;
+        }
+        l4sWeight_ += kL4sWeightEwmaGain * (frac - l4sWeight_);
+      }
 
       if (newCEEchoed > 0) {
         // Log in qlogger
@@ -88,8 +94,24 @@ double EcnL4sTracker::getL4sWeight() const {
   return l4sWeight_;
 }
 
+std::chrono::microseconds EcnL4sTracker::getRttVirt() const {
+  return rttVirt_;
+}
+
 double EcnL4sTracker::getNormalizedL4sWeight() const {
   // Normalize the weight over the srtt
   return l4sWeight_ * conn_.lossState.srtt / rttVirt_;
+}
+
+void EcnL4sTracker::restart(TimePoint now) {
+  restarted_ = true;
+  restarting_ = true;
+  lastUpdateTime_ = now;
+  lastECT1Echoed_ = conn_.ackStates.appDataAckState.ecnECT1CountEchoed;
+  lastCEEchoed_ = conn_.ackStates.appDataAckState.ecnCECountEchoed;
+}
+
+bool EcnL4sTracker::isRestarting() const {
+  return restarting_;
 }
 } // namespace quic

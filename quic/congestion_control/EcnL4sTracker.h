@@ -28,6 +28,17 @@ class EcnL4sTracker : public PacketProcessor {
   // the congestion controller uses to react to the ECN markings once per RTT.
   [[nodiscard]] double getNormalizedL4sWeight() const;
 
+  // The period of the weight updates: srtt, but at least 25ms.
+  [[nodiscard]] std::chrono::microseconds getRttVirt() const;
+
+  // Measures the weight anew from `now`. The first update after this sets the
+  // weight to the CE fraction since `now`. From then on, a first CE mark does
+  // not set the weight to 1.
+  void restart(TimePoint now);
+
+  // Whether the first update after restart() is still to come.
+  [[nodiscard]] bool isRestarting() const;
+
  private:
   QuicConnectionStateBase& conn_;
   std::chrono::microseconds rttVirt_;
@@ -36,6 +47,8 @@ class EcnL4sTracker : public PacketProcessor {
   TimePoint lastUpdateTime_{Clock::now()};
   uint64_t lastECT1Echoed_{0};
   uint64_t lastCEEchoed_{0};
+  bool restarted_{false};
+  bool restarting_{false};
 };
 
 } // namespace quic

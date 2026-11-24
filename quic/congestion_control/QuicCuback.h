@@ -37,7 +37,8 @@ cubackIncreaseBytes(const CubackEpoch& epoch, double w, double smss);
 
 // Cuback, as specified in draft-kazuho-ccwg-cuback-01: CUBIC (RFC 9438) whose
 // congestion avoidance is driven by acknowledged bytes. Slow start is HyStart++
-// (RFC 9406).
+// (RFC 9406). On an L4S path, its response to CE marks follows Prague
+// (draft-briscoe-iccrg-prague-congestion-control-04).
 class Cuback : public CongestionController {
  public:
   enum class State : uint8_t {
@@ -83,14 +84,18 @@ class Cuback : public CongestionController {
     uint64_t pendingBytes;
     State state;
     PacketNum recoveryEndPacketNum;
+    bool l4sEpoch;
     // Packets of the event that are declared lost and not acknowledged.
     uint64_t lostPackets;
   };
 
   void onSpuriousLosses(const AckEvent& ack);
   void onEcnCounts(const AckEvent& ack);
+  void onL4sCe(const AckEvent& ack);
+  void endL4sEpoch();
   void onLoss(const LossEvent& loss);
   void onAck(const AckEvent& ack);
+  void restartL4sWeight(const AckEvent& ack);
   void onCongestionEvent(std::string_view trigger);
   void onPersistentCongestion();
 
@@ -103,6 +108,8 @@ class Cuback : public CongestionController {
   [[nodiscard]] Optional<UndoState> undoState(const LossEvent& loss) const;
   [[nodiscard]] bool isCwndLimited(const AckEvent& ack) const;
   [[nodiscard]] uint64_t ackedBytesAfterRecovery(const AckEvent& ack) const;
+  [[nodiscard]] uint64_t unmarkedBytes(uint64_t ackedBytes) const;
+  [[nodiscard]] bool isL4s() const;
   [[nodiscard]] uint64_t increaseBytes();
   [[nodiscard]] double bandwidth(uint64_t window) const;
   [[nodiscard]] PacketNum nextPacketNum() const;
@@ -129,6 +136,19 @@ class Cuback : public CongestionController {
   PacketNum cwndLimitedEndPacketNum_{0};
   bool appLimited_{false};
   uint64_t ecnCeCount_{0};
+  uint64_t ecnEct1Count_{0};
+  // The marks that the latest ACK added to the echoed counts.
+  uint64_t newCeMarks_{0};
+  uint64_t newEct1Marks_{0};
+  // Set by a reduction on L4S marks and cleared by a loss. While set, cwnd
+  // grows by Prague's additive increase.
+  bool l4sEpoch_{false};
+  // L4S marks before this time do not reduce cwnd.
+  TimePoint ignoreCeUntil_;
+  // Set when slow start ends. The first ACK in congestion avoidance then
+  // restarts the tracker's weight, so that the marks of slow start's overshoot
+  // do not count toward it.
+  bool l4sRestartPending_{false};
   Optional<UndoState> undo_;
 
   PacketNum hystartRoundEndPacketNum_{0};

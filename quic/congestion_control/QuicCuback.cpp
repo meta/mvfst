@@ -9,6 +9,7 @@
 
 #include <folly/lang/Assume.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
+#include <quic/congestion_control/EcnL4sTracker.h>
 #include <quic/logging/QLoggerConstants.h>
 #include <quic/logging/QLoggerMacros.h>
 
@@ -34,8 +35,12 @@ constexpr uint64_t kCssRounds = 5;
 // Pacing at twice cwnd over srtt keeps the pacing rate after a reduction above
 // the send rate before it.
 constexpr uint64_t kPacingGain = 2;
+// Prague paces at cwnd over srtt outside slow start.
+constexpr double kL4sPacingGain = 1;
 
 constexpr auto kEcnTrigger = "ecn";
+constexpr auto kL4sTrigger = "l4s";
+constexpr auto kL4sEndTrigger = "l4s end";
 constexpr auto kDelayIncreaseTrigger = "delay increase";
 constexpr auto kDelayDecreaseTrigger = "delay decrease";
 constexpr auto kCssRoundsTrigger = "css rounds";
@@ -60,6 +65,11 @@ double cubicAckedBytes(const CubackEpoch& epoch, double w, double smss) {
   return epoch.bandwidth * (k + std::cbrt((w - epoch.wMax) / (kCubicC * smss)));
 }
 
+bool isSlowStart(Cuback::State state) {
+  return state == Cuback::State::SlowStart ||
+      state == Cuback::State::ConservativeSlowStart;
+}
+
 } // namespace
 
 double cubackAckedBytes(const CubackEpoch& epoch, double w, double smss) {
@@ -82,6 +92,7 @@ Cuback::Cuback(QuicConnectionStateBase& conn)
           conn.transportSettings.maxCwndInMss,
           conn.transportSettings.minCwndInMss)),
       ecnCeCount_(conn.ackStates.appDataAckState.ecnCECountEchoed),
+      ecnEct1Count_(conn.ackStates.appDataAckState.ecnECT1CountEchoed),
       hystartRoundEndPacketNum_(conn.ackStates.appDataAckState.nextPacketNum) {
   if (conn_.pacer) {
     conn_.pacer->setRttFactor(1, 1);
@@ -119,6 +130,9 @@ void Cuback::onPacketAckOrLoss(
   }
 
   if (ack) {
+    if (l4sEpoch_ && !isL4s()) {
+      endL4sEpoch();
+    }
     onSpuriousLosses(*ack);
     onEcnCounts(*ack);
   }
@@ -208,6 +222,7 @@ void Cuback::onSpuriousLosses(const AckEvent& ack) {
     epoch_ = undo_->epoch;
     pendingBytes_ = undo_->pendingBytes;
     recoveryEndPacketNum_ = undo_->recoveryEndPacketNum;
+    l4sEpoch_ = undo_->l4sEpoch;
     setState(undo_->state, kSpuriousLossTrigger);
   }
   undo_.reset();
@@ -215,17 +230,72 @@ void Cuback::onSpuriousLosses(const AckEvent& ack) {
 
 void Cuback::onEcnCounts(const AckEvent& ack) {
   // The transport keeps running maxima of the echoed counts.
-  const uint64_t ceCount = conn_.ackStates.appDataAckState.ecnCECountEchoed;
-  if (ceCount <= ecnCeCount_) {
+  const auto& ackState = conn_.ackStates.appDataAckState;
+  newCeMarks_ = ackState.ecnCECountEchoed - ecnCeCount_;
+  newEct1Marks_ = ackState.ecnECT1CountEchoed - ecnEct1Count_;
+  ecnCeCount_ = ackState.ecnCECountEchoed;
+  ecnEct1Count_ = ackState.ecnECT1CountEchoed;
+  if (newCeMarks_ == 0) {
     return;
   }
-  ecnCeCount_ = ceCount;
+  if (isL4s()) {
+    onL4sCe(ack);
+    return;
+  }
   const bool ecnValidated = conn_.ecnState == ECNState::ValidatedECN ||
       conn_.ecnState == ECNState::ValidatedL4S;
   if (ecnValidated && ack.largestAckedPacket >= recoveryEndPacketNum_) {
     undo_.reset();
     onCongestionEvent(kEcnTrigger);
   }
+}
+
+void Cuback::onL4sCe(const AckEvent& ack) {
+  const bool slowStart = isSlowStart(state_);
+  // Marks during a recovery, within a virtual RTT of a reduction, or before
+  // the tracker's first update after slow start do not reduce cwnd.
+  if (!slowStart &&
+      (state_ == State::Recovery || ack.ackTime < ignoreCeUntil_ ||
+       l4sRestartPending_ || conn_.ecnL4sTracker->isRestarting())) {
+    return;
+  }
+  // Prague starts alpha at 1, so the mark that ends slow start halves cwnd.
+  const double alpha = slowStart ? 1 : conn_.ecnL4sTracker->getL4sWeight();
+  undo_.reset();
+  setCwnd(
+      static_cast<uint64_t>(static_cast<double>(cwndBytes_) * (1 - alpha / 2)));
+  ssthreshBytes_ = cwndBytes_;
+  pendingBytes_ = 0;
+  l4sEpoch_ = true;
+  ignoreCeUntil_ = ack.ackTime + conn_.ecnL4sTracker->getRttVirt();
+  if (slowStart) {
+    // The packets in flight left during the overshoot of slow start, so their
+    // marks and losses do not reduce cwnd again.
+    recoveryEndPacketNum_ = nextPacketNum();
+    setState(State::Recovery, kL4sTrigger);
+  }
+  QLOG(
+      conn_,
+      addCongestionMetricUpdate,
+      conn_.lossState.inflightBytes,
+      cwndBytes_,
+      std::string(kL4sTrigger),
+      std::string(cubackStateToString(state_)));
+}
+
+void Cuback::endL4sEpoch() {
+  // Without L4S feedback, cwnd grows on the Cuback curve again, as if slow
+  // start had just ended.
+  l4sEpoch_ = false;
+  epoch_.cwndPrior = static_cast<double>(cwndBytes_);
+  enterCongestionAvoidance(kL4sEndTrigger);
+  QLOG(
+      conn_,
+      addCongestionMetricUpdate,
+      conn_.lossState.inflightBytes,
+      cwndBytes_,
+      std::string(kL4sEndTrigger),
+      std::string(cubackStateToString(state_)));
 }
 
 void Cuback::onLoss(const LossEvent& loss) {
@@ -259,18 +329,34 @@ void Cuback::onAck(const AckEvent& ack) {
       break;
     case State::CongestionAvoidance:
       if (grow) {
-        growInCongestionAvoidance(ackedBytes);
+        growInCongestionAvoidance(
+            l4sEpoch_ ? unmarkedBytes(ackedBytes) : ackedBytes);
       }
       break;
     case State::Recovery:
       break;
   }
+  restartL4sWeight(ack);
+}
+
+void Cuback::restartL4sWeight(const AckEvent& ack) {
+  // The transport adds the tracker when it validates L4S. Until then, the
+  // restart stays pending.
+  if (!l4sRestartPending_ || state_ != State::CongestionAvoidance ||
+      !conn_.ecnL4sTracker) {
+    return;
+  }
+  conn_.ecnL4sTracker->restart(ack.ackTime);
+  l4sRestartPending_ = false;
 }
 
 void Cuback::onCongestionEvent(std::string_view trigger) {
   const auto cwnd = static_cast<double>(cwndBytes_);
-  // Fast convergence: a flow that peaks below its last W_max lowers W_max.
-  epoch_.wMax = cwnd < epoch_.wMax ? cwnd * (1 + kBetaCubic) / 2 : cwnd;
+  // Fast convergence: a flow that peaks below its last W_max lowers W_max. In
+  // an L4S epoch, the marks hold cwnd in place, and W_max is stale.
+  epoch_.wMax =
+      cwnd < epoch_.wMax && !l4sEpoch_ ? cwnd * (1 + kBetaCubic) / 2 : cwnd;
+  l4sEpoch_ = false;
   epoch_.cwndPrior = cwnd;
   epoch_.bandwidth = bandwidth(cwndBytes_);
   ssthreshBytes_ = boundedCwnd(
@@ -288,6 +374,7 @@ void Cuback::onCongestionEvent(std::string_view trigger) {
 void Cuback::onPersistentCongestion() {
   setCwnd(conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen);
   pendingBytes_ = 0;
+  l4sEpoch_ = false;
   // The packets that were in flight still belong to the congestion event, so
   // their losses do not reduce cwnd again.
   recoveryEndPacketNum_ = nextPacketNum();
@@ -409,6 +496,7 @@ Optional<Cuback::UndoState> Cuback::undoState(const LossEvent& loss) const {
       .pendingBytes = pendingBytes_,
       .state = state_,
       .recoveryEndPacketNum = recoveryEndPacketNum_,
+      .l4sEpoch = l4sEpoch_,
       .lostPackets = loss.lostPackets};
 }
 
@@ -428,7 +516,32 @@ uint64_t Cuback::ackedBytesAfterRecovery(const AckEvent& ack) const {
   return bytes;
 }
 
+uint64_t Cuback::unmarkedBytes(uint64_t ackedBytes) const {
+  // The ECN counts are in packets, so the share of the bytes that carried CE
+  // comes from the packets.
+  const uint64_t marks = newCeMarks_ + newEct1Marks_;
+  return marks == 0 ? ackedBytes : ackedBytes * newEct1Marks_ / marks;
+}
+
+bool Cuback::isL4s() const {
+  return conn_.ecnState == ECNState::ValidatedL4S && conn_.ecnL4sTracker;
+}
+
 uint64_t Cuback::increaseBytes() {
+  if (l4sEpoch_) {
+    // Prague adds one segment per cwnd acknowledged at the virtual RTT, and
+    // 1/M^2 of that at a shorter srtt, where M is the virtual RTT over srtt.
+    // Flows then converge to rates that do not depend on their RTTs.
+    const auto srtt = conn_.lossState.srtt;
+    const double m = srtt > 0us && conn_.ecnL4sTracker
+        ? std::max(
+              1.0,
+              static_cast<double>(conn_.ecnL4sTracker->getRttVirt().count()) /
+                  static_cast<double>(srtt.count()))
+        : 1.0;
+    return static_cast<uint64_t>(
+        std::ceil(m * m * static_cast<double>(cwndBytes_)));
+  }
   if (!increaseBytes_) {
     // Without an RTT sample the epoch's bandwidth is unknown, and cwnd grows
     // like Reno.
@@ -467,7 +580,10 @@ void Cuback::setCwnd(uint64_t cwndBytes) {
 void Cuback::setPacingRate() {
   if (conn_.pacer) {
     conn_.pacer->refreshPacingRate(
-        cwndBytes_ * kPacingGain, conn_.lossState.srtt);
+        l4sEpoch_ ? static_cast<uint64_t>(
+                        static_cast<double>(cwndBytes_) * kL4sPacingGain)
+                  : cwndBytes_ * kPacingGain,
+        conn_.lossState.srtt);
   }
 }
 
@@ -481,6 +597,9 @@ void Cuback::setState(State state, std::string_view trigger) {
       std::string(cubackStateToString(state_)),
       std::string(cubackStateToString(state)),
       std::string(trigger));
+  if (isSlowStart(state_) && !isSlowStart(state)) {
+    l4sRestartPending_ = true;
+  }
   state_ = state;
 }
 

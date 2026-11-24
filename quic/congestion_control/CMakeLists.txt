@@ -225,6 +225,7 @@ mvfst_add_library(mvfst_congestion_control_cuback
     QuicCuback.cpp
   DEPS
     mvfst_congestion_control_congestion_control_functions
+    mvfst_congestion_control_ecn_l4s_tracker
     mvfst_logging_qlogger_constants
     mvfst_logging_qlogger_macros
     Folly::folly_lang_assume

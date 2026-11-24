@@ -10,6 +10,7 @@
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <quic/common/test/TestUtils.h>
+#include <quic/congestion_control/EcnL4sTracker.h>
 #include <quic/congestion_control/test/Utils.h>
 #include <quic/logging/QLoggerConstants.h>
 #include <quic/state/QuicStateFunctions.h>
@@ -234,8 +235,69 @@ class CubackTest : public Test {
     }
     ackEvent.rttSample = rtt;
     updateRtt(*conn_, rtt, 0us);
-    onPacketAckOrLossWrapper(
-        conn_.get(), &cuback, std::move(ackEvent), std::nullopt);
+    onPacketAckOrLossWrapper(conn_.get(), &cuback, ackEvent, std::nullopt);
+    // The transport passes each ACK to the L4S tracker after the congestion
+    // controller.
+    if (conn_->ecnL4sTracker) {
+      conn_->ecnL4sTracker->onPacketAck(&ackEvent);
+    }
+  }
+
+  // Validates L4S and adds the tracker, as the transport does.
+  void enableL4s() {
+    conn_->ecnState = ECNState::ValidatedL4S;
+    conn_->ecnL4sTracker = std::make_shared<EcnL4sTracker>(*conn_);
+  }
+
+  // Acks the packets with `ce` of them echoed as CE and the rest as ECT(1).
+  void ackL4s(
+      Cuback& cuback,
+      const std::vector<PacketNum>& packetNums,
+      uint64_t ce,
+      std::chrono::microseconds rtt = 100ms) {
+    auto& ackState = conn_->ackStates.appDataAckState;
+    ackState.ecnCECountEchoed += ce;
+    ackState.ecnECT1CountEchoed += packetNums.size() - ce;
+    ack(cuback, packetNums, rtt);
+  }
+
+  // Acks a flight without marks, which gives the tracker RTT samples. Then
+  // acks the first packet of the next flight as CE and returns the rest.
+  std::vector<PacketNum> enterL4sEpoch(
+      Cuback& cuback,
+      std::chrono::microseconds rtt = 100ms) {
+    enableL4s();
+    for (const auto packetNum : fillCwnd(cuback)) {
+      ackL4s(cuback, {packetNum}, 0, rtt);
+    }
+    auto flight = fillCwnd(cuback);
+    ackL4s(cuback, {flight[0]}, 1, rtt);
+    flight.erase(flight.begin());
+    return flight;
+  }
+
+  // A virtual RTT after the tracker restarts, acks two packets of a new
+  // flight, one of them CE, which sets the weight to 0.5. Returns the rest of
+  // the flight.
+  std::vector<PacketNum> ackFirstL4sSample(
+      Cuback& cuback,
+      std::chrono::microseconds rtt = 100ms) {
+    auto flight = fillCwnd(cuback);
+    now_ += std::max<std::chrono::microseconds>(rtt, 25ms);
+    ackL4s(cuback, {flight[0], flight[1]}, 1, rtt);
+    flight.erase(flight.begin(), flight.begin() + 2);
+    return flight;
+  }
+
+  // Ends slow start with a CE mark, ends the recovery that follows, and gives
+  // the tracker its first weight after slow start. Returns the packets in
+  // flight.
+  std::vector<PacketNum> enterL4sAvoidance(
+      Cuback& cuback,
+      std::chrono::microseconds rtt = 100ms) {
+    enterL4sEpoch(cuback, rtt);
+    endRecovery(cuback, rtt);
+    return ackFirstL4sSample(cuback, rtt);
   }
 
   // Acks each packet on its own, so that each ACK carries an RTT sample.
@@ -305,11 +367,11 @@ class CubackTest : public Test {
   // Acks the packets sent before the congestion event, then ends Recovery
   // with the ACK of one packet sent after it. Returns the bytes that this last
   // ACK counts toward congestion avoidance.
-  uint64_t endRecovery(Cuback& cuback) {
+  uint64_t endRecovery(Cuback& cuback, std::chrono::microseconds rtt = 100ms) {
     if (!outstanding_.empty()) {
-      ack(cuback, inFlight());
+      ack(cuback, inFlight(), rtt);
     }
-    ack(cuback, {send(cuback)});
+    ack(cuback, {send(cuback)}, rtt);
     return kPacketSize;
   }
 
@@ -870,6 +932,311 @@ TEST_F(CubackTest, LogsStateChanges) {
     }
   }
   EXPECT_EQ(triggers, std::vector<std::string>{kCongestionPacketLoss});
+}
+
+TEST_F(CubackTest, L4sCeEndsSlowStartWithHalfTheWindowAndARecovery) {
+  enableL4s();
+  Cuback cuback(*conn_);
+  ackL4s(cuback, fillCwnd(cuback), 0);
+  const auto flight = fillCwnd(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {flight[0]}, 1);
+  EXPECT_EQ(cuback.getState(), State::Recovery);
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd / 2);
+  EXPECT_EQ(ssthresh(cuback), cwnd / 2);
+
+  // The rest of the flight left before the reduction.
+  now_ += 200ms;
+  ackL4s(cuback, {flight[1]}, 1);
+  lose(cuback, {flight[2]});
+  EXPECT_EQ(cuback.getState(), State::Recovery);
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd / 2);
+}
+
+TEST_F(CubackTest, L4sWeightIsMeasuredAgainAfterSlowStart) {
+  Cuback cuback(*conn_);
+  enterL4sEpoch(cuback);
+  // The tracker's weight started at 1 on the first mark.
+  ASSERT_GT(conn_->ecnL4sTracker->getL4sWeight(), 0.9);
+  endRecovery(cuback);
+  const auto flight = fillCwnd(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  // Marks do not reduce cwnd until the tracker's first update after the
+  // recovery, a virtual RTT later.
+  ackL4s(cuback, {flight[0]}, 1);
+  now_ += 100ms;
+  ackL4s(cuback, {flight[1], flight[2], flight[3]}, 0);
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd);
+  // The update set the weight to the CE fraction since the recovery.
+  const double weight = conn_->ecnL4sTracker->getL4sWeight();
+  EXPECT_EQ(weight, 0.25);
+  ackL4s(cuback, {flight[4]}, 1);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      static_cast<uint64_t>(static_cast<double>(cwnd) * (1 - weight / 2)));
+}
+
+TEST_F(CubackTest, L4sWeightIsMeasuredAfterALossEndsSlowStart) {
+  Cuback cuback(*conn_);
+  reduceAt(cuback, 40 * kPacketSize);
+  endRecovery(cuback);
+  // L4S is validated after slow start, and the next ACK restarts the tracker.
+  enableL4s();
+  const auto flight = fillCwnd(cuback);
+  const auto beforeMark = cuback.getCongestionWindow();
+  ackL4s(cuback, {flight[0]}, 1);
+  EXPECT_GE(cuback.getCongestionWindow(), beforeMark);
+  now_ += 100ms;
+  ackL4s(cuback, {flight[1], flight[2], flight[3], flight[4]}, 1);
+  const double weight = conn_->ecnL4sTracker->getL4sWeight();
+  ASSERT_EQ(weight, 0.25);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {flight[5]}, 1);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      static_cast<uint64_t>(static_cast<double>(cwnd) * (1 - weight / 2)));
+}
+
+TEST_F(CubackTest, L4sWeightIsMeasuredAgainWhenCssEnds) {
+  enableL4s();
+  Cuback cuback(*conn_);
+  ackEach(cuback, fillCwnd(cuback), 20ms);
+  for (int round = 0; round < 5; round++) {
+    ackEach(cuback, fillCwnd(cuback), 40ms);
+  }
+  const auto flight = fillCwnd(cuback);
+  ack(cuback, {flight[0]}, 40ms);
+  ASSERT_EQ(cuback.getState(), State::CongestionAvoidance);
+  const auto beforeMark = cuback.getCongestionWindow();
+  ackL4s(cuback, {flight[1]}, 1, 40ms);
+  EXPECT_GE(cuback.getCongestionWindow(), beforeMark);
+  now_ += 100ms;
+  ackL4s(cuback, {flight[2], flight[3], flight[4]}, 0, 40ms);
+  const double weight = conn_->ecnL4sTracker->getL4sWeight();
+  ASSERT_EQ(weight, 0.25);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {flight[5]}, 1, 40ms);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      static_cast<uint64_t>(static_cast<double>(cwnd) * (1 - weight / 2)));
+}
+
+TEST_F(CubackTest, L4sCeReducesByHalfTheTrackerWeight) {
+  Cuback cuback(*conn_);
+  const auto inFlight = enterL4sAvoidance(cuback);
+  const double weight = conn_->ecnL4sTracker->getL4sWeight();
+  ASSERT_EQ(weight, 0.5);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {inFlight[0]}, 1);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      static_cast<uint64_t>(static_cast<double>(cwnd) * (1 - weight / 2)));
+}
+
+TEST_F(CubackTest, L4sReducesAtMostOncePerVirtualRtt) {
+  Cuback cuback(*conn_);
+  const auto inFlight = enterL4sAvoidance(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {inFlight[0]}, 1);
+  const auto reduced = cuback.getCongestionWindow();
+  ASSERT_LT(reduced, cwnd);
+  now_ += 90ms;
+  ackL4s(cuback, {inFlight[1]}, 1);
+  EXPECT_EQ(cuback.getCongestionWindow(), reduced);
+  now_ += 10ms;
+  ackL4s(cuback, {inFlight[2]}, 1);
+  EXPECT_LT(cuback.getCongestionWindow(), reduced);
+}
+
+TEST_F(CubackTest, L4sVirtualRttIsAtLeast25ms) {
+  Cuback cuback(*conn_);
+  const auto inFlight = enterL4sAvoidance(cuback, 10ms);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {inFlight[0]}, 1, 10ms);
+  const auto reduced = cuback.getCongestionWindow();
+  ASSERT_LT(reduced, cwnd);
+  now_ += 20ms;
+  ackL4s(cuback, {inFlight[1]}, 1, 10ms);
+  EXPECT_EQ(cuback.getCongestionWindow(), reduced);
+  now_ += 5ms;
+  ackL4s(cuback, {inFlight[2]}, 1, 10ms);
+  EXPECT_LT(cuback.getCongestionWindow(), reduced);
+}
+
+TEST_F(CubackTest, L4sReductionDoesNotStartARecoveryPeriod) {
+  Cuback cuback(*conn_);
+  const auto inFlight = enterL4sAvoidance(cuback);
+  ackL4s(cuback, {inFlight[0]}, 1);
+  const auto reduced = cuback.getCongestionWindow();
+  // A packet sent before the reduction is lost, which is a congestion event.
+  lose(cuback, {inFlight[1]});
+  EXPECT_EQ(cuback.getState(), State::Recovery);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      static_cast<uint64_t>(static_cast<double>(reduced) * kBeta));
+}
+
+TEST_F(CubackTest, L4sGrowsOneSegmentPerCwndAcknowledged) {
+  Cuback cuback(*conn_);
+  enterL4sEpoch(cuback);
+  // The ACK that ends the recovery counts one packet.
+  endRecovery(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  const auto packets = cwnd / kPacketSize;
+  const auto flight = fillCwnd(cuback);
+  ASSERT_EQ(flight.size(), packets);
+  for (uint64_t i = 0; i + 2 < packets; i++) {
+    ackL4s(cuback, {flight[i]}, 0);
+  }
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd);
+  ackL4s(cuback, {flight[packets - 2]}, 0);
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd + kPacketSize);
+}
+
+TEST_F(CubackTest, L4sGrowthSlowsWithTheSquareOfVirtualRttOverSrtt) {
+  Cuback cuback(*conn_);
+  enterL4sEpoch(cuback, 5ms);
+  // The ACK that ends the recovery counts one packet.
+  endRecovery(cuback, 5ms);
+  const auto cwnd = cuback.getCongestionWindow();
+  // The virtual RTT is 25ms, five times srtt, so an increase takes 25 cwnds.
+  std::vector<PacketNum> inFlight;
+  const auto ackNext = [&]() {
+    if (inFlight.empty()) {
+      inFlight = fillCwnd(cuback);
+    }
+    ackL4s(cuback, {inFlight.front()}, 0, 5ms);
+    inFlight.erase(inFlight.begin());
+  };
+  for (uint64_t acked = 2 * kPacketSize; acked < 25 * cwnd;
+       acked += kPacketSize) {
+    ackNext();
+  }
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd);
+  ackNext();
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd + kPacketSize);
+}
+
+TEST_F(CubackTest, L4sGrowthCountsOnlyUnmarkedBytes) {
+  Cuback cuback(*conn_);
+  enterL4sEpoch(cuback);
+  // The ACK that ends the recovery counts one packet.
+  endRecovery(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  const auto packets = cwnd / kPacketSize;
+  const auto flight = fillCwnd(cuback);
+  ASSERT_EQ(flight.size(), packets);
+  // Half of these carry CE and count as two unmarked packets. The marks come
+  // before the tracker's first update after slow start, so cwnd stays.
+  ackL4s(cuback, {flight.begin(), flight.begin() + 4}, 2);
+  for (uint64_t i = 4; i < packets; i++) {
+    ackL4s(cuback, {flight[i]}, 0);
+  }
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd);
+  ackL4s(cuback, {send(cuback)}, 0);
+  EXPECT_EQ(cuback.getCongestionWindow(), cwnd + kPacketSize);
+}
+
+TEST_F(CubackTest, L4sLossUsesTheCubackResponse) {
+  enableL4s();
+  Cuback cuback(*conn_);
+  reduceAt(cuback, 40 * kPacketSize);
+  endRecovery(cuback);
+  const auto flight = ackFirstL4sSample(cuback);
+  ackL4s(cuback, {flight[0]}, 1);
+  const auto cwnd = cuback.getCongestionWindow();
+  lose(cuback, {flight[1]});
+  ASSERT_EQ(cuback.getState(), State::Recovery);
+  // The L4S epoch kept cwnd below the W_max of the first loss, and fast
+  // convergence does not apply.
+  const auto epoch = epochAfterReduction(cwnd, conn_->lossState.srtt);
+  const auto reduced = cuback.getCongestionWindow();
+  EXPECT_EQ(reduced, static_cast<uint64_t>(epoch.cwndEpoch));
+
+  // Marks during the recovery leave cwnd alone.
+  now_ += 200ms;
+  ackL4s(cuback, {flight[2]}, 1);
+  EXPECT_EQ(cuback.getCongestionWindow(), reduced);
+
+  // After the recovery, cwnd grows on the Cuback curve.
+  auto acked = endRecovery(cuback);
+  const auto next = fillCwnd(cuback);
+  ack(cuback, next);
+  acked += next.size() * kPacketSize;
+  EXPECT_EQ(
+      cuback.getCongestionWindow(), cwndAfterAcking(epoch, reduced, acked));
+}
+
+TEST_F(CubackTest, L4sEndsWhenEcnValidationFails) {
+  Cuback cuback(*conn_);
+  enterL4sEpoch(cuback);
+  endRecovery(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  // The transport removes the tracker when validation fails.
+  conn_->ecnState = ECNState::FailedValidation;
+  conn_->ecnL4sTracker.reset();
+  // cwnd grows on the Cuback curve of an epoch that starts at cwnd.
+  const CubackEpoch epoch{
+      .wMax = static_cast<double>(cwnd),
+      .cwndPrior = static_cast<double>(cwnd),
+      .cwndEpoch = static_cast<double>(cwnd),
+      .bandwidth = static_cast<double>(cwnd) * 1e6 /
+          static_cast<double>(conn_->lossState.srtt.count())};
+  const auto flight = fillCwnd(cuback);
+  ack(cuback, flight);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      cwndAfterAcking(epoch, cwnd, flight.size() * kPacketSize));
+}
+
+TEST_F(CubackTest, L4sEpochPacesAtCwndOverSrtt) {
+  Cuback cuback(*conn_);
+  const auto inFlight = enterL4sEpoch(cuback);
+  ackL4s(cuback, {inFlight[0]}, 0);
+  EXPECT_EQ(pacingBytes_, cuback.getCongestionWindow());
+  EXPECT_EQ(pacingRtt_, conn_->lossState.srtt);
+}
+
+TEST_F(CubackTest, DoesNotUndoL4sReductions) {
+  enableL4s();
+  Cuback cuback(*conn_);
+  const auto flight = fillCwnd(cuback);
+  lose(cuback, {flight[0]});
+  endRecovery(cuback);
+  ackL4s(cuback, {ackFirstL4sSample(cuback)[0]}, 1);
+  const auto reduced = cuback.getCongestionWindow();
+  // The packet lost before turns out to have arrived.
+  ackSpurious(cuback, 1);
+  EXPECT_EQ(cuback.getCongestionWindow(), reduced);
+}
+
+TEST_F(CubackTest, ClassicEcnKeepsTheCubackCurveAndPacing) {
+  conn_->ecnState = ECNState::ValidatedECN;
+  Cuback cuback(*conn_);
+  const auto flight = fillCwnd(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  conn_->ackStates.appDataAckState.ecnCECountEchoed = 1;
+  ack(cuback, {flight[0]});
+  ASSERT_EQ(cuback.getState(), State::Recovery);
+  const auto epoch = epochAfterReduction(cwnd, conn_->lossState.srtt);
+  const auto reduced = cuback.getCongestionWindow();
+  ASSERT_EQ(reduced, static_cast<uint64_t>(epoch.cwndEpoch));
+
+  auto acked = endRecovery(cuback);
+  const auto next = fillCwnd(cuback);
+  ack(cuback, next);
+  acked += next.size() * kPacketSize;
+  EXPECT_EQ(
+      cuback.getCongestionWindow(), cwndAfterAcking(epoch, reduced, acked));
+  EXPECT_EQ(pacingBytes_, 2 * cuback.getCongestionWindow());
+}
+
+TEST_F(CubackTest, L4sCeIsIgnoredBeforeValidation) {
+  conn_->ecnState = ECNState::AttemptingL4S;
+  Cuback cuback(*conn_);
+  const auto flight = fillCwnd(cuback);
+  ackL4s(cuback, {flight[0]}, 1);
+  EXPECT_EQ(cuback.getState(), State::SlowStart);
 }
 
 } // namespace quic::test
