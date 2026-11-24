@@ -132,8 +132,7 @@ pub enum Initiator {
 
 /// A readiness edge of one stream, from [`Connection::readiness`](crate::Connection::readiness).
 ///
-/// Readiness does not report byte progress or stream deadlines, and RESET_STREAM_AT is not
-/// supported.
+/// Readiness does not report stream deadlines, and RESET_STREAM_AT is not supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamReady {
     /// The peer opened the stream.
@@ -144,6 +143,9 @@ pub enum StreamReady {
     Finished,
     /// The stream's allowance rose to its low-water mark, for senders that push data.
     Writable,
+    /// The peer acknowledged every byte below the offset given to
+    /// [`StreamMut::track`](crate::StreamMut::track).
+    Progress,
     /// Both halves are terminal; the stream is reaped after this edge.
     Closed,
     /// The peer sent STOP_SENDING.

@@ -19,6 +19,7 @@ use crate::SendError;
 use crate::SendOrder;
 use crate::StreamError;
 use crate::streams::conn::staging_budget;
+use crate::streams::send_buf::SendBuffer;
 
 impl Connection {
     /// Returns the bytes the connection may stage on all its streams, from its congestion window.
@@ -92,6 +93,17 @@ impl Connection {
         if let Some(mut stream) = self.sources.streams.streams.stream(id) {
             stream.set_producer_pending(pending);
         }
+    }
+
+    /// Tracks `offset` on stream `id`, for a `Progress` edge once every byte below it is
+    /// acknowledged.
+    pub(crate) fn stream_track(&mut self, id: StreamId, offset: u64) -> Result<(), SendError> {
+        self.sources.streams.track(id, offset)
+    }
+
+    /// Returns stream `id`'s send buffer, if it has a send half here.
+    pub(crate) fn stream_send_buf(&self, id: StreamId) -> Option<&SendBuffer> {
+        self.sources.streams.send_buf(id)
     }
 
     /// Returns stream `id`'s readable bytes.

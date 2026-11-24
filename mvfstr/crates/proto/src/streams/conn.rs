@@ -45,6 +45,7 @@ use super::share::Bucket;
 use super::share::Holding;
 use super::share::share_key;
 use super::state::RecvState;
+use super::state::SendState;
 use super::state::Transition;
 use crate::AppCode;
 use crate::CreditDue;
@@ -875,6 +876,40 @@ impl StreamState {
         Ok(())
     }
 
+    /// Tracks `offset` on stream `id`, for a `Progress` edge once every byte below it is
+    /// acknowledged.
+    pub(crate) fn track(&mut self, id: StreamId, offset: u64) -> Result<(), SendError> {
+        let Some(mut stream) = self.streams.stream(id) else {
+            return Err(SendError::Ended);
+        };
+        let view = stream.view();
+        let reset = matches!(
+            view.send_state(),
+            Some(SendState::ResetSent { .. } | SendState::ResetRecvd { .. })
+        );
+        let peer_stop = view.peer_stop();
+        let Some(send) = stream.data_mut().send.as_mut() else {
+            return Err(SendError::NoSendHalf);
+        };
+        if reset {
+            return Err(peer_stop.map_or(SendError::Ended, |code| SendError::Stopped { code }));
+        }
+        let reached = send.buf.track(offset);
+        stream.on_track();
+        if reached {
+            stream.mark(Edge::Progress);
+        }
+        Ok(())
+    }
+
+    /// Returns stream `id`'s send buffer, if the stream has a send half here.
+    pub(crate) fn send_buf(&self, id: StreamId) -> Option<&SendBuffer> {
+        self.streams
+            .get(id)
+            .and_then(|stream| stream.data().send.as_ref())
+            .map(|send| &send.buf)
+    }
+
     /// Returns the in-order bytes of stream `id` not yet consumed.
     pub(crate) fn readable(&self, id: StreamId) -> &BufQueue {
         self.streams
@@ -1248,8 +1283,12 @@ impl StreamState {
             return;
         };
         send.buf.on_ack(offset, usize::from(len), fin);
+        let progress = send.buf.take_progress();
         if send.buf.is_acked() {
             let _ = stream.on_all_acked();
+        }
+        if progress {
+            stream.mark(Edge::Progress);
         }
     }
 

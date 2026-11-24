@@ -16,6 +16,7 @@ use bytes::Bytes;
 use mvfstr_wire::StreamId;
 use roxygen_bufqueue::BufQueue;
 
+use super::send_buf::SendBuffer;
 use crate::AppCode;
 use crate::Connection;
 use crate::SendOrder;
@@ -72,6 +73,35 @@ impl StreamMut<'_> {
     /// discarded.
     pub fn reset(&mut self, code: AppCode) -> Result<(), SendError> {
         self.conn.stream_reset(self.id, code)
+    }
+
+    /// Returns the offset below which the peer has acknowledged every byte of the stream, or zero
+    /// without a send half. Once the send half is reset, it is the final size.
+    pub fn acked_end(&self) -> u64 {
+        self.conn
+            .stream_send_buf(self.id)
+            .map_or(0, SendBuffer::acked_end)
+    }
+
+    /// Returns the offset after the highest byte sent on the stream, its flow-control usage, or
+    /// zero without a send half.
+    pub fn sent_end(&self) -> u64 {
+        self.conn
+            .stream_send_buf(self.id)
+            .map_or(0, SendBuffer::sent_end)
+    }
+
+    /// Tracks `offset`, so that a [`StreamReady::Progress`](crate::StreamReady::Progress) edge is
+    /// marked once the peer has acknowledged every byte below it. The FIN counts as the byte at
+    /// the final size, so an offset past the final size is reached when every byte and the FIN
+    /// are acknowledged, and not before. An offset reached already gives the edge at once. Each
+    /// call replaces the offset tracked before, drops an undelivered edge for it, and gives at
+    /// most one edge. A reset of the send half, by [`reset`](Self::reset) or the peer's
+    /// STOP_SENDING, cancels the offset and drops an undelivered edge. After a reset, it fails
+    /// with [`SendError::Stopped`] if the peer sent STOP_SENDING, or else with
+    /// [`SendError::Ended`].
+    pub fn track(&mut self, offset: u64) -> Result<(), SendError> {
+        self.conn.stream_track(self.id, offset)
     }
 
     /// Moves the stream to a new place in the wire order.

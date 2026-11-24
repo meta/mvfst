@@ -618,7 +618,7 @@ impl QuicSession for Echo {
             StreamReady::Closed => {
                 let _ = self.reports.send(Report::Closed("server", id));
             }
-            StreamReady::Stopped { .. } | StreamReady::Reset { .. } => {}
+            StreamReady::Progress | StreamReady::Stopped { .. } | StreamReady::Reset { .. } => {}
         }
     }
 
@@ -691,7 +691,10 @@ impl QuicSession for PushClient {
             StreamReady::Closed => {
                 let _ = self.reports.send(Report::Closed("client", id));
             }
-            StreamReady::Opened | StreamReady::Stopped { .. } | StreamReady::Reset { .. } => {}
+            StreamReady::Opened
+            | StreamReady::Progress
+            | StreamReady::Stopped { .. }
+            | StreamReady::Reset { .. } => {}
         }
     }
 

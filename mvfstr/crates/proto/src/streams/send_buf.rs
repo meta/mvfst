@@ -103,6 +103,9 @@ pub struct SendBuffer {
     /// Acknowledged ranges above `acked`.
     acked_above: RangeSet,
     fin: FinState,
+    /// The offset set by [`track`](Self::track), or 0, which every stream has reached, when the
+    /// buffer does not track one.
+    tracked: u64,
 }
 
 /// Where the FIN is; the final size is `end` once the FIN is staged.
@@ -228,12 +231,14 @@ impl SendBuffer {
         (self.base - before) as usize
     }
 
-    /// Abandons the stream for a RESET_STREAM: drops every entry and lost range, and returns the
-    /// final size, the offset after the highest byte sent, as RFC 9000 defines it.
+    /// Abandons the stream for a RESET_STREAM: drops every entry and lost range and the tracked
+    /// offset, and returns the final size, the offset after the highest byte sent, as RFC 9000
+    /// defines it.
     pub fn reset(&mut self) -> u64 {
         self.entries.clear();
         self.lost.clear();
         self.acked_above.clear();
+        self.tracked = 0;
         self.base = self.sent;
         self.end = self.sent;
         self.acked = self.sent;
@@ -274,6 +279,25 @@ impl SendBuffer {
     /// Returns the offset after the last byte pushed.
     pub fn staged_end(&self) -> u64 {
         self.end
+    }
+
+    /// Tracks `offset`, in place of any offset tracked before, until every byte below it is
+    /// acknowledged, which [`take_progress`](Self::take_progress) reports. The FIN counts as the
+    /// byte at the final size, as mvfst counts it for delivery callbacks, so an offset past the
+    /// final size is reached once every byte and the FIN are acknowledged. A reset drops the
+    /// offset. Returns whether the offset is reached already, which stops tracking it.
+    pub fn track(&mut self, offset: u64) -> bool {
+        self.tracked = offset;
+        offset == 0 || self.take_progress()
+    }
+
+    /// Returns whether the tracked offset is reached, and stops tracking it if so.
+    pub fn take_progress(&mut self) -> bool {
+        if self.tracked == 0 || (self.tracked > self.acked && !self.is_acked()) {
+            return false;
+        }
+        self.tracked = 0;
+        true
     }
 
     /// Returns the final size, once the stream ended with `finish` or `reset`.
@@ -1571,5 +1595,18 @@ mod tests {
             .flat_map(|s| s.to_vec())
             .collect();
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn a_tracked_offset_is_reached_only_when_the_acknowledged_prefix_covers_it() {
+        let mut buf = SendBuffer::new();
+        buf.push(Bytes::from(vec![1u8; 10])).unwrap();
+        while emit_one(&mut buf, 1000).is_some() {}
+        assert!(!buf.track(10), "nothing is acknowledged");
+        buf.on_ack(5, 5, false);
+        assert!(!buf.take_progress(), "bytes 0..5 are not acknowledged");
+        buf.on_ack(0, 5, false);
+        assert!(buf.take_progress());
+        assert!(!buf.take_progress(), "reported once");
     }
 }

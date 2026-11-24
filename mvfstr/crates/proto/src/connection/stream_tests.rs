@@ -2893,3 +2893,420 @@ fn misuse_of_a_stream_is_a_typed_error() {
     assert_eq!(stream.consume(2), Err(StreamError::BeyondReadable));
     assert_eq!(readable(&stream), b"x", "a refused call changes nothing");
 }
+
+#[test]
+fn sent_end_reports_the_offset_after_the_last_byte_sent() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.sent_end(), 0, "staged, not sent");
+    pair.step();
+    assert_eq!(pair.client.conn_mut().stream(a).unwrap().sent_end(), 5);
+}
+
+#[test]
+fn acked_end_reports_the_offset_below_which_every_byte_is_acknowledged() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    pair.step();
+    assert_eq!(
+        pair.client.conn_mut().stream(a).unwrap().acked_end(),
+        0,
+        "sent; the ACK is a round trip away"
+    );
+    pair.run(pair.now + RTT);
+    assert_eq!(pair.client.conn_mut().stream(a).unwrap().acked_end(), 5);
+}
+
+#[test]
+fn progress_is_reported_once_when_the_acknowledged_bytes_reach_the_tracked_offset() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.track(6), Ok(()));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 5);
+    assert_eq!(edges(conn), [], "the acknowledged bytes stop short of 6");
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"!")), Ok(1));
+    pair.step();
+    assert_eq!(edges(pair.client.conn_mut()), [], "sent, not acknowledged");
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 6);
+    assert_eq!(edges(conn), [(a, StreamReady::Progress)]);
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"more")), Ok(4));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 10);
+    assert_eq!(edges(conn), [], "the offset is reported once");
+}
+
+#[test]
+fn progress_at_an_offset_acknowledged_already_is_reported_at_once() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 5);
+    assert_eq!(conn.stream(a).unwrap().track(3), Ok(()));
+    assert_eq!(edges(conn), [(a, StreamReady::Progress)]);
+}
+
+#[test]
+fn progress_past_the_final_size_waits_for_the_fin_to_be_acknowledged() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(
+        stream.track(6),
+        Ok(()),
+        "the FIN counts as the byte at the final size"
+    );
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 5);
+    assert_eq!(
+        edges(conn),
+        [],
+        "every byte is acknowledged, but the FIN is not sent"
+    );
+    assert_eq!(conn.stream(a).unwrap().finish(), Ok(()));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(
+        conn.sources.streams.streams.get(a).unwrap().send_state(),
+        Some(SendState::DataRecvd),
+        "the FIN is acknowledged"
+    );
+    assert_eq!(edges(conn), [(a, StreamReady::Progress)]);
+}
+
+#[test]
+fn a_reset_cancels_the_tracked_offset() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    pair.step();
+    let mut stream = pair.client.conn_mut().stream(a).unwrap();
+    assert_eq!(stream.track(5), Ok(()));
+    assert_eq!(stream.reset(AppCode::from_u32(7)), Ok(()));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert!(
+        matches!(
+            conn.sources.streams.streams.get(a).unwrap().send_state(),
+            Some(SendState::ResetRecvd { .. })
+        ),
+        "the bytes and the RESET_STREAM are acknowledged"
+    );
+    assert_eq!(edges(conn), []);
+}
+
+#[test]
+fn a_reset_drops_an_undelivered_progress_edge() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.track(5), Ok(()));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 5, "the edge is marked");
+    assert_eq!(conn.stream(a).unwrap().reset(AppCode::from_u32(7)), Ok(()));
+    assert_eq!(edges(conn), []);
+}
+
+#[test]
+fn a_peer_stop_sending_drops_an_undelivered_progress_edge() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.track(5), Ok(()));
+    pair.run(pair.now + RTT);
+    assert_eq!(pair.client.conn_mut().stream(a).unwrap().acked_end(), 5);
+    let code = AppCode::from_u32(9);
+    let server = pair.server.conn_mut();
+    assert_eq!(server.stream(a).unwrap().stop_sending(code), Ok(()));
+    pair.run(pair.now + RTT);
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [(a, StreamReady::Stopped { code })],
+        "the STOP_SENDING reset the send half"
+    );
+}
+
+#[test]
+fn track_on_a_stream_without_a_send_half_is_refused() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let server = pair.server.conn_mut();
+    let theirs = server.open_stream(Dir::Uni, ORDER).unwrap();
+    let mut stream = server.stream(theirs).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"x")), Ok(1));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(
+        edges(conn),
+        [
+            (theirs, StreamReady::Opened),
+            (theirs, StreamReady::Readable)
+        ]
+    );
+    let mut stream = conn.stream(theirs).unwrap();
+    assert_eq!(stream.track(0), Err(SendError::NoSendHalf));
+    assert_eq!((stream.acked_end(), stream.sent_end()), (0, 0));
+    assert_eq!(edges(conn), [], "a refused track marks nothing");
+}
+
+#[test]
+fn track_after_a_reset_is_refused() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    pair.step();
+    let mut stream = pair.client.conn_mut().stream(a).unwrap();
+    assert_eq!(stream.reset(AppCode::from_u32(7)), Ok(()));
+    assert_eq!(stream.track(5), Err(SendError::Ended));
+    pair.run(pair.now + RTT);
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [],
+        "the ACK of the bytes reports nothing"
+    );
+}
+
+#[test]
+fn track_after_the_peer_stopped_the_stream_is_refused_with_its_code() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    pair.run(pair.now + RTT);
+    let code = AppCode::from_u32(9);
+    let server = pair.server.conn_mut();
+    assert_eq!(server.stream(a).unwrap().stop_sending(code), Ok(()));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(edges(conn), [(a, StreamReady::Stopped { code })]);
+    assert_eq!(
+        conn.stream(a).unwrap().track(5),
+        Err(SendError::Stopped { code })
+    );
+}
+
+/// Returns stream `id`'s capacity after parking its producer, or after waking it if `ready`.
+fn capacity_when(conn: &mut Connection, id: StreamId, ready: bool) -> usize {
+    let mut stream = conn.stream(id).unwrap();
+    if ready {
+        stream.wake_producer();
+    } else {
+        stream.park_producer();
+    }
+    stream.send_capacity()
+}
+
+#[test]
+fn a_parked_stream_reports_the_capacity_it_has_with_a_ready_producer() {
+    let (_, mut pair) = handshake(wide_windows().pair());
+    let conn = pair.client.conn_mut();
+    let busy = conn.open_stream(Dir::Uni, INCREMENTAL).unwrap();
+    assert_eq!(
+        conn.stream(busy)
+            .unwrap()
+            .send(&mut Bytes::from(vec![0; CAP])),
+        Ok(CAP)
+    );
+    let parked = conn.open_stream(Dir::Uni, INCREMENTAL).unwrap();
+    assert_eq!(
+        capacity_when(conn, parked, false),
+        CAP,
+        "half of the 256 KiB budget and what the busy peer holds is 128 KiB, so the cap binds"
+    );
+    assert_eq!(capacity_when(conn, parked, true), CAP);
+
+    let (_, mut pair) = handshake(wide_windows().pair());
+    let conn = pair.client.conn_mut();
+    fill_the_staging_budget(conn);
+    let parked = conn.open_stream(Dir::Uni, ORDER).unwrap();
+    assert_eq!(
+        capacity_when(conn, parked, false),
+        0,
+        "the streams ahead hold the whole budget"
+    );
+    assert_eq!(capacity_when(conn, parked, true), 0);
+}
+
+#[test]
+fn progress_comes_before_the_closed_edge_of_a_stream_the_acknowledgment_ends() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let uni = conn.open_stream(Dir::Uni, ORDER).unwrap();
+    let mut stream = conn.stream(uni).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.finish(), Ok(()));
+    assert_eq!(stream.track(6), Ok(()));
+    pair.run(pair.now + RTT);
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [(uni, StreamReady::Progress), (uni, StreamReady::Closed)]
+    );
+}
+
+#[test]
+fn tracking_a_new_offset_drops_the_undelivered_edge_of_the_one_before() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.track(5), Ok(()));
+    pair.run(pair.now + RTT);
+    let mut stream = pair.client.conn_mut().stream(a).unwrap();
+    assert_eq!(stream.acked_end(), 5, "the edge for 5 is marked");
+    assert_eq!(stream.finish(), Ok(()));
+    assert_eq!(stream.track(6), Ok(()));
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [],
+        "the FIN is not acknowledged"
+    );
+    pair.run(pair.now + RTT);
+    assert_eq!(edges(pair.client.conn_mut()), [(a, StreamReady::Progress)]);
+}
+
+#[test]
+fn each_track_replaces_the_offset_tracked_before() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.track(10), Ok(()));
+    assert_eq!(stream.track(3), Ok(()));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 5);
+    assert_eq!(edges(conn), [(a, StreamReady::Progress)], "3 replaced 10");
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"world")), Ok(5));
+    assert_eq!(
+        stream.track(10),
+        Ok(()),
+        "a reported offset may be followed by another"
+    );
+    pair.step();
+    assert_eq!(edges(pair.client.conn_mut()), [], "sent, not acknowledged");
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 10);
+    assert_eq!(edges(conn), [(a, StreamReady::Progress)]);
+}
+
+#[test]
+fn progress_at_offset_zero_is_reported_at_once() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    assert_eq!(conn.stream(a).unwrap().track(0), Ok(()));
+    assert_eq!(edges(conn), [(a, StreamReady::Progress)]);
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.stream(a).unwrap().acked_end(), 5);
+    assert_eq!(edges(conn), [], "nothing is tracked after the edge");
+}
+
+#[test]
+fn a_peer_stop_sending_before_the_ack_cancels_the_tracked_offset() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let server = pair.server.conn_mut();
+    let theirs = server.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = server.stream(theirs).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"x")), Ok(1));
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    assert_eq!(
+        edges(conn),
+        [
+            (theirs, StreamReady::Opened),
+            (theirs, StreamReady::Readable)
+        ]
+    );
+    let mut stream = conn.stream(theirs).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.track(5), Ok(()));
+    // Both sides send at the same instant, so the STOP_SENDING reaches the client before the ACK.
+    let code = AppCode::from_u32(9);
+    let server = pair.server.conn_mut();
+    assert_eq!(server.stream(theirs).unwrap().stop_sending(code), Ok(()));
+    pair.run(pair.now + RTT);
+    assert_eq!(
+        send_state(&pair.client, theirs),
+        Some(SendState::ResetRecvd {
+            code,
+            final_size: 5
+        }),
+        "the bytes went out before the STOP_SENDING arrived, and the RESET_STREAM is acknowledged"
+    );
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [(theirs, StreamReady::Stopped { code })],
+        "the ACK of the bytes reports nothing"
+    );
+}
+
+#[test]
+fn a_stop_sending_after_the_fin_is_acknowledged_keeps_an_undelivered_progress_edge() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.send(&mut Bytes::from_static(b"hello")), Ok(5));
+    assert_eq!(stream.finish(), Ok(()));
+    assert_eq!(stream.track(6), Ok(()));
+    pair.run(pair.now + RTT);
+    assert_eq!(
+        send_state(&pair.client, a),
+        Some(SendState::DataRecvd),
+        "the FIN is acknowledged, so the edge is marked"
+    );
+    to_client(
+        &mut pair,
+        &[Frame::StopSending {
+            id: a,
+            error_code: varint(9),
+        }],
+    );
+    let code = AppCode::from_u32(9);
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [
+            (a, StreamReady::Stopped { code }),
+            (a, StreamReady::Progress)
+        ],
+        "a send half that ended does not reset, so its progress stands"
+    );
+}
