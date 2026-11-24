@@ -19,6 +19,7 @@ use rustls::pki_types::ServerName;
 
 use super::ConnSetup;
 use super::Connection;
+use super::DatagramPool;
 use super::stream_tests::ORDER;
 use super::tests::LIMIT;
 use super::tests::handshake;
@@ -99,10 +100,11 @@ fn start_sending(
         rng_seed: [3; 32],
         horizon: Duration::ZERO,
         src_ports: None,
+        pool: DatagramPool::default(),
     };
     let raw = params(own.local_cid);
     let name = ServerName::try_from("localhost").unwrap();
-    let conn = Connection::client_with_params(setup, tls, name, raw).unwrap();
+    let conn = Connection::client_with_params(setup, &tls, name, raw).unwrap();
     pair.client.conn = Some(conn);
     (epoch, pair)
 }

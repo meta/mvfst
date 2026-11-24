@@ -620,7 +620,16 @@ pub(crate) mod fixtures {
                 self.tls.deliver(step)?;
                 delivered = true;
             }
-            while let Some(input) = self.tls.tls_input() {
+            loop {
+                let due = self.tls.has_tls_input();
+                let Some(input) = self.tls.tls_input() else {
+                    assert!(
+                        !due,
+                        "has_tls_input saw an input tls_input does not hand out"
+                    );
+                    break;
+                };
+                assert!(due, "has_tls_input missed an input");
                 self.handed.push(Handed::of(&input));
                 match host.handle(CONN, input) {
                     TlsPoll::Ready(step) => self.tls.deliver(step)?,

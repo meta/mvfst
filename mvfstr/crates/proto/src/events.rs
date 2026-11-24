@@ -48,6 +48,10 @@ impl fmt::Display for AppCode {
 /// 0-RTT and the QUIC DATAGRAM extension are not supported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnEvent {
+    /// The 1-RTT write keys are installed, so 1-RTT packets can be sent: for a server once it
+    /// has written its handshake flight, before the client's Finished; for a client on rustls just
+    /// before `Connected`, and for an External client with the step that carries its 1-RTT secrets.
+    WriteKeysReady,
     /// The handshake completed: 1-RTT keys are installed and the peer's transport parameters
     /// validated.
     Connected,

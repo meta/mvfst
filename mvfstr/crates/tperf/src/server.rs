@@ -11,11 +11,14 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 
 use mvfstr_driver::Conn;
 use mvfstr_driver::ConnHandle;
@@ -34,6 +37,10 @@ use mvfstr_proto::Dir;
 use mvfstr_proto::SendOrder;
 use mvfstr_proto::StreamId;
 use mvfstr_proto::StreamReady;
+use mvfstr_proto::TlsConnId;
+use mvfstr_proto::TlsHost;
+use mvfstr_proto::TlsPoll;
+use mvfstr_tls::testing::RustlsHost;
 
 use crate::flags::Flags;
 
@@ -57,6 +64,14 @@ pub(crate) struct Closed {
     pub(crate) phase_pacing_wakes: u64,
 }
 
+/// The ID of a session's connection to its own TLS host.
+const HOSTED: TlsConnId = TlsConnId(0);
+
+/// How long a session whose handshake runs on its own TLS host waits before it polls the host
+/// again. The driver does not report when the client's next flight arrives, and polling on every
+/// driver turn would keep the worker busy until the client answers or times out.
+const TLS_POLL: Duration = Duration::from_millis(1);
+
 /// The settings every connection of a server shares.
 #[derive(Clone, Debug)]
 pub(crate) struct Settings {
@@ -69,11 +84,18 @@ pub(crate) struct Settings {
     closed: mpsc::Sender<Closed>,
     /// The driver's work budget per poll, from `--work_budget_us`.
     pub(crate) work_budget: Option<Duration>,
+    /// The rustls config of each connection's TLS host under `--tls_backend=external`.
+    host_tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Settings {
-    /// Creates the settings from `flags`, with closed connections reported to `closed`.
-    pub(crate) fn new(flags: &Flags, closed: mpsc::Sender<Closed>) -> Self {
+    /// Creates the settings from `flags`, with closed connections reported to `closed` and, under
+    /// `--tls_backend=external`, the handshakes run on TLS hosts with `host_tls`.
+    pub(crate) fn new(
+        flags: &Flags,
+        closed: mpsc::Sender<Closed>,
+        host_tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> Self {
         Self {
             num_streams: flags.num_streams,
             bytes_per_stream: flags.bytes_per_stream,
@@ -82,6 +104,7 @@ impl Settings {
             closed,
             work_budget: (flags.work_budget_us > 0)
                 .then(|| Duration::from_micros(u64::from(flags.work_budget_us))),
+            host_tls,
         }
     }
 }
@@ -113,6 +136,10 @@ impl<B: Backend> QuicApplication for ServerApp<B> {
         _options: &mut ConnOptions,
     ) -> Result<ServerSession<B>, Refusal> {
         Ok(ServerSession {
+            tls_host: self.settings.host_tls.clone().map(|tls| Hosted {
+                host: RustlsHost::server(tls),
+                poll_at: None,
+            }),
             settings: self.settings.clone(),
             driver: Rc::clone(&self.driver),
             producers: HashMap::new(),
@@ -132,9 +159,49 @@ pub(crate) struct ServerSession<B: Backend> {
     to_open: u32,
     /// The handle that wakes the session to replace a finished stream, set once connected.
     handle: Option<ConnHandle>,
+    /// Under `--tls_backend=external`, the TLS host of the connection's handshake, until the
+    /// handshake completes or the connection closes.
+    tls_host: Option<Hosted>,
+}
+
+/// A connection's TLS host, rustls behind the External interface, and when the session polls
+/// it next.
+struct Hosted {
+    host: RustlsHost,
+    poll_at: Option<Instant>,
+}
+
+impl fmt::Debug for Hosted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hosted")
+            .field("poll_at", &self.poll_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<B: Backend> ServerSession<B> {
+    /// Hands the connection's TLS inputs to its host and delivers each step, or cancels the
+    /// host's work once the connection has closed.
+    fn run_tls(&mut self, conn: &mut Conn<'_>) {
+        let Some(Hosted { host, .. }) = &mut self.tls_host else {
+            return;
+        };
+        if conn.take_tls_cancel() {
+            host.cancel(HOSTED);
+            return;
+        }
+        let now = conn.now();
+        while let Some(input) = conn.tls_input() {
+            // The rustls host answers every input at once.
+            let TlsPoll::Ready(step) = host.handle(HOSTED, input) else {
+                return;
+            };
+            if conn.tls_deliver(now, step).is_err() {
+                return;
+            }
+        }
+    }
+
     /// Opens the pending streams while the client's stream limit allows.
     fn open_streams(&mut self, conn: &mut Conn<'_>) {
         while self.to_open > 0 {
@@ -153,18 +220,24 @@ impl<B: Backend> QuicSession for ServerSession<B> {
     fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
         match event {
             ConnEvent::Connected => {
+                // The step that completed the handshake was followed by the ticket and `Finish`.
+                self.tls_host = None;
                 self.handle = Some(conn.handle());
                 self.to_open = self.settings.num_streams;
                 self.open_streams(conn);
             }
             ConnEvent::StreamsAvailable { dir: Dir::Uni } => self.open_streams(conn),
-            ConnEvent::Closed { .. } if self.settings.stats => {
-                let endpoint = self.driver.get().map(|driver| driver.stats());
-                let _ = self.settings.closed.send(Closed {
-                    stats: conn.stats(),
-                    socket_stops: endpoint.as_ref().map_or(0, |stats| stats.socket_stops),
-                    phase_pacing_wakes: endpoint.map_or(0, |stats| stats.phase_pacing_wakes),
-                });
+            ConnEvent::Closed { .. } => {
+                self.run_tls(conn);
+                self.tls_host = None;
+                if self.settings.stats {
+                    let endpoint = self.driver.get().map(|driver| driver.stats());
+                    let _ = self.settings.closed.send(Closed {
+                        stats: conn.stats(),
+                        socket_stops: endpoint.as_ref().map_or(0, |stats| stats.socket_stops),
+                        phase_pacing_wakes: endpoint.map_or(0, |stats| stats.phase_pacing_wakes),
+                    });
+                }
             }
             _ => {}
         }
@@ -204,8 +277,16 @@ impl<B: Backend> QuicSession for ServerSession<B> {
     }
 
     fn poll_session(&mut self, _cx: &mut Context<'_>, conn: &mut Conn<'_>) -> Poll<()> {
+        self.run_tls(conn);
+        if let Some(hosted) = &mut self.tls_host {
+            hosted.poll_at = Some(conn.now() + TLS_POLL);
+        }
         self.open_streams(conn);
         Poll::Pending
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.tls_host.as_ref()?.poll_at
     }
 }
 
@@ -253,10 +334,13 @@ mod tests {
         let (closed, _) = mpsc::channel();
         let flags = Flags::parse(["--work_budget_us=250".to_owned()]).unwrap();
         assert_eq!(
-            Settings::new(&flags, closed.clone()).work_budget,
+            Settings::new(&flags, closed.clone(), None).work_budget,
             Some(Duration::from_micros(250))
         );
-        assert_eq!(Settings::new(&Flags::default(), closed).work_budget, None);
+        assert_eq!(
+            Settings::new(&Flags::default(), closed, None).work_budget,
+            None
+        );
     }
 
     #[test]

@@ -11,10 +11,13 @@
 //! [`Link`]s on a virtual clock. Each link has a one-way delay, an MTU, a drop list or seeded
 //! loss, and seeded jitter that reorders datagrams. Datagrams are built into a [`VecSink`],
 //! which checks the slot contract of [`SegmentSink`], and sealed by the [`InlineSealer`]. The
-//! pair advances from one event (a delivery, a connection deadline or a pacing release) to the
-//! next, so a run does not take real time. Not for production use.
+//! pair advances from one event (a delivery, a connection deadline, a pacing release or a TLS
+//! host's step) to the next, so a run does not take real time. A side whose connection runs its
+//! handshake outside it gets a [`TlsHost`] with [`Pair::set_tls_host`], which the pair drives
+//! as a driver would. Not for production use.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -37,6 +40,7 @@ use crate::EndpointConfig;
 use crate::InlineSealer;
 use crate::Inputs;
 use crate::Random;
+use crate::RecvSummary;
 use crate::Release;
 use crate::Route;
 use crate::RxDatagram;
@@ -47,6 +51,10 @@ use crate::ServerConfig;
 use crate::SlotId;
 use crate::Stop;
 use crate::Tick;
+use crate::TlsConnId;
+use crate::TlsHost;
+use crate::TlsPoll;
+use crate::TlsStep;
 use crate::TxClass;
 use crate::TxLimits;
 use crate::TxMeta;
@@ -438,9 +446,40 @@ pub struct Peer {
     pub outcomes: Vec<TxOutcome>,
     /// Datagrams the endpoint dropped, and why.
     pub drops: Vec<RxDropReason>,
+    /// The summary of every receive batch, apart from the datagram that a server's endpoint
+    /// accepts.
+    pub recvs: Vec<RecvSummary>,
     /// The sink.
     pub sink: VecSink,
+    /// The TLS host of a connection whose handshake runs outside it.
+    pub tls: Option<HostedTls>,
     rng: TestRng,
+}
+
+/// A side's [`TlsHost`] and the steps it produced that the pair has not delivered yet.
+pub struct HostedTls {
+    /// The host.
+    pub host: Box<dyn TlsHost>,
+    /// How long each step takes to reach the connection.
+    pub latency: Duration,
+    /// Steps on their way to the connection, with the time each arrives.
+    held: VecDeque<(Instant, TlsStep)>,
+}
+
+impl HostedTls {
+    /// Returns when the next held step arrives.
+    fn next_arrival(&self) -> Option<Instant> {
+        self.held.front().map(|(at, _)| *at)
+    }
+}
+
+impl fmt::Debug for HostedTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedTls")
+            .field("latency", &self.latency)
+            .field("held", &self.held.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Peer {
@@ -456,8 +495,10 @@ impl Peer {
             events: Vec::new(),
             sent: Vec::new(),
             outcomes: Vec::new(),
+            recvs: Vec::new(),
             drops: Vec::new(),
             sink: VecSink::new(max_datagram),
+            tls: None,
             rng: TestRng::new(seed),
         }
     }
@@ -589,10 +630,17 @@ impl Pair {
             config,
             unix_now,
         };
-        let client = &mut pair.client;
+        pair.connect();
+        pair
+    }
+
+    /// Starts a connection from the client's endpoint to the server's.
+    fn connect(&mut self) {
+        let server_addr = self.server.addr;
+        let client = &mut self.client;
         let mut cx = Inputs {
-            now: epoch,
-            unix_now,
+            now: self.now,
+            unix_now: self.unix_now,
             rng: &mut client.rng,
         };
         let conn = client
@@ -602,12 +650,50 @@ impl Pair {
                 client.key,
                 server_addr,
                 ServerName::try_from("localhost").expect("a valid DNS name"),
-                &pair.config.client,
+                &self.config.client,
                 ConnOptions::default(),
             )
             .expect("the client config creates a connection");
         client.conn = Some(conn);
-        pair
+    }
+
+    /// Drops both connections and starts another from the same client endpoint, which the same
+    /// server endpoint accepts. The links and every record start empty again.
+    pub fn reconnect(&mut self) {
+        for peer in [&mut self.client, &mut self.server] {
+            peer.conn = None;
+            peer.events.clear();
+            peer.sent.clear();
+            peer.outcomes.clear();
+            peer.drops.clear();
+            peer.recvs.clear();
+            if let Some(tls) = &mut peer.tls {
+                tls.held.clear();
+            }
+        }
+        let seed = self.config.seed;
+        self.to_server = Link::new(self.config.to_server.clone(), seed.wrapping_add(2));
+        self.to_client = Link::new(self.config.to_client.clone(), seed.wrapping_add(3));
+        self.connect();
+    }
+
+    /// Gives `side` a TLS host for a connection whose handshake runs outside it; each step reaches
+    /// the connection `latency` after the host produced it.
+    pub fn set_tls_host(
+        &mut self,
+        side: mvfstr_wire::Side,
+        host: Box<dyn TlsHost>,
+        latency: Duration,
+    ) {
+        let side = match side {
+            mvfstr_wire::Side::Client => Side::Client,
+            mvfstr_wire::Side::Server => Side::Server,
+        };
+        self.peer(side).tls = Some(HostedTls {
+            host,
+            latency,
+            held: VecDeque::new(),
+        });
     }
 
     /// Returns the limits of an attempt at the current time.
@@ -639,6 +725,7 @@ impl Pair {
             let mut progress = self.deliver_to_server();
             progress |= self.deliver_to_client();
             for side in [Side::Client, Side::Server] {
+                progress |= self.host_tls(side);
                 progress |= self.fire_deadline(side);
                 progress |= self.transmit(side);
                 self.collect_events(side);
@@ -658,11 +745,15 @@ impl Pair {
         let releases = [&self.client, &self.server]
             .into_iter()
             .filter_map(|peer| peer.outcomes.last()?.pacing_at);
+        let steps = [&self.client, &self.server]
+            .into_iter()
+            .filter_map(|peer| peer.tls.as_ref()?.next_arrival());
         [self.to_server.next_arrival(), self.to_client.next_arrival()]
             .into_iter()
             .flatten()
             .chain(deadlines)
             .chain(releases)
+            .chain(steps)
             .min()
     }
 
@@ -772,6 +863,44 @@ impl Pair {
         true
     }
 
+    /// Moves work between a side's connection and its TLS host: cancels the host's work once the
+    /// connection has closed, delivers the steps that have arrived, and hands the host each input.
+    fn host_tls(&mut self, side: Side) -> bool {
+        let now = self.now;
+        let peer = self.peer(side);
+        let id = TlsConnId(u64::from(peer.key.index));
+        let (Some(conn), Some(tls)) = (peer.conn.as_mut(), peer.tls.as_mut()) else {
+            return false;
+        };
+        let mut progress = false;
+        if conn.take_tls_cancel() {
+            tls.host.cancel(id);
+            tls.held.clear();
+            progress = true;
+        }
+        while let Some((_, step)) = tls.host.poll_ready() {
+            tls.held.push_back((now + tls.latency, step));
+        }
+        while tls.held.front().is_some_and(|(at, _)| *at <= now) {
+            if let Some((_, step)) = tls.held.pop_front() {
+                let _ = conn.tls_deliver(now, step);
+                progress = true;
+            }
+        }
+        while let Some(input) = conn.tls_input() {
+            progress = true;
+            let TlsPoll::Ready(step) = tls.host.handle(id, input) else {
+                break;
+            };
+            if !tls.latency.is_zero() {
+                tls.held.push_back((now + tls.latency, step));
+                break;
+            }
+            let _ = conn.tls_deliver(now, step);
+        }
+        progress
+    }
+
     fn fire_deadline(&mut self, side: Side) -> bool {
         let now = self.now;
         let Some(conn) = self.peer(side).conn.as_mut() else {
@@ -866,7 +995,8 @@ fn recv(peer: &mut Peer, now: Instant, src: SocketAddr, mut batch: Vec<Vec<u8>>)
         .zip(&metas)
         .map(|(data, meta)| RxDatagram { meta, data })
         .collect();
-    conn.recv_batch(now, &mut datagrams);
+    let summary = conn.recv_batch(now, &mut datagrams);
+    peer.recvs.push(summary);
 }
 
 /// Configs for tests: a self-signed certificate, rustls configs, and pair configs.
@@ -886,8 +1016,10 @@ pub(crate) mod fixtures {
     use super::PairConfig;
     use crate::AlpnPolicy;
     use crate::ClientConfig;
+    use crate::ClientTls;
     use crate::EndpointConfig;
     use crate::ServerConfig;
+    use crate::ServerTls;
     use crate::TransportConfig;
 
     /// Returns the server's fixed Ed25519 key. Ed25519 signatures have a fixed length and are
@@ -972,6 +1104,12 @@ pub(crate) mod fixtures {
 
         /// Builds the pair config.
         pub(crate) fn pair(&self) -> PairConfig {
+            let (server, client) = self.rustls();
+            self.pair_with(server.into(), client.into())
+        }
+
+        /// Builds the rustls configs of both sides.
+        pub(crate) fn rustls(&self) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
             let names = std::iter::once("localhost".to_owned())
                 .chain((1..self.cert_names).map(|i| format!("host-{i:04}.a-rather-long-name.test")))
                 .collect::<Vec<_>>();
@@ -998,13 +1136,19 @@ pub(crate) mod fixtures {
                 self.client_alpn,
             )
             .expect("a client TLS config");
-            let server = ServerConfig::builder(Arc::new(server_tls))
+            (Arc::new(server_tls), Arc::new(client_tls))
+        }
+
+        /// Builds the pair config, with `server` and `client` setting where each side's
+        /// handshakes run.
+        pub(crate) fn pair_with(&self, server: ServerTls, client: ClientTls) -> PairConfig {
+            let server = ServerConfig::builder(server)
                 .transport(self.server_transport.clone())
                 .versions(self.server_versions.clone())
                 .alpn(self.alpn)
                 .build()
                 .expect("a server config");
-            let client = ClientConfig::builder(Arc::new(client_tls))
+            let client = ClientConfig::builder(client)
                 .transport(self.client_transport.clone())
                 .versions(self.client_versions.clone())
                 .alpn(self.alpn)

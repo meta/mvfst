@@ -611,7 +611,7 @@ enum Next {
     Done,
 }
 
-/// The random source of a TLS config's crypto provider.
+/// The random source of a TLS config.
 struct SecureRng(&'static dyn SecureRandom);
 
 impl Random for SecureRng {
@@ -945,7 +945,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
         let socket = B::connect(remote, &self.options)?;
         let key = self.slab.borrow_mut().reserve();
-        let mut rng = SecureRng(config.tls().crypto_provider().secure_random);
+        let mut rng = SecureRng(config.tls().secure_random());
         let mut inputs = Inputs {
             now: self.clock(),
             unix_now: UnixTime::now(),
@@ -2536,7 +2536,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
         let paces = transport.pacing();
         let key = self.slab.borrow_mut().reserve();
-        let mut rng = SecureRng(server.config.tls().crypto_provider().secure_random);
+        let mut rng = SecureRng(server.config.tls().secure_random());
         let mut inputs = Inputs {
             now,
             unix_now: UnixTime::now(),

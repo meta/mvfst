@@ -274,7 +274,7 @@ impl ServerSetup {
         let addr = resolve(flags)?;
         let endpoint = config::endpoint_config(flags)?;
         let build_horizon = endpoint.build_horizon();
-        let server = config::server_config(flags)?;
+        let (server, host_tls) = config::server_config(flags)?;
         let transport = Arc::clone(server.transport());
         let (closed_tx, closed) = mpsc::channel();
         Ok(Self {
@@ -283,7 +283,7 @@ impl ServerSetup {
             build_horizon,
             server,
             transport,
-            settings: Settings::new(flags, closed_tx),
+            settings: Settings::new(flags, closed_tx, host_tls),
             segments: max_segments(flags),
             closed,
         })
@@ -612,6 +612,7 @@ impl From<ManagedWorkerError> for RunError {
 mod tests {
     use super::*;
     use crate::flags::QuicVersion;
+    use crate::flags::TlsBackend;
     use crate::report;
     use crate::report::format_g;
 
@@ -794,6 +795,31 @@ mod tests {
                 "{host_loop:?}: {stats:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_server_whose_handshakes_run_on_an_external_tls_host_moves_bytes() {
+        let server = start_server(&Flags {
+            tls_backend: TlsBackend::External,
+            stats: true,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let parsed =
+            report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
+        assert!(parsed.bytes > 0, "{output}");
+        let Closed { stats, .. } = server
+            .closed_connections()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server reports the closed connection");
+        assert!(stats.sent_packets > 0);
     }
 
     #[test]

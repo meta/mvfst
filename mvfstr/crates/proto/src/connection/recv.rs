@@ -17,6 +17,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use mvfstr_crypto::unprotect_header;
 use mvfstr_tls::KeyChange;
+use mvfstr_tls::TlsError;
 use mvfstr_wire::AckFrame;
 use mvfstr_wire::ConnectionId;
 use mvfstr_wire::Dir;
@@ -32,10 +33,8 @@ use mvfstr_wire::VarInt;
 use mvfstr_wire::VersionNegotiation;
 use mvfstr_wire::decode_packet_number;
 
-use super::Buffered;
 use super::ConnError;
 use super::Connection;
-use super::MAX_BUFFERED;
 use super::MAX_CRYPTO_BUFFER;
 use super::MIN_DATAGRAM;
 use super::PeerParams;
@@ -133,7 +132,22 @@ impl Connection {
             self.recv_datagram(now, datagram.meta, datagram.data, &mut summary);
         }
         self.replay_buffered(now, &mut summary);
-        // The ACK decision is made once per batch, after every packet in it (RFC 9000).
+        summary.tls_due = self.tls_due();
+        self.decide_acks(now);
+        summary
+    }
+
+    /// Opens the buffered packets whose keys a TLS host's step installed, as a batch of their own.
+    pub(super) fn replay_after_tls(&mut self, now: Instant) {
+        let mut summary = RecvSummary::default();
+        self.replay_buffered(now, &mut summary);
+        if summary.packets > 0 {
+            self.decide_acks(now);
+        }
+    }
+
+    /// Makes the ACK decision, once per batch, after every packet in it (RFC 9000).
+    fn decide_acks(&mut self, now: Instant) {
         let policy = self.config.ack_policy();
         // The timer fires up to one granularity late, which the advertised max_ack_delay,
         // rounded up to whole milliseconds, absorbs.
@@ -143,7 +157,6 @@ impl Connection {
                 ack.decide(now, policy.eliciting_threshold, delay);
             }
         }
-        summary
     }
 
     /// Processes the packets of one datagram, in order.
@@ -285,13 +298,8 @@ impl Connection {
             return;
         }
         if !self.can_open(space) {
-            if self.buffered.len() < MAX_BUFFERED {
-                self.buffered.push_back(Buffered {
-                    space,
-                    meta: *meta,
-                    datagram_len,
-                    data: packet.to_vec(),
-                });
+            let limit = self.config.buffered_packets();
+            if self.buffered.push(space, meta, datagram_len, packet, limit) {
                 summary.buffered += 1;
             } else {
                 summary.dropped += 1;
@@ -386,11 +394,10 @@ impl Connection {
         }
     }
 
-    /// Returns whether a packet in `space` can be opened now. A server does not open 1-RTT
-    /// packets before the handshake completes, though it holds the keys (RFC 9001).
+    /// Returns whether a packet in `space` can be opened now. Each side opens 1-RTT packets only
+    /// once its handshake completes, though it may hold the keys earlier (RFC 9001).
     fn can_open(&self, space: Space) -> bool {
-        self.has_keys(space)
-            && !(space == Space::Data && self.side == Side::Server && !self.handshake.complete)
+        self.has_keys(space) && (space != Space::Data || self.handshake.complete)
     }
 
     /// Removes header protection and decrypts in place; returns the packet number, the
@@ -823,7 +830,7 @@ impl Connection {
 
     /// Feeds TLS the in-order CRYPTO bytes of the level it reads, drains its output, and
     /// repeats at each new read level, where bytes may already be buffered.
-    fn feed_tls(&mut self) -> Result<(), ConnError> {
+    pub(super) fn feed_tls(&mut self) -> Result<(), ConnError> {
         loop {
             let level = self.tls.read_level();
             let space = level_space(level).index();
@@ -882,6 +889,7 @@ impl Connection {
                     self.key_phases = Some(KeyPhases::new(update, &keys));
                     self.spaces[Space::Data.index()].keys = Some(keys);
                     self.replay_due = true;
+                    self.push_event(ConnEvent::WriteKeysReady);
                 }
                 Some(KeyChange::ZeroRtt(_)) | None => {}
             }
@@ -968,7 +976,14 @@ impl Connection {
         self.issue_cids();
         if self.side == Side::Server {
             self.sources.crypto[Space::Data.index()].send_handshake_done();
+            // A TLS host writes the session ticket that rustls sends by itself, here with an empty
+            // application token.
+            self.tls.request_ticket(Vec::new());
             self.confirm();
+            // Every CRYPTO byte TLS wrote is drained by now, so a rustls server's tickets go out.
+            // A client keeps its TLS state to read tickets, which a server may send at any time
+            // (RFC 8446).
+            self.tls.finish();
         }
         self.replay_due = true;
         Ok(())
@@ -1001,8 +1016,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Confirms the handshake, after which ACK delays count; `recv_packet` discards the
-    /// Handshake space once the packet being processed is done (RFC 9001).
+    /// Confirms the handshake, after which ACK delays count; `recv_packet`, or `tls_deliver` for a
+    /// TLS host's step, discards the Handshake space once the packet or step being processed is
+    /// done (RFC 9001).
     fn confirm(&mut self) {
         if self.handshake.confirmed {
             return;
@@ -1016,28 +1032,32 @@ impl Connection {
     fn replay_buffered(&mut self, now: Instant, summary: &mut RecvSummary) {
         while self.replay_due {
             self.replay_due = false;
-            for mut packet in std::mem::take(&mut self.buffered) {
-                if self.state == State::Drained {
-                    break;
+            let mut queue = self.buffered.take();
+            while let Some(mut packet) = queue.pop_front() {
+                if self.state != State::Drained
+                    && let Some(info) = self.parse(&packet.data)
+                {
+                    // Counted as buffered when it arrived.
+                    let len = info.len.min(packet.data.len());
+                    self.recv_packet(
+                        now,
+                        &packet.meta,
+                        packet.datagram_len,
+                        &mut packet.data[..len],
+                        info,
+                        summary,
+                    );
                 }
-                let Some(info) = self.parse(&packet.data) else {
-                    continue;
-                };
-                // Counted as buffered when it arrived.
-                let datagram_len = packet.datagram_len;
-                let meta = packet.meta;
-                let len = info.len.min(packet.data.len());
-                self.recv_packet(
-                    now,
-                    &meta,
-                    datagram_len,
-                    &mut packet.data[..len],
-                    info,
-                    summary,
-                );
+                self.buffered.recycle(packet.data);
             }
+            self.buffered.recycle_queue(queue);
         }
     }
+}
+
+/// Returns the connection error for a TLS failure outside any frame, such as a TLS host's alert.
+pub(super) fn tls_failure(error: &TlsError) -> ConnError {
+    ConnError::new(error.transport_error_code(), "TLS handshake failed")
 }
 
 /// Returns the frame type of `kind` for the Frame Type field of a CONNECTION_CLOSE: the lowest

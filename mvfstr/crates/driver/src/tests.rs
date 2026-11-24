@@ -3094,7 +3094,13 @@ fn a_session_left_by_an_initial_that_does_not_open_panics_in_drop_alone() {
 #[test]
 fn a_panic_while_an_initial_creates_its_connection_ends_only_that_attempt() {
     let mut harness = Harness::new();
-    let mut tls = rustls::ServerConfig::clone(harness.server_config.tls());
+    let mut tls = rustls::ServerConfig::clone(
+        harness
+            .server_config
+            .tls()
+            .rustls()
+            .expect("a rustls server"),
+    );
     tls.cert_resolver = Arc::new(DoomedResolver(Arc::clone(&tls.cert_resolver)));
     harness.server_config = ServerConfig::builder(Arc::new(tls))
         .build()
@@ -3170,7 +3176,13 @@ fn a_panic_while_an_initial_creates_its_connection_ends_only_that_attempt() {
 #[test]
 fn a_certificate_resolver_reads_the_endpoint_counters_while_a_connection_is_created() {
     let mut harness = Harness::new();
-    let mut tls = rustls::ServerConfig::clone(harness.server_config.tls());
+    let mut tls = rustls::ServerConfig::clone(
+        harness
+            .server_config
+            .tls()
+            .rustls()
+            .expect("a rustls server"),
+    );
     tls.cert_resolver = Arc::new(CountingResolver(Arc::clone(&tls.cert_resolver)));
     harness.server_config = ServerConfig::builder(Arc::new(tls))
         .build()
@@ -4100,7 +4112,13 @@ fn a_panic_while_a_connect_creates_its_connection_fails_only_that_connect() {
     await_reports(&rx, vec![Report::Event("server", ConnEvent::Connected)]);
 
     // The new connection writes its ClientHello as it is created, and reads the store first.
-    let mut tls = rustls::ClientConfig::clone(harness.client_config.tls());
+    let mut tls = rustls::ClientConfig::clone(
+        harness
+            .client_config
+            .tls()
+            .rustls()
+            .expect("a rustls client"),
+    );
     tls.resumption = Resumption::store(Arc::new(DoomedStore));
     let doomed = ClientConfig::builder(Arc::new(tls))
         .build()
@@ -5106,7 +5124,13 @@ fn the_rest_of_a_first_flight_kept_behind_the_handshake_cap_reaches_its_new_conn
     });
     // A ClientHello that offers a long list of protocols takes two Initial datagrams. A client
     // whose second datagram the server dropped would have to declare it lost and send it again.
-    let mut tls = rustls::ClientConfig::clone(harness.client_config.tls());
+    let mut tls = rustls::ClientConfig::clone(
+        harness
+            .client_config
+            .tls()
+            .rustls()
+            .expect("a rustls client"),
+    );
     tls.alpn_protocols
         .extend((b'a'..b'i').map(|letter| vec![letter; 200]));
     harness.client_config = ClientConfig::builder(Arc::new(tls))

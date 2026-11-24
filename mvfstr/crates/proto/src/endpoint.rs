@@ -66,6 +66,7 @@ use crate::RxMeta;
 use crate::ServerConfig;
 use crate::cid::CidGenerator;
 use crate::connection::ConnSetup;
+use crate::connection::DatagramPool;
 use crate::connection::MIN_DATAGRAM;
 
 /// The driver's slab key of a connection: its slot index and the slot's generation, so a stale
@@ -385,6 +386,8 @@ pub struct Endpoint {
     shared_src_ports: Arc<SrcPortState>,
     /// How many host IDs the endpoint truncated to 24 bits.
     host_id_truncations: u64,
+    /// Spare buffers for the packets its connections keep until their keys arrive.
+    pool: DatagramPool,
 }
 
 /// A token bucket for stateless replies: RFC 9000 lets a server limit the Version Negotiation
@@ -451,6 +454,7 @@ impl Endpoint {
             release_horizon: Duration::ZERO,
             src_ports: None,
             shared_src_ports: Arc::default(),
+            pool: DatagramPool::default(),
         }
     }
 
@@ -689,8 +693,9 @@ impl Endpoint {
             rng_seed,
             horizon: self.config.build_horizon().min(self.release_horizon),
             src_ports: Some(Arc::clone(&self.shared_src_ports)),
+            pool: self.pool.clone(),
         };
-        let mut conn = Connection::server(setup, config.tls().clone(), without_alpn.cloned())
+        let mut conn = Connection::server(setup, config.tls(), without_alpn.cloned())
             .map_err(|e| AcceptError::Tls(rustls_error(e)))?;
         let meta = incoming.meta;
         let mut datagram = incoming.datagram;
@@ -750,8 +755,9 @@ impl Endpoint {
             // The client's socket is not the endpoint's, so its release support is unknown.
             horizon: Duration::ZERO,
             src_ports: None,
+            pool: self.pool.clone(),
         };
-        let conn = Connection::client(setup, config.tls().clone(), server_name)
+        let conn = Connection::client(setup, config.tls(), server_name)
             .map_err(|e| ConnectError::Tls(rustls_error(e)))?;
         self.insert_route(local_cid, key);
         Ok(conn)

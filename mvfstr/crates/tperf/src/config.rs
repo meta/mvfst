@@ -18,6 +18,7 @@ use mvfstr_proto::ConfigError;
 use mvfstr_proto::DatagramSize;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::ServerTls;
 use mvfstr_proto::TransportConfig;
 use mvfstr_proto::Version;
 use mvfstr_tls::ServerVerification;
@@ -33,6 +34,7 @@ use crate::flags::Flags;
 use crate::flags::MIN_BURST;
 use crate::flags::PACING_TICK_US;
 use crate::flags::QuicVersion;
+use crate::flags::TlsBackend;
 
 /// The application protocol the mvfst tperf server selects.
 const ALPN: &[u8] = b"quic_test";
@@ -115,8 +117,12 @@ pub(crate) fn self_signed()
 
 /// Returns the server's settings: a fresh certificate, ALPN `quic_test`, and versions 1 and MVFST
 /// and mvfst's aliases of them, which mvfst's tperf server accepts too. With `--compat_mvfst`, a
-/// ClientHello of MVFST or its alias may also leave out ALPN, as mvfst's tperf client does.
-pub(crate) fn server_config(flags: &Flags) -> Result<Arc<ServerConfig>, SetupError> {
+/// ClientHello of MVFST or its alias may also leave out ALPN, as mvfst's tperf client does. With
+/// `--tls_backend=external` the second value is the rustls config for the TLS host that runs the
+/// handshakes, and `--compat_mvfst` does not apply.
+pub(crate) fn server_config(
+    flags: &Flags,
+) -> Result<(Arc<ServerConfig>, Option<Arc<rustls::ServerConfig>>), SetupError> {
     let (cert, key) = self_signed()?;
     let tls = |alpn: &[&[u8]]| {
         mvfstr_tls::server_config(
@@ -128,7 +134,12 @@ pub(crate) fn server_config(flags: &Flags) -> Result<Arc<ServerConfig>, SetupErr
         )
         .map(Arc::new)
     };
-    let mut builder = ServerConfig::builder(tls(&[ALPN])?)
+    let main = tls(&[ALPN])?;
+    let (backend, host_tls) = match flags.tls_backend {
+        TlsBackend::Inline => (ServerTls::Rustls(main), None),
+        TlsBackend::External => (ServerTls::External, Some(main)),
+    };
+    let mut builder = ServerConfig::builder(backend)
         .transport(server_transport(flags)?)
         .versions(vec![
             Version::V1,
@@ -137,10 +148,10 @@ pub(crate) fn server_config(flags: &Flags) -> Result<Arc<ServerConfig>, SetupErr
             Version::QUIC_V1_ALIAS2,
             Version::MVFST_ALIAS,
         ]);
-    if flags.compat_mvfst {
+    if flags.compat_mvfst && host_tls.is_none() {
         builder = builder.mvfst_tls(tls(&[])?);
     }
-    Ok(builder.build()?)
+    Ok((builder.build()?, host_tls))
 }
 
 /// Returns how far ahead of its release a server connection may build: `--build_horizon_us`,
@@ -415,12 +426,16 @@ mod tests {
 
     #[test]
     fn the_server_takes_quic_test_and_in_compat_mode_mvfst_without_alpn() {
-        let config = server_config(&Flags::default()).unwrap();
+        let (config, host) = server_config(&Flags::default()).unwrap();
+        assert!(host.is_none());
         assert_eq!(config.versions(), SERVER_VERSIONS);
         assert_eq!(config.transport().max_window(), 860_000);
-        assert_eq!(config.tls().alpn_protocols, [b"quic_test".to_vec()]);
         assert_eq!(
-            first_suite(config.tls().crypto_provider()),
+            config.tls().rustls().unwrap().alpn_protocols,
+            [b"quic_test".to_vec()]
+        );
+        assert_eq!(
+            first_suite(config.tls().rustls().unwrap().crypto_provider()),
             CipherSuite::TLS13_AES_128_GCM_SHA256,
             "AES-128-GCM, which mvfst peers negotiate"
         );
@@ -440,8 +455,30 @@ mod tests {
             compat_mvfst: false,
             ..Flags::default()
         };
-        let config = server_config(&strict).unwrap();
+        let (config, _) = server_config(&strict).unwrap();
         assert_eq!(config.versions(), SERVER_VERSIONS);
+        let (mvfst, policy) = config.tls_without_alpn(Version::MVFST);
+        assert!(mvfst.is_none());
+        assert_eq!(policy, AlpnPolicy::Required);
+    }
+
+    #[test]
+    fn an_external_tls_backend_gives_the_host_the_quic_test_config() {
+        let external = Flags {
+            tls_backend: TlsBackend::External,
+            ..Flags::default()
+        };
+        let (config, host) = server_config(&external).unwrap();
+        assert!(config.tls().rustls().is_none());
+        let host = host.expect("a rustls config for the host");
+        assert_eq!(host.alpn_protocols, [b"quic_test".to_vec()]);
+        assert_eq!(
+            first_suite(host.crypto_provider()),
+            CipherSuite::TLS13_AES_128_GCM_SHA256
+        );
+        assert_eq!(config.versions(), SERVER_VERSIONS);
+        assert_eq!(config.transport().max_window(), 860_000);
+        // The host answers ClientHellos without ALPN itself, so the compat mode does not apply.
         let (mvfst, policy) = config.tls_without_alpn(Version::MVFST);
         assert!(mvfst.is_none());
         assert_eq!(policy, AlpnPolicy::Required);
@@ -451,11 +488,14 @@ mod tests {
     fn the_client_offers_version_1_with_quic_test_or_mvfst_without_alpn() {
         let config = client_config(&Flags::default()).unwrap();
         assert_eq!(config.versions(), [Version::V1]);
-        assert_eq!(config.tls().alpn_protocols, [b"quic_test".to_vec()]);
+        assert_eq!(
+            config.tls().rustls().unwrap().alpn_protocols,
+            [b"quic_test".to_vec()]
+        );
         assert_eq!(config.alpn(), AlpnPolicy::Required);
         assert_eq!(config.transport().max_data_autotune(), Some(32 << 20));
         assert_eq!(
-            first_suite(config.tls().crypto_provider()),
+            first_suite(config.tls().rustls().unwrap().crypto_provider()),
             CipherSuite::TLS13_AES_128_GCM_SHA256
         );
 
@@ -466,7 +506,7 @@ mod tests {
         };
         let config = client_config(&mvfst).unwrap();
         assert_eq!(config.versions(), [Version::MVFST]);
-        assert!(config.tls().alpn_protocols.is_empty());
+        assert!(config.tls().rustls().unwrap().alpn_protocols.is_empty());
         assert_eq!(config.alpn(), AlpnPolicy::AllowMissing);
     }
 

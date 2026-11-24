@@ -429,6 +429,15 @@ impl TlsSession {
         }
     }
 
+    /// Returns whether [`tls_input`](Self::tls_input) has an input to hand out, without handing
+    /// it out.
+    pub fn has_tls_input(&self) -> bool {
+        match self {
+            Self::Rustls(_) => false,
+            Self::External(session) => session.has_input(),
+        }
+    }
+
     /// Applies the host's step for the input the session last handed out. Drain the step's CRYPTO
     /// bytes and keys with [`write_crypto`](Self::write_crypto) afterwards. A session that is not
     /// waiting for a step refuses it with [`TlsError::NotPending`].

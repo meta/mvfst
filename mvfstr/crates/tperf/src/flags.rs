@@ -53,6 +53,17 @@ pub(crate) enum CidFormat {
     V2,
 }
 
+/// Where a server runs its TLS handshakes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TlsBackend {
+    /// On rustls inside each connection.
+    #[default]
+    Inline,
+    /// On a TLS host outside the connections: rustls behind the External interface, as a TLS
+    /// library such as Fizz would run.
+    External,
+}
+
 /// The parsed flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Flags {
@@ -90,6 +101,7 @@ pub struct Flags {
     pub(crate) work_budget_us: u32,
     /// The layout of the connection IDs this side issues.
     pub(crate) cid_format: CidFormat,
+    pub(crate) tls_backend: TlsBackend,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -129,6 +141,7 @@ impl Default for Flags {
             host_loop: HostLoop::Tokio,
             work_budget_us: 0,
             cid_format: CidFormat::Random,
+            tls_backend: TlsBackend::Inline,
         }
     }
 }
@@ -162,7 +175,7 @@ impl Flags {
                 return Err(FlagError::Unknown(body.to_owned()));
             }
         }
-        // As mvfst tperf: only the server opens streams.
+        // Only the server opens streams, as in mvfst tperf, and only it takes `--tls_backend`.
         if flags.mode == Mode::Client {
             if flags.num_streams != 1 {
                 return Err(FlagError::ServerOnly("num_streams"));
@@ -172,6 +185,9 @@ impl Flags {
             }
             if flags.congestion == CongestionControl::Bbr3 {
                 return Err(FlagError::Bbr3ServerSide);
+            }
+            if flags.tls_backend != TlsBackend::Inline {
+                return Err(FlagError::ServerOnly("tls_backend"));
             }
         }
         if flags.congestion == CongestionControl::Bbr3 && !flags.pacing {
@@ -272,6 +288,13 @@ impl Flags {
                     _ => return Err(bad()),
                 }
             }
+            "tls_backend" => {
+                self.tls_backend = match value {
+                    "inline" => TlsBackend::Inline,
+                    "external" => TlsBackend::External,
+                    _ => return Err(bad()),
+                }
+            }
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -297,7 +320,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 21] = [
+const VALUE_FLAGS: [&str; 22] = [
     "mode",
     "host",
     "port",
@@ -317,6 +340,7 @@ const VALUE_FLAGS: [&str; 21] = [
     "host_loop",
     "work_budget_us",
     "cid_format",
+    "tls_backend",
     "minloglevel",
     "v",
 ];
@@ -449,6 +473,7 @@ mod tests {
             host_loop: HostLoop::Tokio,
             work_budget_us: 0,
             cid_format: CidFormat::Random,
+            tls_backend: TlsBackend::Inline,
         };
         assert_eq!(flags, expected);
     }
@@ -510,6 +535,7 @@ mod tests {
                 host_loop: HostLoop::Tokio,
                 work_budget_us: 0,
                 cid_format: CidFormat::Random,
+                tls_backend: TlsBackend::Inline,
             }
         );
         let server = parse(&[
@@ -518,6 +544,7 @@ mod tests {
             "--bytes_per_stream=1000000",
             "--congestion=cubic",
             "--quic_version=v1",
+            "--tls_backend=external",
         ])
         .unwrap();
         assert_eq!(
@@ -525,9 +552,12 @@ mod tests {
             Flags {
                 num_streams: 4,
                 bytes_per_stream: 1_000_000,
+                tls_backend: TlsBackend::External,
                 ..Flags::default()
             }
         );
+        let inline = parse(&["--tls_backend", "inline"]).unwrap();
+        assert_eq!(inline.tls_backend, TlsBackend::Inline);
     }
 
     #[test]
@@ -606,6 +636,7 @@ mod tests {
             "--pacing_granularity_us=0",
             "--pacing_min_burst=0",
             "--pacing_min_burst=65536",
+            "--tls_backend=fizz",
         ] {
             let (flag, value) = arg[2..].split_once('=').unwrap();
             assert_eq!(
@@ -668,6 +699,10 @@ mod tests {
             parse(&["--bytes_per_stream=10", "--mode=client"]),
             Err(FlagError::ServerOnly("bytes_per_stream")),
             "checked once every flag is read"
+        );
+        assert_eq!(
+            parse(&["--mode=client", "--tls_backend=external"]),
+            Err(FlagError::ServerOnly("tls_backend"))
         );
         assert!(parse(&["--mode=client", "--num_streams=1", "--bytes_per_stream=0"]).is_ok());
     }

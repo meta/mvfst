@@ -67,4 +67,8 @@ pub struct RecvSummary {
     pub dropped: u32,
     /// Packets buffered until their keys arrive.
     pub buffered: u32,
+    /// Whether the connection may have work for its TLS host: an input from
+    /// [`tls_input`](crate::Connection::tls_input), or a cancel from
+    /// [`take_tls_cancel`](crate::Connection::take_tls_cancel).
+    pub tls_due: bool,
 }

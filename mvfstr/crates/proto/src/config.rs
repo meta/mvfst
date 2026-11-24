@@ -13,12 +13,14 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
 use mvfstr_wire::ConnectionId;
 use mvfstr_wire::VarInt;
 use mvfstr_wire::Version;
+use rustls::crypto::SecureRandom;
 use rustls::pki_types::ServerName;
 
 use crate::cid::CidLayout;
@@ -364,6 +366,7 @@ pub struct TransportConfig {
     active_connection_id_limit: u64,
     key_update: KeyUpdatePolicy,
     datagram_size: DatagramSize,
+    buffered_packets: usize,
 }
 
 /// mvfst's default stream window, 65 KiB.
@@ -395,6 +398,7 @@ impl Default for TransportConfig {
             active_connection_id_limit: 2,
             key_update: KeyUpdatePolicy::default(),
             datagram_size: DatagramSize::default(),
+            buffered_packets: 20,
         }
     }
 }
@@ -404,6 +408,9 @@ impl TransportConfig {
     /// connection keeps state for the peer's IDs and their retirements in proportion to the limit,
     /// so the cap bounds the memory a peer can make it hold.
     pub const MAX_ACTIVE_CONNECTION_ID_LIMIT: u64 = 8;
+
+    /// The most packets a connection may keep until their keys arrive.
+    pub const MAX_BUFFERED_PACKETS: usize = 256;
 
     /// Starts a builder from the defaults.
     pub fn builder() -> TransportConfigBuilder {
@@ -533,6 +540,11 @@ impl TransportConfig {
     /// Returns the size of the datagrams sent.
     pub fn datagram_size(&self) -> DatagramSize {
         self.datagram_size
+    }
+
+    /// Returns how many packets a connection keeps until their keys arrive.
+    pub fn buffered_packets(&self) -> usize {
+        self.buffered_packets
     }
 }
 
@@ -695,6 +707,15 @@ impl TransportConfigBuilder {
         self
     }
 
+    /// Sets how many packets a connection keeps until their keys arrive, as RFC 9001 allows, such
+    /// as a client's Handshake packets that come before the ServerHello is read, or 1-RTT packets
+    /// that come before the handshake completes. At most
+    /// [`TransportConfig::MAX_BUFFERED_PACKETS`]. Default 20.
+    pub fn buffered_packets(mut self, count: usize) -> Self {
+        self.config.buffered_packets = count;
+        self
+    }
+
     /// Validates the settings.
     pub fn build(self) -> Result<Arc<TransportConfig>, ConfigError> {
         let c = &self.config;
@@ -756,6 +777,10 @@ impl TransportConfigBuilder {
             "active_connection_id_limit",
         )?;
         check(c.key_update != KeyUpdatePolicy::Every(0), "key_update")?;
+        check(
+            c.buffered_packets <= TransportConfig::MAX_BUFFERED_PACKETS,
+            "buffered_packets",
+        )?;
         // The congestion controller refuses anything else, and a connection needs it to start.
         check(c.min_window >= 2, "min_window")?;
         check(c.max_window >= c.min_window, "max_window")?;
@@ -780,10 +805,55 @@ const SUPPORTED_VERSIONS: [Version; 5] = [
     Version::MVFST_ALIAS,
 ];
 
+/// Where the connections of a server run their TLS handshakes.
+#[derive(Clone, Debug)]
+pub enum ServerTls {
+    /// On rustls, inside each connection, with this config, which supplies certificates, cipher
+    /// suites, key exchange groups and ALPN protocols.
+    Rustls(Arc<rustls::ServerConfig>),
+    /// On a [`TlsHost`](mvfstr_tls::TlsHost) outside the connection, which the caller drives
+    /// through [`Connection::tls_input`](crate::Connection::tls_input) and
+    /// [`Connection::tls_deliver`](crate::Connection::tls_deliver). The host chooses the
+    /// certificates, cipher suites, key exchange groups and ALPN protocol.
+    External,
+}
+
+impl ServerTls {
+    /// Returns the rustls config of a server whose handshakes run on rustls, or `None` for an
+    /// External server.
+    pub fn rustls(&self) -> Option<&Arc<rustls::ServerConfig>> {
+        match self {
+            Self::Rustls(tls) => Some(tls),
+            Self::External => None,
+        }
+    }
+
+    /// Returns a random source for the caller's [`Random`](crate::Random): the rustls config's
+    /// crypto provider's, or for an External server that of mvfstr_crypto's default provider.
+    pub fn secure_random(&self) -> &'static dyn SecureRandom {
+        match self {
+            Self::Rustls(tls) => tls.crypto_provider().secure_random,
+            Self::External => default_secure_random(),
+        }
+    }
+}
+
+impl From<Arc<rustls::ServerConfig>> for ServerTls {
+    fn from(tls: Arc<rustls::ServerConfig>) -> Self {
+        Self::Rustls(tls)
+    }
+}
+
+/// Returns the random source of mvfstr_crypto's default provider, built once.
+fn default_secure_random() -> &'static dyn SecureRandom {
+    static RANDOM: OnceLock<&'static dyn SecureRandom> = OnceLock::new();
+    *RANDOM.get_or_init(|| mvfstr_crypto::default_provider().secure_random)
+}
+
 /// Settings for accepting connections.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    tls: Arc<rustls::ServerConfig>,
+    tls: ServerTls,
     transport: Arc<TransportConfig>,
     versions: Vec<Version>,
     alpn: AlpnPolicy,
@@ -791,12 +861,13 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Starts a builder around a rustls server config, with the default transport config,
-    /// version 1 only and [`AlpnPolicy::Required`].
-    pub fn builder(tls: Arc<rustls::ServerConfig>) -> ServerConfigBuilder {
+    /// Starts a builder around where handshakes run, a rustls server config or
+    /// [`ServerTls::External`], with the default transport config, version 1 only and
+    /// [`AlpnPolicy::Required`].
+    pub fn builder(tls: impl Into<ServerTls>) -> ServerConfigBuilder {
         ServerConfigBuilder {
             config: ServerConfig {
-                tls,
+                tls: tls.into(),
                 transport: Arc::new(TransportConfig::default()),
                 versions: vec![Version::V1],
                 alpn: AlpnPolicy::Required,
@@ -805,9 +876,8 @@ impl ServerConfig {
         }
     }
 
-    /// Returns the rustls config, which supplies certificates, cipher suites, key exchange groups
-    /// and ALPN protocols.
-    pub fn tls(&self) -> &Arc<rustls::ServerConfig> {
+    /// Returns where the handshakes of accepted connections run.
+    pub fn tls(&self) -> &ServerTls {
         &self.tls
     }
 
@@ -879,23 +949,32 @@ impl ServerConfigBuilder {
     /// ALPN keeps the main config. rustls, following RFC 9001, refuses a ClientHello without ALPN
     /// when its config lists protocols, and one that offers protocols when the list is empty, so a
     /// server that takes both kinds, as mvfst's tperf server does, picks the config by the
-    /// ClientHello. By default these connections use the main config.
+    /// ClientHello. By default these connections use the main config. [`build`](Self::build)
+    /// refuses it for a [`ServerTls::External`] server, whose host answers such ClientHellos
+    /// itself.
     pub fn mvfst_tls(mut self, tls: Arc<rustls::ServerConfig>) -> Self {
         self.config.mvfst_tls = Some(tls);
         self
     }
 
-    /// Validates the settings and the parts of the rustls config QUIC depends on: a TLS 1.3
+    /// Validates the settings and the parts of each rustls config QUIC depends on: a TLS 1.3
     /// cipher suite usable for QUIC, ALPN protocols when required, early data disabled, and
-    /// whatever else rustls needs to create a QUIC connection, such as TLS 1.3 being enabled.
+    /// whatever else rustls needs to create a QUIC connection, such as TLS 1.3 being enabled. The
+    /// host of a [`ServerTls::External`] server checks its own TLS settings.
     pub fn build(self) -> Result<Arc<ServerConfig>, ConfigError> {
         let c = &self.config;
         check_versions(&c.versions)?;
         if !c.versions.contains(&Version::V1) {
             return Err(ConfigError::Version1Required);
         }
-        check_server_tls(&c.tls, c.alpn)?;
+        if let ServerTls::Rustls(tls) = &c.tls {
+            check_server_tls(tls, c.alpn)?;
+        }
         if let Some(tls) = &c.mvfst_tls {
+            // A TLS host answers ClientHellos without ALPN itself.
+            if matches!(c.tls, ServerTls::External) {
+                return Err(ConfigError::OutOfRange { field: "mvfst_tls" });
+            }
             check_server_tls(tls, AlpnPolicy::AllowMissing)?;
         }
         Ok(Arc::new(self.config))
@@ -918,22 +997,63 @@ fn check_server_tls(tls: &Arc<rustls::ServerConfig>, alpn: AlpnPolicy) -> Result
     Ok(())
 }
 
+/// Where the connections of a client run their TLS handshakes.
+#[derive(Clone, Debug)]
+pub enum ClientTls {
+    /// On rustls, inside each connection, with this config, which supplies the certificate
+    /// verifier, cipher suites, key exchange groups and the ALPN protocols to offer.
+    Rustls(Arc<rustls::ClientConfig>),
+    /// On a [`TlsHost`](mvfstr_tls::TlsHost) outside the connection, which the caller drives
+    /// through [`Connection::tls_input`](crate::Connection::tls_input) and
+    /// [`Connection::tls_deliver`](crate::Connection::tls_deliver). The host verifies the
+    /// server and chooses what to offer, and keeps its state for the connection until the
+    /// connection closes, so that it reads the server's session tickets.
+    External,
+}
+
+impl ClientTls {
+    /// Returns the rustls config of a client whose handshakes run on rustls, or `None` for an
+    /// External client.
+    pub fn rustls(&self) -> Option<&Arc<rustls::ClientConfig>> {
+        match self {
+            Self::Rustls(tls) => Some(tls),
+            Self::External => None,
+        }
+    }
+
+    /// Returns a random source for the caller's [`Random`](crate::Random): the rustls config's
+    /// crypto provider's, or for an External client that of mvfstr_crypto's default provider.
+    pub fn secure_random(&self) -> &'static dyn SecureRandom {
+        match self {
+            Self::Rustls(tls) => tls.crypto_provider().secure_random,
+            Self::External => default_secure_random(),
+        }
+    }
+}
+
+impl From<Arc<rustls::ClientConfig>> for ClientTls {
+    fn from(tls: Arc<rustls::ClientConfig>) -> Self {
+        Self::Rustls(tls)
+    }
+}
+
 /// Settings for opening connections.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    tls: Arc<rustls::ClientConfig>,
+    tls: ClientTls,
     transport: Arc<TransportConfig>,
     versions: Vec<Version>,
     alpn: AlpnPolicy,
 }
 
 impl ClientConfig {
-    /// Starts a builder around a rustls client config, with the default transport config,
-    /// version 1 only and [`AlpnPolicy::Required`].
-    pub fn builder(tls: Arc<rustls::ClientConfig>) -> ClientConfigBuilder {
+    /// Starts a builder around where handshakes run, a rustls client config or
+    /// [`ClientTls::External`], with the default transport config, version 1 only and
+    /// [`AlpnPolicy::Required`].
+    pub fn builder(tls: impl Into<ClientTls>) -> ClientConfigBuilder {
         ClientConfigBuilder {
             config: ClientConfig {
-                tls,
+                tls: tls.into(),
                 transport: Arc::new(TransportConfig::default()),
                 versions: vec![Version::V1],
                 alpn: AlpnPolicy::Required,
@@ -941,9 +1061,8 @@ impl ClientConfig {
         }
     }
 
-    /// Returns the rustls config, which supplies the certificate verifier, cipher suites, key
-    /// exchange groups and the ALPN protocols to offer.
-    pub fn tls(&self) -> &Arc<rustls::ClientConfig> {
+    /// Returns where the handshakes of opened connections run.
+    pub fn tls(&self) -> &ClientTls {
         &self.tls
     }
 
@@ -991,31 +1110,40 @@ impl ClientConfigBuilder {
 
     /// Validates the settings and the parts of the rustls config QUIC depends on: a TLS 1.3
     /// cipher suite usable for QUIC, ALPN protocols when required, early data disabled, and
-    /// whatever else rustls needs to create a QUIC connection, such as TLS 1.3 being enabled.
+    /// whatever else rustls needs to create a QUIC connection, such as TLS 1.3 being enabled. The
+    /// host of a [`ClientTls::External`] client checks its own TLS settings.
     pub fn build(self) -> Result<Arc<ClientConfig>, ConfigError> {
         let c = &self.config;
         check_versions(&c.versions)?;
-        check_tls(
-            c.tls.crypto_provider(),
-            &c.tls.alpn_protocols,
-            c.alpn,
-            c.tls.enable_early_data,
-        )?;
-        // As for the server, creating a QUIC connection is the check. A client connection writes
-        // its ClientHello at once, which draws on the provider's RNG and would take a ticket from
-        // the caller's session store, so the probe runs on a copy without resumption.
-        let mut probe = rustls::ClientConfig::clone(&c.tls);
-        probe.resumption = rustls::client::Resumption::disabled();
-        let name = ServerName::try_from("mvfstr.invalid").expect("a valid DNS name");
-        rustls::quic::ClientConnection::new(
-            Arc::new(probe),
-            rustls::quic::Version::V1,
-            name,
-            Vec::new(),
-        )
-        .map_err(ConfigError::Tls)?;
+        if let ClientTls::Rustls(tls) = &c.tls {
+            check_client_tls(tls, c.alpn)?;
+        }
         Ok(Arc::new(self.config))
     }
+}
+
+/// Checks a rustls client config as [`ClientConfigBuilder::build`] describes.
+fn check_client_tls(tls: &Arc<rustls::ClientConfig>, alpn: AlpnPolicy) -> Result<(), ConfigError> {
+    check_tls(
+        tls.crypto_provider(),
+        &tls.alpn_protocols,
+        alpn,
+        tls.enable_early_data,
+    )?;
+    // As for the server, creating a QUIC connection is the check. A client connection writes its
+    // ClientHello at once, which draws on the provider's RNG and would take a ticket from the
+    // caller's session store, so the probe runs on a copy without resumption.
+    let mut probe = rustls::ClientConfig::clone(tls);
+    probe.resumption = rustls::client::Resumption::disabled();
+    let name = ServerName::try_from("mvfstr.invalid").expect("a valid DNS name");
+    rustls::quic::ClientConnection::new(
+        Arc::new(probe),
+        rustls::quic::Version::V1,
+        name,
+        Vec::new(),
+    )
+    .map_err(ConfigError::Tls)?;
+    Ok(())
 }
 
 /// Per-connection overrides, given to [`Endpoint::accept`](crate::Endpoint::accept) or
@@ -1275,6 +1403,11 @@ mod tests {
             (
                 TransportConfig::builder().key_update(KeyUpdatePolicy::Every(0)),
                 "key_update",
+            ),
+            (
+                TransportConfig::builder()
+                    .buffered_packets(TransportConfig::MAX_BUFFERED_PACKETS + 1),
+                "buffered_packets",
             ),
             (TransportConfig::builder().min_window(1), "min_window"),
             (
@@ -1614,7 +1747,7 @@ mod tests {
     fn server_defaults() {
         let tls = Arc::new(server_tls(&[b"h3"]));
         let config = ServerConfig::builder(tls.clone()).build().unwrap();
-        assert!(Arc::ptr_eq(config.tls(), &tls));
+        assert!(Arc::ptr_eq(config.tls().rustls().unwrap(), &tls));
         assert_eq!(**config.transport(), TransportConfig::default());
         assert_eq!(config.versions(), [Version::V1]);
         assert_eq!(config.alpn(), AlpnPolicy::Required);
@@ -1677,6 +1810,26 @@ mod tests {
             assert!(tls.is_none(), "{version:?}");
             assert_eq!(policy, AlpnPolicy::Required);
         }
+    }
+
+    #[test]
+    fn external_configs_build_without_rustls_but_take_no_mvfst_tls_config() {
+        let server = ServerConfig::builder(ServerTls::External)
+            .versions(vec![Version::V1, Version::MVFST])
+            .build()
+            .unwrap();
+        assert!(server.tls().rustls().is_none());
+        let (mvfst, policy) = server.tls_without_alpn(Version::MVFST);
+        assert!(mvfst.is_none());
+        assert_eq!(policy, AlpnPolicy::Required);
+        let client = ClientConfig::builder(ClientTls::External).build().unwrap();
+        assert!(client.tls().rustls().is_none());
+        // The host answers ClientHellos without ALPN itself.
+        let mvfst = ServerConfig::builder(ServerTls::External)
+            .versions(vec![Version::V1, Version::MVFST])
+            .mvfst_tls(Arc::new(server_tls(&[])))
+            .build();
+        assert_eq!(mvfst.unwrap_err(), out_of_range("mvfst_tls"));
     }
 
     #[test]
@@ -1806,7 +1959,7 @@ mod tests {
     fn client_defaults() {
         let tls = Arc::new(client_tls(&[b"h3"]));
         let config = ClientConfig::builder(tls.clone()).build().unwrap();
-        assert!(Arc::ptr_eq(config.tls(), &tls));
+        assert!(Arc::ptr_eq(config.tls().rustls().unwrap(), &tls));
         assert_eq!(**config.transport(), TransportConfig::default());
         assert_eq!(config.versions(), [Version::V1]);
         assert_eq!(config.alpn(), AlpnPolicy::Required);

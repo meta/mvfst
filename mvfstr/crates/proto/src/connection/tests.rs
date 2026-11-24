@@ -389,8 +389,12 @@ fn the_handshake_completes_for_client_and_server() {
         assert_eq!(conn.version(), Version::V1);
         assert_eq!(conn.alpn(), Some(&b"h3"[..]));
         assert_eq!(
-            peer.events[..2],
-            [ConnEvent::Connected, ConnEvent::Confirmed]
+            peer.events[..3],
+            [
+                ConnEvent::WriteKeysReady,
+                ConnEvent::Connected,
+                ConnEvent::Confirmed
+            ]
         );
         // Both handshake spaces are discarded once the handshake is confirmed (RFC 9001).
         assert!(conn.spaces[Space::Initial.index()].discarded);
@@ -611,6 +615,8 @@ fn one_server_takes_mvfst_clients_with_or_without_alpn_and_version_1_clients_wit
     .pair()
     .server
     .tls()
+    .rustls()
+    .expect("a rustls server")
     .clone();
     let with_server = |client: Setup| {
         let mut config = client.pair();
@@ -1014,7 +1020,47 @@ fn an_idle_connection_reports_idle_and_keys_pending_waits_for_keys() {
 
 #[test]
 fn a_server_buffers_1rtt_packets_until_the_handshake_completes() {
-    let mut config = Setup::default().pair();
+    buffers_1rtt_packets_up_to(Setup::default(), 20);
+}
+
+#[test]
+fn a_server_buffers_as_many_packets_as_configured() {
+    let setup = Setup {
+        server_transport: TransportConfig::builder()
+            .buffered_packets(3)
+            .build()
+            .unwrap(),
+        ..Setup::default()
+    };
+    buffers_1rtt_packets_up_to(setup, 3);
+}
+
+#[test]
+fn discarding_a_space_drops_the_packets_that_wait_for_its_keys() {
+    let (_, mut pair) = start(Setup::default().pair());
+    let client = pair.client.conn_mut();
+    let now = client.now;
+    let meta = RxMeta {
+        src: server_addr(),
+        dst_ip: None,
+        ecn: Ecn::NotEct,
+        stride: 0,
+        rx_time: now,
+    };
+    // A Handshake packet that came before the server's Initial, and a 1-RTT packet.
+    for space in [Space::Handshake, Space::Data] {
+        assert!(client.buffered.push(space, &meta, 100, &[0; 100], 20));
+    }
+    client.discard_space(Space::Handshake, now);
+    let waiting = client.buffered.take();
+    let spaces: Vec<_> = waiting.iter().map(|packet| packet.space).collect();
+    assert_eq!(spaces, [Space::Data]);
+}
+
+/// Checks that the server of a pair from `setup` buffers `limit` copies of the client's first
+/// 1-RTT packet, drops the next, and opens the buffered ones once its handshake completes.
+fn buffers_1rtt_packets_up_to(setup: Setup, limit: usize) {
+    let mut config = setup.pair();
     // The client's second datagram carries its Finished and, coalesced after it, a 1-RTT PING;
     // it is held back and delivered in pieces below.
     config.to_server.loss = Loss::Drop(vec![1]);
@@ -1044,7 +1090,7 @@ fn a_server_buffers_1rtt_packets_until_the_handshake_completes() {
     let server = pair.server.conn_mut();
     // The server holds 1-RTT keys but, as RFC 9001 requires, does not open 1-RTT packets before
     // the handshake completes; it buffers a bounded number.
-    for copy in 0..=super::MAX_BUFFERED {
+    for copy in 0..=limit {
         let mut data = one_rtt.clone();
         let summary = server.recv_batch(
             now,
@@ -1053,11 +1099,7 @@ fn a_server_buffers_1rtt_packets_until_the_handshake_completes() {
                 data: &mut data,
             }],
         );
-        let expect = if copy < super::MAX_BUFFERED {
-            (1, 0)
-        } else {
-            (0, 1)
-        };
+        let expect = if copy < limit { (1, 0) } else { (0, 1) };
         assert_eq!((summary.buffered, summary.dropped), expect);
         assert_eq!(summary.packets, 0);
     }
@@ -1073,7 +1115,7 @@ fn a_server_buffers_1rtt_packets_until_the_handshake_completes() {
     // The Handshake packet, then one copy of the PING; the other copies are duplicates, and the
     // Initial is in a datagram below 1,200 bytes.
     assert_eq!(summary.packets, 2);
-    assert_eq!(summary.dropped, super::MAX_BUFFERED as u32);
+    assert_eq!(summary.dropped, limit as u32);
     assert_eq!(server.sources.ack[Space::Data.index()].log.received, [0]);
 }
 

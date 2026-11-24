@@ -22,6 +22,7 @@
 
 #[cfg(test)]
 mod accessor_tests;
+mod buffered;
 #[cfg(test)]
 mod cc_tests;
 #[cfg(test)]
@@ -42,6 +43,8 @@ mod stream_tests;
 mod streams;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tls_tests;
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -53,13 +56,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use buffered::BufferedPackets;
+pub(crate) use buffered::DatagramPool;
 use bytes::Bytes;
 use key_update::KeyPhases;
 use mvfstr_crypto::KeySet;
 use mvfstr_crypto::Sealer;
 use mvfstr_tls::Level;
 use mvfstr_tls::TlsError;
+use mvfstr_tls::TlsInput;
 use mvfstr_tls::TlsSession;
+use mvfstr_tls::TlsStep;
 use mvfstr_wire::ConnectionId;
 use mvfstr_wire::Dir;
 use mvfstr_wire::ResetToken;
@@ -76,6 +83,7 @@ use rustls::pki_types::ServerName;
 
 use crate::AlpnPolicy;
 use crate::AppCode;
+use crate::ClientTls;
 use crate::CloseReason;
 use crate::CongestionControl;
 use crate::ConnEvent;
@@ -88,6 +96,7 @@ use crate::RecvSummary;
 use crate::RxDatagram;
 use crate::SegmentSink;
 use crate::SendOrder;
+use crate::ServerTls;
 use crate::StreamError;
 use crate::StreamMut;
 use crate::StreamReady;
@@ -129,8 +138,6 @@ use crate::streams::recv_buf::RecvBuffer;
 pub(crate) const MIN_DATAGRAM: u16 = 1200;
 /// The number of ACK ranges kept per space.
 const MAX_ACK_RANGES: usize = 32;
-/// The most packets kept until their keys arrive; RFC 9001 allows buffering a bounded number.
-const MAX_BUFFERED: usize = 16;
 /// The out-of-order CRYPTO bytes a level holds past the bytes TLS has read; RFC 9000 requires at
 /// least 4,096.
 const MAX_CRYPTO_BUFFER: u64 = 64 * 1024;
@@ -155,6 +162,29 @@ impl ConnError {
     }
 }
 
+/// The reason [`Connection::tls_deliver`] refused a step; the connection did not change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsDeliverError {
+    /// The connection is not waiting for a step: its handshake runs on rustls inside it, or
+    /// [`tls_input`](Connection::tls_input) has not returned an input since the last step.
+    NotPending,
+    /// The connection is closed. Its host's work is cancelled once
+    /// [`take_tls_cancel`](Connection::take_tls_cancel) has returned `true` and the caller has
+    /// called [`TlsHost::cancel`](mvfstr_tls::TlsHost::cancel).
+    Closed,
+}
+
+impl fmt::Display for TlsDeliverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotPending => "the connection waits for no TLS step",
+            Self::Closed => "the connection is closed",
+        })
+    }
+}
+
+impl std::error::Error for TlsDeliverError {}
+
 /// One packet number space's keys and received CRYPTO bytes; its frame sources live in
 /// [`Sources`].
 #[derive(Debug, Default)]
@@ -162,6 +192,18 @@ struct PacketSpace {
     keys: Option<KeySet>,
     discarded: bool,
     crypto_recv: RecvBuffer,
+}
+
+/// What the TLS host of an External handshake holds for the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostState {
+    /// The host does not hold state: it has not had an input, it has answered `Finish`, or its
+    /// work was cancelled after a close.
+    Idle,
+    /// The handshake's state.
+    Live,
+    /// The state it frees once it answers the `Finish` input it has.
+    Finishing,
 }
 
 /// Where the connection is in its life (RFC 9000).
@@ -229,15 +271,6 @@ struct IdleTimer {
     sent_since_receive: bool,
 }
 
-/// A packet kept until its keys arrive.
-#[derive(Debug)]
-struct Buffered {
-    space: Space,
-    meta: crate::RxMeta,
-    datagram_len: usize,
-    data: Vec<u8>,
-}
-
 /// What a connection is created with; the endpoint builds it.
 #[derive(Clone, Debug)]
 pub(crate) struct ConnSetup {
@@ -262,6 +295,8 @@ pub(crate) struct ConnSetup {
     /// The endpoint's source port blocklist, which a server connection checks when its peer
     /// moves.
     pub(crate) src_ports: Option<Arc<SrcPortState>>,
+    /// The endpoint's buffers for packets kept until their keys arrive.
+    pub(crate) pool: DatagramPool,
 }
 
 impl ConnSetup {
@@ -293,6 +328,7 @@ pub struct Connection {
     /// initial_source_connection_id must match it (RFC 9000).
     peer_initial_scid: Option<ConnectionId>,
     tls: TlsSession,
+    tls_host: HostState,
     spaces: [PacketSpace; 3],
     sources: Sources,
     cid_gen: CidGenerator,
@@ -335,7 +371,7 @@ pub struct Connection {
     endpoint_events: VecDeque<EndpointEvent>,
     /// The peer reset tokens last reported to the endpoint.
     reported_tokens: [Option<(SocketAddr, ResetToken)>; 2],
-    buffered: VecDeque<Buffered>,
+    buffered: BufferedPackets,
     /// Whether keys or handshake progress may have made buffered packets processable.
     replay_due: bool,
     crypto_pool: PagePool,
@@ -354,10 +390,11 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Creates a client connection and its ClientHello.
+    /// Creates a client connection and, on rustls, its ClientHello; an External client's host
+    /// writes it from the first [`tls_input`](Self::tls_input).
     pub(crate) fn client(
         setup: ConnSetup,
-        tls: Arc<rustls::ClientConfig>,
+        tls: &ClientTls,
         server_name: ServerName<'static>,
     ) -> Result<Self, TlsError> {
         let setup = setup.with_capped_horizon();
@@ -377,11 +414,18 @@ impl Connection {
     /// `params`.
     fn client_with_params(
         setup: ConnSetup,
-        tls: Arc<rustls::ClientConfig>,
+        tls: &ClientTls,
         server_name: ServerName<'static>,
         params: Vec<u8>,
     ) -> Result<Self, TlsError> {
-        let session = TlsSession::client(tls, setup.version, server_name, params)?;
+        let session = match tls {
+            ClientTls::Rustls(tls) => {
+                TlsSession::client(tls.clone(), setup.version, server_name, params)?
+            }
+            ClientTls::External => {
+                TlsSession::external_client(setup.version, &server_name.to_str(), params)?
+            }
+        };
         let mut conn = Self::new(Side::Client, setup, session)?;
         // A client does not need to validate the path, which it chose.
         conn.path.validated = true;
@@ -393,10 +437,11 @@ impl Connection {
     }
 
     /// Creates a server connection for a client's first Initial, before processing it. With
-    /// `without_alpn`, a ClientHello that does not offer ALPN gets that config instead of `tls`.
+    /// `without_alpn`, a ClientHello that does not offer ALPN gets that config instead of the
+    /// rustls config in `tls`.
     pub(crate) fn server(
         setup: ConnSetup,
-        tls: Arc<rustls::ServerConfig>,
+        tls: &ServerTls,
         without_alpn: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<Self, TlsError> {
         let setup = setup.with_capped_horizon();
@@ -412,11 +457,17 @@ impl Connection {
             },
         );
         let params = encode(&params);
-        let session = match without_alpn {
-            Some(without_alpn) => {
-                TlsSession::server_choosing_by_alpn(tls, without_alpn, setup.version, params)?
+        let session = match (tls, without_alpn) {
+            (ServerTls::Rustls(tls), Some(without_alpn)) => TlsSession::server_choosing_by_alpn(
+                tls.clone(),
+                without_alpn,
+                setup.version,
+                params,
+            )?,
+            (ServerTls::Rustls(tls), None) => {
+                TlsSession::server(tls.clone(), setup.version, params)?
             }
-            None => TlsSession::server(tls, setup.version, params)?,
+            (ServerTls::External, _) => TlsSession::external_server(setup.version, params)?,
         };
         let peer_scid = setup.remote_cid;
         let mut conn = Self::new(Side::Server, setup, session)?;
@@ -456,6 +507,7 @@ impl Connection {
             original_dcid: setup.original_dcid,
             peer_initial_scid: None,
             tls,
+            tls_host: HostState::Idle,
             spaces,
             sources: Sources::new(MAX_ACK_RANGES, StreamState::new(side, &config), cids),
             cid_gen: setup.cids,
@@ -487,7 +539,7 @@ impl Connection {
             events: VecDeque::with_capacity(8),
             endpoint_events: VecDeque::with_capacity(4),
             reported_tokens: [None; 2],
-            buffered: VecDeque::new(),
+            buffered: BufferedPackets::new(setup.pool),
             replay_due: false,
             crypto_pool: PagePool::new(),
             tls_out: Vec::new(),
@@ -510,6 +562,80 @@ impl Connection {
         self.refresh_pacing_rate();
         self.wake_writable();
         summary
+    }
+
+    /// Returns the next input for the [`TlsHost`](mvfstr_tls::TlsHost) of a connection whose
+    /// handshake runs outside it ([`ServerTls::External`], [`ClientTls::External`]), or `None`
+    /// while the handshake does not need one, the host has not answered the previous one, or the
+    /// connection has closed. Hand it to the host and give its step to
+    /// [`tls_deliver`](Self::tls_deliver), at once or later; timers and received packets go on
+    /// meanwhile.
+    pub fn tls_input(&mut self) -> Option<TlsInput<'_>> {
+        if self.state != State::Open {
+            return None;
+        }
+        let input = self.tls.tls_input()?;
+        self.tls_host = match input {
+            TlsInput::Finish => HostState::Finishing,
+            _ => HostState::Live,
+        };
+        Some(input)
+    }
+
+    /// Applies the host's step for the input [`tls_input`](Self::tls_input) last returned: queues
+    /// its CRYPTO bytes, installs its keys, takes what it negotiated, and opens the buffered
+    /// packets the keys open. A step that fails the handshake, such as one with an alert, closes
+    /// the connection. Call `tls_input` again afterwards, since the step may leave another input
+    /// ready.
+    pub fn tls_deliver(&mut self, now: Instant, step: TlsStep) -> Result<(), TlsDeliverError> {
+        if self.state != State::Open {
+            return Err(TlsDeliverError::Closed);
+        }
+        if !self.tls.is_pending() {
+            return Err(TlsDeliverError::NotPending);
+        }
+        self.now = self.now.max(now);
+        match self.tls.deliver(step) {
+            Err(error) => self.close_on_error(now, recv::tls_failure(&error)),
+            Ok(()) => {
+                if self.tls_host == HostState::Finishing {
+                    self.tls_host = HostState::Idle;
+                }
+                match self.feed_tls() {
+                    Ok(()) => self.replay_after_tls(now),
+                    Err(error) => self.close_on_error(now, error),
+                }
+            }
+        }
+        // A server's step can confirm the handshake outside a received packet, and a later packet
+        // may never come, so the step discards the Handshake keys, as RFC 9001 requires.
+        if self.handshake.confirmed {
+            self.discard_space(Space::Handshake, now);
+        }
+        self.refresh_pacing_rate();
+        self.wake_writable();
+        Ok(())
+    }
+
+    /// Returns `true` once after the connection closed while its TLS host held state for it;
+    /// the caller then calls [`TlsHost::cancel`](mvfstr_tls::TlsHost::cancel) for it, which also
+    /// drops any step the host has not returned.
+    pub fn take_tls_cancel(&mut self) -> bool {
+        if self.state == State::Open || self.tls_host == HostState::Idle {
+            return false;
+        }
+        self.tls_host = HostState::Idle;
+        true
+    }
+
+    /// Returns whether [`tls_input`](Self::tls_input) or
+    /// [`take_tls_cancel`](Self::take_tls_cancel) has work for the TLS host.
+    fn tls_due(&self) -> bool {
+        if self.state == State::Open {
+            self.tls.has_tls_input()
+        } else {
+            self.tls_host != HostState::Idle
+        }
     }
 
     /// Makes one transmit attempt: builds packets into slots from `sink`, seals each with
@@ -1126,7 +1252,7 @@ impl Connection {
         state.crypto_recv = RecvBuffer::new();
         self.sources.discard(space, MAX_ACK_RANGES);
         self.recovery.discard_space(space, now);
-        self.buffered.retain(|packet| packet.space != space);
+        self.buffered.discard(space);
     }
 }
 

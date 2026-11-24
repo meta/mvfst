@@ -545,6 +545,15 @@ impl ExternalSession {
         self.pending
     }
 
+    pub(crate) fn has_input(&self) -> bool {
+        !self.pending
+            && !self.finished
+            && (self.ticket.is_some()
+                || self.finishing
+                || !self.waiting.is_empty()
+                || (!self.started && self.side == Side::Client))
+    }
+
     pub(crate) fn tls_input(&mut self) -> Option<TlsInput<'_>> {
         if self.pending || self.finished {
             return None;
@@ -1185,6 +1194,10 @@ mod tests {
             server.tls.tls_input().is_none(),
             "the host still has the Start input"
         );
+        assert!(
+            !server.tls.has_tls_input(),
+            "the ClientHello waits until the host answers Start"
+        );
         assert!(server.tls.is_pending());
         assert!(server.tls.write_crypto(&mut Vec::new()).is_none());
         // Each later step is delivered when the host completes it.
@@ -1564,10 +1577,15 @@ mod tests {
         );
 
         server.tls.request_ticket(b"app token".to_vec());
+        assert!(server.tls.has_tls_input(), "the ticket request waits");
         server.tls.finish();
         let input = server.tls.tls_input().map(|input| Handed::of(&input));
         assert_eq!(input, Some(Handed::WriteTicket(b"app token".to_vec())));
         assert!(server.tls.tls_input().is_none());
+        assert!(
+            !server.tls.has_tls_input(),
+            "Finish waits until the host answers WriteTicket"
+        );
         let mut step = TlsStep::default();
         step.crypto[Level::OneRtt as usize] = b"ticket".to_vec();
         server.tls.deliver(step).unwrap();
