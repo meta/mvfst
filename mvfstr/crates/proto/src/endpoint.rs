@@ -383,6 +383,8 @@ pub struct Endpoint {
     /// The same list and the drop count, shared with the server connections, which check the list
     /// when their peer moves.
     shared_src_ports: Arc<SrcPortState>,
+    /// How many host IDs the endpoint truncated to 24 bits.
+    host_id_truncations: u64,
 }
 
 /// A token bucket for stateless replies: RFC 9000 lets a server limit the Version Negotiation
@@ -438,6 +440,7 @@ impl Endpoint {
     pub fn new(config: Arc<EndpointConfig>, server: Option<Arc<ServerConfig>>) -> Self {
         Self {
             cids: CidGenerator::new(&config),
+            host_id_truncations: u64::from(config.cid_layout().has_wide_host_id()),
             config,
             server,
             routes: HashMap::new(),
@@ -621,6 +624,13 @@ impl Endpoint {
     /// source port.
     pub fn src_port_drops(&self) -> SrcPortDrops {
         SrcPortDrops(Arc::clone(&self.shared_src_ports))
+    }
+
+    /// Returns how many host IDs the endpoint truncated to the 24 bits that a version 2 connection
+    /// ID carries: 1 when the `host_id` of its [`CidLayout::MvfstV2`](crate::CidLayout::MvfstV2)
+    /// is wider, and 0 otherwise.
+    pub fn host_id_truncations(&self) -> u64 {
+        self.host_id_truncations
     }
 
     /// Checks a connection attempt that [`route`](Self::route) returned before the latest
@@ -922,11 +932,15 @@ mod tests {
     use mvfstr_wire::VarInt;
 
     use super::*;
+    use crate::CidLayout;
     use crate::CloseReason;
     use crate::ConnEvent;
     use crate::Ecn;
     use crate::Initiator;
+    use crate::MvfstCid;
+    use crate::MvfstV2Fields;
     use crate::TxLimits;
+    use crate::parse_v2;
     use crate::recovery::test_epoch;
     use crate::testing::TestRng;
     use crate::testing::VecSink;
@@ -1196,11 +1210,7 @@ mod tests {
     }
 
     fn worker(index: u16, count: u16) -> Endpoint {
-        let config = EndpointConfig::builder([7; 32])
-            .worker(index, count)
-            .build()
-            .unwrap();
-        Endpoint::new(config, Some(Setup::default().pair().server))
+        worker_with(index, count, CidLayout::Random)
     }
 
     /// Returns a short-header packet of `len` bytes for the 8-byte connection ID `dcid`.
@@ -1238,6 +1248,143 @@ mod tests {
                 ),
                 "{first}"
             );
+        }
+    }
+
+    fn v2_layout(host_id: u32, process: bool) -> CidLayout {
+        CidLayout::MvfstV2 {
+            host_id,
+            prev_host_id: 0,
+            process,
+        }
+    }
+
+    /// Returns a server endpoint that is worker `index` of `count` and issues IDs in `layout`.
+    fn worker_with(index: u16, count: u16, layout: CidLayout) -> Endpoint {
+        let config = EndpointConfig::builder([7; 32])
+            .worker(index, count)
+            .cid_layout(layout)
+            .build()
+            .unwrap();
+        Endpoint::new(config, Some(Setup::default().pair().server))
+    }
+
+    #[test]
+    fn the_first_server_initial_names_the_issuing_worker_and_process_in_its_source_id() {
+        // The client addresses its Handshake packets to this source ID, so load balancers and
+        // in-host steering route them by it.
+        let now = test_epoch();
+        let setup = Setup::default();
+        for (index, count, process) in [(3, 8, true), (0, 1, false), (255, 256, false)] {
+            let mut endpoint = worker_with(index, count, v2_layout(0xab_cdef, process));
+            let (_, datagram) = client(&setup, now);
+            let incoming = incoming(endpoint.route(now, &meta(now), &datagram));
+            let mut rng = TestRng::new(2);
+            let mut cx = Inputs {
+                now,
+                unix_now: unix_now(),
+                rng: &mut rng,
+            };
+            let config = setup.pair().server;
+            let mut conn = endpoint
+                .accept(&mut cx, KEY, incoming, &config, ConnOptions::default())
+                .unwrap();
+            let mut sink = VecSink::new(1500);
+            let limits = TxLimits {
+                now,
+                max_segments: 1,
+                max_datagram: 1500,
+                max_bytes: u32::MAX,
+                epoch: None,
+            };
+            conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+            let first = sink.take().remove(0).data;
+            let Ok(Header::Protected(header)) = Header::parse(&first, 8) else {
+                panic!("a long header");
+            };
+            assert_eq!(header.ty(), PacketType::Initial);
+            assert_eq!(
+                parse_v2(header.scid()),
+                Some(MvfstCid::V2(MvfstV2Fields {
+                    host_id: 0xab_cdef,
+                    worker: u8::try_from(index).unwrap(),
+                    process,
+                })),
+                "worker {index} of {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_the_version_2_layout_a_miss_reads_the_worker_in_byte_4_and_a_hit_reads_nothing() {
+        let now = test_epoch();
+        let setup = Setup::default();
+        let mut endpoint = worker_with(2, 4, v2_layout(0x12_3456, false));
+        for index in 0..4 {
+            connect_to_server(&mut endpoint, &setup, now, index);
+        }
+        let routed: Vec<ConnectionId> = endpoint.routes.keys().copied().collect();
+        let parses = || crate::cid::V2_PARSES.with(std::cell::Cell::get);
+        let before = parses();
+        for cid in &routed {
+            let packet = short_header(cid[..].try_into().unwrap(), 100);
+            assert!(
+                matches!(endpoint.route(now, &meta(now), &packet), Route::Existing(_)),
+                "{cid}"
+            );
+        }
+        assert_eq!(parses(), before, "a routed ID is not read");
+        // Byte 0 is congruent to this worker, so only byte 4 names another one.
+        for worker in [1, 3, 5, 255] {
+            let packet = short_header([0x82, 0x12, 0x34, 0x56, worker, 0, 1, 2], 100);
+            assert!(
+                matches!(
+                    endpoint.route(now, &meta(now), &packet),
+                    Route::Drop(RxDropReason::OtherWorker)
+                ),
+                "worker byte {worker}"
+            );
+        }
+        // Byte 0 is not, and byte 4 names this worker modulo the count.
+        for worker in [2, 6] {
+            let packet = short_header([0x81, 0x12, 0x34, 0x56, worker, 0, 1, 2], 100);
+            let reset = reply(endpoint.route(now, &meta(now), &packet));
+            assert_eq!(reset.kind(), StatelessKind::Reset, "worker byte {worker}");
+        }
+        assert_eq!(parses(), before + 6, "each miss reads its ID once");
+    }
+
+    #[test]
+    fn host_ids_wider_than_24_bits_are_truncated_and_counted() {
+        let now = test_epoch();
+        let mut endpoint = worker_with(0, 1, v2_layout(0x1234_5678, false));
+        assert_eq!(endpoint.host_id_truncations(), 1);
+        connect_to_server(&mut endpoint, &Setup::default(), now, 1);
+        let cid = *endpoint.routes.keys().next().unwrap();
+        assert!(
+            matches!(
+                parse_v2(&cid),
+                Some(MvfstCid::V2(MvfstV2Fields {
+                    host_id: 0x34_5678,
+                    ..
+                }))
+            ),
+            "{cid}"
+        );
+        // IDs do not carry the previous host ID, so a wide one is not truncated.
+        let with_prev = |host_id, prev_host_id| CidLayout::MvfstV2 {
+            host_id,
+            prev_host_id,
+            process: true,
+        };
+        for (layout, truncations) in [
+            (v2_layout(0xff_ffff, false), 0),
+            (with_prev(1 << 24, u32::MAX), 1),
+            (with_prev(1, u32::MAX), 0),
+            (CidLayout::Random, 0),
+        ] {
+            let endpoint = worker_with(0, 1, layout);
+            assert_eq!(endpoint.host_id_truncations(), truncations, "{layout:?}");
         }
     }
 

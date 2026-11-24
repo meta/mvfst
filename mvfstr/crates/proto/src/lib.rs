@@ -37,7 +37,7 @@
 //! | [`recovery`] | RTT, ACK tracking, sent packets, loss detection, PTO (RFC 9002) |
 //! | [`cc`] | NewReno and CUBIC with explicit inputs and outputs |
 //! | [`pacer`] | the per-path virtual departure clock |
-//! | `cid` | connection IDs, reset tokens, the connection RNG |
+//! | `cid` | connection IDs and their layouts, reset tokens, the connection RNG |
 //! | [`events`] | connection, stream and endpoint events |
 //! | [`testing`] | deterministic in-memory pair harness |
 
@@ -60,6 +60,10 @@ mod cid;
 mod sources;
 
 pub use bytes::Bytes;
+pub use cid::CidLayout;
+pub use cid::MvfstCid;
+pub use cid::MvfstV2Fields;
+pub use cid::parse_v2;
 pub use config::AckPolicy;
 pub use config::AlpnPolicy;
 pub use config::ClientConfig;

@@ -43,6 +43,16 @@ pub(crate) enum HostLoop {
     Manual,
 }
 
+/// The layout of the connection IDs a side's endpoint issues.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CidFormat {
+    /// mvfstr's own: random bytes.
+    #[default]
+    Random,
+    /// mvfst's version 2 server connection ID.
+    V2,
+}
+
 /// The parsed flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Flags {
@@ -78,6 +88,8 @@ pub struct Flags {
     pub(crate) host_loop: HostLoop,
     /// The server driver's work budget per poll, in µs; 0 runs it without one.
     pub(crate) work_budget_us: u32,
+    /// The layout of the connection IDs this side issues.
+    pub(crate) cid_format: CidFormat,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -116,6 +128,7 @@ impl Default for Flags {
             build_horizon_us: None,
             host_loop: HostLoop::Tokio,
             work_budget_us: 0,
+            cid_format: CidFormat::Random,
         }
     }
 }
@@ -252,6 +265,13 @@ impl Flags {
                 }
             }
             "work_budget_us" => self.work_budget_us = value.parse().map_err(|_| bad())?,
+            "cid_format" => {
+                self.cid_format = match value {
+                    "random" => CidFormat::Random,
+                    "v2" => CidFormat::V2,
+                    _ => return Err(bad()),
+                }
+            }
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -277,7 +297,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 20] = [
+const VALUE_FLAGS: [&str; 21] = [
     "mode",
     "host",
     "port",
@@ -296,6 +316,7 @@ const VALUE_FLAGS: [&str; 20] = [
     "build_horizon_us",
     "host_loop",
     "work_budget_us",
+    "cid_format",
     "minloglevel",
     "v",
 ];
@@ -427,6 +448,7 @@ mod tests {
             build_horizon_us: None,
             host_loop: HostLoop::Tokio,
             work_budget_us: 0,
+            cid_format: CidFormat::Random,
         };
         assert_eq!(flags, expected);
     }
@@ -487,6 +509,7 @@ mod tests {
                 build_horizon_us: None,
                 host_loop: HostLoop::Tokio,
                 work_budget_us: 0,
+                cid_format: CidFormat::Random,
             }
         );
         let server = parse(&[
@@ -754,6 +777,26 @@ mod tests {
             Err(FlagError::BadValue {
                 flag: "host_loop".to_owned(),
                 value: "epoll".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn cid_format_v2_chooses_mvfsts_version_2_ids() {
+        assert_eq!(Flags::default().cid_format, CidFormat::Random);
+        assert_eq!(
+            parse(&["--cid_format=v2"]).map(|flags| flags.cid_format),
+            Ok(CidFormat::V2)
+        );
+        assert_eq!(
+            parse(&["--cid_format=v2", "--cid_format", "random"]).map(|flags| flags.cid_format),
+            Ok(CidFormat::Random)
+        );
+        assert_eq!(
+            parse(&["--cid_format=v3"]),
+            Err(FlagError::BadValue {
+                flag: "cid_format".to_owned(),
+                value: "v3".to_owned(),
             })
         );
     }

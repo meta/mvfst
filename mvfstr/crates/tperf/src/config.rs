@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mvfstr_proto::AlpnPolicy;
+use mvfstr_proto::CidLayout;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::ConfigError;
 use mvfstr_proto::DatagramSize;
@@ -27,6 +28,7 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::time_provider::DefaultTimeProvider;
 
+use crate::flags::CidFormat;
 use crate::flags::Flags;
 use crate::flags::MIN_BURST;
 use crate::flags::PACING_TICK_US;
@@ -147,15 +149,25 @@ pub(crate) fn build_horizon(flags: &Flags) -> Duration {
     Duration::from_micros(flags.build_horizon_us.map_or(0, u64::from))
 }
 
-/// Returns an endpoint config with a random stateless reset key and the [`build_horizon`].
+/// Returns an endpoint config with a random stateless reset key, the [`build_horizon`] and, with
+/// `--cid_format=v2`, mvfst's version 2 connection IDs with host ID 1.
 pub(crate) fn endpoint_config(flags: &Flags) -> Result<Arc<EndpointConfig>, SetupError> {
     let mut reset_key = [0; 32];
     provider()
         .secure_random
         .fill(&mut reset_key)
         .map_err(rustls::Error::from)?;
+    let cid_layout = match flags.cid_format {
+        CidFormat::Random => CidLayout::Random,
+        CidFormat::V2 => CidLayout::MvfstV2 {
+            host_id: 1,
+            prev_host_id: 0,
+            process: false,
+        },
+    };
     Ok(EndpointConfig::builder(reset_key)
         .build_horizon(build_horizon(flags))
+        .cid_layout(cid_layout)
         .build()?)
 }
 
@@ -473,6 +485,26 @@ mod tests {
         assert_eq!(
             endpoint_config(&flags).unwrap().build_horizon(),
             Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn cid_format_v2_gives_the_endpoint_mvfsts_version_2_ids() {
+        assert_eq!(
+            endpoint_config(&Flags::default()).unwrap().cid_layout(),
+            CidLayout::Random
+        );
+        let flags = Flags {
+            cid_format: CidFormat::V2,
+            ..Flags::default()
+        };
+        assert_eq!(
+            endpoint_config(&flags).unwrap().cid_layout(),
+            CidLayout::MvfstV2 {
+                host_id: 1,
+                prev_host_id: 0,
+                process: false,
+            }
         );
     }
 

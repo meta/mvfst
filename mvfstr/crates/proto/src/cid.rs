@@ -7,10 +7,10 @@
 
 //! Connection ID management (RFC 9000).
 //!
-//! It covers issuing local connection IDs with NEW_CONNECTION_ID up to the peer's
-//! active_connection_id_limit, stateless reset tokens derived from the endpoint key, the peer's
-//! IDs with retire_prior_to and a bounded RETIRE_CONNECTION_ID queue, the peer ID each path sends
-//! with or waits for, and the endpoint events that keep routing current.
+//! It covers the layouts of local connection IDs, issuing them with NEW_CONNECTION_ID up to the
+//! peer's active_connection_id_limit, stateless reset tokens derived from the endpoint key, the
+//! peer's IDs with retire_prior_to and a bounded RETIRE_CONNECTION_ID queue, the peer ID each path
+//! sends with or waits for, and the endpoint events that keep routing current.
 
 use mvfstr_crypto::hkdf_expand_label;
 use mvfstr_crypto::hkdf_extract_sha256;
@@ -36,6 +36,127 @@ use crate::sources::delivery::Delivery;
 use crate::sources::path::CURRENT;
 use crate::transmit::admission::Class;
 
+/// The layout of the connection IDs an endpoint issues.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CidLayout {
+    /// Random bytes. With several workers, the first byte is congruent to the worker index modulo
+    /// the worker count.
+    #[default]
+    Random,
+    /// mvfst's version 2 server connection ID, which load balancers in front of mvfst servers
+    /// parse to route packets: 8 bytes, the version bits `10` at the top of byte 0, the host ID in
+    /// bytes 1-3, big-endian, the worker index in byte 4 and the process bit at the top of byte 5.
+    /// The other 29 bits are random. It needs a local connection ID length of 8 and at most 256
+    /// workers. With so few random bits, an ID that a connection issues after the handshake can
+    /// collide with an ID of another connection, and packets sent to it then reach the other one.
+    MvfstV2 {
+        /// The host ID. IDs carry its low 24 bits: an endpoint truncates a wider one and counts
+        /// it in [`Endpoint::host_id_truncations`](crate::Endpoint::host_id_truncations).
+        host_id: u32,
+        /// The host ID before the last change, or 0 if it has not changed, as in mvfst. The
+        /// endpoint does not read it: the IDs it issues carry `host_id`, and route misses do not
+        /// check the host.
+        prev_host_id: u32,
+        /// The process bit, which differs between a server process and the one that takes over
+        /// its sockets.
+        process: bool,
+    },
+}
+
+impl CidLayout {
+    /// Returns whether the layout's host ID is wider than the 24 bits that a version 2 ID carries.
+    pub(crate) fn has_wide_host_id(&self) -> bool {
+        matches!(*self, Self::MvfstV2 { host_id, .. } if host_id > MAX_HOST_ID)
+    }
+}
+
+/// The largest host ID a version 2 connection ID carries.
+const MAX_HOST_ID: u32 = 0xff_ffff;
+
+/// The fields of an mvfst version 2 server connection ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MvfstV2Fields {
+    /// The host ID, 24 bits.
+    pub host_id: u32,
+    /// The worker index.
+    pub worker: u8,
+    /// The process bit.
+    pub process: bool,
+}
+
+impl MvfstV2Fields {
+    /// Returns the 8-byte connection ID that has these fields and takes its other 29 bits from
+    /// `random`. Only the low 24 bits of the host ID are written, as mvfst writes them.
+    pub fn encode(self, random: [u8; 8]) -> ConnectionId {
+        let [_, h1, h2, h3] = self.host_id.to_be_bytes();
+        let [r0, _, _, _, _, r5, r6, r7] = random;
+        let process = if self.process { PROCESS_BIT } else { 0 };
+        let bytes = [
+            V2_BITS | r0 & !VERSION_MASK,
+            h1,
+            h2,
+            h3,
+            self.worker,
+            process | r5 & !PROCESS_BIT,
+            r6,
+            r7,
+        ];
+        ConnectionId::new(&bytes).expect("should fit: 8 bytes")
+    }
+}
+
+/// A server connection ID classified by its mvfst version, the top two bits of its first byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MvfstCid {
+    /// Version bits `00`: an ID that is not laid out for routing.
+    V0,
+    /// Version 1, with a 16-bit host ID; its fields are not read.
+    V1,
+    /// Version 2, with its fields.
+    V2(MvfstV2Fields),
+    /// Version 3, with a 32-bit host ID; its fields are not read.
+    V3,
+}
+
+/// Reads `cid` as an mvfst server connection ID. Returns `None` for an empty ID and for a version 2
+/// ID shorter than the 6 bytes its fields take. An endpoint reads only IDs that do not route to
+/// any of its connections.
+pub fn parse_v2(cid: &[u8]) -> Option<MvfstCid> {
+    #[cfg(test)]
+    V2_PARSES.with(|parses| parses.set(parses.get() + 1));
+    let first = *cid.first()?;
+    match first >> VERSION_SHIFT {
+        0 => Some(MvfstCid::V0),
+        1 => Some(MvfstCid::V1),
+        2 => {
+            let &[_, h1, h2, h3, worker, last, ..] = cid else {
+                return None;
+            };
+            Some(MvfstCid::V2(MvfstV2Fields {
+                host_id: u32::from_be_bytes([0, h1, h2, h3]),
+                worker,
+                process: last & PROCESS_BIT != 0,
+            }))
+        }
+        _ => Some(MvfstCid::V3),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many IDs [`parse_v2`] has read on this thread.
+    pub(crate) static V2_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Where the version bits of an mvfst server connection ID start, at the top of its first byte.
+const VERSION_SHIFT: u8 = 6;
+/// The version bits of an mvfst server connection ID.
+const VERSION_MASK: u8 = 0b11 << VERSION_SHIFT;
+/// The version bits of a version 2 ID.
+const V2_BITS: u8 = 0b10 << VERSION_SHIFT;
+/// The process bit of a version 2 ID, at the top of byte 5.
+const PROCESS_BIT: u8 = 0x80;
+
 /// A generator of one endpoint's connection IDs and their stateless reset tokens.
 ///
 /// A token is HKDF-Expand-Label of a key extracted once from the endpoint's reset secret, with the
@@ -46,16 +167,30 @@ pub(crate) struct CidGenerator {
     len: u8,
     worker_index: u16,
     worker_count: u16,
+    /// The fields of every ID under [`CidLayout::MvfstV2`].
+    v2: Option<MvfstV2Fields>,
     reset_prk: [u8; 32],
 }
 
 impl CidGenerator {
     pub(crate) fn new(config: &EndpointConfig) -> Self {
         let (worker_index, worker_count) = config.worker();
+        let v2 = match config.cid_layout() {
+            CidLayout::Random => None,
+            CidLayout::MvfstV2 {
+                host_id, process, ..
+            } => Some(MvfstV2Fields {
+                host_id: host_id & MAX_HOST_ID,
+                worker: u8::try_from(worker_index)
+                    .expect("should fit: the config allows the layout at most 256 workers"),
+                process,
+            }),
+        };
         Self {
             len: u8::try_from(config.local_cid_len()).unwrap_or(u8::MAX),
             worker_index,
             worker_count,
+            v2,
             reset_prk: hkdf_extract_sha256(b"mvfstr stateless reset", config.reset_key()),
         }
     }
@@ -76,9 +211,14 @@ impl CidGenerator {
             .expect("should fit: a reset is at most 43 bytes and the context 255");
     }
 
-    /// Returns a random connection ID of the endpoint's length, whose first byte names its worker
-    /// when the endpoint has several.
+    /// Returns a connection ID in the endpoint's layout: a random one of the endpoint's length,
+    /// whose first byte names its worker when the endpoint has several, or a version 2 ID.
     pub(crate) fn generate<R: Random>(&self, rng: &mut R) -> ConnectionId {
+        if let Some(fields) = self.v2 {
+            let mut random = [0; 8];
+            rng.fill(&mut random);
+            return fields.encode(random);
+        }
         let mut bytes = [0; ConnectionId::MAX_LEN];
         let id = &mut bytes[..usize::from(self.len)];
         rng.fill(id);
@@ -90,13 +230,21 @@ impl CidGenerator {
         ConnectionId::new(id).expect("should fit: the config caps the length")
     }
 
-    /// Returns the worker `cid` names, or `None` when one worker issues every ID.
+    /// Returns the worker `cid` names, or `None` when one worker issues every ID or, under
+    /// [`CidLayout::MvfstV2`], when `cid` is not a version 2 ID. A worker byte of the count or
+    /// more names the worker it is congruent to.
     pub(crate) fn worker_of(&self, cid: &[u8]) -> Option<u16> {
         if self.worker_count <= 1 {
             return None;
         }
-        cid.first()
-            .map(|first| u16::from(*first) % self.worker_count)
+        let byte = match self.v2 {
+            None => *cid.first()?,
+            Some(_) => match parse_v2(cid)? {
+                MvfstCid::V2(fields) => fields.worker,
+                MvfstCid::V0 | MvfstCid::V1 | MvfstCid::V3 => return None,
+            },
+        };
+        Some(u16::from(byte) % self.worker_count)
     }
 
     /// Returns a first byte congruent to the worker index modulo the worker count, picked by
@@ -1689,6 +1837,108 @@ mod tests {
         );
         let single = CidGenerator::new(&EndpointConfig::builder([7; 32]).build().unwrap());
         assert_eq!(single.worker_of(&ids[0]), None);
+    }
+
+    #[test]
+    fn an_mvfst_servers_version_2_id_parses_to_its_host_worker_and_process() {
+        // 997800003f0cb4dc, from an mvfst server with host ID 0x780000: version bits 10, then
+        // the host ID, worker 0x3f in byte 4 and the process bit, clear, at the top of byte 5.
+        let id = [0x99, 0x78, 0x00, 0x00, 0x3f, 0x0c, 0xb4, 0xdc];
+        assert_eq!(
+            parse_v2(&id),
+            Some(MvfstCid::V2(MvfstV2Fields {
+                host_id: 0x78_0000,
+                worker: 0x3f,
+                process: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn ids_of_other_versions_are_classified_rather_than_read_as_version_2() {
+        // The bytes of a version 2 ID with the process bit set, under each other version.
+        let mut id = [0x19, 0x78, 0x00, 0x00, 0x3f, 0x8c, 0xb4, 0xdc];
+        for (bits, version) in [
+            (0b00, MvfstCid::V0),
+            (0b01, MvfstCid::V1),
+            (0b11, MvfstCid::V3),
+        ] {
+            id[0] = bits << 6 | 0x19;
+            assert_eq!(parse_v2(&id), Some(version), "{bits:#04b}");
+            assert_eq!(
+                parse_v2(&id[..1]),
+                Some(version),
+                "the first byte holds the version"
+            );
+        }
+        assert_eq!(parse_v2(&[]), None, "an empty ID has no version");
+        assert_eq!(
+            parse_v2(&[0x80, 0, 0, 1, 2]),
+            None,
+            "a version 2 ID too short for its fields"
+        );
+        assert_eq!(
+            parse_v2(&[0x80, 0, 0, 1, 2, 0x80]),
+            Some(MvfstCid::V2(MvfstV2Fields {
+                host_id: 1,
+                worker: 2,
+                process: true,
+            })),
+            "the fields end in byte 5"
+        );
+    }
+
+    fn v2_generator(host_id: u32, process: bool, (index, count): (u16, u16)) -> CidGenerator {
+        let config = EndpointConfig::builder([7; 32])
+            .worker(index, count)
+            .cid_layout(CidLayout::MvfstV2 {
+                host_id,
+                prev_host_id: 0,
+                process,
+            })
+            .build()
+            .unwrap();
+        CidGenerator::new(&config)
+    }
+
+    #[test]
+    fn version_2_ids_round_trip_at_the_edges_of_the_host_id() {
+        let mut rng = TestRng::new(1);
+        for host_id in [1, 0xffff, 0x7f_ffff, 0xff_ffff] {
+            for (worker, process) in [((0, 1), false), ((3, 5), true), ((255, 256), true)] {
+                let id = v2_generator(host_id, process, worker).generate(&mut rng);
+                assert_eq!(id.len(), 8);
+                assert_eq!(
+                    parse_v2(&id),
+                    Some(MvfstCid::V2(MvfstV2Fields {
+                        host_id,
+                        worker: u8::try_from(worker.0).unwrap(),
+                        process,
+                    })),
+                    "{id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn version_2_ids_vary_in_their_29_free_bits_and_nowhere_else() {
+        let generator = v2_generator(0x12_3456, true, (7, 9));
+        let mut rng = TestRng::new(2);
+        let ids: Vec<u64> = (0..256)
+            .map(|_| u64::from_be_bytes(generator.generate(&mut rng)[..].try_into().unwrap()))
+            .collect();
+        let set = ids.iter().fold(0, |acc, id| acc | id);
+        let clear = ids.iter().fold(0, |acc, id| acc | !id);
+        // The low 6 bits of byte 0, the low 7 of byte 5 and bytes 6 and 7.
+        let free: u64 = 0x3f << 56 | 0x7f << 16 | 0xffff;
+        assert_eq!(free.count_ones(), 29);
+        assert_eq!(
+            set & clear,
+            free,
+            "the bits that vary: {:#018x}",
+            set & clear
+        );
     }
 
     #[test]

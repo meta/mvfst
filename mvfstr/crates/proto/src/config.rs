@@ -21,6 +21,7 @@ use mvfstr_wire::VarInt;
 use mvfstr_wire::Version;
 use rustls::pki_types::ServerName;
 
+use crate::cid::CidLayout;
 use crate::endpoint::HEALTH_CHECK_ANSWER;
 use crate::recovery::RecoveryConfig;
 
@@ -78,7 +79,7 @@ impl std::error::Error for ConfigError {
     }
 }
 
-/// The fewest random bytes an issued connection ID holds besides the byte that names the worker.
+/// The fewest random bytes a [`CidLayout::Random`] ID holds besides the byte that names the worker.
 const MIN_RANDOM_CID_BYTES: u8 = 6;
 
 /// Settings shared by every connection of an endpoint.
@@ -90,6 +91,7 @@ pub struct EndpointConfig {
     worker_count: u16,
     build_horizon: Duration,
     health_check_token: Option<Bytes>,
+    cid_layout: CidLayout,
 }
 
 impl EndpointConfig {
@@ -104,6 +106,7 @@ impl EndpointConfig {
                 worker_count: 1,
                 build_horizon: Duration::ZERO,
                 health_check_token: None,
+                cid_layout: CidLayout::Random,
             },
         }
     }
@@ -134,6 +137,11 @@ impl EndpointConfig {
         self.health_check_token.as_deref()
     }
 
+    /// Returns the layout of the connection IDs this endpoint issues.
+    pub fn cid_layout(&self) -> CidLayout {
+        self.cid_layout
+    }
+
     /// Returns a builder that starts from these settings, for a config that changes only a few of
     /// them, such as one per worker.
     pub fn to_builder(&self) -> EndpointConfigBuilder {
@@ -151,6 +159,7 @@ impl fmt::Debug for EndpointConfig {
             .field("worker_count", &self.worker_count)
             .field("build_horizon", &self.build_horizon)
             .field("health_check_token", &self.health_check_token)
+            .field("cid_layout", &self.cid_layout)
             .finish_non_exhaustive()
     }
 }
@@ -163,15 +172,17 @@ pub struct EndpointConfigBuilder {
 
 impl EndpointConfigBuilder {
     /// Sets the length of the connection IDs this endpoint issues: 0, or 6 to 20 bytes with one
-    /// worker and 7 to 20 with several, so a nonempty ID holds at least 6 random bytes. Default 8.
+    /// worker and 7 to 20 with several, so a nonempty [`CidLayout::Random`] ID holds at least 6
+    /// random bytes. Default 8. [`CidLayout::MvfstV2`] requires 8, and its IDs hold 29 random bits.
     pub fn local_cid_len(mut self, len: usize) -> Self {
         self.config.local_cid_len = u8::try_from(len).unwrap_or(u8::MAX);
         self
     }
 
     /// Makes this endpoint worker `index` of `count` workers, at most 256, that share the address.
-    /// With several, the first byte of each ID it issues names the worker, and short-header packets
-    /// that name another worker are dropped rather than answered. Default: worker 0 of 1.
+    /// With several, each ID it issues names the worker in its first byte, or in byte 4 under
+    /// [`CidLayout::MvfstV2`], and short-header packets that name another worker are dropped rather
+    /// than answered. Default: worker 0 of 1.
     pub fn worker(mut self, index: u16, count: u16) -> Self {
         self.config.worker_index = index;
         self.config.worker_count = count;
@@ -197,6 +208,12 @@ impl EndpointConfigBuilder {
         self
     }
 
+    /// Sets the layout of the connection IDs this endpoint issues. Default [`CidLayout::Random`].
+    pub fn cid_layout(mut self, layout: CidLayout) -> Self {
+        self.config.cid_layout = layout;
+        self
+    }
+
     /// Validates the settings.
     pub fn build(self) -> Result<Arc<EndpointConfig>, ConfigError> {
         if self.config.local_cid_len() > ConnectionId::MAX_LEN {
@@ -208,14 +225,21 @@ impl EndpointConfigBuilder {
             local_cid_len,
             worker_index,
             worker_count,
+            cid_layout,
             ..
         } = self.config;
         let one_byte_names_the_worker = worker_count <= 256 && worker_index < worker_count;
         if !one_byte_names_the_worker || (worker_count > 1 && local_cid_len == 0) {
             return Err(ConfigError::OutOfRange { field: "worker" });
         }
-        // A connection issues IDs without access to the endpoint's routes, so only enough
-        // randomness keeps its IDs distinct from each other and from other connections' IDs.
+        if matches!(cid_layout, CidLayout::MvfstV2 { .. }) && local_cid_len != 8 {
+            return Err(ConfigError::OutOfRange {
+                field: "cid_layout",
+            });
+        }
+        // A connection issues random IDs without access to the endpoint's routes, so only enough
+        // randomness keeps its IDs distinct from each other and from other connections' IDs. The
+        // version 2 layout has mvfst's 29 random bits instead.
         let random_bytes = if worker_count > 1 {
             local_cid_len.saturating_sub(1)
         } else {
@@ -1480,6 +1504,37 @@ mod tests {
         for (len, count) in [(0, 1), (6, 1), (7, 2), (7, 256), (20, 256)] {
             assert!(build(len, count).is_ok(), "{len} bytes, {count} workers");
         }
+    }
+
+    #[test]
+    fn the_version_2_layout_needs_8_byte_ids_and_at_most_256_workers() {
+        let v2 = CidLayout::MvfstV2 {
+            host_id: 1,
+            prev_host_id: 0,
+            process: false,
+        };
+        let builder = EndpointConfig::builder([0; 32]).cid_layout(v2);
+        for len in [0, 6, 7, 9, 20] {
+            assert_eq!(
+                builder.clone().local_cid_len(len).build().unwrap_err(),
+                out_of_range("cid_layout"),
+                "{len} bytes"
+            );
+        }
+        for (index, count) in [(0, 1), (255, 256)] {
+            let config = builder.clone().worker(index, count).build().unwrap();
+            assert_eq!(config.cid_layout(), v2);
+            assert_eq!(config.local_cid_len(), 8);
+        }
+        assert_eq!(
+            builder.clone().worker(0, 257).build().unwrap_err(),
+            out_of_range("worker"),
+            "byte 4 names at most 256 workers"
+        );
+        let rebuilt = builder.build().unwrap().to_builder().worker(1, 2).build();
+        assert_eq!(rebuilt.unwrap().cid_layout(), v2);
+        let default = EndpointConfig::builder([0; 32]).build().unwrap();
+        assert_eq!(default.cid_layout(), CidLayout::Random);
     }
 
     #[test]
