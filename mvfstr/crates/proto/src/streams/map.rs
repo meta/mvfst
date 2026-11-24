@@ -387,6 +387,12 @@ impl<T> StreamTable<T> {
         ids.limit.saturating_sub(ids.next)
     }
 
+    /// Returns the peer's limit on local streams in direction `dir`, and the index of the next one.
+    pub fn local_limit(&self, dir: Dir) -> (u64, u64) {
+        let ids = &self.local[dir_index(dir)];
+        (ids.limit, ids.next)
+    }
+
     /// Returns the peer's limit for direction `dir` if it stops the next local open: the value
     /// for a STREAMS_BLOCKED frame.
     pub fn streams_blocked(&self, dir: Dir) -> Option<u64> {

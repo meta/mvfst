@@ -35,6 +35,7 @@ use mvfstr_wire::HeaderSpec;
 use mvfstr_wire::PacketLayout;
 use mvfstr_wire::PacketWriter;
 use mvfstr_wire::Side;
+use mvfstr_wire::VarInt;
 use mvfstr_wire::packet_number_len;
 
 use super::Connection;
@@ -416,7 +417,7 @@ impl Connection {
             let times = Times { now, release: now };
             let cx = self.send_cx(times, space, path, &mut scratch);
             for id in SourceId::ORDER {
-                if joins.skipped.contains(id) || !self.source_active(id, path, &cx.packet) {
+                if joins.skipped.contains(id) || !self.source_active(id, space, path, &cx.packet) {
                     continue;
                 }
                 let Some(cand) = self.sources.candidate(id, &cx) else {
@@ -498,13 +499,21 @@ impl Connection {
             && self.cc.cwnd() > self.recovery.bytes_in_flight()
     }
 
-    /// Returns whether source `id` may write into a packet on `path` holding `packet` in the
-    /// connection's state: the alternate path carries only Path frames, and only while open;
-    /// while closing, only CLOSE starts a packet and an ACK joins only a packet holding the
-    /// CLOSE (RFC 9000); a draining connection does not send.
-    fn source_active(&self, id: SourceId, path: PathId, packet: &PacketCx) -> bool {
+    /// Returns whether source `id` may write into a packet in `space` on `path` holding `packet`
+    /// in the connection's state: the alternate path carries only Path frames, and only while
+    /// open; while closing, only CLOSE starts a packet and an ACK joins only a packet holding the
+    /// CLOSE (RFC 9000); a draining connection does not send. A 0-RTT packet does not carry ACK,
+    /// CRYPTO or path frames (RFC 9000).
+    fn source_active(&self, id: SourceId, space: Space, path: PathId, packet: &PacketCx) -> bool {
         if path != PathId(0) {
             return id == SourceId::Path && self.state == State::Open && self.alt.is_some();
+        }
+        if space == Space::Data && self.zero_rtt_write_keys().is_some() {
+            return self.state == State::Open
+                && matches!(
+                    id,
+                    SourceId::Control | SourceId::Probe | SourceId::Scheduled | SourceId::Ping
+                );
         }
         match self.state {
             State::Open => true,
@@ -551,7 +560,7 @@ impl Connection {
     /// within `joins`; the caller sets the size the joiner would force.
     fn join_gate(&self, space: Space, room: u64, joins: JoinLimits) -> Gate {
         Gate {
-            keys: self.has_keys(space),
+            keys: self.can_seal(space),
             credit: room,
             datagram_size: 0,
             probes_due: self.recovery.probes_due(space),
@@ -609,10 +618,16 @@ impl Connection {
         let dcid = self.dcid_of(path).map_or(0, |cid| cid.len());
         let scid = self.local_cid.len();
         let pn_offset = match space {
-            // Type, version, both connection IDs with their lengths, an empty token's length
+            // Type, version, both connection IDs with their lengths, the token with its length
             // and a Length field of up to 4 bytes.
-            Space::Initial => 1 + 4 + 1 + dcid + 1 + scid + 1 + 4,
+            Space::Initial => {
+                let token = self.retry.as_ref().map_or(0, |retry| retry.token.len());
+                let token_len = VarInt::from_u64(token as u64).map_or(8, VarInt::encoded_size);
+                1 + 4 + 1 + dcid + 1 + scid + token_len + token + 4
+            }
             Space::Handshake => 1 + 4 + 1 + dcid + 1 + scid + 4,
+            // A 0-RTT packet's long header is laid out as a Handshake packet's.
+            Space::Data if self.zero_rtt_write_keys().is_some() => 1 + 4 + 1 + dcid + 1 + scid + 4,
             Space::Data => 1 + dcid,
         };
         (pn_offset + 4 + TAG_LEN).saturating_add(payload.max(1))
@@ -641,7 +656,7 @@ impl Connection {
         let mut left = room.saturating_sub(first as u64);
         let mut scratch = Vec::new();
         for space in Space::ALL.into_iter().filter(|&space| space > start.space) {
-            if !self.has_keys(space) || self.header_dcid(space, start.path).is_none() {
+            if !self.can_seal(space) || self.header_dcid(space, start.path).is_none() {
                 continue;
             }
             let cx = self.send_cx(times, space, start.path, &mut scratch);
@@ -650,7 +665,8 @@ impl Connection {
             let smallest = SourceId::ORDER
                 .into_iter()
                 .filter(|&id| {
-                    !joins.skipped.contains(id) && self.source_active(id, start.path, &cx.packet)
+                    !joins.skipped.contains(id)
+                        && self.source_active(id, space, start.path, &cx.packet)
                 })
                 .filter_map(|id| self.sources.candidate(id, &cx))
                 .filter(|cand| may_join(cand.class, &gate, probe))
@@ -730,7 +746,9 @@ impl Connection {
                 sent: &mut sent,
             };
             for id in SourceId::FILL_ORDER {
-                if !joins.skipped.contains(id) && self.source_active(id, start.path, &cx.packet) {
+                if !joins.skipped.contains(id)
+                    && self.source_active(id, space, start.path, &cx.packet)
+                {
                     self.sources.fill(id, &mut w, &mut cx, admit);
                 }
             }
@@ -797,11 +815,12 @@ impl Connection {
         sealer: &mut Z,
     ) -> Outcome {
         for packet in built.iter().flatten() {
-            let keys = &self.spaces[packet.space.index()]
-                .keys
-                .as_ref()
-                .expect("should hold the keys of a space it built a packet in")
-                .local;
+            let keys = match &self.spaces[packet.space.index()].keys {
+                Some(keys) => &keys.local,
+                None => self
+                    .zero_rtt_write_keys()
+                    .expect("should hold the keys of a space it built a packet in"),
+            };
             let job = SealJob {
                 slot,
                 keys,
@@ -890,6 +909,9 @@ impl Connection {
             self.idle.base = now;
             self.idle.sent_since_receive = true;
         }
+        if ack_eliciting {
+            self.keepalive_base = now;
+        }
         // A client discards its Initial keys when it first sends a Handshake packet (RFC 9001).
         if handshake_sent && self.side == Side::Client {
             self.discard_space(Space::Initial, now);
@@ -947,16 +969,22 @@ impl Connection {
 
     /// Returns the header of a packet in `space` on `path`, if the path has a peer connection ID
     /// to put in it.
-    fn header_spec(&self, space: Space, path: PathId) -> Option<HeaderSpec<'static>> {
+    fn header_spec(&self, space: Space, path: PathId) -> Option<HeaderSpec<'_>> {
         let dcid = self.header_dcid(space, path)?;
         Some(match space {
             Space::Initial => HeaderSpec::Initial {
                 version: self.version,
                 dcid,
                 scid: self.local_cid,
-                token: &[],
+                // Every Initial after a Retry carries its token, as RFC 9000 requires.
+                token: self.retry.as_ref().map_or(&[], |retry| &retry.token[..]),
             },
             Space::Handshake => HeaderSpec::Handshake {
+                version: self.version,
+                dcid,
+                scid: self.local_cid,
+            },
+            Space::Data if self.zero_rtt_write_keys().is_some() => HeaderSpec::ZeroRtt {
                 version: self.version,
                 dcid,
                 scid: self.local_cid,

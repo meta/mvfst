@@ -1076,6 +1076,10 @@ pub(crate) mod fixtures {
         pub(crate) alpn: AlpnPolicy,
         /// The number of names in the server's certificate, which sets its size.
         pub(crate) cert_names: usize,
+        /// The client sends 0-RTT when it resumes, and the server accepts it.
+        pub(crate) early_data: bool,
+        /// The client does not trust any root, so it refuses the server's certificate.
+        pub(crate) empty_roots: bool,
     }
 
     impl Default for Setup {
@@ -1090,6 +1094,8 @@ pub(crate) mod fixtures {
                 server_alpn: &[b"h3"],
                 alpn: AlpnPolicy::Required,
                 cert_names: 1,
+                early_data: false,
+                empty_roots: false,
             }
         }
     }
@@ -1129,13 +1135,15 @@ pub(crate) mod fixtures {
                 self.server_alpn,
             )
             .expect("a server TLS config");
-            let client_tls = mvfstr_tls::client_config(
-                provider(self.pq),
-                time,
-                ServerVerification::AcceptAnyCertificate,
-                self.client_alpn,
-            )
-            .expect("a client TLS config");
+            let verification = if self.empty_roots {
+                ServerVerification::Roots(Arc::new(rustls::RootCertStore::empty()))
+            } else {
+                ServerVerification::AcceptAnyCertificate
+            };
+            let mut client_tls =
+                mvfstr_tls::client_config(provider(self.pq), time, verification, self.client_alpn)
+                    .expect("a client TLS config");
+            client_tls.enable_early_data = self.early_data;
             (Arc::new(server_tls), Arc::new(client_tls))
         }
 
@@ -1146,6 +1154,7 @@ pub(crate) mod fixtures {
                 .transport(self.server_transport.clone())
                 .versions(self.server_versions.clone())
                 .alpn(self.alpn)
+                .accept_early_data(self.early_data)
                 .build()
                 .expect("a server config");
             let client = ClientConfig::builder(client)

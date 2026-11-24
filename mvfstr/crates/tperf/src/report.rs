@@ -322,6 +322,8 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             cwnd: 1_452_000,
             bytes_in_flight: 63_888,
             smoothed_rtt: Duration::from_micros(150),
+            latest_rtt: Duration::from_micros(160),
+            rtt_var: Duration::from_micros(20),
             tx_inconsistent: 0,
         };
         assert_eq!(
@@ -342,6 +344,8 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             cwnd: 1_452_000,
             bytes_in_flight: 63_888,
             smoothed_rtt: Duration::from_micros(150),
+            latest_rtt: Duration::from_micros(160),
+            rtt_var: Duration::from_micros(20),
             tx_inconsistent: 0,
         };
         assert_eq!(
@@ -362,6 +366,8 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             cwnd: 1_452_000,
             bytes_in_flight: 63_888,
             smoothed_rtt: Duration::from_micros(150),
+            latest_rtt: Duration::from_micros(160),
+            rtt_var: Duration::from_micros(20),
             tx_inconsistent: 0,
         };
         assert_eq!(

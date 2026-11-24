@@ -63,6 +63,8 @@ pub(crate) struct LocalIds {
     pub(crate) original_dcid: Option<ConnectionId>,
     /// For a server, the stateless reset token of `initial_scid`.
     pub(crate) reset_token: Option<ResetToken>,
+    /// For a server that sent a Retry, the Retry's Source Connection ID.
+    pub(crate) retry_scid: Option<ConnectionId>,
 }
 
 /// Returns the parameters a connection with `config` and build horizon `horizon` advertises.
@@ -93,6 +95,7 @@ pub(crate) fn local_params(
         disable_active_migration: config.disable_active_migration(),
         initial_source_connection_id: Some(ids.initial_scid),
         stateless_reset_token: ids.reset_token,
+        retry_source_connection_id: ids.retry_scid,
         extra: config.extra_params().to_vec(),
         ..TransportParameters::default()
     }
@@ -132,6 +135,8 @@ pub(crate) struct PeerIds {
     pub(crate) initial_scid: ConnectionId,
     /// The Destination Connection ID of the client's first Initial packet.
     pub(crate) original_dcid: ConnectionId,
+    /// For a client that followed a Retry, the Retry's Source Connection ID.
+    pub(crate) retry_scid: Option<ConnectionId>,
 }
 
 /// Decodes and checks the peer's parameters.
@@ -151,9 +156,14 @@ pub(crate) fn peer_params(raw: &[u8], ids: PeerIds) -> Result<TransportParameter
             }
         }
         Side::Client => {
-            // The client does not act on Retry, so this parameter must be absent (RFC 9000).
-            if params.retry_source_connection_id.is_some() {
-                return Err(error("retry_source_connection_id without a Retry"));
+            // RFC 9000 requires this parameter exactly when the client followed a Retry.
+            match ids.retry_scid {
+                Some(scid) => check_cid(params.retry_source_connection_id, scid, ids.version)
+                    .map_err(|()| error("retry_source_connection_id mismatch"))?,
+                None if params.retry_source_connection_id.is_some() => {
+                    return Err(error("retry_source_connection_id without a Retry"));
+                }
+                None => {}
             }
             check_cid(
                 params.original_destination_connection_id,
@@ -187,6 +197,42 @@ pub(crate) fn max_datagram_frame_size(params: &TransportParameters) -> Result<u6
         Ok((size, len)) if len == value.len() => Ok(size.into_inner()),
         _ => Err(()),
     }
+}
+
+/// Returns the parameters a client remembered with a session as 0-RTT uses them (RFC 9000):
+/// those that describe the connection rather than the server's limits take their defaults.
+pub(crate) fn zero_rtt_view(remembered: &TransportParameters) -> TransportParameters {
+    let defaults = TransportParameters::default();
+    TransportParameters {
+        ack_delay_exponent: defaults.ack_delay_exponent,
+        max_ack_delay: defaults.max_ack_delay,
+        initial_source_connection_id: None,
+        original_destination_connection_id: None,
+        preferred_address: None,
+        retry_source_connection_id: None,
+        stateless_reset_token: None,
+        ..remembered.clone()
+    }
+}
+
+/// Returns whether a server that accepted 0-RTT lowered a limit the client may have used under
+/// it, which RFC 9000 forbids.
+pub(crate) fn early_limits_shrank(early: &TransportParameters, new: &TransportParameters) -> bool {
+    let limits = |p: &TransportParameters| {
+        [
+            p.active_connection_id_limit,
+            p.initial_max_data,
+            p.initial_max_stream_data_bidi_local,
+            p.initial_max_stream_data_bidi_remote,
+            p.initial_max_stream_data_uni,
+            p.initial_max_streams_bidi,
+            p.initial_max_streams_uni,
+        ]
+    };
+    limits(new)
+        .iter()
+        .zip(limits(early))
+        .any(|(new, early)| *new < early)
 }
 
 /// Checks that a connection ID parameter matches `expected` and, on version 1 and its aliases, is
@@ -288,6 +334,7 @@ mod tests {
             version,
             initial_scid: cid(2),
             original_dcid: cid(1),
+            retry_scid: None,
         }
     }
 
@@ -299,6 +346,7 @@ mod tests {
                 initial_scid: cid(2),
                 original_dcid: Some(cid(1)),
                 reset_token: Some(ResetToken([5; 16])),
+                retry_scid: None,
             },
         )
     }
@@ -329,6 +377,7 @@ mod tests {
                 initial_scid: cid(1),
                 original_dcid: None,
                 reset_token: None,
+                retry_scid: None,
             },
         );
         assert_eq!(params.max_ack_delay, VarInt::from_u32(11));
@@ -356,6 +405,7 @@ mod tests {
             initial_scid: cid(1),
             original_dcid: None,
             reset_token: None,
+            retry_scid: None,
         };
         let params = local_params(&TransportConfig::default(), ms(2), ids);
         assert_eq!(params.max_ack_delay, VarInt::from_u32(28));
@@ -387,6 +437,7 @@ mod tests {
                 initial_scid: cid(2),
                 original_dcid: Some(cid(1)),
                 reset_token: Some(ResetToken([5; 16])),
+                retry_scid: None,
             },
         );
         assert!(params.disable_active_migration);
@@ -412,6 +463,7 @@ mod tests {
             initial_scid: cid(2),
             original_dcid: Some(cid(1)),
             reset_token: Some(ResetToken([5; 16])),
+            retry_scid: None,
         };
         let params = local_params(&config, Duration::ZERO, ids);
         assert_eq!(
@@ -536,6 +588,7 @@ mod tests {
             version: Version::V1,
             initial_scid: cid(2),
             original_dcid: cid(1),
+            retry_scid: None,
         };
         let mut client = local_params(
             &TransportConfig::default(),
@@ -544,6 +597,7 @@ mod tests {
                 initial_scid: cid(2),
                 original_dcid: None,
                 reset_token: None,
+                retry_scid: None,
             },
         );
         assert!(peer_params(&encode(&client), ids).is_ok());
@@ -568,6 +622,98 @@ mod tests {
         params.extra = vec![(MAX_DATAGRAM_FRAME_SIZE, Bytes::from_static(&[0x05]))];
         let accepted = peer_params(&encode(&params), client_ids(Version::V1)).unwrap();
         assert_eq!(max_datagram_frame_size(&accepted), Ok(5));
+    }
+
+    #[test]
+    fn retry_source_connection_id_is_required_exactly_after_a_retry() {
+        let after_retry = PeerIds {
+            retry_scid: Some(cid(3)),
+            ..client_ids(Version::V1)
+        };
+        let mut retried = server_params();
+        retried.retry_source_connection_id = Some(cid(3));
+        assert!(peer_params(&encode(&retried), after_retry).is_ok());
+        let error = peer_params(&encode(&retried), client_ids(Version::V1)).unwrap_err();
+        assert_eq!(error.reason, "retry_source_connection_id without a Retry");
+        let mut wrong = server_params();
+        wrong.retry_source_connection_id = Some(cid(4));
+        let error = peer_params(&encode(&wrong), after_retry).unwrap_err();
+        assert_eq!(error.code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+        assert_eq!(error.reason, "retry_source_connection_id mismatch");
+        let error = peer_params(&encode(&server_params()), after_retry).unwrap_err();
+        assert_eq!(error.reason, "retry_source_connection_id mismatch");
+        // The other two IDs are still checked after a Retry.
+        let mut wrong_odcid = retried.clone();
+        wrong_odcid.original_destination_connection_id = Some(cid(3));
+        let error = peer_params(&encode(&wrong_odcid), after_retry).unwrap_err();
+        assert_eq!(error.reason, "original_destination_connection_id mismatch");
+        let mut wrong_iscid = retried;
+        wrong_iscid.initial_source_connection_id = Some(cid(3));
+        let error = peer_params(&encode(&wrong_iscid), after_retry).unwrap_err();
+        assert_eq!(error.reason, "initial_source_connection_id mismatch");
+    }
+
+    #[test]
+    fn the_zero_rtt_view_keeps_limits_and_defaults_the_connection_parameters() {
+        let mut remembered = server_params();
+        remembered.max_udp_payload_size = VarInt::from_u32(1200);
+        remembered.max_idle_timeout = VarInt::from_u32(7_000);
+        remembered.ack_delay_exponent = VarInt::from_u32(10);
+        remembered.max_ack_delay = VarInt::from_u32(100);
+        remembered.retry_source_connection_id = Some(cid(3));
+        remembered.disable_active_migration = true;
+        let view = zero_rtt_view(&remembered);
+        let defaults = TransportParameters::default();
+        assert_eq!(view.max_udp_payload_size, VarInt::from_u32(1200));
+        assert_eq!(view.max_idle_timeout, VarInt::from_u32(7_000));
+        assert_eq!(view.initial_max_data, remembered.initial_max_data);
+        assert_eq!(
+            view.initial_max_stream_data_bidi_remote,
+            remembered.initial_max_stream_data_bidi_remote
+        );
+        assert_eq!(
+            view.initial_max_streams_bidi,
+            remembered.initial_max_streams_bidi
+        );
+        assert_eq!(
+            view.active_connection_id_limit,
+            remembered.active_connection_id_limit
+        );
+        assert!(view.disable_active_migration);
+        assert_eq!(view.ack_delay_exponent, defaults.ack_delay_exponent);
+        assert_eq!(view.max_ack_delay, defaults.max_ack_delay);
+        assert_eq!(view.initial_source_connection_id, None);
+        assert_eq!(view.original_destination_connection_id, None);
+        assert_eq!(view.preferred_address, None);
+        assert_eq!(view.retry_source_connection_id, None);
+        assert_eq!(view.stateless_reset_token, None);
+    }
+
+    #[test]
+    fn lowering_any_limit_0rtt_used_counts_and_other_parameters_do_not() {
+        let early = zero_rtt_view(&server_params());
+        assert!(!early_limits_shrank(&early, &server_params()));
+        let lower = |change: fn(&mut TransportParameters)| {
+            let mut new = server_params();
+            change(&mut new);
+            early_limits_shrank(&early, &new)
+        };
+        assert!(lower(|p| p.active_connection_id_limit = VarInt::from_u32(1)));
+        assert!(lower(|p| p.initial_max_data = VarInt::from_u32(1)));
+        assert!(lower(
+            |p| p.initial_max_stream_data_bidi_local = VarInt::from_u32(1)
+        ));
+        assert!(lower(
+            |p| p.initial_max_stream_data_bidi_remote = VarInt::from_u32(1)
+        ));
+        assert!(lower(
+            |p| p.initial_max_stream_data_uni = VarInt::from_u32(1)
+        ));
+        assert!(lower(|p| p.initial_max_streams_bidi = VarInt::from_u32(1)));
+        assert!(lower(|p| p.initial_max_streams_uni = VarInt::from_u32(1)));
+        assert!(!lower(|p| p.max_idle_timeout = VarInt::from_u32(1_000)));
+        assert!(!lower(|p| p.max_udp_payload_size = VarInt::from_u32(1_200)));
+        assert!(!lower(|p| p.initial_max_data = VarInt::from_u32(1 << 30)));
     }
 
     #[test]

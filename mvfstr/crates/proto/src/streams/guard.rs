@@ -550,6 +550,11 @@ impl<D: StreamData> Streams<D> {
         self.table.streams_blocked(dir)
     }
 
+    /// Returns the peer's limit on local streams in direction `dir`, and the index of the next one.
+    pub(crate) fn local_limit(&self, dir: Dir) -> (u64, u64) {
+        self.table.local_limit(dir)
+    }
+
     /// Applies the peer's stream limit for `dir` (see [`StreamTable::on_peer_max_streams`]).
     pub(crate) fn on_peer_max_streams(
         &mut self,

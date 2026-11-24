@@ -27,8 +27,10 @@ use mvfstr_wire::Frames;
 use mvfstr_wire::Header;
 use mvfstr_wire::PacketType;
 use mvfstr_wire::ResetToken;
+use mvfstr_wire::RetryHeader;
 use mvfstr_wire::Side;
 use mvfstr_wire::TransportErrorCode;
+use mvfstr_wire::TransportParameters;
 use mvfstr_wire::VarInt;
 use mvfstr_wire::VersionNegotiation;
 use mvfstr_wire::decode_packet_number;
@@ -38,7 +40,9 @@ use super::Connection;
 use super::MAX_CRYPTO_BUFFER;
 use super::MIN_DATAGRAM;
 use super::PeerParams;
+use super::RetryState;
 use super::State;
+use super::congestion_state;
 use super::key_update::KeyPhases;
 use super::key_update::ReadKey;
 use super::level_space;
@@ -53,12 +57,16 @@ use crate::Initiator;
 use crate::RecvSummary;
 use crate::RxDatagram;
 use crate::RxMeta;
+use crate::TlsInfo;
 use crate::cc::AckEvent;
 use crate::cc::AckPart;
 use crate::endpoint::MIN_RESET;
+use crate::recovery::LossRecovery;
+use crate::recovery::RecoveryConfig;
 use crate::recovery::Space;
 use crate::recovery::sent::PacketEvent;
 use crate::recovery::sent::SentFlags;
+use crate::streams::conn::StreamState;
 use crate::streams::recv_buf::RecvError;
 
 /// The TLS no_application_protocol alert (RFC 9001).
@@ -167,6 +175,15 @@ impl Connection {
         data: &mut [u8],
         summary: &mut RecvSummary,
     ) {
+        // A Retry is the whole datagram (RFC 9000); only a client takes one.
+        if self.side == Side::Client
+            && let Ok(Header::Retry(retry)) = Header::parse(data, self.local_cid.len())
+        {
+            if !self.recv_retry(now, &retry, &data[..retry.packet_len()]) {
+                summary.dropped += 1;
+            }
+            return;
+        }
         // Version Negotiation can matter only to a client that has not processed a packet; for
         // anyone else the datagram goes on, and may be a stateless reset.
         if self.side == Side::Client
@@ -221,6 +238,7 @@ impl Connection {
         let answers_first_initial = self.side == Side::Client
             && self.state == State::Open
             && self.stats.recv_packets == 0
+            && self.retry.is_none()
             && vn.dcid() == &self.local_cid[..]
             && vn.scid() == &self.original_dcid[..];
         if !answers_first_initial || vn.versions().any(|version| version == self.version) {
@@ -234,11 +252,71 @@ impl Connection {
         true
     }
 
+    /// Follows the first Retry that answers a client's first Initial (RFC 9000): one before any
+    /// packet from the server, with a valid integrity tag (RFC 9001), a new Source Connection ID
+    /// and a token. The Initial goes again, to that ID, under keys derived from it and with the
+    /// token; 0-RTT data goes again too. What was sent before leaves loss recovery without
+    /// counting as lost, and congestion control starts over. Returns whether the Retry was
+    /// followed; any other is discarded.
+    fn recv_retry(&mut self, now: Instant, retry: &RetryHeader<'_>, packet: &[u8]) -> bool {
+        let Ok(scid) = ConnectionId::new(retry.scid()) else {
+            return false;
+        };
+        // Every version's tag is checked with the version 1 key. mvfst's server tags other
+        // versions, MVFST included, with the draft-29 key, so its Retry on MVFST is ignored here.
+        let follows = self.state == State::Open
+            && self.retry.is_none()
+            && self.stats.recv_packets == 0
+            && self.peer_initial_scid.is_none()
+            && retry.version() == self.version
+            && retry.dcid() == &self.local_cid[..]
+            && scid != self.original_dcid
+            && !retry.token().is_empty()
+            && mvfstr_crypto::verify_retry_integrity(&self.original_dcid, packet);
+        if !follows {
+            return false;
+        }
+        let Ok(keys) = mvfstr_crypto::initial_keys(self.version, &scid, Side::Client) else {
+            return false;
+        };
+        let Self {
+            recovery, sources, ..
+        } = self;
+        for space in [Space::Initial, Space::Data] {
+            for packet in recovery.space(space).outstanding() {
+                sources.on_packet_event(Some(space), PacketEvent::Lost(packet), false);
+            }
+        }
+        let next_pn = Space::ALL.map(|space| self.recovery.space(space).next_pn());
+        let config = RecoveryConfig {
+            initial_rtt: self.config.initial_rtt(),
+            rate_samples: crate::cc::takes_rate_samples(self.config.congestion_control()),
+            ..RecoveryConfig::default()
+        };
+        self.recovery = LossRecovery::new(config, Side::Client, now, next_pn)
+            .expect("should accept the RTT a validated transport config holds");
+        (self.cc, self.pacer) = congestion_state(
+            &self.config,
+            self.mtu,
+            self.horizon,
+            &self.recovery,
+            &mut self.rng,
+        );
+        self.app_limited = false;
+        self.spaces[Space::Initial.index()].keys = Some(keys);
+        self.sources.cids.peer.set_handshake_cid(scid);
+        self.retry = Some(Box::new(RetryState {
+            token: Bytes::copy_from_slice(retry.token()),
+            scid,
+        }));
+        true
+    }
+
     /// Reads the header of the packet at the front of `data`, or `None` for a malformed header
     /// or a packet type that does not carry frames.
     fn parse(&self, data: &[u8]) -> Option<PacketInfo> {
         let Ok(Header::Protected(header)) = Header::parse(data, self.local_cid.len()) else {
-            // Retry is not supported, and Version Negotiation is read before the packets.
+            // Retry and Version Negotiation are read before the packets.
             return None;
         };
         let long = header.version().is_some();
@@ -268,12 +346,15 @@ impl Connection {
             PacketType::Initial => Space::Initial,
             PacketType::Handshake => Space::Handshake,
             PacketType::OneRtt => Space::Data,
-            // 0-RTT is not supported.
+            // A server reads 0-RTT only with the keys of early data it accepted, and drops 0-RTT
+            // packets that come before those keys.
+            PacketType::ZeroRtt if self.zero_rtt_read_keys().is_some() => Space::Data,
             PacketType::ZeroRtt => {
                 summary.dropped += 1;
                 return;
             }
         };
+        let zero_rtt = info.ty == PacketType::ZeroRtt;
         let stale = !info.version_ok
             || self.spaces[space.index()].discarded
             || matches!(self.state, State::Draining { .. } | State::Drained)
@@ -297,7 +378,7 @@ impl Connection {
             summary.dropped += 1;
             return;
         }
-        if !self.can_open(space) {
+        if !zero_rtt && !self.can_open(space) {
             let limit = self.config.buffered_packets();
             if self.buffered.push(space, meta, datagram_len, packet, limit) {
                 summary.buffered += 1;
@@ -331,11 +412,15 @@ impl Connection {
             );
             return;
         }
-        if space == Space::Data
-            && let Err(error) = self.on_one_rtt_opened(now, read, pn)
-        {
-            self.close_on_error(now, error);
-            return;
+        if space == Space::Data && !zero_rtt {
+            // A 1-RTT packet ends the client's 0-RTT (RFC 9001).
+            if self.side == Side::Server {
+                self.early = None;
+            }
+            if let Err(error) = self.on_one_rtt_opened(now, read, pn) {
+                self.close_on_error(now, error);
+                return;
+            }
         }
         if self.peer_initial_scid.is_none() && space == Space::Initial {
             // The client sends to the connection ID the server chose (RFC 9000).
@@ -357,7 +442,7 @@ impl Connection {
                     meta.ecn,
                     meta.rx_time,
                 );
-                if space == Space::Data {
+                if space == Space::Data && !zero_rtt {
                     // Only the highest-numbered non-probing packet moves the connection, as
                     // RFC 9000 requires.
                     let newest = !received.probing
@@ -408,6 +493,10 @@ impl Connection {
         packet: &'p mut [u8],
         info: &PacketInfo,
     ) -> Result<(u64, u8, ReadKey, &'p [u8]), Unopened> {
+        if info.ty == PacketType::ZeroRtt {
+            let keys = self.zero_rtt_read_keys().ok_or(Unopened::Header)?;
+            return self.open_with(space, keys, packet, info);
+        }
         let keys = self.spaces[space.index()]
             .keys
             .as_ref()
@@ -440,6 +529,41 @@ impl Connection {
             .decrypt_in_place(pn, header, payload)
             .map_err(|_| Unopened::Aead)?;
         Ok((pn, first, read, plaintext))
+    }
+
+    /// Opens a 0-RTT packet with a server's 0-RTT `keys`.
+    fn open_with<'p>(
+        &self,
+        space: Space,
+        keys: &mvfstr_crypto::PacketKeys,
+        packet: &'p mut [u8],
+        info: &PacketInfo,
+    ) -> Result<(u64, u8, ReadKey, &'p [u8]), Unopened> {
+        let pn_len = unprotect_header(keys.header(), packet, info.pn_offset)
+            .map_err(|_| Unopened::Header)?;
+        let truncated = packet[info.pn_offset..info.pn_offset + pn_len]
+            .iter()
+            .fold(0u32, |acc, &byte| acc << 8 | u32::from(byte));
+        let largest = self.sources.ack[space.index()]
+            .received()
+            .largest()
+            .map(|(pn, _)| pn);
+        let pn = decode_packet_number(largest, truncated, pn_len);
+        let first = packet[0];
+        let (header, payload) = packet.split_at_mut(info.pn_offset + pn_len);
+        let plaintext = keys
+            .packet()
+            .decrypt_in_place(pn, header, payload)
+            .map_err(|_| Unopened::Aead)?;
+        Ok((pn, first, ReadKey::Current, plaintext))
+    }
+
+    /// Returns a server's 0-RTT read keys while it takes 0-RTT packets.
+    fn zero_rtt_read_keys(&self) -> Option<&mvfstr_crypto::PacketKeys> {
+        if self.side != Side::Server {
+            return None;
+        }
+        self.early.as_ref()?.keys.as_deref()
     }
 
     /// Counts a packet that failed authentication; past the integrity limit, the connection
@@ -835,11 +959,17 @@ impl Connection {
             let level = self.tls.read_level();
             let space = level_space(level).index();
             while let Some(front) = self.spaces[space].crypto_recv.readable().front().cloned() {
-                self.tls.read_crypto(level, &front).map_err(|e| ConnError {
-                    code: e.transport_error_code(),
-                    frame_type: Some(frame_type(FrameKind::Crypto)),
-                    reason: "TLS handshake failed",
-                })?;
+                if let Err(e) = self.tls.read_crypto(level, &front) {
+                    let error = ConnError {
+                        code: e.transport_error_code(),
+                        frame_type: Some(frame_type(FrameKind::Crypto)),
+                        reason: "TLS handshake failed",
+                    };
+                    if let TlsError::Alert { error, .. } | TlsError::Failed(error) = e {
+                        self.local_tls_error = Some(Box::new(error));
+                    }
+                    return Err(error);
+                }
                 self.spaces[space]
                     .crypto_recv
                     .consume(front.len(), &mut self.crypto_pool)
@@ -894,6 +1024,20 @@ impl Connection {
                 Some(KeyChange::ZeroRtt(_)) | None => {}
             }
         }
+        // A server that accepted early data reads 0-RTT (RFC 9001); otherwise rustls does not
+        // return 0-RTT keys.
+        if self.side == Side::Server
+            && !self.handshake.complete
+            && self.early.is_none()
+            && let Some(keys) = self.tls.rustls().and_then(|tls| tls.zero_rtt_keys())
+        {
+            self.early = Some(Box::new(super::EarlyState {
+                keys: Some(std::sync::Arc::new(mvfstr_crypto::PacketKeys::from_rustls(
+                    keys,
+                ))),
+                params: None,
+            }));
+        }
         if self.handshake.peer_params.is_none()
             && let Some(raw) = self.tls.peer_transport_params()
         {
@@ -913,6 +1057,7 @@ impl Connection {
             version: self.version,
             initial_scid: self.peer_initial_scid.unwrap_or(ConnectionId::EMPTY),
             original_dcid: self.original_dcid,
+            retry_scid: self.retry.as_ref().map(|retry| retry.scid),
         };
         let peer = params::peer_params(&raw, ids)?;
         if self.side == Side::Client {
@@ -933,21 +1078,17 @@ impl Connection {
         self.peer_ack_delay_exponent =
             u8::try_from(peer.ack_delay_exponent.into_inner()).unwrap_or(20);
         if self.config.datagram_size() == DatagramSize::PeerMaximum {
-            let peer_max =
-                u16::try_from(peer.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
-            self.mtu = peer_max
-                .min(self.config.max_udp_payload_size())
-                .max(MIN_DATAGRAM);
-            self.cc
-                .set_max_datagram_size(self.mtu)
-                .map_err(|_| ConnError::new(TransportErrorCode::INTERNAL_ERROR, "datagram size"))?;
-            self.pacer.set_max_datagram_size(self.mtu);
+            self.apply_peer_payload_size(&peer)?;
         }
-        let available = self
-            .sources
-            .streams
-            .on_peer_params(&peer)
-            .map_err(|code| ConnError::new(code, "stream limit above 2^60"))?;
+        let early = self
+            .early
+            .take_if(|early| early.params.is_some())
+            .and_then(|early| early.params);
+        let available = match early {
+            Some(early) => self.settle_early_data(&early, &peer)?,
+            None => self.sources.streams.on_peer_params(&peer),
+        }
+        .map_err(|code| ConnError::new(code, "stream limit above 2^60"))?;
         for (dir, available) in [Dir::Bi, Dir::Uni].into_iter().zip(available) {
             if available {
                 self.push_event(ConnEvent::StreamsAvailable { dir });
@@ -955,6 +1096,51 @@ impl Connection {
         }
         self.handshake.peer_params = Some(PeerParams { decoded: peer, raw });
         Ok(())
+    }
+
+    /// Sizes datagrams to the smaller of the peer's max_udp_payload_size and ours.
+    pub(super) fn apply_peer_payload_size(
+        &mut self,
+        peer: &TransportParameters,
+    ) -> Result<(), ConnError> {
+        let peer_max = u16::try_from(peer.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
+        self.mtu = peer_max
+            .min(self.config.max_udp_payload_size())
+            .max(MIN_DATAGRAM);
+        self.cc
+            .set_max_datagram_size(self.mtu)
+            .map_err(|_| ConnError::new(TransportErrorCode::INTERNAL_ERROR, "datagram size"))?;
+        self.pacer.set_max_datagram_size(self.mtu);
+        Ok(())
+    }
+
+    /// Settles the 0-RTT of a client that sent it under `early`, the remembered parameters, once
+    /// the server's parameters arrive with the client's 1-RTT keys (RFC 9001). If the server
+    /// accepted, its limits replace the remembered ones, which they may not lower (RFC 9000). If
+    /// it rejected, the 0-RTT packets leave loss recovery uncounted and every stream opened goes,
+    /// silently, so numbering starts over under the new limits, as ngtcp2 does. Returns, by
+    /// direction, whether `StreamsAvailable` is due.
+    fn settle_early_data(
+        &mut self,
+        early: &TransportParameters,
+        peer: &TransportParameters,
+    ) -> Result<Result<[bool; 2], TransportErrorCode>, ConnError> {
+        let accepted = self.tls.is_early_data_accepted();
+        let available = if accepted {
+            if params::early_limits_shrank(early, peer) {
+                return Err(ConnError::new(
+                    TransportErrorCode::PROTOCOL_VIOLATION,
+                    "0-RTT accepted under lower limits",
+                ));
+            }
+            self.sources.streams.raise_peer_params(peer)
+        } else {
+            self.recovery.forget_space(Space::Data);
+            self.sources.streams = StreamState::new(Side::Client, &self.config);
+            self.sources.streams.on_peer_params(peer)
+        };
+        self.push_event(ConnEvent::EarlyData { accepted });
+        Ok(available)
     }
 
     /// Completes the handshake, and for a server also confirms it (RFC 9001).
@@ -972,6 +1158,7 @@ impl Connection {
             ));
         }
         self.handshake.complete = true;
+        self.handshake.tls_info = self.tls.rustls().map(TlsInfo::of);
         self.push_event(ConnEvent::Connected);
         self.issue_cids();
         if self.side == Side::Server {
@@ -1004,7 +1191,7 @@ impl Connection {
     }
 
     /// Handles NEW_TOKEN, which only a server may send (RFC 9000). A client does not keep the
-    /// token, because Retry and resumption are not supported.
+    /// token, because mvfstr does not support address validation tokens for later connections.
     fn recv_new_token(&self) -> Result<(), ConnError> {
         if self.side == Side::Server {
             return Err(ConnError {

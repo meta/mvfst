@@ -45,13 +45,25 @@ impl fmt::Display for AppCode {
 
 /// A rare fact about a connection, from [`Connection::poll_event`](crate::Connection::poll_event).
 ///
-/// 0-RTT and the QUIC DATAGRAM extension are not supported.
+/// The QUIC DATAGRAM extension is not supported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnEvent {
     /// The 1-RTT write keys are installed, so 1-RTT packets can be sent: for a server once it
     /// has written its handshake flight, before the client's Finished; for a client on rustls just
     /// before `Connected`, and for an External client with the step that carries its 1-RTT secrets.
     WriteKeysReady,
+    /// A client resuming a session that allows early data holds 0-RTT keys: streams open and
+    /// carry data before the handshake completes, within the limits the server remembered with
+    /// the session. Queued by `Connection::client`, so it is the first event, ready before the
+    /// first transmit attempt; at most once per connection.
+    EarlyDataWritable,
+    /// The server accepted or rejected the client's 0-RTT, just before `Connected`. On
+    /// rejection every stream the client opened is gone without edges, as if never opened, and
+    /// stream numbering starts over.
+    EarlyData {
+        /// Whether the server accepted the early data.
+        accepted: bool,
+    },
     /// The handshake completed: 1-RTT keys are installed and the peer's transport parameters
     /// validated.
     Connected,
@@ -112,7 +124,8 @@ pub enum CloseReason {
         /// The reason phrase.
         reason: Bytes,
     },
-    /// The endpoints did not exchange CONNECTION_CLOSE: idle timeout, stateless reset or abort.
+    /// The endpoints did not exchange CONNECTION_CLOSE: idle timeout, PTO limit, stateless reset
+    /// or abort.
     Silent,
     /// The server answered the client's first Initial with a Version Negotiation packet that does
     /// not list any version the client offered.
@@ -130,6 +143,8 @@ pub enum Initiator {
     IdleTimeout,
     /// The peer sent a stateless reset.
     StatelessReset,
+    /// The configured number of consecutive PTOs expired without an acknowledgment.
+    PtoLimit,
     /// An internal failure, such as a contained panic.
     Internal,
 }

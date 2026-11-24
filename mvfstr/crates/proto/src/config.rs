@@ -351,6 +351,19 @@ pub enum ParamsLayout {
     MvfstServer,
 }
 
+/// When a client that is not sending anything else keeps its connection alive with a PING, once
+/// the handshake is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepAlive {
+    /// A PING whenever the client has not sent an ack-eliciting packet for this long; non-zero and
+    /// at most 2^62 - 1 milliseconds, the range of the idle timeout.
+    Interval(Duration),
+    /// An interval from the negotiated idle timeout, as mvfst computes it: 85% of the smaller
+    /// non-zero max_idle_timeout of the two sides, in whole milliseconds. The client does not send
+    /// keepalives when neither side has an idle timeout.
+    NegotiatedIdle,
+}
+
 /// Transport settings of a connection: what it advertises in its transport parameters and how
 /// it sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,6 +395,8 @@ pub struct TransportConfig {
     disable_active_migration: bool,
     params_layout: ParamsLayout,
     extra_params: Vec<(VarInt, Bytes)>,
+    keep_alive: Option<KeepAlive>,
+    max_ptos: Option<u32>,
 }
 
 /// The largest transport parameter id RFC 9000 defines, retry_source_connection_id.
@@ -420,6 +435,8 @@ impl Default for TransportConfig {
             disable_active_migration: false,
             params_layout: ParamsLayout::default(),
             extra_params: Vec::new(),
+            keep_alive: None,
+            max_ptos: None,
         }
     }
 }
@@ -581,6 +598,16 @@ impl TransportConfig {
     /// Returns the transport parameters advertised as given, after those RFC 9000 defines.
     pub fn extra_params(&self) -> &[(VarInt, Bytes)] {
         &self.extra_params
+    }
+
+    /// Returns the keepalive, if any.
+    pub fn keep_alive(&self) -> Option<KeepAlive> {
+        self.keep_alive
+    }
+
+    /// Returns how many consecutive PTO expirations close the connection silently, if set.
+    pub fn max_ptos(&self) -> Option<u32> {
+        self.max_ptos
     }
 }
 
@@ -776,6 +803,20 @@ impl TransportConfigBuilder {
         self
     }
 
+    /// Sets the PINGs that keep the connection alive once the handshake is complete. Default none.
+    pub fn keep_alive(mut self, keep_alive: Option<KeepAlive>) -> Self {
+        self.config.keep_alive = keep_alive;
+        self
+    }
+
+    /// Sets how many consecutive PTO expirations close the connection silently, without a
+    /// CONNECTION_CLOSE, as mvfst's maxNumPTOs does; at least 1. Default none: only the idle
+    /// timeout ends an unanswered connection.
+    pub fn max_ptos(mut self, max_ptos: Option<u32>) -> Self {
+        self.config.max_ptos = max_ptos;
+        self
+    }
+
     /// Validates the settings.
     pub fn build(self) -> Result<Arc<TransportConfig>, ConfigError> {
         let c = &self.config;
@@ -857,6 +898,16 @@ impl TransportConfigBuilder {
             id.into_inner() > LAST_RFC9000_PARAM && c.extra_params[..i].iter().all(|(e, _)| e != id)
         });
         check(extra_ids_ok, "extra_params")?;
+        // The idle timeout's range, so that the keepalive deadline is as representable as the
+        // idle deadline.
+        let keep_alive_ok = match c.keep_alive {
+            Some(KeepAlive::Interval(interval)) => {
+                !interval.is_zero() && interval <= Duration::from_millis(VarInt::MAX.into_inner())
+            }
+            Some(KeepAlive::NegotiatedIdle) | None => true,
+        };
+        check(keep_alive_ok, "keep_alive")?;
+        check(c.max_ptos != Some(0), "max_ptos")?;
         Ok(Arc::new(self.config))
     }
 }
@@ -938,6 +989,7 @@ impl ServerConfig {
                 alpn: AlpnPolicy::Required,
                 mvfst_tls: None,
             },
+            accept_early_data: false,
         }
     }
 
@@ -985,6 +1037,7 @@ impl ServerConfig {
 #[derive(Clone, Debug)]
 pub struct ServerConfigBuilder {
     config: ServerConfig,
+    accept_early_data: bool,
 }
 
 impl ServerConfigBuilder {
@@ -1022,6 +1075,16 @@ impl ServerConfigBuilder {
         self
     }
 
+    /// Sets whether connections on the main rustls config accept 0-RTT: the server then issues
+    /// session tickets allowing early data and reads 0-RTT packets that follow the client's
+    /// Initial. Test grade, for exercising clients: it does not guard against replay beyond
+    /// rustls's single-use stateful tickets and does not limit early data. Default false, and
+    /// the rustls config itself must not enable early data either way.
+    pub fn accept_early_data(mut self, accept: bool) -> Self {
+        self.accept_early_data = accept;
+        self
+    }
+
     /// Validates the settings and the parts of each rustls config QUIC depends on: a TLS 1.3
     /// cipher suite usable for QUIC, ALPN protocols when required, early data disabled, and
     /// whatever else rustls needs to create a QUIC connection, such as TLS 1.3 being enabled. The
@@ -1042,7 +1105,17 @@ impl ServerConfigBuilder {
             }
             check_server_tls(tls, AlpnPolicy::AllowMissing)?;
         }
-        Ok(Arc::new(self.config))
+        let mut config = self.config;
+        if self.accept_early_data
+            && let ServerTls::Rustls(tls) = &config.tls
+        {
+            // rustls's QUIC server accepts only this early data size, the one RFC 9001 requires.
+            let mut tls = rustls::ServerConfig::clone(tls);
+            tls.max_early_data_size = u32::MAX;
+            tls.send_tls13_tickets = tls.send_tls13_tickets.max(1);
+            config.tls = ServerTls::Rustls(Arc::new(tls));
+        }
+        Ok(Arc::new(config))
     }
 }
 
@@ -1174,9 +1247,10 @@ impl ClientConfigBuilder {
     }
 
     /// Validates the settings and the parts of the rustls config QUIC depends on: a TLS 1.3
-    /// cipher suite usable for QUIC, ALPN protocols when required, early data disabled, and
-    /// whatever else rustls needs to create a QUIC connection, such as TLS 1.3 being enabled. The
-    /// host of a [`ClientTls::External`] client checks its own TLS settings.
+    /// cipher suite usable for QUIC, ALPN protocols when required, and whatever else rustls
+    /// needs to create a QUIC connection, such as TLS 1.3 being enabled. With
+    /// `enable_early_data` set, a connection resuming a session that allows early data sends
+    /// 0-RTT. The host of a [`ClientTls::External`] client checks its own TLS settings.
     pub fn build(self) -> Result<Arc<ClientConfig>, ConfigError> {
         let c = &self.config;
         check_versions(&c.versions)?;
@@ -1189,12 +1263,7 @@ impl ClientConfigBuilder {
 
 /// Checks a rustls client config as [`ClientConfigBuilder::build`] describes.
 fn check_client_tls(tls: &Arc<rustls::ClientConfig>, alpn: AlpnPolicy) -> Result<(), ConfigError> {
-    check_tls(
-        tls.crypto_provider(),
-        &tls.alpn_protocols,
-        alpn,
-        tls.enable_early_data,
-    )?;
+    check_tls(tls.crypto_provider(), &tls.alpn_protocols, alpn, false)?;
     // As for the server, creating a QUIC connection is the check. A client connection writes its
     // ClientHello at once, which draws on the provider's RNG and would take a ticket from the
     // caller's session store, so the probe runs on a copy without resumption.
@@ -1400,6 +1469,9 @@ mod tests {
             TransportConfig::builder().ack_policy(ack),
             TransportConfig::builder().min_window(2).max_window(2),
             TransportConfig::builder().max_window(u32::MAX),
+            TransportConfig::builder().keep_alive(Some(KeepAlive::Interval(
+                Duration::from_millis((1 << 62) - 1),
+            ))),
         ];
         for builder in limits {
             assert!(builder.clone().build().is_ok(), "{builder:?}");
@@ -1419,6 +1491,20 @@ mod tests {
                 "max_udp_payload_size",
             ),
             (TransportConfig::builder().max_data(1 << 62), "max_data"),
+            (
+                TransportConfig::builder().keep_alive(Some(KeepAlive::Interval(Duration::ZERO))),
+                "keep_alive",
+            ),
+            (
+                TransportConfig::builder()
+                    .keep_alive(Some(KeepAlive::Interval(Duration::from_millis(1 << 62)))),
+                "keep_alive",
+            ),
+            (
+                TransportConfig::builder().keep_alive(Some(KeepAlive::Interval(Duration::MAX))),
+                "keep_alive",
+            ),
+            (TransportConfig::builder().max_ptos(Some(0)), "max_ptos"),
             (
                 TransportConfig::builder().max_stream_data_bidi_local(1 << 62),
                 "max_stream_data_bidi_local",
@@ -1995,6 +2081,20 @@ mod tests {
         assert_eq!(config.unwrap_err(), ConfigError::EarlyDataUnsupported);
     }
 
+    #[test]
+    fn accept_early_data_lets_tickets_allow_early_data() {
+        let tls = Arc::new(server_tls(&[b"h3"]));
+        let plain = ServerConfig::builder(tls.clone()).build().unwrap();
+        assert_eq!(plain.tls().rustls().unwrap().max_early_data_size, 0);
+        let early = ServerConfig::builder(tls)
+            .accept_early_data(true)
+            .build()
+            .unwrap();
+        let early = early.tls().rustls().unwrap();
+        assert_eq!(early.max_early_data_size, u32::MAX);
+        assert!(early.send_tls13_tickets >= 1);
+    }
+
     /// Asserts that rustls refused the config because it does not enable TLS 1.3.
     fn assert_tls13_refused(error: ConfigError) {
         let ConfigError::Tls(tls_error @ rustls::Error::General(reason)) = &error else {
@@ -2068,8 +2168,7 @@ mod tests {
 
         let mut early = client_tls(&[b"h3"]);
         early.enable_early_data = true;
-        let config = ClientConfig::builder(Arc::new(early)).build();
-        assert_eq!(config.unwrap_err(), ConfigError::EarlyDataUnsupported);
+        assert!(ClientConfig::builder(Arc::new(early)).build().is_ok());
 
         let tls12 = rustls::ClientConfig::builder_with_provider(tls12_only_provider())
             .with_protocol_versions(&[&rustls::version::TLS12])

@@ -467,6 +467,14 @@ impl LossRecovery {
         self.spaces[space.index()].discard()
     }
 
+    /// Forgets the packets of `space` without declaring them lost or signalling congestion, and
+    /// returns the bytes that leave flight: a client's 0-RTT packets that the server rejected
+    /// (RFC 9001). Packet numbers go on.
+    pub fn forget_space(&mut self, space: Space) -> u64 {
+        self.probes_due[space.index()] = 0;
+        self.spaces[space.index()].discard()
+    }
+
     /// Declares lost, in every space, the outstanding packets carried by datagrams `tx`, which
     /// the backend reports did not leave. Not a congestion signal.
     pub fn on_tx_dropped(

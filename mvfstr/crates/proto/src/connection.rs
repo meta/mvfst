@@ -26,6 +26,8 @@ mod buffered;
 #[cfg(test)]
 mod cc_tests;
 #[cfg(test)]
+mod client_tests;
+#[cfg(test)]
 mod horizon_tests;
 mod key_update;
 #[cfg(test)]
@@ -61,6 +63,7 @@ pub(crate) use buffered::DatagramPool;
 use bytes::Bytes;
 use key_update::KeyPhases;
 use mvfstr_crypto::KeySet;
+use mvfstr_crypto::PacketKeys;
 use mvfstr_crypto::Sealer;
 use mvfstr_tls::Level;
 use mvfstr_tls::TlsError;
@@ -89,6 +92,7 @@ use crate::CongestionControl;
 use crate::ConnEvent;
 use crate::EndpointEvent;
 use crate::Initiator;
+use crate::KeepAlive;
 use crate::KeyUpdatePolicy;
 use crate::OpenError;
 use crate::Random;
@@ -251,6 +255,9 @@ struct Handshake {
     complete: bool,
     confirmed: bool,
     peer_params: Option<PeerParams>,
+    /// What a handshake on rustls negotiated, taken when it completes: a server's rustls state is
+    /// freed then.
+    tls_info: Option<TlsInfo>,
 }
 
 /// The peer's transport parameters, once checked and applied.
@@ -269,6 +276,26 @@ struct IdleTimer {
     /// Whether an ack-eliciting packet was sent since the last packet was received; only the
     /// first one restarts the timer.
     sent_since_receive: bool,
+}
+
+/// The Retry a client followed (RFC 9000).
+#[derive(Debug)]
+struct RetryState {
+    /// The token every later Initial carries.
+    token: Bytes,
+    /// The Retry's Source Connection ID.
+    scid: ConnectionId,
+}
+
+/// 0-RTT state (RFC 9001).
+#[derive(Debug)]
+struct EarlyState {
+    /// A client's 0-RTT write keys, until the handshake completes; a server's 0-RTT read keys,
+    /// until it opens a 1-RTT packet.
+    keys: Option<Arc<PacketKeys>>,
+    /// A client's view of the parameters the server remembered (RFC 9000), in force until the
+    /// server's own arrive.
+    params: Option<TransportParameters>,
 }
 
 /// What a connection is created with; the endpoint builds it.
@@ -382,6 +409,15 @@ pub struct Connection {
     /// The sequence number of the next datagram built.
     tx_seq: u64,
     stats: ConnStats,
+    /// The rustls error behind a local TLS failure.
+    local_tls_error: Option<Box<rustls::Error>>,
+    /// The Retry a client followed.
+    retry: Option<Box<RetryState>>,
+    /// 0-RTT keys and parameters while they are in use.
+    early: Option<Box<EarlyState>>,
+    /// When an ack-eliciting packet last went out or the keepalive last fired: the keepalive
+    /// interval runs from here.
+    keepalive_base: Instant,
     /// The latest time passed to a receive batch, transmit attempt or timer: the clock of the
     /// stream API's flow-control updates.
     now: Instant,
@@ -405,6 +441,7 @@ impl Connection {
                 initial_scid: setup.local_cid,
                 original_dcid: None,
                 reset_token: None,
+                retry_scid: None,
             },
         );
         Self::client_with_params(setup, tls, server_name, encode(&params))
@@ -433,6 +470,7 @@ impl Connection {
         if let Err(error) = conn.drain_tls() {
             conn.close_on_error(now, error);
         }
+        conn.start_early_data();
         Ok(conn)
     }
 
@@ -454,6 +492,7 @@ impl Connection {
                 // With zero-length IDs every connection would share one token.
                 reset_token: (!setup.local_cid.is_empty())
                     .then(|| setup.cids.reset_token(&setup.local_cid)),
+                retry_scid: None,
             },
         );
         let params = params::encode_server_params(&setup.transport, setup.version, params);
@@ -546,6 +585,10 @@ impl Connection {
             sent_frames: Default::default(),
             tx_seq: 0,
             stats: ConnStats::default(),
+            local_tls_error: None,
+            retry: None,
+            early: None,
+            keepalive_base: setup.now,
             now: setup.now,
             config,
             _not_sync: PhantomData,
@@ -705,6 +748,7 @@ impl Connection {
             loss,
             key_discard,
             self.path_deadline(),
+            self.keepalive_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -743,6 +787,10 @@ impl Connection {
         self.check_retire_bound(now);
         if self.state != State::Open {
             return;
+        }
+        if self.keepalive_deadline().is_some_and(|at| now >= at) {
+            self.sources.ping.queue();
+            self.keepalive_base = now;
         }
         let amplification_blocked = self.amplification_blocked();
         let Self {
@@ -785,6 +833,21 @@ impl Connection {
             }
             TimeoutOutcome::None => {}
         }
+        // As mvfst does with maxNumPTOs, close silently on a peer that does not answer, since it
+        // would not receive a CONNECTION_CLOSE.
+        if matches!(outcome, TimeoutOutcome::Probe(_))
+            && self
+                .config
+                .max_ptos()
+                .is_some_and(|max| self.recovery.pto_count() >= max)
+        {
+            self.push_event(ConnEvent::Closed {
+                reason: CloseReason::Silent,
+                initiator: Initiator::PtoLimit,
+            });
+            self.drained();
+            return;
+        }
         self.refresh_pacing_rate();
     }
 
@@ -821,8 +884,8 @@ impl Connection {
         }
     }
 
-    /// Sends a PING in a 1-RTT packet, once 1-RTT keys exist: an application keepalive or RTT
-    /// probe.
+    /// Sends a PING in a 1-RTT packet, or a 0-RTT one before the 1-RTT keys: an application
+    /// keepalive or RTT probe.
     pub fn ping(&mut self) {
         if self.state == State::Open {
             self.sources.ping.queue();
@@ -832,6 +895,32 @@ impl Connection {
     /// Takes the next connection event, if any.
     pub fn poll_event(&mut self) -> Option<ConnEvent> {
         self.events.pop_front()
+    }
+
+    /// Takes the next growth of a local send half's acknowledged prefix, oldest first: the stream
+    /// and the bytes from offset 0 the peer has acknowledged without a gap, the FIN not counted.
+    /// Growths of one stream not yet polled coalesce into one entry with the latest value. A
+    /// stream's last value is queued no later than its [`StreamReady::Closed`] edge and stays
+    /// queued after the stream is reaped. Only a client connection queues growths.
+    pub fn poll_stream_acked(&mut self) -> Option<(StreamId, u64)> {
+        self.sources.streams.poll_acked()
+    }
+
+    /// Returns the rustls error behind the TLS failure that closed this connection, if one did
+    /// here; if TLS raised an alert, the CONNECTION_CLOSE carried it as CRYPTO_ERROR (RFC 9001).
+    pub fn local_tls_error(&self) -> Option<&rustls::Error> {
+        self.local_tls_error.as_deref()
+    }
+
+    /// Returns what the TLS handshake negotiated once it is complete, if it ran on rustls.
+    pub fn tls_info(&self) -> Option<TlsInfo> {
+        self.handshake.tls_info
+    }
+
+    /// Returns the peer's limit on streams this endpoint opens in direction `dir`, as a count: 0
+    /// before its transport parameters arrive, or the remembered limit while sending 0-RTT.
+    pub fn peer_max_streams(&self, dir: Dir) -> u64 {
+        self.sources.streams.streams.local_limit(dir).0
     }
 
     /// Takes the next fact for the endpoint's routing table, if any.
@@ -968,6 +1057,8 @@ impl Connection {
             cwnd: self.cc.cwnd(),
             bytes_in_flight: self.recovery.bytes_in_flight(),
             smoothed_rtt: self.recovery.rtt().smoothed(),
+            latest_rtt: self.recovery.rtt().latest(),
+            rtt_var: self.recovery.rtt().var(),
             ..self.stats
         }
     }
@@ -1035,10 +1126,8 @@ impl Connection {
     /// least three PTOs (RFC 9000).
     fn idle_timeout(&self) -> Option<Duration> {
         let peer = self
-            .handshake
-            .peer_params
-            .as_ref()
-            .map(|p| p.decoded.max_idle_timeout.into_inner())
+            .peer_params_in_force()
+            .map(|p| p.max_idle_timeout.into_inner())
             .filter(|&millis| millis > 0)
             .map(Duration::from_millis);
         let timeout = match (self.config.idle_timeout(), peer) {
@@ -1050,6 +1139,104 @@ impl Connection {
 
     fn idle_deadline(&self) -> Option<Instant> {
         self.idle_timeout().map(|timeout| self.idle.base + timeout)
+    }
+
+    /// Returns the peer's transport parameters, or a 0-RTT client's view of the remembered ones
+    /// until those arrive.
+    fn peer_params_in_force(&self) -> Option<&TransportParameters> {
+        self.handshake
+            .peer_params
+            .as_ref()
+            .map(|p| &p.decoded)
+            .or_else(|| self.early.as_ref().and_then(|early| early.params.as_ref()))
+    }
+
+    /// Returns the keepalive interval, once the handshake is complete. The negotiated one is 85%
+    /// of the smaller non-zero max_idle_timeout of the two sides, in whole milliseconds as mvfst
+    /// computes it, without the three-PTO floor of the idle timeout.
+    fn keepalive_interval(&self) -> Option<Duration> {
+        if !self.handshake.complete {
+            return None;
+        }
+        match self.config.keep_alive()? {
+            KeepAlive::Interval(interval) => Some(interval),
+            KeepAlive::NegotiatedIdle => {
+                let local = self
+                    .config
+                    .idle_timeout()
+                    .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+                let peer = self
+                    .handshake
+                    .peer_params
+                    .as_ref()
+                    .map(|p| p.decoded.max_idle_timeout.into_inner())
+                    .filter(|&millis| millis > 0);
+                let idle = match (local, peer) {
+                    (Some(local), Some(peer)) => local.min(peer),
+                    (local, peer) => local.or(peer)?,
+                };
+                // idle * 15 / 100, split so that the products do not overflow.
+                let reduction = idle / 100 * 15 + idle % 100 * 15 / 100;
+                Some(Duration::from_millis(idle - reduction))
+            }
+        }
+    }
+
+    /// Returns when the keepalive sends a PING: an interval after the last ack-eliciting packet.
+    fn keepalive_deadline(&self) -> Option<Instant> {
+        if self.state != State::Open {
+            return None;
+        }
+        self.keepalive_interval()
+            .map(|interval| self.keepalive_base + interval)
+    }
+
+    /// For a client resuming a session that allows early data, installs the 0-RTT write keys and
+    /// the remembered parameters as 0-RTT uses them (RFC 9000 and RFC 9001).
+    fn start_early_data(&mut self) {
+        if self.state != State::Open {
+            return;
+        }
+        let Some(tls) = self.tls.rustls() else {
+            return;
+        };
+        let Some(keys) = tls.zero_rtt_keys() else {
+            return;
+        };
+        let Some(remembered) = tls
+            .quic_transport_parameters()
+            .and_then(|raw| TransportParameters::decode(raw, &[]).ok())
+        else {
+            return;
+        };
+        let view = params::zero_rtt_view(&remembered);
+        if self.config.datagram_size() == crate::DatagramSize::PeerMaximum
+            && self.apply_peer_payload_size(&view).is_err()
+        {
+            return;
+        }
+        if self.sources.streams.on_peer_params(&view).is_err() {
+            return;
+        }
+        self.early = Some(Box::new(EarlyState {
+            keys: Some(Arc::new(PacketKeys::from_rustls(keys))),
+            params: Some(view),
+        }));
+        self.push_event(ConnEvent::EarlyDataWritable);
+    }
+
+    /// Returns the keys that seal 0-RTT packets while a client sends them, before its 1-RTT keys.
+    fn zero_rtt_write_keys(&self) -> Option<&Arc<PacketKeys>> {
+        if self.side != Side::Client || self.has_keys(Space::Data) {
+            return None;
+        }
+        self.early.as_ref()?.keys.as_ref()
+    }
+
+    /// Returns whether this endpoint can seal a packet in `space`: with its keys, or with 0-RTT
+    /// keys in the application data space.
+    fn can_seal(&self, space: Space) -> bool {
+        self.has_keys(space) || (space == Space::Data && self.zero_rtt_write_keys().is_some())
     }
 
     /// Queues a connection event unless an equal one is queued, so the queue stays bounded.
@@ -1425,6 +1612,30 @@ impl fmt::Debug for PullReady<'_> {
     }
 }
 
+/// What the TLS handshake of a connection negotiated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsInfo {
+    /// The key exchange group; `None` on a resumption without a key exchange.
+    pub group: Option<rustls::NamedGroup>,
+    /// Whether the handshake resumed a session.
+    pub resumed: bool,
+    /// The cipher suite.
+    pub suite: Option<rustls::CipherSuite>,
+}
+
+impl TlsInfo {
+    /// Returns what a rustls connection negotiated.
+    fn of(tls: &rustls::quic::Connection) -> TlsInfo {
+        TlsInfo {
+            group: tls
+                .negotiated_key_exchange_group()
+                .map(|group| group.name()),
+            resumed: tls.handshake_kind() == Some(rustls::HandshakeKind::Resumed),
+            suite: tls.negotiated_cipher_suite().map(|suite| suite.suite()),
+        }
+    }
+}
+
 /// Connection counters and current values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnStats {
@@ -1444,6 +1655,10 @@ pub struct ConnStats {
     pub bytes_in_flight: u64,
     /// The smoothed RTT.
     pub smoothed_rtt: Duration,
+    /// The latest RTT sample.
+    pub latest_rtt: Duration,
+    /// The RTT variation (RFC 9002).
+    pub rtt_var: Duration,
     /// Candidates that did not fit an empty packet and were skipped; expected to stay zero.
     pub tx_inconsistent: u64,
 }

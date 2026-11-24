@@ -17,6 +17,7 @@
 //! state; every per-stream change goes through the stream guard, whose drop recomputes the
 //! stream's list and scheduler membership from what [`StreamData`] reports.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
@@ -353,6 +354,29 @@ pub(crate) struct StreamState {
     ranked: Vec<Ranked>,
     /// The final sizes of the latest reaped streams that had a receive half, oldest first.
     reaped_sizes: VecDeque<(StreamId, u64)>,
+    /// Growths of the acknowledged prefixes of send halves not yet polled; only a client has them.
+    acked: Option<AckedProgress>,
+}
+
+/// Growths of acknowledged prefixes in the order they happened, one entry per stream with the
+/// latest value.
+#[derive(Debug, Default)]
+struct AckedProgress {
+    order: VecDeque<StreamId>,
+    latest: HashMap<StreamId, u64>,
+}
+
+impl AckedProgress {
+    fn record(&mut self, id: StreamId, acked: u64) {
+        if self.latest.insert(id, acked).is_none() {
+            self.order.push_back(id);
+        }
+    }
+
+    fn pop(&mut self) -> Option<(StreamId, u64)> {
+        let id = self.order.pop_front()?;
+        self.latest.remove(&id).map(|acked| (id, acked))
+    }
 }
 
 impl std::fmt::Debug for StreamState {
@@ -402,7 +426,14 @@ impl StreamState {
             empty: BufQueue::new(0),
             ranked: Vec::new(),
             reaped_sizes: VecDeque::new(),
+            acked: (side == Side::Client).then(AckedProgress::default),
         }
+    }
+
+    /// Takes the next growth of a send half's acknowledged prefix (see
+    /// [`Connection::poll_stream_acked`](crate::Connection::poll_stream_acked)).
+    pub(crate) fn poll_acked(&mut self) -> Option<(StreamId, u64)> {
+        self.acked.as_mut()?.pop()
     }
 
     /// Returns what a later transmit attempt reads of the streams, for the empty-attempt digest:
@@ -465,6 +496,55 @@ impl StreamState {
             bidi_remote: peer.initial_max_stream_data_bidi_remote.into_inner(),
             uni: peer.initial_max_stream_data_uni.into_inner(),
         };
+        let mut available = [false; 2];
+        for (dir, max) in [
+            (Dir::Bi, peer.initial_max_streams_bidi),
+            (Dir::Uni, peer.initial_max_streams_uni),
+        ] {
+            available[dir_index(dir)] = self
+                .raise_stream_limit(dir, max.into_inner())
+                .map_err(|_| TransportErrorCode::TRANSPORT_PARAMETER_ERROR)?;
+        }
+        Ok(available)
+    }
+
+    /// Takes the transport parameters of a server that accepted 0-RTT sent under the
+    /// remembered ones, which they may only raise: the connection credit, the windows of
+    /// streams already open and to come, and the stream limits rise without forgetting what
+    /// 0-RTT used. Returns, by direction, whether `StreamsAvailable` is due.
+    pub(crate) fn raise_peer_params(
+        &mut self,
+        peer: &TransportParameters,
+    ) -> Result<[bool; 2], TransportErrorCode> {
+        self.on_max_data(peer.initial_max_data.into_inner());
+        self.config.peer = Windows {
+            bidi_local: peer.initial_max_stream_data_bidi_local.into_inner(),
+            bidi_remote: peer.initial_max_stream_data_bidi_remote.into_inner(),
+            uni: peer.initial_max_stream_data_uni.into_inner(),
+        };
+        // 0-RTT opened local streams below the remembered limits only.
+        let side = self.config.side;
+        let opened = [Dir::Bi, Dir::Uni].into_iter().flat_map(|dir| {
+            let (_, next) = self.streams.local_limit(dir);
+            (0..next).filter_map(move |index| StreamId::new(side, dir, index))
+        });
+        for id in opened.collect::<Vec<_>>() {
+            let window = match id.dir() {
+                Dir::Bi => self.config.peer.bidi_remote,
+                Dir::Uni => self.config.peer.uni,
+            };
+            let Some(mut stream) = self.streams.stream(id) else {
+                continue;
+            };
+            let rose = stream
+                .data_mut()
+                .send
+                .as_mut()
+                .is_some_and(|send| send.credit.on_max(window));
+            if rose {
+                stream.on_control_sent(Owed::STREAM_DATA_BLOCKED);
+            }
+        }
         let mut available = [false; 2];
         for (dir, max) in [
             (Dir::Bi, peer.initial_max_streams_bidi),
@@ -1282,9 +1362,17 @@ impl StreamState {
         let Some(send) = stream.data_mut().send.as_mut() else {
             return;
         };
+        let before = send.buf.acked_end();
         send.buf.on_ack(offset, usize::from(len), fin);
+        let after = send.buf.acked_end();
+        let all_acked = send.buf.is_acked();
         let progress = send.buf.take_progress();
-        if send.buf.is_acked() {
+        if after > before
+            && let Some(acked) = &mut self.acked
+        {
+            acked.record(id, after);
+        }
+        if all_acked {
             let _ = stream.on_all_acked();
         }
         if progress {
