@@ -95,6 +95,7 @@ class Cuback : public CongestionController {
   void endL4sEpoch();
   void onLoss(const LossEvent& loss);
   void onAck(const AckEvent& ack);
+  void finishL4sSlowStartExit();
   void restartL4sWeight(const AckEvent& ack);
   void onCongestionEvent(std::string_view trigger);
   void onPersistentCongestion();
@@ -149,6 +150,8 @@ class Cuback : public CongestionController {
   // restarts the tracker's weight, so that the marks of slow start's overshoot
   // do not count toward it.
   bool l4sRestartPending_{false};
+  // The window at the L4S mark that ended slow start, until the recovery ends.
+  Optional<uint64_t> l4sExitCwndBytes_;
   Optional<UndoState> undo_;
 
   PacketNum hystartRoundEndPacketNum_{0};

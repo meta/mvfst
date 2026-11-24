@@ -37,6 +37,9 @@ constexpr uint64_t kCssRounds = 5;
 constexpr uint64_t kPacingGain = 2;
 // Prague paces at cwnd over srtt outside slow start.
 constexpr double kL4sPacingGain = 1;
+// The window at the end of the L4S slow-start exit, as a fraction of the
+// window at the mark.
+constexpr double kBetaL4sExit = 0.85;
 
 constexpr auto kEcnTrigger = "ecn";
 constexpr auto kL4sTrigger = "l4s";
@@ -259,8 +262,12 @@ void Cuback::onL4sCe(const AckEvent& ack) {
        l4sRestartPending_ || conn_.ecnL4sTracker->isRestarting())) {
     return;
   }
-  // Prague starts alpha at 1, so the mark that ends slow start halves cwnd.
+  // The mark that ends slow start halves cwnd until the end of the recovery,
+  // so that slow start's queue drains before the tracker's weight restarts.
   const double alpha = slowStart ? 1 : conn_.ecnL4sTracker->getL4sWeight();
+  if (slowStart) {
+    l4sExitCwndBytes_ = cwndBytes_;
+  }
   undo_.reset();
   setCwnd(
       static_cast<uint64_t>(static_cast<double>(cwndBytes_) * (1 - alpha / 2)));
@@ -287,6 +294,7 @@ void Cuback::endL4sEpoch() {
   // Without L4S feedback, cwnd grows on the Cuback curve again, as if slow
   // start had just ended.
   l4sEpoch_ = false;
+  l4sExitCwndBytes_.reset();
   epoch_.cwndPrior = static_cast<double>(cwndBytes_);
   enterCongestionAvoidance(kL4sEndTrigger);
   QLOG(
@@ -319,6 +327,7 @@ void Cuback::onAck(const AckEvent& ack) {
       return;
     }
     setState(State::CongestionAvoidance, kRecoveryEndTrigger);
+    finishL4sSlowStartExit();
   }
   const uint64_t ackedBytes = ackedBytesAfterRecovery(ack);
   const bool grow = isCwndLimited(ack);
@@ -339,6 +348,17 @@ void Cuback::onAck(const AckEvent& ack) {
   restartL4sWeight(ack);
 }
 
+void Cuback::finishL4sSlowStartExit() {
+  if (!l4sExitCwndBytes_) {
+    return;
+  }
+  setCwnd(
+      static_cast<uint64_t>(
+          static_cast<double>(*l4sExitCwndBytes_) * kBetaL4sExit));
+  ssthreshBytes_ = cwndBytes_;
+  l4sExitCwndBytes_.reset();
+}
+
 void Cuback::restartL4sWeight(const AckEvent& ack) {
   // The transport adds the tracker when it validates L4S. Until then, the
   // restart stays pending.
@@ -351,6 +371,7 @@ void Cuback::restartL4sWeight(const AckEvent& ack) {
 }
 
 void Cuback::onCongestionEvent(std::string_view trigger) {
+  l4sExitCwndBytes_.reset();
   const auto cwnd = static_cast<double>(cwndBytes_);
   // Fast convergence: a flow that peaks below its last W_max lowers W_max. In
   // an L4S epoch, the marks hold cwnd in place, and W_max is stale.
@@ -372,6 +393,7 @@ void Cuback::onCongestionEvent(std::string_view trigger) {
 }
 
 void Cuback::onPersistentCongestion() {
+  l4sExitCwndBytes_.reset();
   setCwnd(conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen);
   pendingBytes_ = 0;
   l4sEpoch_ = false;

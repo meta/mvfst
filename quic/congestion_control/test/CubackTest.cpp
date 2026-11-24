@@ -953,6 +953,35 @@ TEST_F(CubackTest, L4sCeEndsSlowStartWithHalfTheWindowAndARecovery) {
   EXPECT_EQ(cuback.getCongestionWindow(), cwnd / 2);
 }
 
+TEST_F(CubackTest, L4sRecoveryEndRaisesCwndTo85PercentOfTheExitWindow) {
+  enableL4s();
+  Cuback cuback(*conn_);
+  ackL4s(cuback, fillCwnd(cuback), 0);
+  const auto flight = fillCwnd(cuback);
+  const auto cwnd = cuback.getCongestionWindow();
+  ackL4s(cuback, {flight[0]}, 1);
+  ASSERT_EQ(cuback.getCongestionWindow(), cwnd / 2);
+  endRecovery(cuback);
+  EXPECT_EQ(
+      cuback.getCongestionWindow(),
+      static_cast<uint64_t>(static_cast<double>(cwnd) * 0.85));
+  EXPECT_EQ(ssthresh(cuback), cuback.getCongestionWindow());
+}
+
+TEST_F(CubackTest, LossAfterTheL4sSlowStartExitKeepsTheLossResponse) {
+  enableL4s();
+  Cuback cuback(*conn_);
+  ackL4s(cuback, fillCwnd(cuback), 0);
+  const auto flight = fillCwnd(cuback);
+  ackL4s(cuback, {flight[0]}, 1);
+  // A packet sent after the first mark is lost, which is a congestion event.
+  lose(cuback, {send(cuback)});
+  ASSERT_EQ(cuback.getState(), State::Recovery);
+  const auto reduced = cuback.getCongestionWindow();
+  endRecovery(cuback);
+  EXPECT_EQ(cuback.getCongestionWindow(), reduced);
+}
+
 TEST_F(CubackTest, L4sWeightIsMeasuredAgainAfterSlowStart) {
   Cuback cuback(*conn_);
   enterL4sEpoch(cuback);
