@@ -16,12 +16,14 @@
 //! host on rustls for tests.
 //! The config helpers [`server_config`] and [`client_config`] build TLS 1.3-only rustls configs
 //! whose suites carry mvfstr's packet protection, and [`ManualTimeProvider`] keeps rustls off the
-//! system clock.
+//! system clock. [`app_token`] holds session-ticket app tokens in mvfst's format and mvfst's
+//! 0-RTT checks on them.
 //!
 //! The crate does not do I/O or read a clock.
 
 #![forbid(unsafe_code)]
 
+pub mod app_token;
 mod config;
 mod external;
 mod session;
