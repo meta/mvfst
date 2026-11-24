@@ -422,8 +422,12 @@ pub struct SentPackets {
     holes: VecDeque<u64>,
     /// The packet number where loss detection starts; the holes below it are not outstanding.
     loss_scan_from: u64,
-    /// The send snapshot of each record, in step with `pkts`.
+    /// The send snapshot, if any, of each packet number from `snapshots_from` through the last
+    /// record given one. [`SentPackets::set_last_snapshot`] drops the snapshots of pruned records,
+    /// so pruning leaves this ring alone and a connection without snapshots never touches it.
     snapshots: VecDeque<Option<SendSnapshot>>,
+    /// The packet number of `snapshots[0]`; every tracked record is at or above it.
+    snapshots_from: u64,
     /// Records visited by ACK processing and loss detection, for tests of their cost.
     #[cfg(test)]
     examined: u64,
@@ -454,6 +458,7 @@ impl SentPackets {
             holes: VecDeque::new(),
             loss_scan_from: 0,
             snapshots: VecDeque::new(),
+            snapshots_from: 0,
             #[cfg(test)]
             examined: 0,
         }
@@ -478,7 +483,14 @@ impl SentPackets {
     /// Records `snapshot` as the send snapshot of the packet just recorded by
     /// [`SentPackets::on_sent`]. A packet recorded without this call does not get one.
     pub fn set_last_snapshot(&mut self, snapshot: SendSnapshot) {
-        // `snapshots[i]` belongs to `pkts[i]`; records past its end do not have one.
+        let Some(front) = self.pkts.front().map(|p| p.pn) else {
+            return;
+        };
+        // Drop the snapshots of the records pruned since the last call, so that `snapshots[i]`
+        // belongs to `pkts[i]` again; records past its end do not have one.
+        let pruned = (front - self.snapshots_from).min(self.snapshots.len() as u64);
+        self.snapshots.drain(..pruned as usize);
+        self.snapshots_from = front;
         self.snapshots.resize(self.pkts.len(), None);
         if let Some(last) = self.snapshots.back_mut() {
             *last = Some(snapshot);
@@ -828,7 +840,6 @@ impl SentPackets {
                 forgotten_lost += 1;
             }
             self.pkts.pop_front();
-            self.snapshots.pop_front();
             let next_frames = self.pkts.front().map_or(self.frames_end, |p| p.frames);
             let n = next_frames.wrapping_sub(self.frames_front) as usize;
             self.frames.drain(..n);
@@ -911,7 +922,11 @@ impl SentPackets {
             flags: pkt.flags,
             tx_seq: pkt.tx_seq,
             on_path: self.on_path(pkt),
-            snapshot: self.snapshots.get(i).and_then(Option::as_ref),
+            // Every tracked record is at or above `snapshots_from`.
+            snapshot: self
+                .snapshots
+                .get(pkt.pn.wrapping_sub(self.snapshots_from) as usize)
+                .and_then(Option::as_ref),
             frames: frames_of(
                 &self.pkts,
                 &self.frames,

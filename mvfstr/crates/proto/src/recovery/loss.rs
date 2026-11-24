@@ -26,6 +26,7 @@ use super::sent::SendSnapshot;
 use super::sent::SentError;
 use super::sent::SentFlags;
 use super::sent::SentFrame;
+use super::sent::SentPacket;
 use super::sent::SentPackets;
 use crate::config::ConfigError;
 use crate::transmit::TxSeqRange;
@@ -143,6 +144,31 @@ pub struct RateSample {
     pub lost: u64,
     /// The bytes sent on the connection through the newest packet.
     pub total_sent: u64,
+}
+
+/// The newest (latest send, then largest number) and the largest-numbered of the on-path packets
+/// with send snapshots that an ACK frame newly acknowledges.
+#[derive(Default)]
+struct AckedSnapshots {
+    newest: Option<(Instant, u64, SendSnapshot)>,
+    largest: Option<(u64, Instant)>,
+}
+
+impl AckedSnapshots {
+    /// Takes in a newly acknowledged packet `p` with its `snapshot`. Kept out of line so the
+    /// per-packet event path stays small enough to inline for connections without snapshots.
+    #[inline(never)]
+    fn note(&mut self, p: &SentPacket<'_>, snapshot: &SendSnapshot) {
+        if self
+            .newest
+            .is_none_or(|(sent, pn, _)| (p.time_sent, p.pn) > (sent, pn))
+        {
+            self.newest = Some((p.time_sent, p.pn, *snapshot));
+        }
+        if self.largest.is_none_or(|(pn, _)| p.pn > pn) {
+            self.largest = Some((p.pn, p.time_sent));
+        }
+    }
 }
 
 /// The event the loss detection timer is set for.
@@ -507,7 +533,8 @@ impl LossRecovery {
     /// packets do not feed any of it, since RFC 9000 keeps one path's packets out of another's
     /// congestion control. Every on-path packet counts toward C.total_sent, as toward mvfst's
     /// totalBytesSent; only in-flight ones take part in the samples, as only they are in mvfst's
-    /// outstanding packets.
+    /// outstanding packets. Out of line, off the send path of connections without rate samples.
+    #[inline(never)]
     fn snapshot_send(&mut self, space: Space, now: Instant, size: u16, flags: SentFlags) {
         if flags.contains(SentFlags::OFF_PATH) {
             return;
@@ -561,25 +588,17 @@ impl LossRecovery {
     {
         self.lost_samples.clear();
         let largest_before = self.spaces[space.index()].largest_acked();
-        // Of the newly acknowledged on-path in-flight packets, the only ones with snapshots: the
-        // newest (latest send, then largest number) with its snapshot, and the largest with its
-        // send time.
-        let mut newest: Option<(Instant, u64, SendSnapshot)> = None;
-        let mut largest: Option<(u64, Instant)> = None;
+        let mut acked = AckedSnapshots::default();
         let ack = self.spaces[space.index()].on_ack(ranges, now, |event| {
             if let PacketEvent::Acked(p) = &event
                 && let Some(snapshot) = p.snapshot
                 && p.on_path
             {
-                if newest.is_none_or(|(sent, pn, _)| (p.time_sent, p.pn) > (sent, pn)) {
-                    newest = Some((p.time_sent, p.pn, *snapshot));
-                }
-                if largest.is_none_or(|(pn, _)| p.pn > pn) {
-                    largest = Some((p.pn, p.time_sent));
-                }
+                acked.note(p, snapshot);
             }
             on_event(event);
         })?;
+        let AckedSnapshots { newest, largest } = acked;
         let mut outcome = AckOutcome {
             ack,
             ..AckOutcome::default()

@@ -38,6 +38,7 @@ use super::map::Half;
 use super::recv_buf::PagePool;
 use super::recv_buf::RecvBuffer;
 use super::recv_buf::RecvError;
+use super::send_buf::Pending;
 use super::send_buf::PushError;
 use super::send_buf::SendBuffer;
 use super::share::Bucket;
@@ -197,6 +198,15 @@ impl StreamData for StreamParts {
 
     fn has_lost(&self) -> bool {
         self.send.as_ref().is_some_and(|send| send.buf.has_lost())
+    }
+
+    fn wire_data(&self) -> (bool, bool) {
+        // `pending` returns `Retransmit` while lost data waits, so one call gives both.
+        let pending = self
+            .send
+            .as_ref()
+            .and_then(|send| send.buf.pending(send.credit.limit()));
+        (pending.is_some(), pending == Some(Pending::Retransmit))
     }
 }
 

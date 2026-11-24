@@ -81,6 +81,13 @@ pub(crate) trait StreamData {
 
     /// Returns whether lost bytes or a lost FIN wait for retransmission.
     fn has_lost(&self) -> bool;
+
+    /// Returns [`StreamData::has_wire_data`] and whether [`StreamData::has_lost`] also holds, both
+    /// of which an implementation may read from its send buffer in one call.
+    fn wire_data(&self) -> (bool, bool) {
+        let wire = self.has_wire_data();
+        (wire, wire && self.has_lost())
+    }
 }
 
 /// A readiness edge the connection marks after updating the data parts.
@@ -179,10 +186,9 @@ struct Stream<D> {
 struct Entry<D> {
     stream: Stream<D>,
     links: [Link; LISTS],
-    /// One bit per [`List`] the stream is on.
+    /// One bit per [`List`] the stream is on, and [`LOST_DATA`] while it is counted in
+    /// [`Streams::lost`].
     member: u8,
-    /// Whether the stream is counted in [`Streams::lost`].
-    lost: bool,
     /// Whether the shares record the stream as the only peer of its order's bucket; cleared when
     /// the order changes, until the next reindex checks again.
     alone: bool,
@@ -215,12 +221,16 @@ const EMPTY_LIST: ListHead = ListHead {
 /// The membership a stream's state calls for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Membership {
+    /// One bit per [`List`], and [`LOST_DATA`] if the stream counts in [`Streams::lost`].
     lists: u8,
     scheduled: Option<SendOrder>,
     reap: bool,
-    /// Whether the stream counts among the streams with lost data.
-    lost: bool,
 }
+
+/// The membership bit of a stream whose send buffer holds lost bytes or a lost FIN. It sits
+/// beside the [`List`] bits, so a reindex counts the stream without another load.
+const LOST_DATA: u8 = 1 << 7;
+const _: () = assert!(LISTS < 7);
 
 impl List {
     pub(crate) const ALL: [List; LISTS] = [
@@ -277,15 +287,20 @@ impl<D: StreamData> Stream<D> {
         if !self.due().is_empty() {
             lists |= List::Control.bit();
         }
-        let scheduled = send.is_some_and(|s| s.may_send_stream()) && self.data.has_wire_data();
-        let reap = self.halves.is_closed() && self.closed_delivered && self.edges.0 == 0;
+        // Lost data counts as a sendable stream's wire data, so only a scheduled stream can have
+        // lost data waiting.
+        let (scheduled, lost) = if send.is_some_and(|s| s.may_send_stream()) {
+            self.data.wire_data()
+        } else {
+            (false, false)
+        };
+        if lost {
+            lists |= LOST_DATA;
+        }
         Membership {
             lists,
             scheduled: scheduled.then_some(self.order),
-            reap,
-            // Lost data makes a sendable stream's wire data, so only a scheduled stream can
-            // have lost data waiting.
-            lost: scheduled && self.data.has_lost(),
+            reap: self.halves.is_closed() && self.closed_delivered && self.edges.0 == 0,
         }
     }
 }
@@ -568,21 +583,24 @@ impl<D: StreamData> Streams<D> {
         };
         let want = entry.stream.membership();
         let (have, alone) = (entry.member, entry.alone);
-        for list in List::ALL {
-            match (want.lists & list.bit() != 0, have & list.bit() != 0) {
-                (true, false) => self.link(list, slot),
-                (false, true) => self.unlink(list, slot),
-                _ => {}
+        let changed = want.lists ^ have;
+        if changed != 0 {
+            for list in List::ALL {
+                if changed & list.bit() != 0 {
+                    if want.lists & list.bit() != 0 {
+                        self.link(list, slot);
+                    } else {
+                        self.unlink(list, slot);
+                    }
+                }
             }
-        }
-        let entry = self.entry_mut(slot);
-        entry.member = want.lists;
-        if entry.lost != want.lost {
-            entry.lost = want.lost;
-            if want.lost {
-                self.lost += 1;
-            } else {
-                self.lost -= 1;
+            self.entry_mut(slot).member = want.lists;
+            if changed & LOST_DATA != 0 {
+                if want.lists & LOST_DATA != 0 {
+                    self.lost += 1;
+                } else {
+                    self.lost -= 1;
+                }
             }
         }
         let moved = match want.scheduled {
@@ -740,7 +758,6 @@ impl<D> Entry<D> {
             },
             links: [UNLINKED; LISTS],
             member: 0,
-            lost: false,
             alone: false,
         }
     }
@@ -1070,7 +1087,6 @@ impl<D: StreamData> Streams<D> {
                 "scheduling of stream {id}"
             );
             assert!(!want.reap, "stream {id} should have been reaped");
-            assert_eq!(entry.lost, want.lost, "stream {id} counted with lost data");
             assert_eq!(
                 entry.alone,
                 self.shares.alone(key.slot()),
@@ -1124,7 +1140,12 @@ impl<D: StreamData> Streams<D> {
                 .filter(|(_, _, e)| e.stream.membership().scheduled.is_some())
                 .count()
         );
-        let lost = self.table.map().iter().filter(|(_, _, e)| e.lost).count();
+        let lost = self
+            .table
+            .map()
+            .iter()
+            .filter(|(_, _, e)| e.member & LOST_DATA != 0)
+            .count();
         assert_eq!(self.lost as usize, lost, "streams with lost data");
     }
 }

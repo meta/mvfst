@@ -263,6 +263,8 @@ pub fn takes_rate_samples(kind: CongestionControl) -> bool {
 }
 
 /// A congestion controller.
+// An explicit tag byte, which the per-packet calls dispatch on more cheaply than on a niche.
+#[repr(u8)]
 #[derive(Clone, Debug)]
 pub enum Cc {
     /// NewReno (RFC 9002).
@@ -315,11 +317,17 @@ impl Cc {
     }
 
     /// Records the send of a packet counted in flight.
+    #[inline]
     pub fn on_sent(&mut self, sent: &SentEvent) {
         match self {
             Self::NewReno(_) => {}
             Self::Cubic(c) => c.on_sent(sent.time_sent, sent.bytes_in_flight),
-            Self::Bbr3(c) => c.on_sent(sent),
+            Self::Bbr3(c) => {
+                // A copy for the out-of-line call, so the caller's event can stay in registers
+                // once this is inlined.
+                let sent = *sent;
+                c.on_sent(&sent)
+            }
             #[cfg(test)]
             Self::Recording(c) => c.on_sent(sent),
         }

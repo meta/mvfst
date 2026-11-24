@@ -75,6 +75,7 @@ impl Cubic {
         }
     }
 
+    #[inline]
     pub(crate) fn on_sent(&mut self, now: Instant, bytes_in_flight: u64) {
         // Restarting after idle: the idle time is application-limited too (RFC 9438),
         // unless an application-limited ACK already paused the curve. Idle starts at the later
