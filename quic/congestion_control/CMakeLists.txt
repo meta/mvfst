@@ -302,7 +302,6 @@ mvfst_add_library(mvfst_congestion_control_ecn_l4s_tracker
   SRCS
     EcnL4sTracker.cpp
   DEPS
-    mvfst_exception
     mvfst_logging_qlogger_macros
     mvfst_observer_socket_observer_macros
   EXPORTED_DEPS

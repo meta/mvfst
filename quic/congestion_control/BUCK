@@ -486,7 +486,6 @@ mvfst_cpp_library(
         "EcnL4sTracker.h",
     ],
     deps = [
-        "fbsource//xplat/quic:exception",
         "fbsource//xplat/quic/logging:qlogger_macros",
         "fbsource//xplat/quic/observer:socket_observer_macros",
     ],

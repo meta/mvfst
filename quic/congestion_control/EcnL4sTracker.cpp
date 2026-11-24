@@ -7,7 +7,6 @@
 
 #include <quic/congestion_control/EcnL4sTracker.h>
 
-#include <quic/QuicException.h>
 #include <quic/logging/QLoggerMacros.h>
 #include <quic/observer/SocketObserverMacros.h>
 
@@ -32,18 +31,18 @@ void EcnL4sTracker::onPacketAck(const AckEvent* ackEvent) {
     rttVirt_ = std::max(conn_.lossState.srtt, kRttVirtMin);
   }
 
+  // The transport keeps running maxima of the counts echoed for AppData. A
+  // reordered ACK, or an ACK for another packet number space, carries lower
+  // counts.
+  const uint64_t ect1Echoed =
+      conn_.ackStates.appDataAckState.ecnECT1CountEchoed;
+  const uint64_t ceEchoed = conn_.ackStates.appDataAckState.ecnCECountEchoed;
   if (ackEvent->ackTime - lastUpdateTime_ >= rttVirt_ ||
-      (ackEvent->ecnCECount > 0 && lastCEEchoed_ == 0)) {
+      (ceEchoed > 0 && lastCEEchoed_ == 0)) {
     // It's time to update the l4s weight.
-    if (ackEvent->ecnECT1Count < lastECT1Echoed_ ||
-        ackEvent->ecnCECount < lastCEEchoed_) {
-      throw QuicTransportException(
-          "Number of ACKed packets with ECT1 or CE marking moved backwards.",
-          TransportErrorCode::PROTOCOL_VIOLATION);
-    }
-
-    double newECT1Echoed = ackEvent->ecnECT1Count - lastECT1Echoed_;
-    double newCEEchoed = ackEvent->ecnCECount - lastCEEchoed_;
+    const auto newECT1Echoed =
+        static_cast<double>(ect1Echoed - lastECT1Echoed_);
+    const auto newCEEchoed = static_cast<double>(ceEchoed - lastCEEchoed_);
 
     if (newCEEchoed + newECT1Echoed == 0) {
       // No new marks in the last rttVirt. Skip this ACK.
@@ -51,7 +50,7 @@ void EcnL4sTracker::onPacketAck(const AckEvent* ackEvent) {
     }
 
     // Update the l4s weight if we have seen any CE marks on this connection.
-    if (ackEvent->ecnCECount > 0) {
+    if (ceEchoed > 0) {
       if (lastCEEchoed_ == 0) {
         // First CE mark is seen. Initialize the weight to 1.0
         l4sWeight_ = 1.0;
@@ -80,8 +79,8 @@ void EcnL4sTracker::onPacketAck(const AckEvent* ackEvent) {
     }
 
     lastUpdateTime_ = ackEvent->ackTime;
-    lastECT1Echoed_ = ackEvent->ecnECT1Count;
-    lastCEEchoed_ = ackEvent->ecnCECount;
+    lastECT1Echoed_ = ect1Echoed;
+    lastCEEchoed_ = ceEchoed;
   }
 }
 

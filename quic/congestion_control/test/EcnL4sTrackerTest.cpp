@@ -7,6 +7,8 @@
 
 #include <quic/congestion_control/EcnL4sTracker.h>
 
+#include <algorithm>
+
 #include <folly/portability/GTest.h>
 #include <quic/api/test/MockQuicSocket.h>
 #include <quic/api/test/Mocks.h>
@@ -29,21 +31,33 @@ class EcnL4sTrackerTest : public Test {
     l4sTracker_ = std::make_unique<EcnL4sTracker>(*conn_);
   }
 
+  // Records the echoed counts the way the transport does before it builds the
+  // AckEvent.
+  AckEvent buildAckEvent(
+      TimePoint ackTime,
+      uint64_t ect0,
+      uint64_t ect1,
+      uint64_t ce,
+      PacketNumberSpace space = PacketNumberSpace::AppData) {
+    auto& ackState = space == PacketNumberSpace::AppData
+        ? conn_->ackStates.appDataAckState
+        : *conn_->ackStates.handshakeAckState;
+    ackState.ecnECT0CountEchoed = std::max(ackState.ecnECT0CountEchoed, ect0);
+    ackState.ecnECT1CountEchoed = std::max(ackState.ecnECT1CountEchoed, ect1);
+    ackState.ecnCECountEchoed = std::max(ackState.ecnCECountEchoed, ce);
+    return AckEvent::Builder()
+        .setAckTime(ackTime)
+        .setAdjustedAckTime(ackTime)
+        .setAckDelay(0us)
+        .setPacketNumberSpace(space)
+        .setLargestAckedPacket(1000)
+        .setEcnCounts(ect0 /*ECT0*/, ect1 /*ECT1*/, ce /*CE*/)
+        .build();
+  }
+
   std::unique_ptr<QuicConnectionStateBase> conn_;
   std::unique_ptr<EcnL4sTracker> l4sTracker_;
 };
-
-AckEvent
-buildAckEvent(TimePoint ackTime, uint64_t ect0, uint64_t ect1, uint64_t ce) {
-  return AckEvent::Builder()
-      .setAckTime(ackTime)
-      .setAdjustedAckTime(ackTime)
-      .setAckDelay(0us)
-      .setPacketNumberSpace(PacketNumberSpace::AppData)
-      .setLargestAckedPacket(1000)
-      .setEcnCounts(ect0 /*ECT0*/, ect1 /*ECT1*/, ce /*CE*/)
-      .build();
-}
 
 TEST_F(EcnL4sTrackerTest, StartsWithZeroWeight) {
   EXPECT_EQ(l4sTracker_->getL4sWeight(), 0.0);
@@ -155,7 +169,7 @@ TEST_F(EcnL4sTrackerTest, WeightScaledForShortRTT) {
   }
 }
 
-TEST_F(EcnL4sTrackerTest, ThrowOnCountersMovingBackwardsECT1) {
+TEST_F(EcnL4sTrackerTest, ReorderedAckIsIgnored) {
   conn_->ecnState = ECNState::ValidatedL4S;
 
   conn_->lossState.srtt = 30ms;
@@ -166,22 +180,34 @@ TEST_F(EcnL4sTrackerTest, ThrowOnCountersMovingBackwardsECT1) {
     ack.rttSample = 30ms;
 
     l4sTracker_->onPacketAck(&ack);
-    EXPECT_EQ(
-        l4sTracker_->getL4sWeight(),
-        1.0 + kL4sWeightEwmaGain * (0.1 - 1.0)); // 0.1 is 1 CE/(9 ECT1 + 1 CE)
+  }
+  const auto weight = l4sTracker_->getL4sWeight();
+
+  {
+    // An ACK that the peer sent before the previous one arrives with lower
+    // counts.
+    nextAckTime += 30ms;
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 8 /*ECT1*/, 0 /*CE*/);
+    ack.rttSample = 30ms;
+
+    EXPECT_NO_THROW(l4sTracker_->onPacketAck(&ack));
+    EXPECT_EQ(l4sTracker_->getL4sWeight(), weight);
   }
 
   {
-    // A bad packet with lower ECT1 triggers and exception
+    // The next update covers the marks since the previous one.
     nextAckTime += 30ms;
-    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 8 /*ECT1*/, 1 /*CE*/);
+    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 12 /*ECT1*/, 2 /*CE*/);
     ack.rttSample = 30ms;
 
-    EXPECT_THROW(l4sTracker_->onPacketAck(&ack);, quic::QuicTransportException);
+    l4sTracker_->onPacketAck(&ack);
+    EXPECT_EQ(
+        l4sTracker_->getL4sWeight(),
+        weight + kL4sWeightEwmaGain * (0.25 - weight)); // 1 CE/(3 ECT1 + 1 CE)
   }
 }
 
-TEST_F(EcnL4sTrackerTest, ThrowOnCountersMovingBackwardsCE) {
+TEST_F(EcnL4sTrackerTest, AckForAnotherSpaceIsIgnored) {
   conn_->ecnState = ECNState::ValidatedL4S;
 
   conn_->lossState.srtt = 30ms;
@@ -192,19 +218,21 @@ TEST_F(EcnL4sTrackerTest, ThrowOnCountersMovingBackwardsCE) {
     ack.rttSample = 30ms;
 
     l4sTracker_->onPacketAck(&ack);
-    EXPECT_EQ(
-        l4sTracker_->getL4sWeight(),
-        1.0 + kL4sWeightEwmaGain * (0.1 - 1.0)); // 0.1 is 1 CE/(9 ECT1 + 1 CE)
   }
+  const auto weight = l4sTracker_->getL4sWeight();
 
-  {
-    // A bad packet with lower CE triggers an exception
-    nextAckTime += 30ms;
-    auto ack = buildAckEvent(nextAckTime, 0 /*ECT0*/, 10 /*ECT1*/, 0 /*CE*/);
-    ack.rttSample = 30ms;
+  // Each packet number space has its own counts.
+  nextAckTime += 30ms;
+  auto ack = buildAckEvent(
+      nextAckTime,
+      0 /*ECT0*/,
+      2 /*ECT1*/,
+      0 /*CE*/,
+      PacketNumberSpace::Handshake);
+  ack.rttSample = 30ms;
 
-    EXPECT_THROW(l4sTracker_->onPacketAck(&ack);, quic::QuicTransportException);
-  }
+  EXPECT_NO_THROW(l4sTracker_->onPacketAck(&ack));
+  EXPECT_EQ(l4sTracker_->getL4sWeight(), weight);
 }
 
 TEST_F(EcnL4sTrackerTest, NoUpdateWithNoNewMarks) {
