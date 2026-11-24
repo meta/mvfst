@@ -1199,3 +1199,46 @@ fn bbr3_fills_a_fixed_rate_link_within_a_few_round_trips_and_keeps_its_queue_sma
         "an average queue of {average} bytes"
     );
 }
+
+/// Returns the stream's goodput from 3 s to 6 s after it starts, with `cc` pacing over a 10 Mbit/s
+/// link of 100 ms round trip, a BDP of 125,000 bytes, with a 1-BDP buffer and 0.5% of the client's
+/// datagrams lost at random.
+fn goodput_with_random_loss(cc: CongestionControl) -> u128 {
+    let mut config = setup(config(|c| c.congestion_control(cc).pacing(true))).pair();
+    config.to_server.rate = Some(1_250_000);
+    config.to_server.buffer = Some(125_000);
+    config.to_server.delay = Duration::from_millis(50);
+    config.to_client.delay = Duration::from_millis(50);
+    config.to_server.loss = Loss::Seeded {
+        seed: 7,
+        per_mille: 5,
+    };
+    let (_, mut pair) = handshake(config);
+    let start = pair.now;
+    let mut bulk = Bulk::start(&mut pair, 16 << 20);
+    bulk.run(&mut pair, start + Duration::from_secs(3));
+    let early = bulk.received();
+    bulk.run(&mut pair, start + Duration::from_secs(6));
+    assert!(pair.to_server.lost() > 0, "{cc:?}: no loss");
+    (bulk.received() - early) as u128 / 3
+}
+
+#[test]
+fn bbr3_keeps_most_of_a_randomly_lossy_link_and_far_more_than_cubic() {
+    // A probe responds to loss only above 2% of a round's bytes in two loss events, and the
+    // short-term bounds drop no lower than a loss round's delivery, so 0.5% keeps BBR3 near the
+    // link rate. 85% leaves room for DOWN's round at 0.9 times bw and retransmissions.
+    const RATE: u128 = 1_250_000;
+    let bbr3 = goodput_with_random_loss(CongestionControl::Bbr3);
+    assert!(bbr3 * 100 >= RATE * 85, "BBR3: {bbr3} bytes per second");
+    // CUBIC's Reno-friendly window averages sqrt(3 / (2p)) datagrams (RFC 9438), 17 per round trip
+    // here, about 210,000 bytes per second, a sixth of BBR3's. The buffer bounds the queue CUBIC's
+    // slow start builds, so by 3 s CUBIC is cut by the random loss whichever datagrams it picks:
+    // with seeds 1 to 12, BBR3 kept at least 93% of the link and 3.3 to 6.9 times CUBIC's goodput.
+    // Two and a half times leaves margin for that.
+    let cubic = goodput_with_random_loss(CongestionControl::Cubic);
+    assert!(
+        bbr3 * 2 >= 5 * cubic,
+        "BBR3: {bbr3}, CUBIC: {cubic} bytes per second"
+    );
+}

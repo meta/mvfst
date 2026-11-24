@@ -6,6 +6,7 @@
  */
 
 use std::collections::VecDeque;
+use std::mem;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -18,6 +19,10 @@ use crate::config::CongestionControl;
 use crate::recovery::Space;
 use crate::recovery::loss::RateSample;
 use crate::recovery::sent::LostSample;
+
+mod loss;
+mod probe_rtt;
+mod undo;
 
 const MSS: u64 = 1200;
 const MS: Duration = Duration::from_millis(1);
@@ -50,6 +55,9 @@ struct Sim {
     app_limited: bool,
     /// RS.lost for the next rate sample, in place of the computed one.
     sample_lost: Option<u64>,
+    /// Whether to leave the next ACK frame without an RTT sample, as when its largest acknowledged
+    /// packet was acknowledged before.
+    no_rtt_sample: bool,
 }
 
 impl Sim {
@@ -70,6 +78,7 @@ impl Sim {
             bw: 1_000_000,
             app_limited: false,
             sample_lost: None,
+            no_rtt_sample: false,
         }
     }
 
@@ -168,10 +177,11 @@ impl Sim {
                 total_sent: p.total_sent,
             }
         });
+        let no_rtt_sample = mem::take(&mut self.no_rtt_sample);
         let ack = (acked > 0 || spurious > 0).then(|| AckPart {
             acked_bytes: MSS * acked as u64,
             largest_acked_sent: newest.map(|p| p.sent),
-            rtt_sample: newest.map(|p| self.now - p.sent),
+            rtt_sample: newest.filter(|_| !no_rtt_sample).map(|p| self.now - p.sent),
             rate,
         });
         self.cc.on_ack_or_loss(&AckOrLoss {
@@ -845,10 +855,16 @@ fn a_send_into_an_empty_pipe_restarts_the_ack_aggregation_interval_and_count() {
 
 #[test]
 fn up_keeps_probing_while_inflight_longterm_limits_a_sender_that_fills_the_cwnd() {
-    let mut sim = Sim::new();
+    // inflight_longterm at the maximum window cannot grow, so it stays the limit.
+    let config = CcConfig {
+        max_window_packets: 100,
+        ..CcConfig::default()
+    };
+    let mut sim = Sim::start(config, CcStart::default());
     sim.to_probe_bw_up();
     sim.now += 20 * MS;
     sim.ack(1);
+    assert_eq!(sim.cc.cwnd(), 100 * MSS);
     sim.bbr_mut().inflight_longterm = Some(sim.cc.cwnd());
     // Each round the sender fills the cwnd, which is at inflight_longterm, restarts the
     // plateau check from max_bw, not from the samples' lower rate, so rounds without growth of
@@ -942,14 +958,17 @@ fn a_ce_mark_changes_nothing() {
 }
 
 #[test]
-fn an_event_with_neither_a_newly_acknowledged_packet_nor_a_loss_changes_nothing() {
+fn an_event_with_neither_a_newly_acknowledged_packet_nor_a_loss_only_resolves_the_episode() {
     let mut sim = Sim::new();
     sim.to_probe_bw();
-    sim.lose(1);
+    sim.lose(2);
     let before = format!("{:?}", sim.cc);
-    // A frame that acknowledges only the lost packet, late enough that an ACK would end DOWN's
-    // probe wait.
+    // A frame that acknowledges only one of the two lost packets, late enough that an ACK would end
+    // DOWN's probe wait. Only the episode's count of pending losses changes.
     sim.now += 3000 * MS;
     sim.event(0, 0, 1, false);
-    assert_eq!(format!("{:?}", sim.cc), before);
+    assert_eq!(
+        format!("{:?}", sim.cc),
+        before.replace("pending: 2", "pending: 1")
+    );
 }

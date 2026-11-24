@@ -10,12 +10,13 @@
 //! Where mvfst's BBR3 behaves differently from -07, mvfstr matches mvfst, not the draft, so that
 //! the two controllers behave alike in a benchmark. The comments note each such difference.
 //!
-//! The controller takes one event per ACK frame or loss timeout, in mvfst's order: the loss
-//! response first, then the draft's per-ACK steps, with an empty sample when the frame did not
-//! produce one. cwnd lives in the shared `Window`, so admission and the maximum window work as
-//! for NewReno and CUBIC, except that BBR.MinPipeCwnd, four datagrams, wins over a smaller
-//! maximum. It is meant to run with pacing on: the initial window goes out unpaced, and later
-//! sends are paced at C.pacing_rate.
+//! The controller takes one event per ACK frame or loss timeout, in mvfst's order: the undo of a
+//! spurious loss episode first, then the loss response, then the draft's per-ACK steps with an
+//! empty sample if the frame did not produce one, or only the control outputs for a loss timeout.
+//! cwnd lives in the shared `Window`, so admission and the maximum window work as for NewReno and
+//! CUBIC, except that BBR.MinPipeCwnd, four datagrams, wins over a smaller maximum. It is meant to
+//! run with pacing on: the initial window goes out unpaced, and later sends are paced at
+//! C.pacing_rate.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -40,6 +41,11 @@ const PROBE_BW_CRUISE_PACING_GAIN: u64 = 100;
 const PROBE_BW_REFILL_PACING_GAIN: u64 = 100;
 const PROBE_BW_UP_PACING_GAIN: u64 = 125;
 const PROBE_BW_UP_CWND_GAIN: u64 = 225;
+const PROBE_RTT_PACING_GAIN: u64 = 100;
+const PROBE_RTT_CWND_GAIN: u64 = 50;
+/// MinRTTFilterLen.
+const MIN_RTT_FILTER_LEN: Duration = Duration::from_secs(10);
+const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
 /// BBR.inflight_longterm's headroom in percent.
 const HEADROOM: u64 = 15;
 /// The probe wait is 2 s plus a uniform whole number of milliseconds below PROBE_WAIT_JITTER_MS.
@@ -51,6 +57,9 @@ const EXTRA_ACKED_ROUNDS: u64 = 10;
 /// BBR.LossThresh in percent, and the loss events a round needs before its loss counts as too high.
 const LOSS_THRESH: u64 = 2;
 const STARTUP_FULL_LOSS_COUNT: u64 = 6;
+const PROBE_BW_FULL_LOSS_COUNT: u64 = 2;
+/// BBR.Beta in percent.
+const BETA: u64 = 70;
 /// The most full rounds Drain lasts.
 const MAX_DRAIN_ROUNDS: u64 = 3;
 /// BBR.full_bw growth that counts as growth, in percent, and the rounds without it that
@@ -120,6 +129,18 @@ fn too_high(lost: u64, tx_in_flight: u64, events: u64, min_events: u64) -> bool 
         && u128::from(lost) * 100 > u128::from(tx_in_flight) * u128::from(LOSS_THRESH)
 }
 
+/// Returns the inflight at which the loss rate crossed LossThresh, the draft's InflightAtLoss(),
+/// where `lost` includes `lost_packet`. The prefix is 0 if earlier losses already crossed it.
+fn inflight_at_loss(lost_packet: &LostSample, lost: u64) -> u64 {
+    let size = u64::from(lost_packet.size);
+    let inflight_prev = lost_packet.tx_in_flight.saturating_sub(size);
+    let lost_prev = u128::from(lost.saturating_sub(size));
+    let prefix = (u128::from(inflight_prev) * u128::from(LOSS_THRESH))
+        .saturating_sub(lost_prev * 100)
+        / u128::from(100 - LOSS_THRESH);
+    inflight_prev.saturating_add(u64::try_from(prefix).unwrap_or(u64::MAX))
+}
+
 /// Loss events as mvfst counts them, each a run of consecutive lost packet numbers in one space.
 #[derive(Clone, Copy, Debug, Default)]
 struct LossEvents {
@@ -135,6 +156,27 @@ impl LossEvents {
         }
         *largest = Some(largest.map_or(lost.pn, |largest| largest.max(lost.pn)));
     }
+}
+
+/// A loss episode, as in mvfst: losses that may yet be acknowledged as spurious, and the state that
+/// undoing them restores.
+#[derive(Clone, Copy, Debug)]
+struct LossEpisode {
+    prior_cwnd: u64,
+    bw_shortterm: Option<u64>,
+    inflight_shortterm: Option<u64>,
+    inflight_longterm: Option<u64>,
+    /// Declared losses not yet acknowledged as spurious.
+    pending: u32,
+    /// The newest send time when it opened; losses of packets sent by then join it.
+    start: Option<Instant>,
+    /// The state its losses ended, Startup or UP, if they ended one.
+    undo_target: Option<State>,
+}
+
+/// Returns the larger of two bounds, where `None` is infinite.
+fn max_bound(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    Some(a?.max(b?))
 }
 
 /// BBR.extra_acked's filter: the largest excess per round over the last few rounds.
@@ -218,10 +260,24 @@ pub struct Bbr3 {
     bw_shortterm: Option<u64>,
     inflight_shortterm: Option<u64>,
     inflight_longterm: Option<u64>,
+    /// C.total_sent as of the newest packet that inflight_longterm did not cap, one sent in Startup
+    /// or Drain or before a probe's loss set it. As in mvfst, samples of packets sent by then do
+    /// not raise inflight_longterm.
+    uncapped_sent: Option<u64>,
     /// C.is_cwnd_limited within the current round.
     cwnd_limited_in_round: bool,
     /// BBR.min_rtt; empty until the first RTT sample, as in mvfst.
     min_rtt: Option<Duration>,
+    min_rtt_stamp: Option<Instant>,
+    min_rtt_expired: bool,
+    /// BBR.probe_rtt_cwnd, saved when min_rtt expires.
+    probe_rtt_cwnd: Option<u64>,
+    probe_rtt_done_stamp: Option<Instant>,
+    probe_rtt_round_done: bool,
+    /// BBR.idle_restart.
+    idle_restart: bool,
+    /// C.delivered as of the latest ACK frame or loss timeout.
+    delivered: u64,
     /// C.pacing_rate in bytes per second.
     pacing_rate: u64,
     /// Whether the initial pacing rate was set again from the first min_rtt.
@@ -254,6 +310,7 @@ pub struct Bbr3 {
     recovery_start: Option<Instant>,
     /// The newest send time.
     last_send: Option<Instant>,
+    loss_episode: Option<LossEpisode>,
 }
 
 impl Bbr3 {
@@ -287,8 +344,16 @@ impl Bbr3 {
             bw_shortterm: None,
             inflight_shortterm: None,
             inflight_longterm: None,
+            uncapped_sent: None,
             cwnd_limited_in_round: false,
             min_rtt: None,
+            min_rtt_stamp: None,
+            min_rtt_expired: false,
+            probe_rtt_cwnd: None,
+            probe_rtt_done_stamp: None,
+            probe_rtt_round_done: false,
+            idle_restart: false,
+            delivered: 0,
             pacing_rate: 0,
             has_seen_rtt: false,
             send_quantum: 0,
@@ -310,6 +375,7 @@ impl Bbr3 {
             in_recovery: false,
             recovery_start: None,
             last_send: None,
+            loss_episode: None,
         };
         bbr.pacing_ready = start.total_sent >= bbr.window.initial;
         bbr.send_quantum = 2 * bbr.window.mss;
@@ -330,6 +396,9 @@ impl Bbr3 {
             return;
         }
         self.last_send = Some(sent.time_sent);
+        if matches!(self.state, State::Startup | State::Drain) {
+            self.uncapped_sent = Some(sent.total_sent);
+        }
         // As in mvfst, any send into an empty pipe restarts from idle, app-limited or not.
         if sent.bytes_in_flight == 0 {
             self.handle_restart_from_idle(sent.time_sent);
@@ -344,16 +413,21 @@ impl Bbr3 {
     /// Restarts from idle as the draft's HandleRestartFromIdle() does, and also zeroes the bytes
     /// counted in the ACK aggregation interval before the idle period.
     fn handle_restart_from_idle(&mut self, now: Instant) {
+        self.idle_restart = true;
         self.extra_acked_interval_start = Some(now);
         self.extra_acked_delivered = 0;
         if self.is_in_probe_bw() {
             let rate = self.pacing_rate;
             self.set_pacing_rate_with_gain(100);
             self.pacer_refresh |= self.pacing_rate != rate;
+        } else if self.state == State::ProbeRtt {
+            self.check_probe_rtt_done(now, self.delivered);
         }
     }
 
     pub(super) fn on_ack_or_loss(&mut self, event: &AckOrLoss<'_>) -> bool {
+        self.delivered = event.delivered;
+        self.resolve_loss_episode(event);
         let newly_acked = event
             .ack
             .is_some_and(|ack| ack.largest_acked_sent.is_some());
@@ -365,37 +439,165 @@ impl Bbr3 {
         }
         match &event.ack {
             Some(ack) => self.on_ack(event, ack),
-            None => self.update_control_parameters(event, 0),
+            None => {
+                self.update_control_parameters(event, 0);
+                false
+            }
         }
-        false
     }
 
     /// Responds to losses: enters recovery, which emulates TCP's as in mvfst, or moves its
     /// start, then handles each lost packet in send order.
     fn on_loss(&mut self, event: &AckOrLoss<'_>) {
+        self.update_loss_episode(event);
         if !self.in_recovery {
             self.save_cwnd();
             self.in_recovery = true;
         }
         self.recovery_start = self.last_send.or(event.largest_lost_sent);
         for lost in event.lost {
-            self.handle_lost_packet(lost, event.delivered);
+            self.handle_lost_packet(lost, event);
         }
         if event.persistent_congestion {
             self.on_persistent_congestion();
         }
     }
 
-    /// Records a lost packet, the draft's HandleLostPacket() with NoteLoss().
-    fn handle_lost_packet(&mut self, lost: &LostSample, delivered: u64) {
+    /// Adds the event's losses to the open loss episode if every lost packet was sent by its start,
+    /// or else ends it and may open a new one. Persistent congestion ends it.
+    fn update_loss_episode(&mut self, event: &AckOrLoss<'_>) {
+        if event.persistent_congestion {
+            self.loss_episode = None;
+            return;
+        }
+        if let Some(episode) = &mut self.loss_episode
+            && event
+                .largest_lost_sent
+                .zip(episode.start)
+                .is_some_and(|(sent, start)| sent <= start)
+        {
+            episode.pending += event.newly_lost;
+            return;
+        }
+        self.loss_episode = None;
+        // An episode is undone as a whole, so a new one does not open while older losses or their
+        // recovery are pending.
+        if event.declared_lost != event.newly_lost || self.in_recovery || self.loss_in_round {
+            return;
+        }
+        self.save_cwnd();
+        self.loss_episode = Some(LossEpisode {
+            prior_cwnd: self.prior_cwnd,
+            bw_shortterm: self.bw_shortterm,
+            inflight_shortterm: self.inflight_shortterm,
+            inflight_longterm: self.inflight_longterm,
+            pending: event.newly_lost,
+            start: self.last_send,
+            undo_target: None,
+        });
+    }
+
+    /// Undoes the loss episode once its losses are all acknowledged as spurious. The declared-lost
+    /// count already has this frame's spurious losses out and this event's new losses in; any other
+    /// change to it ends the episode.
+    fn resolve_loss_episode(&mut self, event: &AckOrLoss<'_>) {
+        let Some(episode) = &mut self.loss_episode else {
+            return;
+        };
+        let (pending, declared) = (episode.pending, event.declared_lost);
+        if event.spurious > pending
+            || event.newly_lost > declared
+            || pending - event.spurious != declared - event.newly_lost
+        {
+            self.loss_episode = None;
+            return;
+        }
+        episode.pending -= event.spurious;
+        if episode.pending == 0 {
+            let episode = *episode;
+            self.loss_episode = None;
+            self.handle_spurious_loss_detection(&episode);
+        }
+    }
+
+    /// Undoes a spurious loss episode, the draft's HandleSpuriousLossDetection().
+    fn handle_spurious_loss_detection(&mut self, episode: &LossEpisode) {
+        self.window.cwnd = self.window.cwnd.max(episode.prior_cwnd);
+        self.in_recovery = false;
+        self.loss_in_round = false;
+        self.losses_in_loss_round = LossEvents::default();
+        self.bytes_lost_in_round = 0;
+        self.losses_in_round = LossEvents::default();
+        self.reset_full_bw();
+        self.bw_shortterm = max_bound(self.bw_shortterm, episode.bw_shortterm);
+        self.inflight_shortterm = max_bound(self.inflight_shortterm, episode.inflight_shortterm);
+        let longterm = max_bound(self.inflight_longterm, episode.inflight_longterm);
+        if longterm != self.inflight_longterm {
+            self.uncapped_sent = None;
+        }
+        self.inflight_longterm = longterm;
+        if episode.undo_target == Some(State::Startup) && self.state != State::Startup {
+            self.full_bw_reached = false;
+            // Startup does not respond to each lost packet, nor does a ProbeRTT that ends in it.
+            self.check_probe_loss = false;
+            if self.state != State::ProbeRtt {
+                self.enter_startup();
+            }
+        } else if episode.undo_target == Some(State::ProbeBwUp)
+            && !matches!(self.state, State::ProbeBwUp | State::ProbeRtt)
+        {
+            self.start_probe_bw_refill(self.delivered);
+        }
+        self.bound_bw_for_model();
+        self.set_pacing_rate();
+        self.set_send_quantum();
+        self.bound_cwnd();
+    }
+
+    /// Records a lost packet, the draft's HandleLostPacket() with NoteLoss(). As in mvfst, a
+    /// probe's loss is too high when the round's lost bytes exceed LossThresh of P.tx_in_flight in
+    /// at least two loss events.
+    fn handle_lost_packet(&mut self, lost: &LostSample, event: &AckOrLoss<'_>) {
         if !self.loss_in_round {
-            self.loss_round_delivered = delivered;
+            self.loss_round_delivered = event.delivered;
             self.save_cwnd();
         }
         self.loss_in_round = true;
         self.losses_in_loss_round.add(lost);
         self.losses_in_round.add(lost);
         self.bytes_lost_in_round += u64::from(lost.size);
+        if self.check_probe_loss
+            && too_high(
+                self.bytes_lost_in_round,
+                lost.tx_in_flight,
+                self.losses_in_round.count,
+                PROBE_BW_FULL_LOSS_COUNT,
+            )
+        {
+            let inflight = inflight_at_loss(lost, self.bytes_lost_in_round);
+            self.handle_inflight_too_high(inflight, lost.is_app_limited, event);
+        }
+    }
+
+    /// Responds to too much loss in a bandwidth probe, the draft's HandleInflightTooHigh().
+    fn handle_inflight_too_high(
+        &mut self,
+        tx_in_flight: u64,
+        app_limited: bool,
+        event: &AckOrLoss<'_>,
+    ) {
+        // Only one response per bandwidth probe.
+        self.check_probe_loss = false;
+        if !app_limited {
+            self.inflight_longterm = Some(tx_in_flight.max(gain(self.target_inflight(), BETA)));
+            self.uncapped_sent = Some(event.total_sent);
+        }
+        if self.state == State::ProbeBwUp {
+            if let Some(episode) = &mut self.loss_episode {
+                episode.undo_target = Some(State::ProbeBwUp);
+            }
+            self.start_probe_bw_down(event.now, event.delivered);
+        }
     }
 
     /// Responds to persistent congestion as mvfst does, in place of the draft's OnEnterRTO().
@@ -410,8 +612,8 @@ impl Bbr3 {
 
     /// Runs the draft's UpdateOnACK(), ending recovery after the model update: the ACK that ends
     /// recovery usually also starts the loss round that Startup's loss exit checks.
-    fn on_ack(&mut self, event: &AckOrLoss<'_>, ack: &AckPart) {
-        self.update_model_and_state(event, ack);
+    fn on_ack(&mut self, event: &AckOrLoss<'_>, ack: &AckPart) -> bool {
+        let app_limited = self.update_model_and_state(event, ack);
         if self.in_recovery
             && ack
                 .largest_acked_sent
@@ -424,6 +626,7 @@ impl Bbr3 {
         if self.round_start {
             self.cwnd_limited_in_round = false;
         }
+        app_limited
     }
 
     /// Saves cwnd in prior_cwnd, the draft's SaveCwnd().
@@ -440,12 +643,15 @@ impl Bbr3 {
         self.window.cwnd = self.window.cwnd.max(self.prior_cwnd);
     }
 
-    /// Updates the model and the state from an ACK, the draft's UpdateModelAndState().
-    fn update_model_and_state(&mut self, event: &AckOrLoss<'_>, ack: &AckPart) {
+    /// Updates the model and the state from an ACK, the draft's UpdateModelAndState(). Returns
+    /// whether to mark the connection app-limited, as the draft's HandleProbeRTT() does.
+    fn update_model_and_state(&mut self, event: &AckOrLoss<'_>, ack: &AckPart) -> bool {
         let rs = ack.rate.as_ref();
         self.update_latest_delivery_signals(rs, event.delivered);
+        // The draft's UpdateCongestionSignals().
         self.update_max_bw(rs, event.delivered);
         if self.loss_round_start {
+            self.adapt_lower_bounds_from_congestion();
             self.loss_in_round = false;
         }
         self.update_ack_aggregation(ack.acked_bytes, event.now);
@@ -453,10 +659,12 @@ impl Bbr3 {
         self.check_startup_high_loss(rs);
         self.check_startup_done();
         self.check_drain_done(event);
-        self.update_probe_bw_cycle_phase(rs, event);
-        self.update_min_rtt(ack.rtt_sample);
+        self.update_probe_bw_cycle_phase(rs, ack.acked_bytes, event);
+        self.update_min_rtt(ack.rtt_sample, event.now);
+        let app_limited = self.check_probe_rtt(rs, event);
         self.advance_latest_delivery_signals(rs);
         self.bound_bw_for_model();
+        app_limited
     }
 
     /// Updates the latest delivery signals, the draft's UpdateLatestDeliverySignals().
@@ -497,6 +705,9 @@ impl Bbr3 {
             )
         {
             return;
+        }
+        if let Some(episode) = &mut self.loss_episode {
+            episode.undo_target = Some(State::Startup);
         }
         self.full_bw_reached = true;
         self.inflight_longterm = Some(self.bdp_multiple(self.bw, 100).max(self.inflight_latest));
@@ -593,6 +804,12 @@ impl Bbr3 {
         }
     }
 
+    /// Enters Startup, the draft's EnterStartup().
+    fn enter_startup(&mut self) {
+        self.state = State::Startup;
+        self.set_gains(STARTUP_PACING_GAIN, DEFAULT_CWND_GAIN);
+    }
+
     /// Enters Drain, the draft's EnterDrain().
     fn enter_drain(&mut self) {
         self.state = State::Drain;
@@ -613,11 +830,16 @@ impl Bbr3 {
     }
 
     /// Advances the ProbeBW cycle, the draft's UpdateProbeBWCyclePhase().
-    fn update_probe_bw_cycle_phase(&mut self, rs: Option<&RateSample>, event: &AckOrLoss<'_>) {
+    fn update_probe_bw_cycle_phase(
+        &mut self,
+        rs: Option<&RateSample>,
+        newly_acked: u64,
+        event: &AckOrLoss<'_>,
+    ) {
         if !self.full_bw_reached {
             return;
         }
-        self.adapt_long_term_model(rs);
+        self.adapt_long_term_model(rs, newly_acked);
         let (now, delivered) = (event.now, event.delivered);
         match self.state {
             State::ProbeBwDown => {
@@ -645,7 +867,7 @@ impl Bbr3 {
 
     /// Adapts the long-term model, the draft's AdaptLongTermModel(). As in mvfst, precautionary
     /// acceleration never fires.
-    fn adapt_long_term_model(&mut self, rs: Option<&RateSample>) {
+    fn adapt_long_term_model(&mut self, rs: Option<&RateSample>, newly_acked: u64) {
         if self.is_bw_probe_stopping && self.round_start {
             // The probe's samples have ended.
             self.check_probe_loss = false;
@@ -654,10 +876,51 @@ impl Bbr3 {
                 self.cycle_count += 1;
             }
         }
+        let (Some(rs), Some(longterm)) = (rs, self.inflight_longterm) else {
+            return;
+        };
+        // Drain, which inflight_longterm does not cap, and packets it did not cap do not raise it.
+        if self.state == State::Drain
+            || self.uncapped_sent.is_some_and(|sent| rs.total_sent <= sent)
+            || too_high(
+                rs.lost,
+                rs.tx_in_flight,
+                self.losses_in_round.count,
+                PROBE_BW_FULL_LOSS_COUNT,
+            )
+        {
+            return;
+        }
+        self.inflight_longterm = Some(longterm.max(rs.tx_in_flight));
+        if self.state == State::ProbeBwUp {
+            self.probe_inflight_longterm_upward(newly_acked);
+        }
+    }
+
+    /// Raises inflight_longterm in UP, the draft's ProbeInflightLongtermUpward().
+    fn probe_inflight_longterm_upward(&mut self, newly_acked: u64) {
+        let Some(longterm) = self.inflight_longterm else {
+            return;
+        };
+        if !self.cwnd_limited_in_round || self.window.cwnd < longterm {
+            return;
+        }
+        self.bw_probe_up_acked += newly_acked;
+        if self.bw_probe_up_acked >= self.probe_up_acked_per_inc {
+            let delta = self.bw_probe_up_acked / self.probe_up_acked_per_inc;
+            self.bw_probe_up_acked -= delta * self.probe_up_acked_per_inc;
+            // At most to the maximum window.
+            self.inflight_longterm =
+                Some((longterm + delta * self.window.mss).min(self.window.max));
+        }
+        if self.round_start {
+            self.raise_inflight_longterm_slope();
+        }
     }
 
     /// Enters DOWN, the draft's StartProbeBW_DOWN(), which also stands in for EnterProbeBW().
     fn start_probe_bw_down(&mut self, now: Instant, delivered: u64) {
+        self.reset_congestion_signals();
         self.probe_up_acked_per_inc = u64::MAX;
         self.pick_probe_wait();
         self.cycle_stamp = Some(now);
@@ -759,6 +1022,27 @@ impl Bbr3 {
         longterm.saturating_sub(headroom).max(self.min_pipe_cwnd())
     }
 
+    /// Clears the congestion signals, the draft's ResetCongestionSignals(), and restarts the loss
+    /// round's event count.
+    fn reset_congestion_signals(&mut self) {
+        self.loss_in_round = false;
+        self.losses_in_loss_round = LossEvents::default();
+        self.bw_latest = 0;
+        self.inflight_latest = 0;
+    }
+
+    /// Sets the short-term bounds after a loss round with loss outside a probe, the draft's
+    /// AdaptLowerBoundsFromCongestion() with InitLowerBounds() and LossLowerBounds().
+    fn adapt_lower_bounds_from_congestion(&mut self) {
+        if self.is_probing_bw() || !self.loss_in_round {
+            return;
+        }
+        let bw = self.bw_shortterm.unwrap_or(self.max_bw.best());
+        let inflight = self.inflight_shortterm.unwrap_or(self.window.cwnd);
+        self.bw_shortterm = Some(self.bw_latest.max(gain(bw, BETA)));
+        self.inflight_shortterm = Some(self.inflight_latest.max(gain(inflight, BETA)));
+    }
+
     /// Clears the short-term model, the draft's ResetShortTermModel().
     fn reset_short_term_model(&mut self) {
         self.bw_shortterm = None;
@@ -787,16 +1071,93 @@ impl Bbr3 {
 
     /// Sets bw, the draft's BoundBWForModel().
     fn bound_bw_for_model(&mut self) {
-        self.bw = self.max_bw.best();
+        self.bw = self
+            .max_bw
+            .best()
+            .min(self.bw_shortterm.unwrap_or(u64::MAX));
     }
 
     /// Updates min_rtt, the draft's UpdateMinRTT().
-    fn update_min_rtt(&mut self, rtt: Option<Duration>) {
+    fn update_min_rtt(&mut self, rtt: Option<Duration>, now: Instant) {
+        let stamp = *self.min_rtt_stamp.get_or_insert(now);
+        self.min_rtt_expired = now > stamp + MIN_RTT_FILTER_LEN;
+        if self.min_rtt_expired {
+            self.probe_rtt_cwnd = Some(self.bdp_multiple(self.bw, PROBE_RTT_CWND_GAIN));
+        }
         if let Some(rtt) = rtt
-            && self.min_rtt.is_none_or(|min| rtt < min)
+            && (self.min_rtt.is_none_or(|min| rtt < min) || self.min_rtt_expired)
         {
             self.min_rtt = Some(rtt);
+            self.min_rtt_stamp = Some(now);
         }
+    }
+
+    /// Enters ProbeRTT once min_rtt has expired, the draft's CheckProbeRTT() with EnterProbeRTT().
+    /// Returns whether HandleProbeRTT() ran, which marks the connection app-limited.
+    fn check_probe_rtt(&mut self, rs: Option<&RateSample>, event: &AckOrLoss<'_>) -> bool {
+        if self.state != State::ProbeRtt && self.min_rtt_expired && !self.idle_restart {
+            self.save_cwnd();
+            self.state = State::ProbeRtt;
+            self.set_gains(PROBE_RTT_PACING_GAIN, PROBE_RTT_CWND_GAIN);
+            self.probe_rtt_done_stamp = None;
+            self.is_bw_probe_stopping = true;
+            self.start_round(event.delivered);
+        }
+        let in_probe_rtt = self.state == State::ProbeRtt;
+        if in_probe_rtt {
+            self.handle_probe_rtt(event);
+        }
+        if rs.is_some_and(|rs| rs.delivered > 0) {
+            self.idle_restart = false;
+        }
+        in_probe_rtt
+    }
+
+    /// Runs ProbeRTT's step, the draft's HandleProbeRTT() without the app-limited mark, which the
+    /// caller applies.
+    fn handle_probe_rtt(&mut self, event: &AckOrLoss<'_>) {
+        match self.probe_rtt_done_stamp {
+            None if event.bytes_in_flight <= self.probe_rtt_cwnd() => {
+                self.probe_rtt_done_stamp = Some(event.now + PROBE_RTT_DURATION);
+                self.probe_rtt_round_done = false;
+                self.start_round(event.delivered);
+            }
+            None => {}
+            Some(_) => {
+                self.probe_rtt_round_done |= self.round_start;
+                if self.probe_rtt_round_done {
+                    self.check_probe_rtt_done(event.now, event.delivered);
+                }
+            }
+        }
+    }
+
+    /// Leaves ProbeRTT once its wait has passed, the draft's CheckProbeRTTDone().
+    fn check_probe_rtt_done(&mut self, now: Instant, delivered: u64) {
+        if self.probe_rtt_done_stamp.is_some_and(|done| now > done) {
+            // The next ProbeRTT is due MinRTTFilterLen from now.
+            self.min_rtt_stamp = Some(now);
+            self.restore_cwnd();
+            self.exit_probe_rtt(now, delivered);
+        }
+    }
+
+    /// Leaves ProbeRTT for CRUISE, or Startup if the pipe was not full, the draft's ExitProbeRTT().
+    fn exit_probe_rtt(&mut self, now: Instant, delivered: u64) {
+        self.reset_short_term_model();
+        if self.full_bw_reached {
+            self.start_probe_bw_down(now, delivered);
+            self.start_probe_bw_cruise();
+        } else {
+            self.enter_startup();
+        }
+    }
+
+    /// Returns ProbeRTT's cwnd, the draft's ProbeRTTCwnd().
+    fn probe_rtt_cwnd(&self) -> u64 {
+        self.bdp_multiple(self.bw, PROBE_RTT_CWND_GAIN)
+            .min(self.probe_rtt_cwnd.unwrap_or(u64::MAX))
+            .max(self.min_pipe_cwnd())
     }
 
     /// Sets the pacing rate from the current gain, the draft's SetPacingRate().
@@ -840,7 +1201,27 @@ impl Bbr3 {
     /// Bounds cwnd as the draft's SetCwnd() does after growth, then to max_window as mvfst does.
     fn bound_cwnd(&mut self) {
         self.window.cwnd = self.window.cwnd.max(self.min_pipe_cwnd());
+        // The draft's BoundCwndForProbeRTT().
+        if self.state == State::ProbeRtt {
+            self.window.cwnd = self.window.cwnd.min(self.probe_rtt_cwnd());
+        }
+        self.bound_cwnd_for_model();
         self.bound_cwnd_to_window();
+    }
+
+    /// Caps cwnd by the model, the draft's BoundCwndForModel(). As in mvfst and the draft's
+    /// pseudocode, inflight_longterm does not cap Drain, though the draft's table of states does.
+    fn bound_cwnd_for_model(&mut self) {
+        let cap = match self.state {
+            State::ProbeBwDown | State::ProbeBwRefill | State::ProbeBwUp => self.inflight_longterm,
+            State::ProbeBwCruise | State::ProbeRtt => Some(self.inflight_with_headroom()),
+            State::Startup | State::Drain => None,
+        };
+        let cap = cap
+            .unwrap_or(u64::MAX)
+            .min(self.inflight_shortterm.unwrap_or(u64::MAX))
+            .max(self.min_pipe_cwnd());
+        self.window.cwnd = self.window.cwnd.min(cap);
     }
 
     /// Bounds cwnd to at most max_window datagrams and at least MinPipeCwnd, the floor winning.
@@ -863,6 +1244,11 @@ impl Bbr3 {
             None => self.window.initial,
             Some(rtt) => gain(bdp(bw, rtt), hundredths),
         }
+    }
+
+    /// Returns the draft's TargetInflight(): the BDP, at most cwnd.
+    fn target_inflight(&self) -> u64 {
+        self.bdp_multiple(self.bw, 100).min(self.window.cwnd)
     }
 
     /// Returns `inflight_cap` with the draft's QuantizationBudget(), using an offload budget of
