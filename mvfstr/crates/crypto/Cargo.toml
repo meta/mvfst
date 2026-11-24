@@ -25,6 +25,10 @@ mvfstr_wire = { version = "0.1.0", path = "../wire" }
 ring = { version = "0.17.14", optional = true }
 rustls = { version = "0.23.46", features = ["std"], default-features = false }
 
+[dev-dependencies]
+rcgen = { version = "0.14.10", features = ["x509-parser"] }
+rustls = { version = "0.23.46", features = ["ring", "std"], default-features = false }
+
 [features]
 aws-lc-rs = ["dep:aws-lc-rs", "rustls/aws-lc-rs", "rustls/prefer-post-quantum"]
 default = ["aws-lc-rs"]

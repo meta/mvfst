@@ -84,7 +84,7 @@ special_module_name = { level = "deny" }
 stable_features = { level = "deny" }
 suspicious_double_ref_op = { level = "allow" }
 unconditional_recursion = { level = "deny" }
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"]}
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)", 'cfg(feature, values("openssl"))']}
 unreachable_code = { level = "warn" }
 unsafe_op_in_unsafe_fn = { level = "deny" }
 unstable_name_collisions = { level = "deny" }

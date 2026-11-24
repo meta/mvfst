@@ -6,13 +6,15 @@
  */
 
 //! The crypto library behind packet protection, header protection, HKDF and the rustls
-//! provider: aws-lc-rs when the `aws-lc-rs` feature is on, even if `ring` is on too, else ring.
+//! provider: aws-lc-rs when the `aws-lc-rs` feature is on, else ring when `ring` is on, else
+//! mvfstr's own binding to the OpenSSL libcrypto an app already links (`crate::native`) when
+//! `openssl` is on.
 //!
 //! The other modules reach the library only through the names re-exported here, whose APIs the
-//! two libraries share, so the choice is made at compile time.
+//! libraries share, so the choice is made at compile time.
 
-#[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
-compile_error!("mvfstr_crypto needs the `aws-lc-rs` or `ring` feature");
+#[cfg(not(any(feature = "aws-lc-rs", feature = "ring", feature = "openssl")))]
+compile_error!("mvfstr_crypto needs the `aws-lc-rs`, `ring` or `openssl` feature");
 
 #[cfg(feature = "aws-lc-rs")]
 use aws_lc_rs as library;
@@ -28,15 +30,19 @@ pub(crate) use self::library::digest;
 pub(crate) use self::library::hkdf;
 pub(crate) use self::library::hmac;
 pub(crate) use self::provider::cipher_suite;
+#[cfg(all(feature = "openssl", not(any(feature = "aws-lc-rs", feature = "ring"))))]
+use crate::native as library;
+#[cfg(all(feature = "openssl", not(any(feature = "aws-lc-rs", feature = "ring"))))]
+use crate::native::provider;
 
 /// Returns the default rustls `CryptoProvider` of the library that protects packets: aws-lc-rs
-/// when the `aws-lc-rs` feature is on, as it is by default, even if `ring` is on too, and ring
-/// when only `ring` is on.
+/// when the `aws-lc-rs` feature is on, as it is by default, even if another is on too, ring when
+/// `ring` is on without it, and mvfstr's provider over OpenSSL when only `openssl` is on.
 ///
-/// The aws-lc-rs provider offers the post-quantum X25519MLKEM768 key exchange first, and ring's
-/// provider does not have it. Its cipher suites are rustls's own, which
-/// [`with_quic_suites`](crate::with_quic_suites) replaces with suites carrying mvfstr's packet
-/// protection.
+/// The aws-lc-rs provider offers the post-quantum X25519MLKEM768 key exchange first, and the
+/// others do not have it. The cipher suites of the aws-lc-rs and ring providers are rustls's own,
+/// which [`with_quic_suites`](crate::with_quic_suites) replaces with suites carrying mvfstr's
+/// packet protection; the OpenSSL provider's suites already carry it.
 pub fn default_provider() -> rustls::crypto::CryptoProvider {
     provider::default_provider()
 }
@@ -106,6 +112,27 @@ mod tests {
             suites_and_groups(&default_provider()),
             suites_and_groups(&rustls::crypto::ring::default_provider()),
             "the default provider is ring's",
+        );
+    }
+
+    #[cfg(all(feature = "openssl", not(any(feature = "aws-lc-rs", feature = "ring"))))]
+    #[test]
+    fn openssl_is_used_without_aws_lc_rs_or_ring() {
+        use std::any::TypeId;
+
+        assert_eq!(
+            TypeId::of::<aead::Algorithm>(),
+            TypeId::of::<crate::native::aead::Algorithm>(),
+            "packet protection runs on mvfstr's OpenSSL binding",
+        );
+        assert_eq!(
+            suites_and_groups(&default_provider()).0,
+            [
+                CipherSuite::TLS13_AES_256_GCM_SHA384,
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            ],
+            "the default provider is mvfstr's OpenSSL provider",
         );
     }
 }

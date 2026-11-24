@@ -304,6 +304,7 @@ mod tests {
     use std::time::Duration;
 
     use rustls::CipherSuite;
+    use rustls::crypto::CryptoProvider;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::PrivatePkcs8KeyDer;
     use rustls::pki_types::ServerName;
@@ -576,7 +577,7 @@ mod tests {
         let log = Arc::new(SecretLog::default());
         client.key_log = log.clone();
         let key = PrivatePkcs8KeyDer::from(unhex(TEST_KEY));
-        let server = rustls::ServerConfig::builder_with_details(provider, time)
+        let server = rustls::ServerConfig::builder_with_details(server_provider(provider), time)
             .with_protocol_versions(tls13)
             .unwrap()
             .with_no_client_auth()
@@ -602,6 +603,23 @@ mod tests {
             local: log.secret("CLIENT_TRAFFIC_SECRET_0"),
             remote: log.secret("SERVER_TRAFFIC_SECRET_0"),
         }
+    }
+
+    /// Returns the server's provider for [`rustls_handshake`]: `provider` itself on aws-lc-rs
+    /// and ring.
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+    fn server_provider(provider: Arc<CryptoProvider>) -> Arc<CryptoProvider> {
+        provider
+    }
+
+    /// Returns the server's provider for [`rustls_handshake`]: `provider` with ring's key loading,
+    /// because the provider over an app's library does not load private keys.
+    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+    fn server_provider(provider: Arc<CryptoProvider>) -> Arc<CryptoProvider> {
+        Arc::new(CryptoProvider {
+            key_provider: rustls::crypto::ring::default_provider().key_provider,
+            ..CryptoProvider::clone(&provider)
+        })
     }
 
     /// Seals a fixed short-header packet with `keys`, as hex.

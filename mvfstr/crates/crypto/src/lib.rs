@@ -19,15 +19,23 @@
 //! [`Sealer`] seam, through which the connection seals a packet it built in a backend slot;
 //! [`InlineSealer`] seals it at once.
 //!
+//! [`verify_tls13_certificate_signature`] checks a TLS 1.3 CertificateVerify signature with the
+//! end-entity certificate's key.
+//!
 //! The crate does not perform I/O or read a clock.
 //!
 //! # Crypto backend
 //!
 //! Packet protection, header protection, HKDF and [`default_provider`] run on aws-lc-rs or ring,
 //! chosen by Cargo feature. The `aws-lc-rs` feature is on by default, and aws-lc-rs is used
-//! whenever it is on, even with `ring` on too. With only `ring` on, ring is used. At least one of
-//! the two must be on. The default provider offers post-quantum key exchange only with aws-lc-rs.
-//! Builds for Android or iOS that do not have aws-lc-rs can turn on only `ring`.
+//! whenever it is on, even with `ring` on too. With only `ring` on, ring is used. For Cargo, at
+//! least one of the two must be on. The default provider offers post-quantum key exchange only
+//! with aws-lc-rs. Builds for Android or iOS that do not have aws-lc-rs can turn on `ring` instead.
+//!
+//! A third backend, the `openssl` feature, runs everything on mvfstr's own binding to the OpenSSL
+//! libcrypto that an app already links, so that the build does not add a second library. It is
+//! used when `aws-lc-rs` and `ring` are both off. The Cargo manifest does not have the feature,
+//! and so far only the crate's own tests turn it on.
 
 mod algorithm;
 mod backend;
@@ -35,13 +43,23 @@ mod header;
 mod hkdf;
 mod initial;
 mod keys;
+#[cfg(all(feature = "openssl", not(any(feature = "aws-lc-rs", feature = "ring"))))]
+mod native;
 mod packet;
 mod retry;
 pub mod seal;
 mod secrets;
+#[cfg(any(
+    all(feature = "openssl", not(any(feature = "aws-lc-rs", feature = "ring"))),
+    test
+))]
+mod spki;
 pub mod suite;
 #[cfg(test)]
+mod testcerts;
+#[cfg(test)]
 mod testdata;
+mod verify;
 
 pub use algorithm::AES_128_GCM;
 pub use algorithm::AES_256_GCM;
@@ -92,3 +110,4 @@ pub use suite::cipher_suite;
 pub use suite::derive_suite;
 pub use suite::quic_algorithm;
 pub use suite::with_quic_suites;
+pub use verify::verify_tls13_certificate_signature;
