@@ -139,8 +139,9 @@ fn parse_short(datagram: &[u8], local_cid_len: usize) -> Result<Header<'_>, Head
 /// Returns whether packets of `version` use the QUIC v1 layout. mvfst's own version lays out its
 /// packets as v1 does; its differences (the Initial salt, the Retry integrity key and nonce, the
 /// transport-parameter extension and the parameters it requires) do not touch the packet layout.
+/// Each of mvfst's aliases has the layout of the version it aliases.
 fn has_v1_layout(version: Version) -> bool {
-    matches!(version, Version::V1 | Version::MVFST)
+    matches!(version.unaliased(), Version::V1 | Version::MVFST)
 }
 
 fn parse_long(datagram: &[u8]) -> Result<Header<'_>, HeaderError> {

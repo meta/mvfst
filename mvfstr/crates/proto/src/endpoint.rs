@@ -1474,6 +1474,43 @@ mod tests {
     }
 
     #[test]
+    fn mvfsts_experimental_versions_get_version_negotiation_listing_every_accepted_version() {
+        let now = test_epoch();
+        let accepted = [
+            Version::V1,
+            Version::MVFST,
+            Version::QUIC_V1_ALIAS,
+            Version::QUIC_V1_ALIAS2,
+            Version::MVFST_ALIAS,
+        ];
+        let mut endpoint = server(&Setup {
+            server_versions: accepted.to_vec(),
+            ..Setup::default()
+        });
+        // mvfst's MVFST_EXPERIMENTAL to MVFST_EXPERIMENTAL5.
+        for version in [
+            0xface_b00e_u32,
+            0xface_b011,
+            0xface_b013,
+            0xface_b014,
+            0xface_b015,
+        ] {
+            let mut datagram = initial(1200, 8);
+            datagram[1..5].copy_from_slice(&version.to_be_bytes());
+            let Route::Stateless(reply) = endpoint.route(now, &meta(now), &datagram) else {
+                panic!("no Version Negotiation for {version:#x}");
+            };
+            assert_eq!(reply.kind(), StatelessKind::VersionNegotiation);
+            let Ok(Header::VersionNegotiation(vn)) = Header::parse(reply.datagram(), 8) else {
+                panic!("not a Version Negotiation packet");
+            };
+            assert_eq!(vn.dcid(), [2; 8]);
+            assert_eq!(vn.scid(), [1; 8]);
+            assert_eq!(vn.versions().collect::<Vec<_>>(), accepted, "{version:#x}");
+        }
+    }
+
+    #[test]
     fn version_negotiation_is_rate_limited() {
         let now = test_epoch();
         let mut endpoint = server(&Setup::default());

@@ -7,7 +7,7 @@
 
 //! Transport parameters: what a connection advertises and how it checks the peer's (RFC 9000).
 //!
-//! On MVFST connections mvfst does not send initial_source_connection_id or
+//! On connections of MVFST and its alias, mvfst does not send initial_source_connection_id or
 //! original_destination_connection_id, so they are not required, but each is still checked when
 //! present.
 
@@ -163,7 +163,8 @@ pub(crate) fn max_datagram_frame_size(params: &TransportParameters) -> Result<u6
     }
 }
 
-/// Checks that a connection ID parameter matches `expected` and, on version 1, is present.
+/// Checks that a connection ID parameter matches `expected` and, on version 1 and its aliases, is
+/// present.
 fn check_cid(
     sent: Option<ConnectionId>,
     expected: ConnectionId,
@@ -171,7 +172,7 @@ fn check_cid(
 ) -> Result<(), ()> {
     match sent {
         Some(cid) if cid == expected => Ok(()),
-        None if version == Version::MVFST => Ok(()),
+        None if version.unaliased() == Version::MVFST => Ok(()),
         _ => Err(()),
     }
 }
@@ -353,27 +354,34 @@ mod tests {
     }
 
     #[test]
-    fn version_1_requires_the_connection_id_parameters() {
+    fn version_1_and_its_aliases_require_the_connection_id_parameters() {
         let mut without_scid = server_params();
         without_scid.initial_source_connection_id = None;
         let mut without_odcid = server_params();
         without_odcid.original_destination_connection_id = None;
-        for params in [without_scid, without_odcid] {
-            let error = peer_params(&encode(&params), client_ids(Version::V1)).unwrap_err();
-            assert_eq!(error.code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+        for version in [Version::V1, Version::QUIC_V1_ALIAS, Version::QUIC_V1_ALIAS2] {
+            for params in [&without_scid, &without_odcid] {
+                let error = peer_params(&encode(params), client_ids(version)).unwrap_err();
+                assert_eq!(error.code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+            }
         }
     }
 
     #[test]
-    fn mvfst_needs_no_connection_id_parameters_but_checks_them_when_present() {
-        let mut bare = server_params();
-        bare.initial_source_connection_id = None;
-        bare.original_destination_connection_id = None;
-        assert!(peer_params(&encode(&bare), client_ids(Version::MVFST)).is_ok());
-        let mut wrong = server_params();
-        wrong.initial_source_connection_id = Some(cid(9));
-        let error = peer_params(&encode(&wrong), client_ids(Version::MVFST)).unwrap_err();
-        assert_eq!(error.code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+    fn mvfst_and_its_alias_need_no_connection_id_parameters_but_check_them_when_present() {
+        for version in [Version::MVFST, Version::MVFST_ALIAS] {
+            let mut bare = server_params();
+            bare.initial_source_connection_id = None;
+            bare.original_destination_connection_id = None;
+            assert!(
+                peer_params(&encode(&bare), client_ids(version)).is_ok(),
+                "{version:?}"
+            );
+            let mut wrong = server_params();
+            wrong.initial_source_connection_id = Some(cid(9));
+            let error = peer_params(&encode(&wrong), client_ids(version)).unwrap_err();
+            assert_eq!(error.code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+        }
     }
 
     #[test]

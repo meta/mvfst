@@ -2735,6 +2735,26 @@ fn an_mvfst_connection_never_updates_first_and_closes_at_the_limit_instead() {
 }
 
 #[test]
+fn a_connection_of_mvfsts_alias_updates_keys_as_version_1_does() {
+    // As in mvfst, the restriction on initiating key updates covers MVFST but not its alias.
+    let setup = Setup {
+        client_versions: vec![mvfstr_wire::Version::MVFST_ALIAS],
+        server_versions: vec![mvfstr_wire::Version::V1, mvfstr_wire::Version::MVFST_ALIAS],
+        ..Setup::default()
+    };
+    let mut pair = settled(&setup);
+    let now = pair.now;
+    let client = pair.client.conn_mut();
+    assert_eq!(client.version, mvfstr_wire::Version::MVFST_ALIAS);
+    let phases = client.key_phases.as_mut().unwrap();
+    phases.confidentiality_limit = 100;
+    phases.sealed = 79;
+    ping(client, now);
+    assert_eq!(generation(client), 1);
+    assert!(!closed_by(client, TransportErrorCode::AEAD_LIMIT_REACHED));
+}
+
+#[test]
 fn an_mvfst_connection_follows_the_peers_update() {
     let mut pair = settled(&mvfst());
     let now = pair.now;

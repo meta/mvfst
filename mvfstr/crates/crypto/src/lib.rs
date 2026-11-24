@@ -7,9 +7,9 @@
 
 //! QUIC packet protection for mvfstr.
 //!
-//! The crate derives the Initial keys of v1 and of MVFST 0xfaceb002 ([`initial_keys`]),
-//! computes v1 Retry integrity tags, and implements AES-128-GCM, AES-256-GCM and
-//! ChaCha20-Poly1305 packet and header protection as rustls `PacketKey`s and
+//! The crate derives the Initial keys of v1, of MVFST 0xfaceb002 and of mvfst's aliases of the
+//! two ([`initial_keys`]), computes v1 Retry integrity tags, and implements AES-128-GCM,
+//! AES-256-GCM and ChaCha20-Poly1305 packet and header protection as rustls `PacketKey`s and
 //! `HeaderProtectionKey`s, with the usage limits of RFC 9001 on every packet key.
 //! [`QuicAlgorithm`] is the `rustls::quic::Algorithm` through which rustls's TLS 1.3 key schedule
 //! builds every Handshake, 1-RTT and key-update key as an mvfstr key; [`with_quic_suites`]

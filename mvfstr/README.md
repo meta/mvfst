@@ -36,8 +36,9 @@ mvfstr is under active development, and its APIs will change before 1.0.
 
 ## Features
 
-- Clients and servers of QUIC version 1, and of mvfst's own version
-  0xfaceb002, which mvfst's tperf client offers.
+- Clients and servers of QUIC version 1, of mvfst's own version 0xfaceb002,
+  which mvfst's tperf client offers, and of mvfst's aliases of the two
+  (0xfaceb003, 0xfaceb004 and 0xfaceb010).
 - Version negotiation, stateless resets, connection ID management and key
   updates.
 - Loss recovery, and congestion control with NewReno or CUBIC (RFC 9438).

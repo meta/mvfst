@@ -276,7 +276,8 @@ impl Default for AckPolicy {
 }
 
 /// When to initiate a key update (RFC 9001). Peer-initiated updates are always answered. On MVFST
-/// connections mvfstr never initiates and closes with AEAD_LIMIT_REACHED at the limit instead.
+/// connections, but not on those of its alias, mvfstr never initiates and closes with
+/// AEAD_LIMIT_REACHED at the limit instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KeyUpdatePolicy {
     /// Initiate only at 0.8 times the AEAD confidentiality limit.
@@ -747,7 +748,13 @@ impl TransportConfigBuilder {
 }
 
 /// The versions mvfstr implements.
-const SUPPORTED_VERSIONS: [Version; 2] = [Version::V1, Version::MVFST];
+const SUPPORTED_VERSIONS: [Version; 5] = [
+    Version::V1,
+    Version::MVFST,
+    Version::QUIC_V1_ALIAS,
+    Version::QUIC_V1_ALIAS2,
+    Version::MVFST_ALIAS,
+];
 
 /// Settings for accepting connections.
 #[derive(Clone, Debug)]
@@ -782,14 +789,17 @@ impl ServerConfig {
 
     /// Returns the rustls config that takes a ClientHello without ALPN on a connection of
     /// `version`, in place of [`tls`](Self::tls), and the connection's ALPN policy: the [MVFST
-    /// config](ServerConfigBuilder::mvfst_tls) and [`AlpnPolicy::AllowMissing`] for an MVFST
-    /// connection when that config is set, and otherwise `None` and [`alpn`](Self::alpn).
+    /// config](ServerConfigBuilder::mvfst_tls) and [`AlpnPolicy::AllowMissing`] for a connection
+    /// of MVFST or its alias when that config is set, and otherwise `None` and
+    /// [`alpn`](Self::alpn).
     pub fn tls_without_alpn(
         &self,
         version: Version,
     ) -> (Option<&Arc<rustls::ServerConfig>>, AlpnPolicy) {
         match &self.mvfst_tls {
-            Some(tls) if version == Version::MVFST => (Some(tls), AlpnPolicy::AllowMissing),
+            Some(tls) if version.unaliased() == Version::MVFST => {
+                (Some(tls), AlpnPolicy::AllowMissing)
+            }
             _ => (None, self.alpn),
         }
     }
@@ -826,7 +836,9 @@ impl ServerConfigBuilder {
     }
 
     /// Sets the versions to accept: without repeats, each one mvfstr implements ([`Version::V1`],
-    /// [`Version::MVFST`]), and always including version 1.
+    /// [`Version::MVFST`] and mvfst's aliases of them, [`Version::QUIC_V1_ALIAS`],
+    /// [`Version::QUIC_V1_ALIAS2`] and [`Version::MVFST_ALIAS`]), and always including version 1.
+    /// A Version Negotiation packet lists them in the order given.
     pub fn versions(mut self, versions: Vec<Version>) -> Self {
         self.config.versions = versions;
         self
@@ -838,12 +850,12 @@ impl ServerConfigBuilder {
         self
     }
 
-    /// Sets a rustls config for MVFST connections whose ClientHello does not offer ALPN, which
-    /// then run with [`AlpnPolicy::AllowMissing`]; an MVFST ClientHello that offers ALPN keeps the
-    /// main config. rustls, following RFC 9001, refuses a ClientHello without ALPN when its config
-    /// lists protocols, and one that offers protocols when the list is empty, so a server that
-    /// takes both kinds, as mvfst's tperf server does, picks the config by the ClientHello. By
-    /// default MVFST connections use the main config.
+    /// Sets a rustls config for connections of MVFST or its alias whose ClientHello does not offer
+    /// ALPN, which then run with [`AlpnPolicy::AllowMissing`]; a ClientHello of either that offers
+    /// ALPN keeps the main config. rustls, following RFC 9001, refuses a ClientHello without ALPN
+    /// when its config lists protocols, and one that offers protocols when the list is empty, so a
+    /// server that takes both kinds, as mvfst's tperf server does, picks the config by the
+    /// ClientHello. By default these connections use the main config.
     pub fn mvfst_tls(mut self, tls: Arc<rustls::ServerConfig>) -> Self {
         self.config.mvfst_tls = Some(tls);
         self
@@ -941,7 +953,7 @@ impl ClientConfigBuilder {
     }
 
     /// Sets the versions to accept, the first of which is offered: non-empty, without repeats,
-    /// each one mvfstr implements ([`Version::V1`], [`Version::MVFST`]).
+    /// each one mvfstr implements (see [`ServerConfigBuilder::versions`]).
     pub fn versions(mut self, versions: Vec<Version>) -> Self {
         self.config.versions = versions;
         self
@@ -1591,6 +1603,25 @@ mod tests {
         let (mvfst, policy) = config.tls_without_alpn(Version::MVFST);
         assert!(mvfst.is_none());
         assert_eq!(policy, AlpnPolicy::Required);
+    }
+
+    #[test]
+    fn the_mvfst_tls_config_serves_mvfsts_alias_and_not_the_aliases_of_version_1() {
+        let tls = Arc::new(server_tls(&[b"quic_test"]));
+        let no_alpn = Arc::new(server_tls(&[]));
+        let config = ServerConfig::builder(tls)
+            .versions(SUPPORTED_VERSIONS.to_vec())
+            .mvfst_tls(no_alpn.clone())
+            .build()
+            .unwrap();
+        let (alias, policy) = config.tls_without_alpn(Version::MVFST_ALIAS);
+        assert!(alias.is_some_and(|alias| Arc::ptr_eq(alias, &no_alpn)));
+        assert_eq!(policy, AlpnPolicy::AllowMissing);
+        for version in [Version::QUIC_V1_ALIAS, Version::QUIC_V1_ALIAS2] {
+            let (tls, policy) = config.tls_without_alpn(version);
+            assert!(tls.is_none(), "{version:?}");
+            assert_eq!(policy, AlpnPolicy::Required);
+        }
     }
 
     #[test]

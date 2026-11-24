@@ -582,6 +582,24 @@ fn the_handshake_completes_on_mvfst_connections() {
 }
 
 #[test]
+fn the_handshake_completes_on_mvfsts_alias_versions() {
+    for version in [
+        Version::QUIC_V1_ALIAS,
+        Version::QUIC_V1_ALIAS2,
+        Version::MVFST_ALIAS,
+    ] {
+        let setup = Setup {
+            client_versions: vec![version],
+            server_versions: vec![Version::V1, Version::MVFST, version],
+            ..Setup::default()
+        };
+        let (_, pair) = handshake(setup.pair());
+        assert_eq!(pair.client.conn().version(), version);
+        assert_eq!(pair.server.conn().version(), version);
+    }
+}
+
+#[test]
 fn one_server_takes_mvfst_clients_with_or_without_alpn_and_version_1_clients_with_it() {
     // rustls refuses a ClientHello without ALPN under the server's main config, which lists h3,
     // and one with ALPN under its MVFST config, whose protocol list is empty.

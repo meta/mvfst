@@ -36,9 +36,10 @@ pub const INITIAL_SALT_MVFST: [u8; 20] = [
     0xbe, 0xf9, 0xf5, 0x02,
 ];
 
-/// Returns the Initial salt of a version, or `None` for a version mvfstr does not implement.
+/// Returns the Initial salt of a version, or `None` for a version mvfstr does not implement. Each
+/// of mvfst's aliases uses the salt of the version it aliases.
 pub fn initial_salt(version: Version) -> Option<&'static [u8; 20]> {
-    match version {
+    match version.unaliased() {
         Version::V1 => Some(&INITIAL_SALT_V1),
         Version::MVFST => Some(&INITIAL_SALT_MVFST),
         _ => None,
@@ -160,6 +161,29 @@ mod tests {
         );
     }
 
+    /// Checks the secrets against those mvfst derives for the RFC 9001 Destination Connection ID:
+    /// its aliases of version 1 use the version 1 salt, and its alias of MVFST the draft-23 salt.
+    #[test]
+    fn mvfsts_alias_versions_have_the_initial_secrets_mvfst_derives() {
+        let v1 = (
+            "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea",
+            "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b",
+        );
+        let mvfst = (
+            "fda3953aecc040e48b34e27ef87de3a6098ecf0e38b7e032c5c57bcbd5975b84",
+            "554366b81912ff90be41f17e8022213090ab17d8149179bcadf222f29ff2ddd5",
+        );
+        for (version, (client, server)) in [
+            (Version::QUIC_V1_ALIAS, v1),
+            (Version::QUIC_V1_ALIAS2, v1),
+            (Version::MVFST_ALIAS, mvfst),
+        ] {
+            let secrets = initial_secrets(version, &RFC9001_DCID).unwrap();
+            assert_eq!(secrets.client.to_vec(), unhex(client), "{version:?}");
+            assert_eq!(secrets.server.to_vec(), unhex(server), "{version:?}");
+        }
+    }
+
     /// Removes header protection and opens `packet`, whose packet number starts at
     /// `pn_offset`; returns the packet number and the plaintext payload.
     fn open(keys: &PacketKeys, packet: &[u8], pn_offset: usize) -> (u64, Vec<u8>) {
@@ -207,10 +231,16 @@ mod tests {
 
     #[test]
     fn other_versions_have_no_initial_secrets() {
+        // The last five are mvfst's experimental versions, which mvfstr does not implement.
         for version in [
             Version::NEGOTIATION,
             Version(0xff00_001d),
             Version(0x6b33_43cf),
+            Version(0xface_b00e),
+            Version(0xface_b011),
+            Version(0xface_b013),
+            Version(0xface_b014),
+            Version(0xface_b015),
         ] {
             assert_eq!(initial_salt(version), None);
             assert_eq!(

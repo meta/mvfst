@@ -57,6 +57,38 @@ fn parses_the_rfc9001_client_initial() {
 }
 
 #[test]
+fn parses_mvfsts_alias_versions_as_version_1_but_not_its_experimental_versions() {
+    for version in [
+        Version::QUIC_V1_ALIAS,
+        Version::QUIC_V1_ALIAS2,
+        Version::MVFST_ALIAS,
+    ] {
+        let mut packet = rfc9001_client_initial();
+        packet[1..5].copy_from_slice(&version.0.to_be_bytes());
+        let header = protected(&packet, 0);
+        assert_eq!(header.ty(), PacketType::Initial);
+        assert_eq!(header.version(), Some(version));
+        assert_eq!(header.dcid(), hex("8394c8f03e515708"));
+        assert_eq!(header.pn_offset(), 18);
+    }
+    // mvfst's MVFST_EXPERIMENTAL to MVFST_EXPERIMENTAL5 stay unsupported.
+    for version in [
+        0xface_b00e_u32,
+        0xface_b011,
+        0xface_b013,
+        0xface_b014,
+        0xface_b015,
+    ] {
+        let mut packet = rfc9001_client_initial();
+        packet[1..5].copy_from_slice(&version.to_be_bytes());
+        let Ok(Header::UnsupportedVersion(header)) = Header::parse(&packet, 0) else {
+            panic!("expected {version:#x} to be unsupported");
+        };
+        assert_eq!(header.version(), Version(version));
+    }
+}
+
+#[test]
 fn parses_zero_rtt_and_handshake_headers_without_a_token_field() {
     // Type bits 01 (0-RTT) and 10 (Handshake); Length 0x0018 = 24 covers PN and payload.
     for (first, ty) in [(0xd0, PacketType::ZeroRtt), (0xe3, PacketType::Handshake)] {

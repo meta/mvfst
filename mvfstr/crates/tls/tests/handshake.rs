@@ -226,10 +226,16 @@ fn has_extension(messages: &[u8], ext: u16, body: &[u8]) -> bool {
 }
 
 #[test]
-fn transport_parameters_use_extension_0x39_for_v1_and_0xffa5_for_mvfst() {
+fn transport_parameters_use_extension_0x39_for_v1_and_0xffa5_for_mvfst_and_their_aliases() {
     let client_tp = b"client transport parameters";
     let server_tp = b"server transport parameters";
-    for (version, ext, other) in [(Version::V1, 0x39, 0xffa5), (Version::MVFST, 0xffa5, 0x39)] {
+    for (version, ext, other) in [
+        (Version::V1, 0x39, 0xffa5),
+        (Version::MVFST, 0xffa5, 0x39),
+        (Version::QUIC_V1_ALIAS, 0x39, 0xffa5),
+        (Version::QUIC_V1_ALIAS2, 0x39, 0xffa5),
+        (Version::MVFST_ALIAS, 0xffa5, 0x39),
+    ] {
         let (mut client, mut server) = pair(version, &[b"h3"], &[b"h3"]);
         run(&mut client, &mut server).unwrap();
         assert!(server.tls.is_handshake_complete(), "{version:?}");

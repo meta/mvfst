@@ -111,9 +111,9 @@ pub(crate) fn self_signed()
     ))
 }
 
-/// Returns the server's settings: a fresh certificate, versions 1 and MVFST, and ALPN
-/// `quic_test`. With `--compat_mvfst`, an MVFST ClientHello may also leave out ALPN, as the one
-/// from mvfst's tperf client does.
+/// Returns the server's settings: a fresh certificate, ALPN `quic_test`, and versions 1 and MVFST
+/// and mvfst's aliases of them, which mvfst's tperf server accepts too. With `--compat_mvfst`, a
+/// ClientHello of MVFST or its alias may also leave out ALPN, as mvfst's tperf client does.
 pub(crate) fn server_config(flags: &Flags) -> Result<Arc<ServerConfig>, SetupError> {
     let (cert, key) = self_signed()?;
     let tls = |alpn: &[&[u8]]| {
@@ -128,7 +128,13 @@ pub(crate) fn server_config(flags: &Flags) -> Result<Arc<ServerConfig>, SetupErr
     };
     let mut builder = ServerConfig::builder(tls(&[ALPN])?)
         .transport(server_transport(flags)?)
-        .versions(vec![Version::V1, Version::MVFST]);
+        .versions(vec![
+            Version::V1,
+            Version::MVFST,
+            Version::QUIC_V1_ALIAS,
+            Version::QUIC_V1_ALIAS2,
+            Version::MVFST_ALIAS,
+        ]);
     if flags.compat_mvfst {
         builder = builder.mvfst_tls(tls(&[])?);
     }
@@ -386,10 +392,19 @@ mod tests {
         provider.cipher_suites[0].suite()
     }
 
+    /// The versions mvfst's tperf server accepts that mvfstr implements.
+    const SERVER_VERSIONS: [Version; 5] = [
+        Version::V1,
+        Version::MVFST,
+        Version::QUIC_V1_ALIAS,
+        Version::QUIC_V1_ALIAS2,
+        Version::MVFST_ALIAS,
+    ];
+
     #[test]
     fn the_server_takes_quic_test_and_in_compat_mode_mvfst_without_alpn() {
         let config = server_config(&Flags::default()).unwrap();
-        assert_eq!(config.versions(), [Version::V1, Version::MVFST]);
+        assert_eq!(config.versions(), SERVER_VERSIONS);
         assert_eq!(config.transport().max_window(), 860_000);
         assert_eq!(config.tls().alpn_protocols, [b"quic_test".to_vec()]);
         assert_eq!(
@@ -414,7 +429,7 @@ mod tests {
             ..Flags::default()
         };
         let config = server_config(&strict).unwrap();
-        assert_eq!(config.versions(), [Version::V1, Version::MVFST]);
+        assert_eq!(config.versions(), SERVER_VERSIONS);
         let (mvfst, policy) = config.tls_without_alpn(Version::MVFST);
         assert!(mvfst.is_none());
         assert_eq!(policy, AlpnPolicy::Required);

@@ -125,9 +125,9 @@ impl std::error::Error for TlsError {
 }
 
 /// Returns the rustls QUIC version for a QUIC version: `V1` for v1, `V1Draft` (transport
-/// parameters in extension 0xffa5) for MVFST.
+/// parameters in extension 0xffa5) for MVFST, and that of the aliased version for an alias.
 fn rustls_version(version: Version) -> Result<quic::Version, TlsError> {
-    match version {
+    match version.unaliased() {
         Version::V1 => Ok(quic::Version::V1),
         Version::MVFST => Ok(quic::Version::V1Draft),
         _ => Err(TlsError::UnsupportedVersion(version)),
@@ -135,9 +135,9 @@ fn rustls_version(version: Version) -> Result<quic::Version, TlsError> {
 }
 
 /// Returns the TLS extension that carries the transport parameters of a QUIC version:
-/// 0x39 (RFC 9001), or the draft codepoint 0xffa5 for MVFST.
+/// 0x39 (RFC 9001), or the draft codepoint 0xffa5 for MVFST and its alias.
 fn transport_parameters_extension(version: Version) -> u16 {
-    if version == Version::MVFST {
+    if version.unaliased() == Version::MVFST {
         0xffa5
     } else {
         0x39
