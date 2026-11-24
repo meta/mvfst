@@ -21,6 +21,8 @@
 //! (RFC 9000), connection ID issuance and the key update policy.
 
 #[cfg(test)]
+mod accessor_tests;
+#[cfg(test)]
 mod cc_tests;
 #[cfg(test)]
 mod horizon_tests;
@@ -67,6 +69,8 @@ use mvfstr_wire::TransportErrorCode;
 use mvfstr_wire::TransportParameters;
 use mvfstr_wire::VarInt;
 use mvfstr_wire::Version;
+pub use params::RawTransportParams;
+pub use params::RawTransportParamsIter;
 use path::AltPath;
 use rustls::pki_types::ServerName;
 
@@ -204,7 +208,15 @@ impl PathCredit {
 struct Handshake {
     complete: bool,
     confirmed: bool,
-    peer_params: Option<TransportParameters>,
+    peer_params: Option<PeerParams>,
+}
+
+/// The peer's transport parameters, once checked and applied.
+#[derive(Debug)]
+struct PeerParams {
+    decoded: TransportParameters,
+    /// The extension as received.
+    raw: Box<[u8]>,
 }
 
 /// The idle timer (RFC 9000).
@@ -358,7 +370,18 @@ impl Connection {
                 reset_token: None,
             },
         );
-        let session = TlsSession::client(tls, setup.version, server_name, encode(&params))?;
+        Self::client_with_params(setup, tls, server_name, encode(&params))
+    }
+
+    /// Creates a client connection whose ClientHello carries the encoded transport parameters
+    /// `params`.
+    fn client_with_params(
+        setup: ConnSetup,
+        tls: Arc<rustls::ClientConfig>,
+        server_name: ServerName<'static>,
+        params: Vec<u8>,
+    ) -> Result<Self, TlsError> {
+        let session = TlsSession::client(tls, setup.version, server_name, params)?;
         let mut conn = Self::new(Side::Client, setup, session)?;
         // A client does not need to validate the path, which it chose.
         conn.path.validated = true;
@@ -777,6 +800,42 @@ impl Connection {
         self.horizon
     }
 
+    /// Returns the newest RTT sample on the current path (RFC 9002), not adjusted for the peer's
+    /// ACK delay; zero before the first sample.
+    pub fn latest_rtt(&self) -> Duration {
+        self.recovery.rtt().latest()
+    }
+
+    /// Returns how many more streams in direction `dir` [`open_stream`](Self::open_stream) would
+    /// open now: the peer's stream limit less the streams already opened, or 0 once the connection
+    /// is closing or [`shutdown`](Self::shutdown) was called.
+    pub fn openable_streams(&self, dir: Dir) -> u64 {
+        if self.state != State::Open {
+            return 0;
+        }
+        self.sources.streams.streams.openable_local(dir)
+    }
+
+    /// Returns the transport parameters extension the peer sent, unknown and reserved parameters
+    /// included, or `None` until those parameters have been checked and applied.
+    pub fn peer_transport_params(&self) -> Option<RawTransportParams<'_>> {
+        let peer = self.handshake.peer_params.as_ref()?;
+        Some(RawTransportParams::new(&peer.raw))
+    }
+
+    /// Returns the peer's max_datagram_frame_size (RFC 9221), or 0 before its transport parameters
+    /// arrive. 0, the default when the peer leaves it out, means that the peer does not take
+    /// DATAGRAM frames.
+    pub fn peer_max_datagram_frame_size(&self) -> u64 {
+        self.handshake
+            .peer_params
+            .as_ref()
+            // The value was checked on receipt.
+            .map_or(0, |peer| {
+                params::max_datagram_frame_size(&peer.decoded).unwrap_or(0)
+            })
+    }
+
     /// Returns counters and current values for logs and benchmarks.
     pub fn stats(&self) -> ConnStats {
         ConnStats {
@@ -842,7 +901,7 @@ impl Connection {
             .peer_params
             .as_ref()
             .map_or(Duration::from_millis(25), |p| {
-                Duration::from_millis(p.max_ack_delay.into_inner())
+                Duration::from_millis(p.decoded.max_ack_delay.into_inner())
             })
     }
 
@@ -853,7 +912,7 @@ impl Connection {
             .handshake
             .peer_params
             .as_ref()
-            .map(|p| p.max_idle_timeout.into_inner())
+            .map(|p| p.decoded.max_idle_timeout.into_inner())
             .filter(|&millis| millis > 0)
             .map(Duration::from_millis);
         let timeout = match (self.config.idle_timeout(), peer) {
@@ -976,6 +1035,7 @@ impl Connection {
             return;
         }
         let limit = peer
+            .decoded
             .active_connection_id_limit
             .into_inner()
             .min(MAX_LOCAL_CIDS);

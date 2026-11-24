@@ -25,6 +25,10 @@ use super::ConnError;
 use super::GRANULARITY;
 use crate::config::TransportConfig;
 
+/// The id of max_datagram_frame_size (RFC 9221), which decoding keeps among the parameters that
+/// RFC 9000 does not define.
+const MAX_DATAGRAM_FRAME_SIZE: VarInt = VarInt::from_u32(0x20);
+
 /// Returns max_ack_delay as advertised for an ACK timer of `delay` on a connection with build
 /// horizon `horizon`: whole milliseconds rounded up, so the ACK timer never runs past it. With a
 /// horizon, an ACK leaves up to the horizon after it is built, and the advertised value adds
@@ -106,7 +110,7 @@ pub(crate) struct PeerIds {
 
 /// Decodes and checks the peer's parameters.
 pub(crate) fn peer_params(raw: &[u8], ids: PeerIds) -> Result<TransportParameters, ConnError> {
-    let params = TransportParameters::decode(raw, &[])
+    let params = TransportParameters::decode(raw, &[MAX_DATAGRAM_FRAME_SIZE])
         .map_err(|e| invalid(e.code(), "malformed transport parameters"))?;
     let error = |reason| invalid(TransportErrorCode::TRANSPORT_PARAMETER_ERROR, reason);
     match ids.side {
@@ -139,7 +143,24 @@ pub(crate) fn peer_params(raw: &[u8], ids: PeerIds) -> Result<TransportParameter
         ids.version,
     )
     .map_err(|()| error("initial_source_connection_id mismatch"))?;
+    max_datagram_frame_size(&params).map_err(|()| error("malformed max_datagram_frame_size"))?;
     Ok(params)
+}
+
+/// Returns the max_datagram_frame_size in `params`, or 0 when it is absent. Fails when its value is
+/// not exactly one variable-length integer.
+pub(crate) fn max_datagram_frame_size(params: &TransportParameters) -> Result<u64, ()> {
+    let Some((_, value)) = params
+        .extra
+        .iter()
+        .find(|(id, _)| *id == MAX_DATAGRAM_FRAME_SIZE)
+    else {
+        return Ok(0);
+    };
+    match VarInt::decode(value) {
+        Ok((size, len)) if len == value.len() => Ok(size.into_inner()),
+        _ => Err(()),
+    }
 }
 
 /// Checks that a connection ID parameter matches `expected` and, on version 1, is present.
@@ -163,8 +184,64 @@ fn invalid(code: TransportErrorCode, reason: &'static str) -> ConnError {
     }
 }
 
+/// A peer's transport parameters extension as received: the raw bytes, which iterate as
+/// (id, value) pairs in the order the peer sent them, unknown and reserved ids included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawTransportParams<'a> {
+    raw: &'a [u8],
+}
+
+impl<'a> RawTransportParams<'a> {
+    /// Wraps `raw`, an extension that [`peer_params`] accepted.
+    pub(crate) fn new(raw: &'a [u8]) -> Self {
+        Self { raw }
+    }
+
+    /// Returns the extension's bytes.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Returns the parameters in the order the peer sent them, each as its id and raw value.
+    pub fn iter(&self) -> RawTransportParamsIter<'a> {
+        RawTransportParamsIter { rest: self.raw }
+    }
+}
+
+impl<'a> IntoIterator for RawTransportParams<'a> {
+    type Item = (VarInt, &'a [u8]);
+    type IntoIter = RawTransportParamsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// An iterator over the parameters of a [`RawTransportParams`] in wire order.
+#[derive(Clone, Debug)]
+pub struct RawTransportParamsIter<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for RawTransportParamsIter<'a> {
+    type Item = (VarInt, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // The extension was decoded before it was kept, so every parameter is whole.
+        let (id, id_len) = VarInt::decode(self.rest).ok()?;
+        let rest = &self.rest[id_len..];
+        let (len, len_len) = VarInt::decode(rest).ok()?;
+        let rest = &rest[len_len..];
+        let value = rest.get(..usize::try_from(len.into_inner()).ok()?)?;
+        self.rest = &rest[value.len()..];
+        Some((id, value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
 
     fn cid(byte: u8) -> ConnectionId {
@@ -328,6 +405,24 @@ mod tests {
         client.original_destination_connection_id = Some(cid(1));
         let error = peer_params(&encode(&client), ids).unwrap_err();
         assert_eq!(error.code, TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+    }
+
+    #[test]
+    fn a_max_datagram_frame_size_that_is_not_one_varint_is_a_transport_parameter_error() {
+        let mut params = server_params();
+        // Empty, a truncated varint, and a varint with a byte after it.
+        for value in [&[][..], &[0x40], &[0x05, 0x00]] {
+            params.extra = vec![(MAX_DATAGRAM_FRAME_SIZE, Bytes::copy_from_slice(value))];
+            let error = peer_params(&encode(&params), client_ids(Version::V1)).unwrap_err();
+            assert_eq!(
+                error.code,
+                TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
+                "{value:?}"
+            );
+        }
+        params.extra = vec![(MAX_DATAGRAM_FRAME_SIZE, Bytes::from_static(&[0x05]))];
+        let accepted = peer_params(&encode(&params), client_ids(Version::V1)).unwrap();
+        assert_eq!(max_datagram_frame_size(&accepted), Ok(5));
     }
 
     #[test]

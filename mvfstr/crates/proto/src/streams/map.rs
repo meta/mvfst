@@ -377,6 +377,16 @@ impl<T> StreamTable<T> {
         Ok(true)
     }
 
+    /// Returns how many more local streams in direction `dir` the peer's limit allows, or 0 after
+    /// [`shutdown`](Self::shutdown).
+    pub fn openable_local(&self, dir: Dir) -> u64 {
+        if self.frozen {
+            return 0;
+        }
+        let ids = &self.local[dir_index(dir)];
+        ids.limit.saturating_sub(ids.next)
+    }
+
     /// Returns the peer's limit for direction `dir` if it stops the next local open: the value
     /// for a STREAMS_BLOCKED frame.
     pub fn streams_blocked(&self, dir: Dir) -> Option<u64> {

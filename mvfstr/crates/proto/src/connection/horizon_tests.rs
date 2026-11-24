@@ -109,7 +109,7 @@ fn the_advertised_max_ack_delay_grows_by_the_horizon_and_a_millisecond_below_2_1
         let (_, pair) = handshake(paired(&setup, 2 * MS));
         assert_eq!(pair.server.conn().build_horizon(), horizon);
         let peer = pair.client.conn().handshake.peer_params.as_ref().unwrap();
-        assert_eq!(peer.max_ack_delay, VarInt::from_u32(advertised));
+        assert_eq!(peer.decoded.max_ack_delay, VarInt::from_u32(advertised));
     }
 }
 

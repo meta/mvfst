@@ -38,6 +38,7 @@ use super::Connection;
 use super::MAX_BUFFERED;
 use super::MAX_CRYPTO_BUFFER;
 use super::MIN_DATAGRAM;
+use super::PeerParams;
 use super::State;
 use super::key_update::KeyPhases;
 use super::key_update::ReadKey;
@@ -888,8 +889,8 @@ impl Connection {
         if self.handshake.peer_params.is_none()
             && let Some(raw) = self.tls.peer_transport_params()
         {
-            let raw = raw.to_vec();
-            self.apply_peer_params(&raw)?;
+            let raw = raw.into();
+            self.apply_peer_params(raw)?;
         }
         if !self.handshake.complete && self.tls.is_handshake_complete() {
             self.complete_handshake()?;
@@ -897,15 +898,15 @@ impl Connection {
         Ok(())
     }
 
-    /// Checks and applies the peer's transport parameters.
-    fn apply_peer_params(&mut self, raw: &[u8]) -> Result<(), ConnError> {
+    /// Checks and applies the peer's transport parameters, the extension `raw`.
+    fn apply_peer_params(&mut self, raw: Box<[u8]>) -> Result<(), ConnError> {
         let ids = params::PeerIds {
             side: self.side,
             version: self.version,
             initial_scid: self.peer_initial_scid.unwrap_or(ConnectionId::EMPTY),
             original_dcid: self.original_dcid,
         };
-        let peer = params::peer_params(raw, ids)?;
+        let peer = params::peer_params(&raw, ids)?;
         if self.side == Side::Client {
             let preferred = peer
                 .preferred_address
@@ -944,7 +945,7 @@ impl Connection {
                 self.push_event(ConnEvent::StreamsAvailable { dir });
             }
         }
-        self.handshake.peer_params = Some(peer);
+        self.handshake.peer_params = Some(PeerParams { decoded: peer, raw });
         Ok(())
     }
 

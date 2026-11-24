@@ -74,6 +74,8 @@ pub use config::TransportConfig;
 pub use connection::ConnStats;
 pub use connection::Connection;
 pub use connection::PullReady;
+pub use connection::RawTransportParams;
+pub use connection::RawTransportParamsIter;
 pub use connection::Readiness;
 pub use endpoint::AcceptError;
 pub use endpoint::ConnKey;

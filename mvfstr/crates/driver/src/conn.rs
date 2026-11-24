@@ -230,6 +230,8 @@ impl ConnHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use mvfstr_proto::ConnKey;
     use mvfstr_proto::Dir;
 
@@ -261,6 +263,10 @@ mod tests {
             assert_eq!(conn.now(), now);
             let _ = conn.stats();
             let _ = conn.remote_address();
+            assert!(conn.latest_rtt() > Duration::ZERO);
+            assert!(conn.openable_streams(Dir::Bi) > 0);
+            assert!(conn.peer_transport_params().is_some());
+            assert_eq!(conn.peer_max_datagram_frame_size(), 0);
         }
         assert!(!dirty, "reads leave the connection clean");
 

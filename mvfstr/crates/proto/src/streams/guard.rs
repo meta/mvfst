@@ -539,6 +539,12 @@ impl<D: StreamData> Streams<D> {
         self.table.on_max_streams_sent(dir, max);
     }
 
+    /// Returns how many more local streams in direction `dir` can be opened (see
+    /// [`StreamTable::openable_local`]).
+    pub(crate) fn openable_local(&self, dir: Dir) -> u64 {
+        self.table.openable_local(dir)
+    }
+
     /// Returns the peer's limit for `dir` if it stops the next local open.
     pub(crate) fn streams_blocked(&self, dir: Dir) -> Option<u64> {
         self.table.streams_blocked(dir)
