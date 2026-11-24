@@ -8,6 +8,7 @@
 //! Congestion control, pacing and retransmission tests over the pair harness of
 //! [`crate::testing`].
 
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,8 @@ use crate::TransportConfig;
 use crate::TxOutcome;
 use crate::TxReport;
 use crate::TxSeqRange;
+use crate::cc::bbr3::State;
+use crate::cc::bbr3::tests::up_and_idle;
 use crate::recovery::Space;
 use crate::testing::Loss;
 use crate::testing::Pair;
@@ -1079,4 +1082,120 @@ fn datagrams_the_backend_dropped_are_lost_with_no_congestion_response() {
         assert_eq!(conn.stats().cwnd, cwnd, "{cc:?}");
         assert_eq!(conn.cc.ssthresh(), u64::MAX, "{cc:?}");
     }
+}
+
+#[test]
+fn bbr3_sends_its_initial_window_unpaced_and_paces_from_the_next_ack() {
+    let bbr3 = config(|c| c.congestion_control(CongestionControl::Bbr3).pacing(true));
+    let (_, mut pair) = handshake(setup(bbr3).pair());
+    pair.run(pair.now + RTT);
+    let conn = pair.client.conn_mut();
+    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
+    let mut data = Bytes::from(pattern(100_000));
+    conn.stream(id).unwrap().send(&mut data).unwrap();
+    // The congestion window, not the pacer, stops the initial window.
+    let now = pair.now;
+    let first = attempt(&mut pair, now);
+    assert_eq!(first.stop, Stop::Cwnd, "{first:?}");
+    let from = pair.client.outcomes.len();
+    pair.run(now + RTT);
+    assert!(pair.client.conn().cc.pacing_ready());
+    let paced = pair.client.outcomes[from..]
+        .iter()
+        .any(|o| matches!(o.stop, Stop::Pacing(_)));
+    assert!(paced);
+}
+
+#[test]
+fn bbr3_restarting_probe_bw_from_idle_paces_the_attempt_at_the_restart_rate() {
+    let bbr3 = config(|c| c.congestion_control(CongestionControl::Bbr3).pacing(true));
+    let (_, mut pair) = handshake(setup(bbr3).pair());
+    let (cc, idle) = up_and_idle();
+    pair.run(idle.max(pair.now + RTT));
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.recovery.bytes_in_flight(), 0);
+    conn.cc = cc;
+    conn.refresh_pacing_rate();
+    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
+    let mut data = Bytes::from(pattern(100_000));
+    conn.stream(id).unwrap().send(&mut data).unwrap();
+    // The first datagram restarts UP from idle at 1 MB/s, and the pacer takes that rate before
+    // it stamps the datagram, without an ACK or timeout in between.
+    let mut pacer = conn.pacer.clone();
+    pacer.set_rate(NonZeroU64::new(1_000_000).unwrap());
+    let now = pair.now;
+    let mut sink = VecSink::new(1500);
+    let outcome = conn.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    for datagram in sink.take() {
+        pacer.on_paced(now, datagram.data.len() as u64);
+    }
+    assert_eq!(
+        outcome.stop,
+        Stop::Pacing(pacer.next_release(now)),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn bbr3_fills_a_fixed_rate_link_within_a_few_round_trips_and_keeps_its_queue_small() {
+    // 10 Mbit/s with a 20 ms round trip, a BDP of 25,000 bytes, and a drop-tail buffer of one
+    // BDP.
+    const RATE: u64 = 1_250_000;
+    const BDP: u64 = RATE / 50;
+    const ROUND_TRIP: Duration = Duration::from_millis(20);
+    let bbr3 = config(|c| c.congestion_control(CongestionControl::Bbr3).pacing(true));
+    let mut config = setup(bbr3).pair();
+    config.to_server.rate = Some(RATE);
+    config.to_server.buffer = Some(BDP as usize);
+    let (_, mut pair) = handshake(config);
+    pair.run(pair.now + RTT);
+    let start = pair.now;
+    let mut bulk = Bulk::start(&mut pair, 16 << 20);
+    // Startup fills the pipe in two round trips and ends after three more without growth, and
+    // Drain empties the queue in one or two, all well within ten.
+    bulk.run(&mut pair, start + 10 * ROUND_TRIP);
+    let (from, early) = (pair.now, bulk.received());
+    let link_bytes = |pair: &Pair| pair.server.conn().stats().recv_bytes;
+    let early_link = link_bytes(&pair);
+    let (mut weighted, mut probing, mut probed) = (0, Duration::ZERO, false);
+    let mut last: Option<(Instant, u64)> = None;
+    let mut sample = |pair: &Pair| {
+        let state = pair.client.conn().cc.bbr3().state();
+        probed |= state == State::ProbeBwUp;
+        // The queue only drains between events, so its size after one bounds it until the next.
+        if let Some((at, queued)) = last {
+            weighted += u128::from(queued) * (pair.now - at).as_nanos();
+            probing += pair.now - at;
+        }
+        let probe_bw = matches!(
+            state,
+            State::ProbeBwDown | State::ProbeBwCruise | State::ProbeBwRefill | State::ProbeBwUp
+        );
+        last = probe_bw.then(|| (pair.now, pair.to_server.queued(pair.now)));
+    };
+    // The link is busy 90% of the next ten round trips or more, which leaves room for at most
+    // one idle round trip. This counts the bytes the link delivers, since the stream bytes the
+    // server reads here also include those held back behind Startup's losses.
+    bulk.run_with(&mut pair, start + 20 * ROUND_TRIP, &mut sample);
+    let busy =
+        u128::from(link_bytes(&pair) - early_link) * 1_000_000_000 / (pair.now - from).as_nanos();
+    assert!(
+        busy * 10 >= u128::from(RATE) * 9,
+        "the link delivered {busy} bytes per second in round trips 10 to 20"
+    );
+    // And the stream gets 90% of the link rate or more from then on, over long enough for one
+    // bandwidth probe: the probe wait after DOWN is below 3 s.
+    bulk.run_with(&mut pair, start + Duration::from_millis(3500), &mut sample);
+    let delivered = (bulk.received() - early) as u128;
+    let rate = delivered * 1_000_000_000 / (pair.now - from).as_nanos();
+    assert!(rate * 10 >= u128::from(RATE) * 9, "{rate} bytes per second");
+    // ProbeBW paces at bw in CRUISE and REFILL. UP paces at 1.25 times bw for a few round trips of
+    // a 2-3 s cycle, and DOWN drains what UP queued by pacing at 0.9 times bw. So the queue's time
+    // average must stay below a quarter of a BDP, far below the buffer's one BDP.
+    assert!(probed, "no bandwidth probe");
+    let average = weighted / probing.as_nanos();
+    assert!(
+        average * 4 < u128::from(BDP),
+        "an average queue of {average} bytes"
+    );
 }

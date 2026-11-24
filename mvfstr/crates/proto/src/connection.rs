@@ -71,11 +71,13 @@ use rustls::pki_types::ServerName;
 use crate::AlpnPolicy;
 use crate::AppCode;
 use crate::CloseReason;
+use crate::CongestionControl;
 use crate::ConnEvent;
 use crate::EndpointEvent;
 use crate::Initiator;
 use crate::KeyUpdatePolicy;
 use crate::OpenError;
+use crate::Random;
 use crate::RecvSummary;
 use crate::RxDatagram;
 use crate::SegmentSink;
@@ -92,6 +94,7 @@ use crate::cc::AckOrLoss;
 use crate::cc::AckPart;
 use crate::cc::Cc;
 use crate::cc::CcConfig;
+use crate::cc::CcStart;
 use crate::cc::CongestionSignal;
 use crate::cid::CidGenerator;
 use crate::cid::Cids;
@@ -380,7 +383,8 @@ impl Connection {
         };
         let recovery = LossRecovery::new(recovery_config, side, setup.now, [0; 3])
             .expect("should accept the RTT a validated transport config holds");
-        let (cc, pacer) = congestion_state(&config, MIN_DATAGRAM, recovery.rtt().smoothed());
+        let mut rng = ConnRng::new(setup.rng_seed);
+        let (cc, pacer) = congestion_state(&config, MIN_DATAGRAM, &recovery, &mut rng);
         let integrity_limit = initial.remote.integrity_limit();
         let mut spaces: [PacketSpace; 3] = Default::default();
         spaces[Space::Initial.index()].keys = Some(initial);
@@ -401,7 +405,7 @@ impl Connection {
             spaces,
             sources: Sources::new(MAX_ACK_RANGES, StreamState::new(side, &config), cids),
             cid_gen: setup.cids,
-            rng: ConnRng::new(setup.rng_seed),
+            rng,
             key_phases: None,
             auth_failures: 0,
             integrity_limit,
@@ -1020,11 +1024,14 @@ impl Connection {
 }
 
 /// Returns the state a path starts with: `config`'s congestion controller for datagrams of
-/// `max_datagram_size` bytes, and a pacer at its rate for a smoothed RTT of `rtt`.
+/// `max_datagram_size` bytes, and a pacer at its rate for `recovery`'s smoothed RTT. A controller
+/// that takes rate samples starts from `recovery`'s counts, and BBR3 draws its seed from `rng`;
+/// NewReno and CUBIC leave `rng` untouched.
 fn congestion_state(
     config: &TransportConfig,
     max_datagram_size: u16,
-    rtt: Duration,
+    recovery: &LossRecovery,
+    rng: &mut ConnRng,
 ) -> (Cc, Pacer) {
     let windows = CcConfig {
         initial_window_packets: config.initial_window(),
@@ -1032,9 +1039,26 @@ fn congestion_state(
         max_window_packets: config.max_window(),
         ..CcConfig::default()
     };
-    let cc = Cc::new(config.congestion_control(), &windows, max_datagram_size)
+    let kind = config.congestion_control();
+    let mut seed = [0; 8];
+    if kind == CongestionControl::Bbr3 {
+        rng.fill(&mut seed);
+    }
+    let rtt = recovery.rtt();
+    let start = CcStart {
+        seed: u64::from_le_bytes(seed),
+        srtt: rtt.first_sample_time().map(|_| rtt.smoothed()),
+        total_sent: recovery.total_sent(),
+        pacing_granularity: GRANULARITY,
+        horizon: Duration::ZERO,
+    };
+    let cc = Cc::start(kind, &windows, max_datagram_size, &start)
         .expect("should accept a validated config's windows and datagrams of at least 1,200 bytes");
-    let pacer = Pacer::new(max_datagram_size, GRANULARITY, cc.pacing_rate(rtt));
+    let pacer = Pacer::new(
+        max_datagram_size,
+        GRANULARITY,
+        cc.pacing_rate(rtt.smoothed()),
+    );
     (cc, pacer)
 }
 

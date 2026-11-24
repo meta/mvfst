@@ -1504,6 +1504,42 @@ fn a_validated_move_to_a_new_ip_resets_the_window_and_the_rtt() {
 }
 
 #[test]
+fn a_bbr3_controller_rebuilt_on_a_move_to_a_new_ip_is_seeded_and_ready_to_pace_at_once() {
+    // A two-datagram initial window, which the handshake's bytes exceed.
+    let setup = Setup {
+        server_transport: TransportConfig::builder()
+            .congestion_control(CongestionControl::Bbr3)
+            .pacing(true)
+            .initial_window(2)
+            .build()
+            .unwrap(),
+        ..Setup::default()
+    };
+    let rebuilt = || {
+        let mut before = 0;
+        let (_, _, pair) = migrate_after_congestion_in(&setup, stranger(), |server| {
+            before = server.cc.bbr3().rng();
+        });
+        let cc = &pair.server.conn().cc;
+        // C.total_sent survives the move, so the new controller is ready to pace at once; the
+        // connection paces from the new path's first RTT sample, as mvfst does from the rebuilt
+        // controller's first control update.
+        assert!(cc.pacing_ready());
+        (before, cc.bbr3().rng())
+    };
+    let (before, after) = rebuilt();
+    assert_ne!(
+        after, before,
+        "a fresh draw from the connection's generator"
+    );
+    assert_eq!(
+        rebuilt(),
+        (before, after),
+        "reproducible from the connection's seed"
+    );
+}
+
+#[test]
 fn a_validated_move_to_a_new_ip_restarts_the_configured_window_and_the_pacer() {
     let setup = Setup {
         server_transport: TransportConfig::builder()
@@ -1836,6 +1872,58 @@ fn after_the_reset_an_acknowledged_response_to_the_old_address_takes_nothing_fro
     let server = pair.server.conn_mut();
     deliver(server, now + Duration::from_millis(10), stranger(), ack);
     assert_eq!(server.cc.cwnd(), window + u64::from(server.mtu));
+}
+
+#[test]
+fn after_the_reset_a_response_sent_to_the_old_address_leaves_the_bbr3_controller_alone() {
+    let setup = Setup {
+        server_transport: TransportConfig::builder()
+            .congestion_control(CongestionControl::Bbr3)
+            .pacing(true)
+            .build()
+            .unwrap(),
+        ..Setup::default()
+    };
+    let (_, _, mut pair) = migrate_after_congestion_in(&setup, stranger(), |_| {});
+    let now = pair.now;
+    let server = pair.server.conn_mut();
+    transmit(server, now);
+    assert_eq!(
+        server.recovery.bytes_in_flight(),
+        0,
+        "nothing on the new path yet"
+    );
+
+    // The client probes from its old address a little later, and the server answers there in a
+    // full-size datagram, which is in flight on the old path.
+    let later = now + Duration::from_millis(5);
+    let probe = from_client(
+        &pair,
+        12,
+        &[Frame::PathChallenge([9; 8]), Frame::Padding { len: 1200 }],
+    );
+    let server = pair.server.conn_mut();
+    deliver(server, later, client_addr(), probe);
+    let before = format!("{:?}", server.cc);
+    let sent = transmit(server, later);
+    let old: Vec<_> = sent
+        .iter()
+        .filter(|datagram| datagram.meta.dst == client_addr())
+        .collect();
+    assert_eq!(old.len(), 1, "{} datagrams", sent.len());
+    assert_eq!(
+        path_frames(server, &old[0].data),
+        [PathFrame::Response([9; 8])]
+    );
+    assert!(old[0].data.len() >= 1200, "{}", old[0].data.len());
+    assert_eq!(
+        server.recovery.bytes_in_flight(),
+        0,
+        "nothing went in flight on the new path"
+    );
+    // RFC 9000 keeps packets sent on the old path out of the new path's congestion control, so
+    // the response does not reach the controller, as a send or as a restart from idle.
+    assert_eq!(format!("{:?}", server.cc), before);
 }
 
 #[test]

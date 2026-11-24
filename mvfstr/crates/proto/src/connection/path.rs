@@ -216,7 +216,7 @@ impl Connection {
             if from.ip() != self.remote.ip() {
                 self.recovery.reset_for_new_path();
                 (self.cc, self.pacer) =
-                    congestion_state(&self.config, self.mtu, self.recovery.rtt().smoothed());
+                    congestion_state(&self.config, self.mtu, &self.recovery, &mut self.rng);
                 self.app_limited = false;
             }
             self.drop_alt();

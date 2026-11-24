@@ -450,12 +450,14 @@ impl Connection {
     }
 
     /// Returns whether the pacer holds back and stamps datagrams: when configured, once the 1-RTT
-    /// keys exist and the path has an RTT sample. Before that sample the rate would come from the
-    /// initial RTT alone, and mvfst does not pace then either.
+    /// keys exist, the path has an RTT sample and the controller is ready to pace. Before that
+    /// sample the rate would come from the initial RTT alone, and mvfst does not pace then either.
+    /// BBR3 sends its initial window unpaced.
     fn pacing_active(&self) -> bool {
         self.config.pacing()
             && self.has_keys(Space::Data)
             && self.recovery.rtt().first_sample_time().is_some()
+            && self.cc.pacing_ready()
     }
 
     /// Returns the pacer's next release, if it holds paced candidates back at `now`.
@@ -720,6 +722,7 @@ impl Connection {
                     bytes_in_flight,
                     size,
                     total_sent: self.recovery.total_sent(),
+                    on_path: !flags.contains(SentFlags::OFF_PATH),
                 });
             }
             self.sources.on_sealed(packet.space, &packet.packet);
@@ -732,6 +735,11 @@ impl Connection {
             ack_eliciting |= packet.ack_eliciting;
             handshake_sent |= packet.space == Space::Handshake;
             challenge |= packet.packet.challenge;
+        }
+        // A send can change the pacing rate (BBR3's restart from idle), which the pacer takes
+        // before it stamps this datagram.
+        if self.cc.take_pacer_refresh() {
+            self.refresh_pacing_rate();
         }
         if self.pacing_active() {
             // ACK-only and probe datagrams do not take pacing tokens.

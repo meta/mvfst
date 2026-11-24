@@ -200,6 +200,8 @@ pub enum CongestionControl {
     /// CUBIC (RFC 9438), the default of mvfst's tperf.
     #[default]
     Cubic,
+    /// BBRv3 as mvfst's BBR3 behaves ([`crate::cc::bbr3`]); it needs pacing.
+    Bbr3,
 }
 
 /// When to acknowledge (RFC 9000).

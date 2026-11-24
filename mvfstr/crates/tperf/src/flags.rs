@@ -123,6 +123,12 @@ impl Flags {
             if flags.bytes_per_stream != 0 {
                 return Err(FlagError::ServerOnly("bytes_per_stream"));
             }
+            if flags.congestion == CongestionControl::Bbr3 {
+                return Err(FlagError::Bbr3ServerSide);
+            }
+        }
+        if flags.congestion == CongestionControl::Bbr3 && !flags.pacing {
+            return Err(FlagError::Bbr3NeedsPacing);
         }
         Ok(flags)
     }
@@ -154,6 +160,7 @@ impl Flags {
                 self.congestion = match value {
                     "newreno" => CongestionControl::NewReno,
                     "cubic" => CongestionControl::Cubic,
+                    "bbr3" => CongestionControl::Bbr3,
                     _ => return Err(bad()),
                 }
             }
@@ -240,6 +247,10 @@ pub(crate) enum FlagError {
     MissingValue(String),
     /// A server-only flag was set in client mode.
     ServerOnly(&'static str),
+    /// BBR3 was chosen without pacing, which it needs.
+    Bbr3NeedsPacing,
+    /// BBR3 was chosen for the client, which never paces.
+    Bbr3ServerSide,
     /// The value does not parse or is out of the flag's range.
     BadValue {
         /// The flag's name.
@@ -255,6 +266,14 @@ impl fmt::Display for FlagError {
             Self::Unknown(flag) => write!(f, "unknown command line flag '{flag}'"),
             Self::MissingValue(flag) => write!(f, "flag '{flag}' is missing its argument"),
             Self::ServerOnly(flag) => write!(f, "{flag} option is server only"),
+            Self::Bbr3NeedsPacing => write!(
+                f,
+                "--congestion=bbr3 needs --pacing; mvfstr-tperf does not fall back to another controller"
+            ),
+            Self::Bbr3ServerSide => write!(
+                f,
+                "--congestion=bbr3 is server-side: the client never paces, so it takes newreno or cubic"
+            ),
             Self::BadValue { flag, value } => {
                 write!(f, "illegal value '{value}' specified for flag '{flag}'")
             }
@@ -437,6 +456,45 @@ mod tests {
                 }),
                 "{arg}"
             );
+        }
+    }
+
+    #[test]
+    fn congestion_bbr3_selects_bbr3_and_bbr_and_bbr2_stay_refused() {
+        // mvfst's spelling.
+        let flags = parse(&["--congestion=bbr3", "--pacing"]).unwrap();
+        assert_eq!(flags.congestion, CongestionControl::Bbr3);
+        for value in ["bbr", "bbr2"] {
+            assert_eq!(
+                parse(&[&format!("--congestion={value}"), "--pacing"]),
+                Err(FlagError::BadValue {
+                    flag: "congestion".to_owned(),
+                    value: value.to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn bbr3_without_pacing_is_refused_rather_than_replaced() {
+        // mvfst's tperf falls back to CUBIC with an error log.
+        for args in [
+            &["--congestion=bbr3"][..],
+            &["--congestion=bbr3", "--nopacing"],
+        ] {
+            assert_eq!(parse(args), Err(FlagError::Bbr3NeedsPacing), "{args:?}");
+        }
+        assert!(parse(&["--pacing", "--congestion=bbr3"]).is_ok());
+    }
+
+    #[test]
+    fn a_client_refuses_bbr3_as_server_side_even_with_pacing() {
+        // The client of mvfst's tperf paces only for bbr and falls back to CUBIC.
+        for args in [
+            &["--mode=client", "--congestion=bbr3"][..],
+            &["--congestion=bbr3", "--pacing", "--mode=client"],
+        ] {
+            assert_eq!(parse(args), Err(FlagError::Bbr3ServerSide), "{args:?}");
         }
     }
 

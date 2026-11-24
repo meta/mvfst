@@ -1182,6 +1182,7 @@ mod tests {
             bytes_in_flight: r.bytes_in_flight(),
             size: 1200,
             total_sent: 0,
+            on_path: true,
         });
         send_one(r, Space::Data, at);
     }

@@ -107,6 +107,7 @@ fn send_events_carry_the_packet_size_send_time_and_bytes_sent() {
             bytes_in_flight: 0,
             size: 1200,
             total_sent: 1200,
+            on_path: true,
         }
     );
     for pair in sent.windows(2) {

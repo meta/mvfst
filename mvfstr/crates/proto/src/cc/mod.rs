@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Congestion control with explicit inputs and outputs: NewReno (RFC 9002) and CUBIC (RFC 9438).
+//! Congestion control with explicit inputs and outputs: NewReno (RFC 9002), CUBIC (RFC 9438)
+//! and BBRv3 (draft-ietf-ccwg-bbr-07).
 //!
 //! A controller is driven by explicit events (packet sent, bytes acknowledged with an RTT sample
 //! and an app-limited flag, congestion event, persistent congestion) and produces the congestion
@@ -16,6 +17,7 @@
 //! recovery period, and the send time of the largest newly acknowledged packet, which determines
 //! whether the ACK ends that period.
 
+pub mod bbr3;
 pub mod cubic;
 pub mod new_reno;
 #[cfg(test)]
@@ -25,6 +27,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 use std::time::Instant;
 
+pub use bbr3::Bbr3;
 pub use cubic::Cubic;
 pub use new_reno::NewReno;
 
@@ -128,6 +131,34 @@ impl Default for CubicConfig {
     }
 }
 
+/// What a controller starts from besides its settings; a controller built for a new path
+/// mid-connection inherits the connection's send count. NewReno and CUBIC ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcStart {
+    /// The seed of the controller's random choices, from the connection's generator. Default 0.
+    pub seed: u64,
+    /// The path's smoothed RTT, if the path has an RTT sample. Default `None`.
+    pub srtt: Option<Duration>,
+    /// C.total_sent, the bytes sent on the connection so far. Default 0.
+    pub total_sent: u64,
+    /// The pacer's enforcement granularity. Default 1 ms.
+    pub pacing_granularity: Duration,
+    /// The pacing horizon, how far ahead of its release a datagram is built. Default 0.
+    pub horizon: Duration,
+}
+
+impl Default for CcStart {
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            srtt: None,
+            total_sent: 0,
+            pacing_granularity: Duration::from_millis(1),
+            horizon: Duration::ZERO,
+        }
+    }
+}
+
 /// What signalled a congestion event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CongestionSignal {
@@ -173,6 +204,9 @@ pub struct SentEvent {
     /// this one included if on the path. Kept only for a controller that takes rate samples
     /// ([`takes_rate_samples`]); 0 otherwise.
     pub total_sent: u64,
+    /// Whether it went on the current path. RFC 9000 says a packet sent to the alternate path's
+    /// address must not feed the current path's controller, and BBR3 ignores it.
+    pub on_path: bool,
 }
 
 /// The ACK frame part of an [`AckOrLoss`].
@@ -224,6 +258,7 @@ pub struct AckOrLoss<'a> {
 pub fn takes_rate_samples(kind: CongestionControl) -> bool {
     match kind {
         CongestionControl::NewReno | CongestionControl::Cubic => false,
+        CongestionControl::Bbr3 => true,
     }
 }
 
@@ -234,6 +269,8 @@ pub enum Cc {
     NewReno(NewReno),
     /// CUBIC (RFC 9438).
     Cubic(Cubic),
+    /// BBRv3 (draft-ietf-ccwg-bbr-07) as mvfst's BBR3 behaves.
+    Bbr3(Box<Bbr3>),
     /// A test controller that keeps NewReno's window, takes rate samples and records its
     /// inputs.
     #[cfg(test)]
@@ -241,18 +278,30 @@ pub enum Cc {
 }
 
 impl Cc {
-    /// Creates a controller of `kind` for datagrams of up to `max_datagram_size` bytes, or fails
-    /// as [`CcConfig::validate`] does.
+    /// Creates a controller of `kind` for datagrams of up to `max_datagram_size` bytes at the
+    /// start of a connection, or fails as [`CcConfig::validate`] does.
     pub fn new(
         kind: CongestionControl,
         config: &CcConfig,
         max_datagram_size: u16,
+    ) -> Result<Self, ConfigError> {
+        Self::start(kind, config, max_datagram_size, &CcStart::default())
+    }
+
+    /// Creates a controller of `kind` for datagrams of up to `max_datagram_size` bytes, starting
+    /// from `start`, or fails as [`CcConfig::validate`] does.
+    pub fn start(
+        kind: CongestionControl,
+        config: &CcConfig,
+        max_datagram_size: u16,
+        start: &CcStart,
     ) -> Result<Self, ConfigError> {
         config.validate(max_datagram_size)?;
         let window = Window::new(config, max_datagram_size);
         Ok(match kind {
             CongestionControl::NewReno => Self::NewReno(NewReno::new(window)),
             CongestionControl::Cubic => Self::Cubic(Cubic::new(window, config.cubic)),
+            CongestionControl::Bbr3 => Self::Bbr3(Box::new(Bbr3::new(window, start))),
         })
     }
 
@@ -270,16 +319,19 @@ impl Cc {
         match self {
             Self::NewReno(_) => {}
             Self::Cubic(c) => c.on_sent(sent.time_sent, sent.bytes_in_flight),
+            Self::Bbr3(c) => c.on_sent(sent),
             #[cfg(test)]
             Self::Recording(c) => c.on_sent(sent),
         }
     }
 
-    /// Records an ACK frame that newly acknowledged in-flight packets.
+    /// Records an ACK frame that newly acknowledged in-flight packets. BBR3 takes ACKs through
+    /// [`Cc::on_ack_or_loss`] instead.
     pub fn on_ack(&mut self, ack: &AckEvent) {
         match self {
             Self::NewReno(c) => c.on_ack(ack),
             Self::Cubic(c) => c.on_ack(ack),
+            Self::Bbr3(_) => {}
             #[cfg(test)]
             Self::Recording(c) => c.inner.on_ack(ack),
         }
@@ -295,6 +347,7 @@ impl Cc {
                 let _ = event;
                 false
             }
+            Self::Bbr3(c) => c.on_ack_or_loss(event),
             #[cfg(test)]
             Self::Recording(c) => c.on_ack_or_loss(event),
         }
@@ -305,22 +358,25 @@ impl Cc {
     /// event inside the current recovery period is ignored, except that CE marks there rule out
     /// undoing its reduction. For losses, `now` is the time given to the
     /// [`crate::recovery::loss::LossRecovery`] call that declared them, so a new recovery period
-    /// starts with the loss episode that may later prove it spurious.
+    /// starts with the loss episode that may later prove it spurious. BBR3 takes losses through
+    /// [`Cc::on_ack_or_loss`] and ignores CE marks, as mvfst's BBR3 does.
     pub fn on_congestion_event(&mut self, now: Instant, sent: Instant, signal: CongestionSignal) {
         match self {
             Self::NewReno(c) => c.on_congestion_event(now, sent),
             Self::Cubic(c) => c.on_congestion_event(now, sent, signal),
+            Self::Bbr3(_) => {}
             #[cfg(test)]
             Self::Recording(c) => c.inner.on_congestion_event(now, sent),
         }
     }
 
     /// Records that persistent congestion was established; the caller reports it after the
-    /// congestion event for the same losses.
+    /// congestion event for the same losses. BBR3 takes it through [`Cc::on_ack_or_loss`].
     pub fn on_persistent_congestion(&mut self) {
         match self {
             Self::NewReno(c) => c.on_persistent_congestion(),
             Self::Cubic(c) => c.on_persistent_congestion(),
+            Self::Bbr3(_) => {}
             #[cfg(test)]
             Self::Recording(c) => c.inner.on_persistent_congestion(),
         }
@@ -329,10 +385,11 @@ impl Cc {
     /// Records that every loss of the loss episode that began at `recovery_start` proved spurious
     /// ([`crate::recovery::loss::AckOutcome`]'s `spurious_congestion`). CUBIC undoes its last
     /// reduction, as RFC 9438 allows, if that reduction's recovery period began at
-    /// `recovery_start` and the window is still below its value then; NewReno ignores it.
+    /// `recovery_start` and the window is still below its value then; NewReno ignores it, and BBR3
+    /// tracks its own loss episodes through [`Cc::on_ack_or_loss`].
     pub fn on_spurious_loss(&mut self, recovery_start: Instant) {
         match self {
-            Self::NewReno(_) => {}
+            Self::NewReno(_) | Self::Bbr3(_) => {}
             Self::Cubic(c) => c.on_spurious_loss(recovery_start),
             #[cfg(test)]
             Self::Recording(_) => {}
@@ -354,6 +411,7 @@ impl Cc {
                 c.forget_undo();
                 &mut c.window
             }
+            Self::Bbr3(c) => &mut c.window,
             #[cfg(test)]
             Self::Recording(c) => &mut c.inner.window,
         };
@@ -366,13 +424,19 @@ impl Cc {
             w.cwnd = w.cwnd.min(w.initial);
         }
         w.cwnd = w.cwnd.clamp(w.min, w.max);
+        if let Self::Bbr3(c) = self {
+            c.on_max_datagram_size();
+        }
         Ok(())
     }
 
-    /// Returns whether a packet sent at `sent` belongs to the current recovery period, whose
-    /// packets do not grow the window when acknowledged (RFC 9002).
+    /// Returns whether a packet sent at `sent` belongs to the current recovery period, for BBR3 its
+    /// own. NewReno and CUBIC do not grow the window when such a packet is acknowledged (RFC 9002).
     pub fn in_recovery(&self, sent: Instant) -> bool {
-        self.window().in_recovery(sent)
+        match self {
+            Self::Bbr3(c) => c.in_recovery(sent),
+            _ => self.window().in_recovery(sent),
+        }
     }
 
     /// Returns the congestion window in bytes.
@@ -386,8 +450,11 @@ impl Cc {
     }
 
     /// Returns the pacing rate in bytes per second, RFC 9002's N * cwnd / smoothed_rtt, with the
-    /// RTT taken as at least one microsecond.
+    /// RTT taken as at least one microsecond. BBR3 sets its own, C.pacing_rate.
     pub fn pacing_rate(&self, smoothed_rtt: Duration) -> NonZeroU64 {
+        if let Self::Bbr3(c) = self {
+            return NonZeroU64::new(c.pacing_rate()).unwrap_or(NonZeroU64::MIN);
+        }
         let w = self.window();
         let (num, den) = w.pacing_gain;
         let rtt_us = smoothed_rtt.as_micros().max(1);
@@ -395,10 +462,38 @@ impl Cc {
         NonZeroU64::new(u64::try_from(rate).unwrap_or(u64::MAX)).unwrap_or(NonZeroU64::MIN)
     }
 
+    /// Returns whether the pacer should pace yet. BBR3 sends its initial window unpaced, as
+    /// mvfst's BBR3 does; the others always pace.
+    pub fn pacing_ready(&self) -> bool {
+        match self {
+            Self::Bbr3(c) => c.pacing_ready(),
+            _ => true,
+        }
+    }
+
+    /// Returns and clears whether a send changed the pacing rate, so that the pacer must take it
+    /// before the next paced datagram. Only BBR3 changes its rate on a send.
+    pub fn take_pacer_refresh(&mut self) -> bool {
+        match self {
+            Self::Bbr3(c) => c.take_pacer_refresh(),
+            _ => false,
+        }
+    }
+
+    /// Returns this controller as BBR3, for a test that built one.
+    #[cfg(test)]
+    pub(crate) fn bbr3(&self) -> &Bbr3 {
+        match self {
+            Self::Bbr3(c) => c,
+            _ => panic!("not BBR3: {self:?}"),
+        }
+    }
+
     fn window(&self) -> &Window {
         match self {
             Self::NewReno(c) => &c.window,
             Self::Cubic(c) => &c.window,
+            Self::Bbr3(c) => &c.window,
             #[cfg(test)]
             Self::Recording(c) => &c.inner.window,
         }

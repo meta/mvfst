@@ -304,13 +304,8 @@ impl Link {
         }
         let mut leaves = now;
         if let Some(rate) = self.config.rate {
-            let queued = self
-                .busy_until
-                .map_or(0, |busy| busy.saturating_duration_since(now).as_nanos())
-                * u128::from(rate)
-                / 1_000_000_000;
             if let Some(buffer) = self.config.buffer
-                && queued + data.len() as u128 > buffer as u128
+                && self.queued(now) as u128 + data.len() as u128 > buffer as u128
             {
                 self.lost += 1;
                 return;
@@ -357,6 +352,16 @@ impl Link {
                 data
             })
             .collect()
+    }
+
+    /// Returns the bytes in the bottleneck queue at `now`, the datagram being serialized included.
+    pub fn queued(&self, now: Instant) -> u64 {
+        let (Some(rate), Some(busy)) = (self.config.rate, self.busy_until) else {
+            return 0;
+        };
+        let bytes =
+            busy.saturating_duration_since(now).as_nanos() * u128::from(rate) / 1_000_000_000;
+        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
     /// Returns the number of datagrams sent into the link.
@@ -1007,6 +1012,28 @@ mod tests {
             link.next_arrival(),
             Some(t0 + 30 * MS + Duration::from_micros(500))
         );
+    }
+
+    #[test]
+    fn the_bottleneck_queue_holds_the_bytes_still_to_serialize() {
+        let t0 = test_epoch();
+        let config = LinkConfig {
+            rate: Some(1_000_000),
+            ..LinkConfig::default()
+        };
+        let mut link = Link::new(config, 1);
+        assert_eq!(link.queued(t0), 0);
+        for _ in 0..3 {
+            link.send(t0, vec![0; 1000]);
+        }
+        assert_eq!(link.queued(t0), 3000);
+        // It drains at the rate, 1,000 bytes per millisecond.
+        assert_eq!(link.queued(t0 + Duration::from_micros(1500)), 1500);
+        assert_eq!(link.queued(t0 + 5 * MS), 0);
+        // A link without a rate does not queue.
+        let mut link = Link::new(LinkConfig::default(), 1);
+        link.send(t0, vec![0; 1000]);
+        assert_eq!(link.queued(t0), 0);
     }
 
     #[test]
