@@ -18,6 +18,7 @@ use std::panic::catch_unwind;
 use std::rc::Rc;
 use std::rc::Weak;
 use std::sync::Arc;
+use std::task::Waker;
 use std::time::Duration;
 
 use mvfstr_io::Backend;
@@ -30,6 +31,7 @@ use mvfstr_proto::Endpoint;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::ServerConfig;
 use mvfstr_proto::SrcPortBlocklist;
+use mvfstr_proto::TlsHost;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::worker::CleanupRegistrationError;
 use roxygen_runtime::worker::WorkerContext;
@@ -71,6 +73,7 @@ impl<A: QuicApplication, B: Backend> EndpointDriver<A, B> {
             steering: None,
             host_timers: None,
             budget: None,
+            tls_host: None,
         }
     }
 }
@@ -100,6 +103,7 @@ pub struct EndpointDriverBuilder<A: QuicApplication, B: Backend> {
     steering: Option<Arc<Steering>>,
     host_timers: Option<HostTimers>,
     budget: Option<WorkBudget>,
+    tls_host: Option<Box<dyn TlsHost>>,
 }
 
 impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
@@ -178,6 +182,18 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
         self
     }
 
+    /// Runs the handshakes of the connections whose configs name an External TLS backend
+    /// ([`ServerTls::External`](mvfstr_proto::ServerTls::External),
+    /// [`ClientTls::External`](mvfstr_proto::ClientTls::External)) on `host`, on the driver's
+    /// thread. A step the host answers at once leaves in the turn of the call unless a stop under a
+    /// work budget delays it. A host that answers `Pending` must wake the driver through
+    /// [`EndpointHandle::tls_waker`] once the step is ready. Without a host, the sessions drive
+    /// those handshakes through [`Conn`](crate::Conn).
+    pub fn tls_host(mut self, host: Box<dyn TlsHost>) -> Self {
+        self.tls_host = Some(host);
+        self
+    }
+
     /// Sets the socket settings of every backend the driver opens. Default `B::Options::default()`.
     pub fn backend_options(mut self, options: B::Options) -> Self {
         self.backend_options = options;
@@ -229,7 +245,8 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
                 steering,
                 self.host_timers.unwrap_or_else(HostTimers::tokio),
             )
-            .with_budget(self.budget),
+            .with_budget(self.budget)
+            .with_tls_host(self.tls_host),
         );
         let task = Rc::clone(&core);
         worker
@@ -273,6 +290,13 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
     /// the send buffer the kernel granted.
     pub fn server_caps(&self) -> Option<TxCaps> {
         self.core.upgrade()?.server_caps()
+    }
+
+    /// Returns the waker that the driver's TLS host must wake, from any thread, when it completes
+    /// a step it answered `Pending`; the driver then takes the step through
+    /// [`TlsHost::poll_ready`]. `None` without a TLS host or once the driver has ended.
+    pub fn tls_waker(&self) -> Option<Waker> {
+        self.core.upgrade()?.tls_waker()
     }
 
     /// Opens a client connection to `remote` with `session` as its application state, on its own

@@ -26,8 +26,11 @@ use std::panic::catch_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
 use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
@@ -37,6 +40,7 @@ use mvfstr_io::Backend;
 use mvfstr_io::FlushOutcome;
 use mvfstr_io::TxCaps;
 use mvfstr_proto::ClientConfig;
+use mvfstr_proto::ClientTls;
 use mvfstr_proto::ConnEvent;
 use mvfstr_proto::ConnKey;
 use mvfstr_proto::ConnOptions;
@@ -55,12 +59,16 @@ use mvfstr_proto::RxDropReason;
 use mvfstr_proto::RxMeta;
 use mvfstr_proto::SegmentSink;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::ServerTls;
 use mvfstr_proto::SrcPortBlocklist;
 use mvfstr_proto::SrcPortDrops;
 use mvfstr_proto::StatelessReply;
 use mvfstr_proto::Stop;
 use mvfstr_proto::StreamId;
 use mvfstr_proto::StreamReady;
+use mvfstr_proto::TlsConnId;
+use mvfstr_proto::TlsHost;
+use mvfstr_proto::TlsPoll;
 use mvfstr_proto::TransportErrorCode;
 use mvfstr_proto::TxClass;
 use mvfstr_proto::TxLimits;
@@ -141,7 +149,8 @@ const INTAKE_PER_TURN: usize = 256;
 /// `poll_send` calls per turn across all connections.
 const POLLS_PER_TURN: usize = 1024;
 
-/// Connection attempts handled per turn; later Initials wait for the next turn.
+/// Connection attempts handled per turn; later Initials wait for the next turn. It also caps,
+/// apart from the attempts, the handshakes the driver starts on its TLS host per turn.
 const HANDSHAKES_PER_TURN: usize = 8;
 
 /// Initials kept for a later turn once a turn's connection attempts run out; more are dropped,
@@ -162,7 +171,8 @@ pub(crate) struct Limits {
     /// Bytes one connection's pull steps may stage per turn, each poll counted at least
     /// [`POLL_CHARGE`].
     pub(crate) turn_staging: u64,
-    /// Connection attempts handled per turn.
+    /// Connection attempts handled per turn, and apart from them, handshakes started on the TLS
+    /// host per turn.
     pub(crate) handshakes: usize,
     /// Initials kept for a later turn once a turn's connection attempts run out.
     pub(crate) waiting_initials: usize,
@@ -199,16 +209,20 @@ pub(crate) enum Phase {
     FirstApp,
     FirstTransmit,
     Receive,
+    /// The calls into the TLS host for the connections due one. A driver without a TLS host
+    /// skips it, and a turn that would resume at it resumes after it unless a connection is due.
+    Tls,
     SecondApp,
     SecondTransmit,
 }
 
 impl Phase {
-    const ALL: [Phase; 6] = [
+    const ALL: [Phase; 7] = [
         Phase::Intake,
         Phase::FirstApp,
         Phase::FirstTransmit,
         Phase::Receive,
+        Phase::Tls,
         Phase::SecondApp,
         Phase::SecondTransmit,
     ];
@@ -219,7 +233,8 @@ impl Phase {
             Phase::Intake => Phase::FirstApp,
             Phase::FirstApp => Phase::FirstTransmit,
             Phase::FirstTransmit => Phase::Receive,
-            Phase::Receive => Phase::SecondApp,
+            Phase::Receive => Phase::Tls,
+            Phase::Tls => Phase::SecondApp,
             Phase::SecondApp => Phase::SecondTransmit,
             Phase::SecondTransmit => Phase::Intake,
         }
@@ -270,6 +285,8 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     steering: Option<Member>,
     /// The work budget the driver's polls run under, if any.
     budget: Option<WorkBudget>,
+    /// The TLS host that runs the handshakes of connections with an External TLS backend, if any.
+    tls: Option<TlsHosting>,
     /// The phase the next turn starts at: the intake, or the phase after the one a check stopped.
     resume: Cell<Phase>,
     /// Whether a transmit phase has stopped since the last receive phase began.
@@ -325,6 +342,79 @@ impl<B: Backend> Server<B> {
     }
 }
 
+/// The driver's TLS host and the connections due a call into it.
+struct TlsHosting {
+    host: RefCell<Box<dyn TlsHost>>,
+    /// The connections whose handshakes have started that may have an input for the host, oldest
+    /// first.
+    due: RefCell<VecDeque<ConnKey>>,
+    /// The connections that may have their first input for the host, oldest first.
+    waiting: RefCell<VecDeque<ConnKey>>,
+    ready: Arc<TlsReady>,
+}
+
+impl TlsHosting {
+    /// Returns whether a connection is due a call.
+    fn has_due(&self) -> bool {
+        !self.due.borrow().is_empty() || !self.waiting.borrow().is_empty()
+    }
+
+    /// Returns the list a connection due a call waits on: the list of handshakes under way if
+    /// `started` is true, else the list of handshakes waiting to start.
+    fn list(&self, started: bool) -> &RefCell<VecDeque<ConnKey>> {
+        if started { &self.due } else { &self.waiting }
+    }
+
+    /// Returns whether a connection is due a call, or the host may hold completed steps the
+    /// driver has not taken.
+    fn has_work(&self) -> bool {
+        self.has_due() || self.ready.flagged.load(Ordering::SeqCst)
+    }
+}
+
+/// The state a TLS phase keeps from one connection to the next.
+struct TlsPass {
+    /// The phase's reading, which its steps are delivered at.
+    now: Instant,
+    /// The phase's reading until its first check takes it.
+    reading: Option<Instant>,
+    /// The number of handshakes the phase has started.
+    starts: usize,
+}
+
+/// The waker of a TLS host's completed steps: it flags them for the next intake and wakes the
+/// driver task.
+struct TlsReady {
+    shared: Arc<Shared>,
+    /// Whether the host may hold steps that `poll_ready` has not returned.
+    flagged: AtomicBool,
+}
+
+impl Wake for TlsReady {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.flagged.store(true, Ordering::SeqCst);
+        self.shared.wake_task();
+    }
+}
+
+/// Returns the ID of a connection at the driver's TLS host: its slab key's generation in the high
+/// 32 bits and its index in the low 32.
+fn tls_id(key: ConnKey) -> TlsConnId {
+    TlsConnId(u64::from(key.generation) << 32 | u64::from(key.index))
+}
+
+/// Returns the slab key of the connection with TLS host ID `id`.
+fn tls_key(id: TlsConnId) -> ConnKey {
+    ConnKey {
+        index: id.0 as u32,
+        generation: (id.0 >> 32) as u32,
+    }
+}
+
 /// The receive path's reused vectors, empty between batches, so they are not allocated again for
 /// each batch. They hold borrows of a socket's buffers during a batch only, so they are kept here
 /// with `'static` element types and [`recycle`]d to the batch's lifetimes and back.
@@ -377,6 +467,12 @@ struct Entry<S, B> {
     app_due: bool,
     /// `on_quiesce` is due.
     quiesce_due: bool,
+    /// The connection's handshake runs on the driver's TLS host.
+    tls_hosted: bool,
+    /// On one of the TLS host's lists of connections due a call.
+    tls_queued: bool,
+    /// The TLS host has been handed the connection's first input.
+    tls_started: bool,
     /// The connection's entry in the deadline timers: the earlier of its own deadline and its
     /// session's.
     deadline: Option<Instant>,
@@ -694,6 +790,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             rx_scratch: RefCell::default(),
             steering,
             budget: None,
+            tls: None,
             resume: Cell::new(Phase::Intake),
             rx_owed: Cell::new(false),
             stopped: Cell::new(false),
@@ -717,6 +814,26 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
         self.budget = budget;
         self
+    }
+
+    /// Runs the handshakes of the connections with an External TLS backend on `host`.
+    pub(crate) fn with_tls_host(mut self, host: Option<Box<dyn TlsHost>>) -> Self {
+        self.tls = host.map(|host| TlsHosting {
+            host: RefCell::new(host),
+            due: RefCell::default(),
+            waiting: RefCell::default(),
+            ready: Arc::new(TlsReady {
+                shared: Arc::clone(&self.shared),
+                flagged: AtomicBool::new(false),
+            }),
+        });
+        self
+    }
+
+    /// Returns the waker the TLS host wakes when it completes a step, if the driver has a host.
+    pub(crate) fn tls_waker(&self) -> Option<Waker> {
+        let tls = self.tls.as_ref()?;
+        Some(Waker::from(Arc::clone(&tls.ready)))
     }
 
     /// Makes the next turn panic outside every connection's guard.
@@ -909,7 +1026,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             .pacing();
         match self.create_client(remote, server_name, &config, options) {
             Ok((key, conn, socket)) => {
-                let wake = self.insert(key, conn, session, Some(Box::new(socket)), paces);
+                let hosted = matches!(config.tls(), ClientTls::External);
+                let wake = self.insert(key, conn, session, Some(Box::new(socket)), paces, hosted);
                 // The call may come from outside the driver's own poll.
                 self.shared.wake_task();
                 Ok(ConnHandle::new(wake))
@@ -1046,9 +1164,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Runs one turn: intake, application phase, transmit, receive, application phase and
-    /// transmit, then decides between another turn, waiting for a wake and finishing. `entry` is
-    /// the reading a poll with a work budget took as it began, which its first turn runs at.
+    /// Runs one turn: intake, application phase, transmit, receive, the TLS host's calls,
+    /// application phase and transmit, then decides between another turn, waiting for a wake and
+    /// finishing. `entry` is the reading a poll with a work budget took as it began, which its
+    /// first turn runs at.
     ///
     /// After a check stops a turn, the next turn starts at the phase after the one that stopped,
     /// and only a turn that starts at the intake counts as a new turn. After a transmit phase
@@ -1063,7 +1182,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if self.fail_turn.take() {
             panic!("an injected driver bug");
         }
-        let start = self.resume.replace(Phase::Intake);
+        // A TLS phase has work only while a connection is due a call, so otherwise a turn that
+        // would resume there resumes at the phase after it, which then runs at the turn's reading.
+        let start = match self.resume.replace(Phase::Intake) {
+            Phase::Tls if !self.tls.as_ref().is_some_and(TlsHosting::has_due) => Phase::SecondApp,
+            phase => phase,
+        };
         let now = entry.unwrap_or_else(|| self.clock());
         if start == Phase::Intake {
             #[cfg(test)]
@@ -1076,8 +1200,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             if phase == Phase::FirstTransmit && self.rx_owed.get() {
                 continue;
             }
+            if phase == Phase::Tls && self.tls.is_none() {
+                continue;
+            }
             #[cfg(test)]
-            self.record.borrow_mut().marks.push(Mark::Phase(phase));
+            self.record.borrow_mut().enter(phase);
             // The phase a turn starts at runs at the turn's reading, as the first application
             // phase does after the intake.
             let at = || if phase == start { now } else { self.clock() };
@@ -1087,12 +1214,22 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     if !self.stopped.get() {
                         self.intake(now, cx);
                     }
+                    if let Some(tls) = &self.tls
+                        && !self.stopped.get()
+                    {
+                        self.drain_tls(tls, now);
+                    }
                 }
                 Phase::FirstApp => self.app_phase(now),
                 Phase::FirstTransmit | Phase::SecondTransmit => self.transmit_phase(at(), cx),
                 Phase::Receive => {
                     self.rx_owed.set(false);
                     self.receive(cx);
+                }
+                Phase::Tls => {
+                    if let Some(tls) = &self.tls {
+                        self.tls_phase(tls, (phase == start).then_some(now));
+                    }
                 }
                 Phase::SecondApp => self.app_phase(at()),
             }
@@ -1148,15 +1285,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     }
 
     /// Returns the host's time. A turn reads it once for its quiesce steps, intake and first
-    /// application phase, then again for each later application or transmit phase and after each
-    /// batch is received, so packet times and RTT samples do not lag by earlier work. A transmit
-    /// phase also reads it for each attempt on a socket with kernel release and each attempt of a
-    /// paced connection, and before each pop from its queue while a pacing wake is armed, until
-    /// the phase's requeue cap is spent; under a work budget, only before the pops on the wakes'
-    /// turn, and once per 64 pops inside a run of stale slots. Under a work budget, a poll also
-    /// reads it as it begins, for the budget and its first turn, and a check reads it only when it
-    /// cannot reuse one of these. Under a work budget, a transmit phase also reads it after its
-    /// end-of-phase flush, and before the flush unless a check stopped the phase.
+    /// application phase, then again for each later application or transmit phase, for a TLS phase
+    /// with connections due a call, and after each batch is received, so packet times and RTT
+    /// samples do not lag by earlier work. A transmit phase also reads it for each attempt on a
+    /// socket with kernel release and each attempt of a paced connection, and before each pop from
+    /// its queue while a pacing wake is armed, until the phase's requeue cap is spent; under a work
+    /// budget, only before the pops on the wakes' turn, and once per 64 pops inside a run of stale
+    /// slots. Under a work budget, a poll also reads it as it begins, for the budget and its first
+    /// turn, and a check reads it only when it cannot reuse one of these. Under a work budget, a
+    /// transmit phase also reads it after its end-of-phase flush, and before the flush unless a
+    /// check stopped the phase.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -1350,10 +1488,19 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Tears down a connection whose session or transport panicked: its routes, timers and
-    /// handles go, it does not send again, and the panic is counted. On the server socket, the
-    /// endpoint answers the peer's next packet with a stateless reset, since its connection ID no
-    /// longer routes.
+    /// Cancels the TLS host's state for a connection being torn down, outside the connection's own
+    /// guards; a panic in the call is contained, as one in the session's `Drop` is.
+    fn cancel_guarded(&self, tls: &TlsHosting, key: ConnKey) {
+        let cancel = || self.call_host(tls, |host| host.cancel(tls_id(key)));
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(cancel)) {
+            self.contain(ContainedPanicScope::Connection, "tls", payload);
+        }
+    }
+
+    /// Tears down a connection whose session, transport or TLS host call panicked: its routes,
+    /// timers and handles go, it does not send again, the TLS host drops any state it holds for
+    /// it, and the panic is counted. On the server socket, the endpoint answers the peer's next
+    /// packet with a stateless reset, since its connection ID no longer routes.
     fn poison(&self, key: ConnKey, site: &'static str, payload: Box<dyn Any + Send>) {
         self.contain(ContainedPanicScope::Connection, site, payload);
         self.endpoint
@@ -1362,6 +1509,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let Some(entry) = self.slab.borrow_mut().remove(key) else {
             return;
         };
+        // The connection's own record of the host's state may be torn by the panic.
+        if entry.tls_hosted
+            && let Some(tls) = &self.tls
+        {
+            self.cancel_guarded(tls, key);
+        }
         let mut sched = self.sched.borrow_mut();
         sched
             .timers
@@ -1658,12 +1811,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         false
     }
 
-    /// Frees the slot of a drained connection: its routes, timers and handles go, and its
-    /// session is dropped.
+    /// Frees the slot of a drained connection: its routes, timers and handles go, its session is
+    /// dropped, and the TLS host drops any state it holds for it.
     fn free(&self, key: ConnKey) {
         let Some(mut entry) = self.slab.borrow_mut().remove(key) else {
             return;
         };
+        if let Some(tls) = &self.tls
+            && entry.conn.take_tls_cancel()
+        {
+            self.cancel_guarded(tls, key);
+        }
         while let Some(event) = entry.conn.poll_endpoint_event() {
             self.endpoint.borrow_mut().handle_event(key, event);
         }
@@ -2320,8 +2478,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                             meta: &waiting.meta,
                             data: &mut waiting.datagram,
                         };
-                        entry.conn.recv_batch(now, &mut [datagram]);
-                        self.after_receive(key, entry);
+                        let summary = entry.conn.recv_batch(now, &mut [datagram]);
+                        self.after_receive(key, entry, summary.tls_due);
                     });
                 }
                 Route::Accept(incoming) => {
@@ -2436,8 +2594,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     .map(|(_, _, meta, data)| RxDatagram { meta, data }),
             );
             self.with_entry(key, "receive", |entry| {
-                entry.conn.recv_batch(now, &mut datagrams);
-                self.after_receive(key, entry);
+                let summary = entry.conn.recv_batch(now, &mut datagrams);
+                self.after_receive(key, entry, summary.tls_due);
             });
         }
         scratch.datagrams = recycle(datagrams);
@@ -2552,7 +2710,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }));
         match created {
             Ok(Ok(conn)) => {
-                self.insert(key, conn, session, None, paces);
+                let hosted = matches!(server.config.tls(), ServerTls::External);
+                self.insert(key, conn, session, None, paces, hosted);
                 return None;
             }
             Ok(Err(_)) => {}
@@ -2580,6 +2739,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         };
         let mut cx = Context::from_waker(rx_waker);
         let mut received = false;
+        let mut tls_due = false;
         let mut drained = false;
         let mut stopped = false;
         let mut spare = mem::take(&mut self.rx_scratch.borrow_mut().datagrams);
@@ -2628,7 +2788,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 start: start.handled,
                 end: at.handled,
             });
-            conn.recv_batch(now, &mut datagrams);
+            tls_due = conn.recv_batch(now, &mut datagrams).tls_due;
             spare = recycle(datagrams);
             received = true;
             if more {
@@ -2642,7 +2802,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             self.sched.borrow_mut().rx.push_back(key);
         }
         if received {
-            self.after_receive(key, entry);
+            self.after_receive(key, entry, tls_due);
         }
     }
 
@@ -2657,15 +2817,41 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Queues the work a receive batch makes.
-    fn after_receive(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
+    /// Queues the work a receive batch makes. `tls_due` is whether the batch left the connection
+    /// work for its TLS host.
+    fn after_receive(&self, key: ConnKey, entry: &mut Entry<A::Session, B>, tls_due: bool) {
         self.mark_dirty(key, entry);
         self.queue_app(key, entry);
+        if tls_due {
+            self.queue_tls(key, entry);
+        }
         self.after_transport(key, entry);
     }
 
-    /// Applies the connection's endpoint events and resyncs its deadline.
+    /// Puts the connection on one of the TLS host's lists of connections due a call, if the driver
+    /// has a host and the connection is not on either list yet.
+    fn queue_tls(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
+        if let Some(tls) = &self.tls
+            && !entry.tls_queued
+        {
+            entry.tls_queued = true;
+            tls.list(entry.tls_started).borrow_mut().push_back(key);
+        }
+    }
+
+    /// Applies the connection's endpoint events and resyncs its deadline. If the connection has
+    /// closed while the TLS host held state for it, that state is cancelled first, so the cancel
+    /// does not wait for the end of the closing period. For a connection still due a call, the TLS
+    /// phase makes the cancel, after a check as for every call there; for any other connection the
+    /// cancel is part of the unit that closed it.
     fn after_transport(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
+        if entry.tls_hosted
+            && !entry.tls_queued
+            && let Some(tls) = &self.tls
+            && entry.conn.take_tls_cancel()
+        {
+            self.call_host(tls, |host| host.cancel(tls_id(key)));
+        }
         while let Some(event) = entry.conn.poll_endpoint_event() {
             #[cfg(test)]
             if let EndpointEvent::NewLocalCid { cid, .. } = event {
@@ -2674,6 +2860,150 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             self.endpoint.borrow_mut().handle_event(key, event);
         }
         self.resync(key, entry);
+    }
+
+    /// Hands the TLS host the inputs of the connections due a call and delivers the steps it
+    /// answers at once, so that what they write leaves in the transmit phase that follows: first
+    /// the handshakes under way, oldest first, then those waiting to start, oldest first, up to
+    /// the cap on handshakes per turn, which counts the starts apart from the turn's accepts. The
+    /// phase runs once per turn, and the handshakes past the cap wait, untouched, for a later
+    /// turn. `now` is the turn's reading if the turn starts at this phase, and `None` otherwise,
+    /// when the phase reads the clock itself; either reading also serves its first check. A stop
+    /// leaves the connection it came in at the head of its list, and the rest behind it in order.
+    fn tls_phase(&self, tls: &TlsHosting, now: Option<Instant>) {
+        if !tls.has_due() {
+            return;
+        }
+        let now = now.unwrap_or_else(|| self.clock());
+        let mut pass = TlsPass {
+            now,
+            reading: Some(now),
+            starts: 0,
+        };
+        let under_way = tls.due.borrow().len();
+        for _ in 0..under_way {
+            if !self.serve_next(tls, &tls.due, &mut pass) {
+                return;
+            }
+        }
+        let waiting = tls.waiting.borrow().len();
+        for _ in 0..waiting {
+            if pass.starts >= self.limits.handshakes {
+                return;
+            }
+            if !self.serve_next(tls, &tls.waiting, &mut pass) {
+                return;
+            }
+        }
+    }
+
+    /// Serves the connection at the head of `list` in the TLS phase `pass`. Returns `false` if a
+    /// check stopped the poll; the connection is then back at the head of its list.
+    fn serve_next(
+        &self,
+        tls: &TlsHosting,
+        list: &RefCell<VecDeque<ConnKey>>,
+        pass: &mut TlsPass,
+    ) -> bool {
+        let Some(key) = list.borrow_mut().pop_front() else {
+            return true;
+        };
+        #[cfg(test)]
+        self.record.borrow_mut().marks.push(Mark::TlsTaken(key));
+        let served = self.with_entry(key, "tls", |entry| {
+            let served = self.serve_tls(tls, key, entry, pass);
+            if !served {
+                tls.list(entry.tls_started).borrow_mut().push_front(key);
+            }
+            served
+        });
+        served != Some(false)
+    }
+
+    /// Delivers the steps the TLS host has completed and not returned yet, and puts their
+    /// connections on the lists of connections due a call, since a step may leave another input.
+    /// A stop leaves the rest with the host, for the next intake.
+    fn drain_tls(&self, tls: &TlsHosting, now: Instant) {
+        // The load spares an atomic read-modify-write in the turns that find the flag clear.
+        if !tls.ready.flagged.load(Ordering::SeqCst)
+            || !tls.ready.flagged.swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        loop {
+            if !self.gate(UnitKind::TlsHostCall, None) {
+                tls.ready.flagged.store(true, Ordering::SeqCst);
+                return;
+            }
+            let Some((id, step)) = self.call_host(tls, |host| host.poll_ready()) else {
+                return;
+            };
+            let key = tls_key(id);
+            self.with_entry(key, "tls", |entry| {
+                // Queued first, so a step that closes the connection leaves the cancel to the TLS
+                // phase's check.
+                self.queue_tls(key, entry);
+                if entry.conn.tls_deliver(now, step).is_ok() {
+                    self.after_tls(key, entry);
+                }
+            });
+        }
+    }
+
+    /// Hands the TLS host the inputs of one connection for as long as the host answers each at
+    /// once, delivering each step, or cancels the host's state for a connection that has closed.
+    /// Under a work budget, a check runs before each input is taken, since the connection's next
+    /// input cannot be inspected without taking it. A first input counts against the phase's
+    /// starts. Returns `false` if a check stopped the poll; the connection then stays due a call.
+    fn serve_tls(
+        &self,
+        tls: &TlsHosting,
+        key: ConnKey,
+        entry: &mut Entry<A::Session, B>,
+        pass: &mut TlsPass,
+    ) -> bool {
+        let id = tls_id(key);
+        let mut delivered = false;
+        let mut stopped = false;
+        loop {
+            if !self.gate(UnitKind::TlsHostCall, pass.reading.take()) {
+                stopped = true;
+                break;
+            }
+            let Some(input) = entry.conn.tls_input() else {
+                if entry.conn.take_tls_cancel() {
+                    self.call_host(tls, |host| host.cancel(id));
+                }
+                break;
+            };
+            if !entry.tls_started {
+                entry.tls_started = true;
+                pass.starts += 1;
+            }
+            let TlsPoll::Ready(step) = self.call_host(tls, |host| host.handle(id, input)) else {
+                break;
+            };
+            delivered |= entry.conn.tls_deliver(pass.now, step).is_ok();
+        }
+        entry.tls_queued = stopped;
+        if delivered {
+            self.after_tls(key, entry);
+        }
+        !stopped
+    }
+
+    /// Makes one call into the TLS host.
+    fn call_host<R>(&self, tls: &TlsHosting, call: impl FnOnce(&mut dyn TlsHost) -> R) -> R {
+        #[cfg(test)]
+        self.record.borrow_mut().tls_call();
+        call(&mut **tls.host.borrow_mut())
+    }
+
+    /// Queues the work a TLS step makes.
+    fn after_tls(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
+        self.mark_dirty(key, entry);
+        self.queue_app(key, entry);
+        self.after_transport(key, entry);
     }
 
     /// Decides between another turn, waiting for a wake and finishing, and arms the host wake
@@ -2699,6 +3029,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             || sched.quiesce_request.is_some()
             || !sched.sweeps.is_empty()
             || (!sched.parked.is_empty() && !sched.server_blocked)
+            || self.tls.as_ref().is_some_and(TlsHosting::has_work)
         {
             return Next::Again;
         }
@@ -2723,7 +3054,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     }
 
     /// Stores a new connection, due a transmit attempt and a first `poll_session`. `paces` is
-    /// whether its transport config turns pacing on.
+    /// whether its transport config turns pacing on, and `hosted` whether its TLS backend is
+    /// External, which puts its handshake on the driver's TLS host if the driver has one.
     fn insert(
         &self,
         key: ConnKey,
@@ -2731,6 +3063,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         session: A::Session,
         socket: Option<Box<B>>,
         paces: bool,
+        hosted: bool,
     ) -> Arc<ConnWake> {
         let wake = ConnWake::new(Arc::clone(&self.shared), key);
         let mut sched = self.sched.borrow_mut();
@@ -2740,6 +3073,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sched.rx.push_back(key);
         }
         drop(sched);
+        let tls_queued = match &self.tls {
+            Some(tls) if hosted => {
+                tls.waiting.borrow_mut().push_back(key);
+                true
+            }
+            _ => false,
+        };
         let pacing_kind = self
             .sched
             .borrow()
@@ -2760,6 +3100,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             app_queued: true,
             app_due: true,
             quiesce_due: self.sched.borrow().quiesce.is_some(),
+            tls_hosted: tls_queued,
+            tls_queued,
+            tls_started: false,
             deadline: None,
             session_deadline: None,
             served_deadline: None,
@@ -2941,6 +3284,10 @@ pub(crate) struct TxRecord {
     pub(crate) phase_clock_reads: u64,
     /// Clock reads.
     pub(crate) clock_reads: u64,
+    /// The count of clock reads when the running phase of a turn began.
+    entered_at_read: u64,
+    /// For each call into the TLS host, the clock reads since its phase began.
+    pub(crate) tls_call_reads: Vec<u64>,
     /// Every transmit attempt, in order.
     pub(crate) attempts: Vec<AttemptRecord>,
     /// Every pacing wake taken, in order.
@@ -2992,6 +3339,10 @@ pub(crate) enum Mark {
         start: usize,
         end: usize,
     },
+    /// A call into the TLS host.
+    TlsCall,
+    /// The TLS phase took this connection from a list of connections due a call.
+    TlsTaken(ConnKey),
 }
 
 /// A transmit attempt: its connection, its transmit phase, and the clock reading it ran at.
@@ -3034,6 +3385,17 @@ impl TxRecord {
         if self.phase.is_some() {
             self.phase_clock_reads += 1;
         }
+    }
+
+    fn enter(&mut self, phase: Phase) {
+        self.marks.push(Mark::Phase(phase));
+        self.entered_at_read = self.clock_reads;
+    }
+
+    fn tls_call(&mut self) {
+        self.marks.push(Mark::TlsCall);
+        self.tls_call_reads
+            .push(self.clock_reads - self.entered_at_read);
     }
 
     fn unit(&mut self, kind: UnitKind) {

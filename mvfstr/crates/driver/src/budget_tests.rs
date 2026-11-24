@@ -1030,6 +1030,51 @@ fn a_stop_with_part_of_a_batch_left_and_the_socket_empty_wakes_the_driver_again(
     assert_eq!(routes(&second), [(64, 128)], "{second:?}");
 }
 
+/// A driver without a TLS host: a poll granted one unit after a receive stop resumes at the
+/// second application phase rather than at the TLS phase, so it runs that phase at its own
+/// reading.
+#[test]
+fn a_poll_resumed_after_a_receive_stop_runs_its_second_application_phase_at_its_own_reading() {
+    let budget = WorkBudget::new(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        budget: Some(budget.clone()),
+        ..ServerPlan::default()
+    });
+    scene.lab.refill_each_iteration(&budget);
+    let batch = gro_batch(&mut scene);
+    polls_while_woken(&scene);
+    scene.lab.net.set_costs(Costs {
+        chunk: SLICE * 2,
+        ..Costs::default()
+    });
+    budget.refill();
+    scene.lab.net.inject(SERVER, batch);
+    let first = scene.poll_server();
+    assert_eq!(stop(&first), Some(Phase::Receive), "{first:?}");
+    budget.set_hold(true);
+    budget.grant();
+    let reads = |scene: &Scene| scene.server.tx_record().clock_reads;
+    let before = reads(&scene);
+    let granted = scene.poll_server();
+    assert_eq!(
+        granted[..3],
+        [
+            Mark::Poll,
+            Mark::Phase(Phase::SecondApp),
+            Mark::Unit(UnitKind::AppVisit)
+        ],
+        "{granted:?}"
+    );
+    assert_eq!(stop(&granted), Some(Phase::SecondTransmit), "{granted:?}");
+    assert_eq!(
+        reads(&scene) - before,
+        3,
+        "one reading for the admit and the application phase, one for the transmit phase, and one \
+         for the check that stops it before its attempt, which leaves nothing to flush: \
+         {granted:?}"
+    );
+}
+
 #[test]
 fn a_slice_that_closes_in_an_accept_stops_right_after_it_in_route_batch() {
     let budget = WorkBudget::per_poll(SLICE);

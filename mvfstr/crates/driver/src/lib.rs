@@ -39,6 +39,8 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 mod timers;
+#[cfg(test)]
+mod tls_tests;
 mod turn;
 mod wake;
 

@@ -858,6 +858,8 @@ pub(crate) struct Probe {
     open: Cell<usize>,
     /// Whether the connection has closed.
     pub(crate) closed: Cell<bool>,
+    /// Whether the next `poll_session` aborts the connection.
+    pub(crate) aborts: Cell<bool>,
 }
 
 impl Probe {
@@ -971,6 +973,10 @@ impl QuicSession for Bulk {
     fn poll_session(&mut self, cx: &mut Context<'_>, conn: &mut Conn<'_>) -> Poll<()> {
         self.net.charge(self.net.costs().visit);
         self.probe.visits.set(self.probe.visits.get() + 1);
+        if self.probe.aborts.take() {
+            conn.abort();
+            return Poll::Pending;
+        }
         let streams = self.probe.open.take();
         self.open(conn, streams);
         self.probe.stats.set(conn.stats());

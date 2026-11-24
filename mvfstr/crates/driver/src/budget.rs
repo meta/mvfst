@@ -47,10 +47,12 @@ pub enum UnitKind {
     /// queued there, as many as the socket accepts. It runs even after a stop, and is not preceded
     /// by a check.
     TransmitFlush,
+    /// One call into the driver's TLS host, with the delivery of the step it returns.
+    TlsHostCall,
 }
 
 impl UnitKind {
-    const COUNT: usize = 10;
+    const COUNT: usize = 11;
 
     fn index(self) -> usize {
         match self {
@@ -64,6 +66,7 @@ impl UnitKind {
             Self::Sweep => 7,
             Self::Remark => 8,
             Self::TransmitFlush => 9,
+            Self::TlsHostCall => 10,
         }
     }
 }
