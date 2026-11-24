@@ -52,7 +52,7 @@ struct CongestionControlConfig {
   // limited.
   bool leaveHeadroomForCwndLimited{false};
 
-  // Used by: Cubic, BBR2, and BBR3
+  // Used by: Cubic, BBR2, BBR3, and Cuback
   // Allow a congestion controller to undo its congestion response when every
   // packet in a loss episode is explicitly acknowledged as spurious.
   bool enableSpuriousLossRecovery{true};

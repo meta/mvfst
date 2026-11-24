@@ -274,6 +274,24 @@ mvfst_cpp_test(
 )
 
 mvfst_cpp_test(
+    name = "CubackTest",
+    srcs = [
+        "CubackTest.cpp",
+    ],
+    network_access = network_access_utils.none(),
+    deps = [
+        "fbsource//xplat/folly/portability:gmock",
+        "fbsource//xplat/folly/portability:gtest",
+        "fbsource//xplat/quic/common/test:test_utils",
+        "fbsource//xplat/quic/congestion_control:cuback",
+        "fbsource//xplat/quic/logging:qlogger_constants",
+        "fbsource//xplat/quic/state:state_functions",
+        "fbsource//xplat/quic/state/test:mocks",
+        ":test_utils",
+    ],
+)
+
+mvfst_cpp_test(
     name = "Bbr2SpuriousLossTest",
     srcs = [
         "Bbr2SpuriousLossTest.cpp",

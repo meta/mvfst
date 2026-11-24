@@ -19,6 +19,7 @@ quic_add_test(TARGET CongestionControllerTests
   C4Test.cpp
   CongestionControlFunctionsTest.cpp
   CopaTest.cpp
+  CubackTest.cpp
   CubicHystartTest.cpp
   CubicRecoveryTest.cpp
   CubicStateTest.cpp
@@ -35,6 +36,7 @@ quic_add_test(TARGET CongestionControllerTests
   mvfst_congestion_control_bbr3_rate_sampler
   mvfst_congestion_control_c4
   mvfst_congestion_control_congestion_controller
+  mvfst_congestion_control_cuback
   mvfst_congestion_control_pacer
   mvfst_congestion_control_simulated_tbf
   mvfst_state_state_functions

@@ -324,6 +324,26 @@ mvfst_cpp_library(
 )
 
 mvfst_cpp_library(
+    name = "cuback",
+    srcs = [
+        "QuicCuback.cpp",
+    ],
+    headers = [
+        "QuicCuback.h",
+    ],
+    deps = [
+        "fbsource//xplat/folly/lang:assume",
+        "fbsource//xplat/quic/logging:qlogger_constants",
+        "fbsource//xplat/quic/logging:qlogger_macros",
+        ":congestion_control_functions",
+    ],
+    exported_deps = [
+        "fbsource//xplat/quic/state:quic_state_machine",
+        ":congestion_controller",
+    ],
+)
+
+mvfst_cpp_library(
     name = "bbr_rtt_sampler",
     srcs = [
         "BbrRttSampler.cpp",

@@ -41,12 +41,18 @@ struct C4Stats {
   uint8_t state;
 };
 
+struct CubackStats {
+  uint8_t state;
+  uint64_t ssthresh;
+};
+
 union CongestionControllerStats {
   struct BbrStats bbrStats;
   struct Bbr2Stats bbr2Stats;
   struct CopaStats copaStats;
   struct CubicStats cubicStats;
   struct C4Stats c4Stats;
+  struct CubackStats cubackStats;
 };
 
 struct CongestionController {
