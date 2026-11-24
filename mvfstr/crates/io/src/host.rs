@@ -463,6 +463,15 @@ impl ManualHost {
     }
 }
 
+/// The epoll instance's descriptor, which is readable while a registered socket is ready or a
+/// [`Notifier`] has notified. A loop that watches it can run [`poll`](ManualHost::poll) whenever
+/// it is readable, without blocking.
+impl AsFd for ManualHost {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.epoll.as_fd()
+    }
+}
+
 impl IoHost for ManualHost {
     type Registration = ManualRegistration;
 

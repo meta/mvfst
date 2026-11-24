@@ -19,6 +19,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use mvfstr_driver::EndpointDriver;
+use mvfstr_driver::EndpointDriverBuilder;
+use mvfstr_driver::HostTimers;
 use mvfstr_io::Backend;
 use mvfstr_io::HostBackend;
 use mvfstr_io::HostOptions;
@@ -32,6 +34,7 @@ use mvfstr_proto::ConnOptions;
 use mvfstr_proto::ConnStats;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::TransportConfig;
 use roxygen_runtime::tokio_host::ManagedWorker;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
 use roxygen_runtime::worker::WorkerContext;
@@ -49,6 +52,7 @@ use crate::flags::Mode;
 use crate::manual::ManualWorker;
 use crate::manual::io_host;
 use crate::report::Measurement;
+use crate::report::closed_line;
 use crate::report::startup_line;
 use crate::report::stats_line;
 use crate::server::Closed;
@@ -144,6 +148,112 @@ impl fmt::Debug for RunningServer {
     }
 }
 
+/// A server on a worker that the caller runs, which serves until that worker stops.
+pub struct HostedServer {
+    addr: SocketAddr,
+    startup: String,
+    closed: mpsc::Receiver<Closed>,
+}
+
+impl HostedServer {
+    /// Returns the address the server listens on.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Returns the line with the server's sending setup, as its socket took it.
+    pub fn startup_line(&self) -> &str {
+        &self.startup
+    }
+
+    /// Returns the stats line of each connection that closed since the last call, under
+    /// `--stats`.
+    pub fn closed_lines(&self) -> Vec<String> {
+        self.closed
+            .try_iter()
+            .map(|closed| {
+                closed_line(
+                    &closed.stats,
+                    closed.socket_stops,
+                    closed.phase_pacing_wakes,
+                )
+            })
+            .collect()
+    }
+}
+
+impl fmt::Debug for HostedServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedServer")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Starts a server configured by `flags`, which must be a server's, on `worker`, from the
+/// worker's thread. `open` returns the server's socket and the timers its driver paces with, for
+/// the address and the socket settings that the flags give.
+pub fn start_hosted_server<B: Backend>(
+    worker: &WorkerContext,
+    flags: &Flags,
+    open: impl FnOnce(SocketAddr, &MmsgOptions) -> io::Result<(B, HostTimers)>,
+) -> Result<HostedServer, RunError> {
+    if flags.mode != Mode::Server {
+        return Err(RunError::Start(
+            "a hosted server needs server flags".to_owned(),
+        ));
+    }
+    let setup = ServerSetup::new(flags)?;
+    let (backend, timers) = open(setup.addr, &backend_options(flags))
+        .map_err(|error| RunError::Start(error.to_string()))?;
+    let (addr, caps) = spawn_server(
+        worker,
+        setup.endpoint,
+        setup.settings,
+        setup.segments,
+        |builder| builder.serve(backend, setup.server).host_timers(timers),
+    )
+    .map_err(RunError::Start)?;
+    Ok(HostedServer {
+        addr,
+        startup: startup_line(&setup.transport, setup.build_horizon, &caps),
+        closed: setup.closed,
+    })
+}
+
+/// The parts of a server that its flags give, built before its driver starts.
+struct ServerSetup {
+    addr: SocketAddr,
+    endpoint: Arc<EndpointConfig>,
+    build_horizon: Duration,
+    server: Arc<ServerConfig>,
+    transport: Arc<TransportConfig>,
+    settings: Settings,
+    segments: u16,
+    closed: mpsc::Receiver<Closed>,
+}
+
+impl ServerSetup {
+    fn new(flags: &Flags) -> Result<Self, RunError> {
+        let addr = resolve(flags)?;
+        let endpoint = config::endpoint_config(flags)?;
+        let build_horizon = endpoint.build_horizon();
+        let server = config::server_config(flags)?;
+        let transport = Arc::clone(server.transport());
+        let (closed_tx, closed) = mpsc::channel();
+        Ok(Self {
+            addr,
+            endpoint,
+            build_horizon,
+            server,
+            transport,
+            settings: Settings::new(flags, closed_tx),
+            segments: max_segments(flags),
+            closed,
+        })
+    }
+}
+
 /// Starts a server configured by `flags`.
 pub(crate) fn start_server(flags: &Flags) -> Result<RunningServer, RunError> {
     start_server_with(flags, backend_options(flags))
@@ -151,14 +261,16 @@ pub(crate) fn start_server(flags: &Flags) -> Result<RunningServer, RunError> {
 
 /// Starts a server configured by `flags`, with the socket settings `options`.
 fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServer, RunError> {
-    let addr = resolve(flags)?;
-    let endpoint = config::endpoint_config(flags)?;
-    let build_horizon = endpoint.build_horizon();
-    let server = config::server_config(flags)?;
-    let transport = Arc::clone(server.transport());
-    let (closed_tx, closed) = mpsc::channel();
-    let settings = Settings::new(flags, closed_tx);
-    let segments = max_segments(flags);
+    let ServerSetup {
+        addr,
+        endpoint,
+        build_horizon,
+        server,
+        transport,
+        settings,
+        segments,
+        closed,
+    } = ServerSetup::new(flags)?;
     let worker = Worker::new(flags.host_loop)?;
     let (started_tx, started) = mpsc::channel();
     let host_loop = flags.host_loop;
@@ -268,11 +380,27 @@ fn serve<B: TperfBackend>(
     options: MmsgOptions,
     segments: u16,
 ) -> Result<(SocketAddr, TxCaps), String> {
+    spawn_server::<B>(worker, endpoint, settings, segments, |builder| {
+        builder
+            .bind_server(addr, server)
+            .backend_options(B::options(options))
+    })
+}
+
+/// Starts the server's driver on `worker`, on backend `B`, after `socket` sets up its server
+/// socket on the builder, and returns the socket's address and capabilities.
+fn spawn_server<B: Backend>(
+    worker: &WorkerContext,
+    endpoint: Arc<EndpointConfig>,
+    settings: Settings,
+    segments: u16,
+    socket: impl FnOnce(
+        EndpointDriverBuilder<ServerApp<B>, B>,
+    ) -> EndpointDriverBuilder<ServerApp<B>, B>,
+) -> Result<(SocketAddr, TxCaps), String> {
     let driver = Driver::<B>::default();
     let app = ServerApp::new(settings, Rc::clone(&driver));
-    let handle = EndpointDriver::<_, B>::builder(endpoint, app)
-        .bind_server(addr, server)
-        .backend_options(B::options(options))
+    let handle = socket(EndpointDriver::<_, B>::builder(endpoint, app))
         .max_segments(segments)
         .spawn(worker)
         .map_err(|error| error.to_string())?;
@@ -380,7 +508,7 @@ fn run_bytes(flags: &Flags) -> usize {
 
 /// Why a run failed.
 #[derive(Debug)]
-pub(crate) enum RunError {
+pub enum RunError {
     /// `--host` does not resolve to an address.
     Resolve {
         /// The host.
@@ -444,8 +572,6 @@ impl From<ManagedWorkerError> for RunError {
 
 #[cfg(test)]
 mod tests {
-    use mvfstr_proto::TransportConfig;
-
     use super::*;
     use crate::flags::QuicVersion;
     use crate::report;
@@ -495,6 +621,70 @@ mod tests {
         assert!(
             !output.contains("Stats:"),
             "no stats line without --stats: {output}"
+        );
+    }
+
+    #[test]
+    fn a_server_hosted_on_a_worker_the_caller_runs_serves_a_client() {
+        let worker = ManagedWorker::new(WORKER_COMMANDS).unwrap();
+        let (started_tx, started) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |context| {
+                let open = |addr, options: &MmsgOptions| {
+                    Ok((MmsgBackend::bind(addr, options)?, HostTimers::tokio()))
+                };
+                let client = start_hosted_server(context, &loopback(Mode::Client, 0), open);
+                let server = start_hosted_server(
+                    context,
+                    &Flags {
+                        stats: true,
+                        ..loopback(Mode::Server, 0)
+                    },
+                    open,
+                );
+                let _ = started_tx.send((client.err().map(|error| error.to_string()), server));
+            })
+            .unwrap();
+        let (client, server) = started.recv().unwrap();
+        assert_eq!(
+            client.as_deref(),
+            Some("cannot start: a hosted server needs server flags")
+        );
+        let server = server.unwrap();
+        assert!(
+            server.startup_line().starts_with("Server: "),
+            "{}",
+            server.startup_line()
+        );
+        let mut out = Vec::new();
+        run_client(
+            &Flags {
+                duration_secs: 1,
+                port: server.addr().port(),
+                ..loopback(Mode::Client, 0)
+            },
+            &mut out,
+        )
+        .unwrap();
+        let output = String::from_utf8(out).unwrap();
+        let parsed =
+            report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
+        assert!(parsed.bytes > 0, "{output}");
+        let closed = server
+            .closed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the closed connection's counters");
+        let line = closed_line(
+            &closed.stats,
+            closed.socket_stops,
+            closed.phase_pacing_wakes,
+        );
+        assert!(line.contains(" socket_stops="), "{line}");
+        assert_eq!(
+            server.closed_lines(),
+            Vec::<String>::new(),
+            "one connection"
         );
     }
 

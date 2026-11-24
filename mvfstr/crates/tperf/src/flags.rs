@@ -45,7 +45,7 @@ pub(crate) enum HostLoop {
 
 /// The parsed flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Flags {
+pub struct Flags {
     pub(crate) mode: Mode,
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -119,7 +119,7 @@ impl Default for Flags {
 
 impl Flags {
     /// Parses the arguments after the program name.
-    pub(crate) fn parse<I>(args: I) -> Result<Flags, FlagError>
+    pub fn parse<I>(args: I) -> Result<Flags, FlagError>
     where
         I: IntoIterator<Item = String>,
     {
@@ -311,7 +311,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 /// Why the arguments were refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FlagError {
+pub enum FlagError {
     /// An unknown flag.
     Unknown(String),
     /// A flag that needs a value is the last argument.

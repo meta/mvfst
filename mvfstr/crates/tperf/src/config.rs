@@ -185,7 +185,7 @@ pub(crate) fn client_config(flags: &Flags) -> Result<Arc<ClientConfig>, SetupErr
 
 /// Why the settings could not be built.
 #[derive(Debug)]
-pub(crate) enum SetupError {
+pub enum SetupError {
     /// Generating the certificate failed.
     Certificate(rcgen::Error),
     /// rustls refused the TLS settings.
