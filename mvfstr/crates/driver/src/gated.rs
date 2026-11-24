@@ -51,6 +51,8 @@ pub(crate) enum Event {
     Dropped,
     /// A flush ran on a socket that was not blocked.
     Flush,
+    /// A flush met the simulated EAGAIN.
+    Blocked,
     /// Datagrams arrived.
     Received,
     /// A run ended; [`Valve::runs`] has its attempt and release.
@@ -67,6 +69,9 @@ pub(crate) struct Run {
     /// How far its release lay ahead of the start of its attempt, on the socket's clock epoch;
     /// zero if not ahead, and `None` for a run without a release time.
     pub(crate) ahead: Option<Duration>,
+    /// How far its release lay behind the start of its attempt; zero if not behind, and `None`
+    /// for a run without a release time.
+    pub(crate) behind: Option<Duration>,
 }
 
 /// A transmit attempt on a gated socket: its connection and when it began.
@@ -264,16 +269,21 @@ impl SegmentSink for GatedSink<'_> {
     fn end_run(&mut self, meta: TxMeta) {
         let dropped = {
             let mut state = self.valve.state();
-            let ahead = match (meta.release, self.epoch) {
-                (Release::At(tick), Some(epoch)) => Some(Duration::from_nanos(
-                    tick.0.saturating_sub(epoch.tick_at(self.started).0),
-                )),
-                _ => None,
+            let (ahead, behind) = match (meta.release, self.epoch) {
+                (Release::At(tick), Some(epoch)) => {
+                    let started = epoch.tick_at(self.started).0;
+                    (
+                        Some(Duration::from_nanos(tick.0.saturating_sub(started))),
+                        Some(Duration::from_nanos(started.saturating_sub(tick.0))),
+                    )
+                }
+                _ => (None, None),
             };
             state.runs.push(Run {
                 attempt: self.attempt,
                 release: meta.release,
                 ahead,
+                behind,
             });
             state.events.push(Event::Run);
             let dropped = state
@@ -345,6 +355,7 @@ impl TxBackend for Gated {
                 state.blocked = true;
             }
             if state.blocked {
+                state.events.push(Event::Blocked);
                 return FlushOutcome {
                     datagrams: 0,
                     blocked: true,

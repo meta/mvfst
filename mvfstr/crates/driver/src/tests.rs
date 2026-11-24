@@ -94,6 +94,7 @@ use crate::Steering;
 use crate::gated::Event;
 use crate::gated::Gated;
 use crate::gated::GatedOptions;
+use crate::gated::Run;
 use crate::gated::Valve;
 use crate::gated::Valves;
 use crate::steer::INBOX_CAPACITY;
@@ -7194,37 +7195,82 @@ const BULK_STALL: Duration = Duration::from_millis(3);
 const BULK_STALLS: usize = 6;
 
 /// Has a [`Bulk`] server send seven datagrams, within the initial window, over gated sockets with
-/// at most two datagrams per attempt, so its connection makes several attempts in one transmit
-/// phase, while the server's worker is held [`BULK_STALL`] after each of its next [`BULK_STALLS`]
-/// attempts. Returns the server valve's events from the client's request on, and the server
+/// `mmsg` and at most two datagrams per attempt, so its connection makes several attempts in one
+/// transmit phase, while the server's worker is held [`BULK_STALL`] after each of its next
+/// [`BULK_STALLS`] attempts. With `horizon` the server's endpoint builds up to that far ahead.
+/// Returns the server valve's events and runs from the client's request on, and the server
 /// driver's record, read together.
-fn stalled_bulk() -> (Vec<Event>, TxRecord) {
+fn stalled_bulk(mmsg: MmsgOptions, horizon: Option<Duration>) -> (Vec<Event>, Vec<Run>, TxRecord) {
     const LEN: usize = 8_000;
     let valves = Arc::new(Valves::default());
     let mut harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg,
         valves: Arc::clone(&valves),
     });
+    if let Some(horizon) = horizon {
+        harness.endpoint = building_ahead(horizon);
+    }
     harness.limits.max_segments = 2;
     let pair = BulkPair::new(&harness, 1, LEN);
     valves.server.clear();
     valves.server.stall(BULK_STALL, BULK_STALLS);
     pair.go();
     await_reports(&pair.rx, vec![Report::Received(uni(3), LEN)]);
-    let (record, events) = tx_record::<Bulk, _>(&harness.server, move || valves.server.events());
+    let (record, (events, runs)) = tx_record::<Bulk, _>(&harness.server, move || {
+        (valves.server.events(), valves.server.runs())
+    });
     // The driver debug-asserts that a connection's attempts and reports do not go back in time.
     let stats = harness.server_stats::<Bulk>();
     assert_eq!(stats.contained_panics, 0, "{stats:?}");
     harness.shutdown();
-    (events, record)
+    (events, runs, record)
 }
 
 #[test]
-fn an_unpaced_connection_keeps_the_phases_reading_and_its_one_flush() {
-    let (events, record) = stalled_bulk();
+fn with_kernel_release_an_attempt_after_a_stall_builds_against_a_fresh_clock() {
+    let ms = Duration::from_millis;
+    let (_, runs, ..) = stalled_bulk(kernel_release(ms(100)), Some(ms(5)));
+    let behind: Vec<Duration> = runs
+        .iter()
+        .map(|run| {
+            run.behind
+                .unwrap_or_else(|| panic!("an unstamped run: {runs:?}"))
+        })
+        .collect();
+    assert!(
+        behind.len() >= 4,
+        "seven datagrams at two per attempt take at least four runs: {runs:?}"
+    );
+    // Each stall is 3 ms, so a release taken from a reading before one lies at least that far
+    // behind its attempt's start.
+    assert!(
+        behind
+            .iter()
+            .all(|&behind| behind <= Duration::from_micros(500)),
+        "a release lay more than 0.5 ms behind its attempt's start: {behind:?}"
+    );
+}
+
+#[test]
+fn with_kernel_release_the_server_socket_is_flushed_after_each_attempt_and_for_an_unpaced_connection_without_it_once_per_phase()
+ {
+    let ms = Duration::from_millis;
+    let (events, ..) = stalled_bulk(kernel_release(ms(100)), Some(ms(5)));
+    assert!(events.contains(&Event::Attempt), "{events:?}");
+    assert!(
+        events
+            .split(|&event| event == Event::Attempt)
+            .skip(1)
+            .all(|after| after.contains(&Event::Flush)),
+        "with kernel release, an attempt was not flushed before the next: {events:?}"
+    );
+
+    // The bulk connection is unpaced, and without kernel release it keeps the phase's reading
+    // and its one flush.
+    let (events, _, record) = stalled_bulk(MmsgOptions::default(), None);
     assert!(
         most_attempts_per_flush(&events) >= 2,
-        "each attempt had its own flush: {events:?}"
+        "without kernel release, each attempt had its own flush: {events:?}"
     );
     let mut readings = HashMap::new();
     for attempt in &record.attempts {
@@ -7240,6 +7286,49 @@ fn an_unpaced_connection_keeps_the_phases_reading_and_its_one_flush() {
         record.wakes.iter().all(|wake| wake.phase.is_none()),
         "a pacing wake was taken inside a transmit phase: {record:?}"
     );
+}
+
+#[test]
+fn with_kernel_release_a_server_socket_behind_an_eagain_is_not_flushed_again_in_its_phase() {
+    // Seven datagrams, within the initial congestion window, at two per attempt.
+    const LEN: usize = 8_000;
+    let ms = Duration::from_millis;
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: kernel_release(ms(100)),
+        valves: Arc::clone(&valves),
+    });
+    harness.endpoint = building_ahead(ms(5));
+    harness.limits.max_segments = 2;
+    let pair = BulkPair::new(&harness, 1, LEN);
+    valves.server.clear();
+    valves.server.block_next_flush();
+    pair.go();
+    let deadline = Instant::now() + WAIT;
+    while !valves.server.waiting() {
+        assert!(
+            Instant::now() < deadline,
+            "the server never waited for its socket"
+        );
+        std::thread::yield_now();
+    }
+    // A command runs between the driver's polls, so the phase that met the EAGAIN has ended.
+    harness.server_stats::<Bulk>();
+    let events = valves.server.events();
+    // The flush after the first attempt meets the EAGAIN, and the attempt after it is refused;
+    // only the end of the phase flushes again.
+    assert!(events.contains(&Event::Refused), "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|&&event| event == Event::Blocked)
+            .count(),
+        2,
+        "the server socket was flushed again behind its EAGAIN: {events:?}"
+    );
+    valves.server.open();
+    await_reports(&pair.rx, vec![Report::Received(uni(3), LEN)]);
+    harness.shutdown();
 }
 
 /// How long the server's worker is held after each of its stalled attempts in [`stalled_paced`]:
@@ -7301,7 +7390,8 @@ impl Default for PacedSetup {
 /// Has three paced [`Bulk`] servers on one endpoint send `setup.len` bytes each to their own
 /// client through a relay that delays each datagram 10 ms, while the server's worker is held
 /// [`PACED_STALL`] after each of its next `setup.stalls` attempts. At a window per round trip
-/// and a minimum burst of 1, each connection releases a datagram every 1.6 ms.
+/// and a minimum burst of 1, each connection releases a datagram every 1.6 ms, and without
+/// kernel release does not build ahead.
 fn stalled_paced(setup: PacedSetup) -> Paced {
     const CLIENTS: usize = 3;
     let PacedSetup {
@@ -7401,7 +7491,8 @@ fn each_run_flushed_before_the_next_attempt(events: &[Event]) -> bool {
 }
 
 #[test]
-fn a_paced_attempt_builds_at_a_fresh_reading_and_is_flushed_before_the_next_attempt() {
+fn without_kernel_release_a_paced_attempt_builds_at_a_fresh_reading_and_is_flushed_before_the_next_attempt()
+ {
     let paced = stalled_paced(PacedSetup::default());
     let events = &paced.events;
     assert!(

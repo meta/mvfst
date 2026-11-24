@@ -106,6 +106,28 @@ impl Timers {
         Some(index)
     }
 
+    /// Returns the earliest pacing wake, of either pacing kind.
+    pub(crate) fn next_pacing(&self) -> Option<Instant> {
+        self.pacing
+            .first()
+            .into_iter()
+            .chain(self.coarse.first())
+            .map(|&(at, _)| at)
+            .min()
+    }
+
+    /// Removes the earliest pacing wake, of either pacing kind, if it is due at `now`, and returns
+    /// its slot.
+    pub(crate) fn pop_due_pacing(&mut self, now: Instant) -> Option<u32> {
+        let kind = match (self.pacing.first(), self.coarse.first()) {
+            (Some(pacing), Some(coarse)) if coarse < pacing => Kind::Coarse,
+            (Some(_), _) => Kind::Pacing,
+            (None, Some(_)) => Kind::Coarse,
+            (None, None) => return None,
+        };
+        self.pop_due(kind, now)
+    }
+
     fn set_of(&mut self, kind: Kind) -> &mut BTreeSet<(Instant, u32)> {
         match kind {
             Kind::Deadline => &mut self.deadlines,
@@ -345,6 +367,47 @@ mod tests {
 
         timers.set(Kind::Pacing, 1, Some(t + Duration::from_micros(200)), None);
         assert_eq!(timers.next(Kind::Pacing), None, "a cleared entry is gone");
+    }
+
+    #[test]
+    fn the_earliest_pacing_wake_of_either_kind_is_found_and_taken_once_due() {
+        let t = Instant::now();
+        let us = Duration::from_micros;
+        let mut timers = Timers::default();
+        timers.set(Kind::Deadline, 9, None, Some(t));
+        assert_eq!(timers.next_pacing(), None, "a deadline is no pacing wake");
+        assert_eq!(timers.pop_due_pacing(t + us(1_000)), None);
+
+        timers.set(Kind::Pacing, 1, None, Some(t + us(300)));
+        timers.set(Kind::Coarse, 2, None, Some(t + us(200)));
+        timers.set(Kind::Pacing, 3, None, Some(t + us(500)));
+        assert_eq!(
+            timers.next_pacing(),
+            Some(t + us(200)),
+            "the coarse wake comes first"
+        );
+        assert_eq!(
+            timers.pop_due_pacing(t + us(100)),
+            None,
+            "nothing is due before its time"
+        );
+        assert_eq!(
+            timers.pop_due_pacing(t + us(400)),
+            Some(2),
+            "the earliest first, of either kind"
+        );
+        assert_eq!(timers.pop_due_pacing(t + us(400)), Some(1));
+        assert_eq!(
+            timers.pop_due_pacing(t + us(400)),
+            None,
+            "the one left is not due"
+        );
+        assert_eq!(timers.next_pacing(), Some(t + us(500)));
+        assert_eq!(
+            timers.next(Kind::Deadline),
+            Some(t),
+            "deadlines are left alone"
+        );
     }
 
     #[test]

@@ -229,12 +229,15 @@ pub(crate) struct Server<B> {
     socket: RefCell<B>,
     addr: SocketAddr,
     config: Arc<ServerConfig>,
+    /// Whether the socket holds datagrams until their release (kernel release), as probed at bind.
+    release: bool,
 }
 
 impl<B: Backend> Server<B> {
     pub(crate) fn new(socket: B, config: Arc<ServerConfig>) -> std::io::Result<Self> {
         Ok(Self {
             addr: socket.local_addr()?,
+            release: socket.caps().release.epoch().is_some(),
             socket: RefCell::new(socket),
             config,
         })
@@ -759,8 +762,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// Returns the host's time. A turn reads it once for its quiesce steps, intake and first
     /// application phase, then again for each later application or transmit phase and after each
     /// batch is received, so packet times and RTT samples do not lag by earlier work. A transmit
-    /// phase also reads it for each attempt of a paced connection, and before each pop from its
-    /// queue while a pacing wake is armed on the timerfd, until the phase's requeue cap is spent.
+    /// phase also reads it for each attempt on a socket with kernel release and each attempt of a
+    /// paced connection, and before each pop from its queue while a pacing wake is armed, until
+    /// the phase's requeue cap is spent.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -1214,17 +1218,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     ///
     /// Attempts run at `now`, read as the phase starts. A connection's own socket is flushed after
     /// its last attempt of the phase, and the server socket, which the other connections share, at
-    /// the end of the phase. A paced connection's attempt runs instead at a reading taken just
-    /// before it, and its socket is also flushed right after it if the attempt built a run, so its
-    /// runs do not wait in the pool behind a stale reading; these flushes of the server socket stop
-    /// once one meets EAGAIN. While a pacing wake is armed on the timerfd, the phase checks before
-    /// each pop from its queue, including any pop that finds it empty, whether such a wake has come
-    /// due; the earliest due wake's connection makes the next attempt at the check's reading unless
-    /// it waits for the next phase, so a wake is late by about an attempt rather than a turn.
-    /// Pacing wakes on the timer wheel wait for the next turn's intake. A pop that finds the queue
-    /// empty ends the phase unless the check before it took a wake that does not give an attempt.
-    /// Serves that give an attempt count against `limits.requeues` with full-batch requeues, and
-    /// the checks stop once that cap is spent.
+    /// the end of the phase. An attempt on a socket with kernel release, or of a paced connection,
+    /// runs instead at a reading taken just before it, and its socket is also flushed right after
+    /// it (without kernel release, only if the attempt built a run), so its runs do not wait in the
+    /// pool behind a stale reading; these flushes of the server socket stop once one meets EAGAIN.
+    /// While a pacing wake is armed, the phase checks before each pop from its queue, including any
+    /// pop that finds it empty, whether a wake has come due; the earliest due wake's connection
+    /// makes the next attempt at the check's reading unless it waits for the next phase, so a wake
+    /// is late by about an attempt rather than a turn. A pop that finds the queue empty ends the
+    /// phase unless the check before it took a wake that does not give an attempt. Serves that give
+    /// an attempt count against `limits.requeues` with full-batch requeues, and the checks stop
+    /// once that cap is spent.
     fn transmit_phase(&self, now: Instant, cx: &mut Context<'_>) {
         #[cfg(test)]
         self.record.borrow_mut().begin_phase();
@@ -1235,6 +1239,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             queue.extend(sched.dirty.drain(..));
             queue
         };
+        let server_release = self.server.as_ref().is_some_and(|server| server.release);
         let mut latest = now;
         let mut flush_server = false;
         // Per-attempt flushes of the server socket stop once one meets an EAGAIN; the end of the
@@ -1246,9 +1251,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         loop {
             let mut reading = None;
             let mut take = Take::Nothing;
-            if spent < self.limits.requeues
-                && self.sched.borrow().timers.next(Kind::Pacing).is_some()
-            {
+            if spent < self.limits.requeues && self.sched.borrow().timers.next_pacing().is_some() {
                 let at = self.clock();
                 latest = at;
                 reading = Some(at);
@@ -1269,10 +1272,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             };
             self.with_entry(key, "transmit", |entry| {
                 entry.dirty = false;
+                let release = entry.socket.as_deref().map_or(server_release, |socket| {
+                    socket.caps().release.epoch().is_some()
+                });
                 // Only paced connections arm pacing wakes, so a served attempt runs at its
                 // check's reading.
                 let at = match reading {
-                    _ if !entry.paces => now,
+                    _ if !release && !entry.paces => now,
                     Some(at) => at,
                     None => {
                         latest = self.clock();
@@ -1331,7 +1337,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     }
                     _ => {}
                 }
-                let flush = entry.paces && outcome.datagrams > 0;
+                let flush = release || (entry.paces && outcome.datagrams > 0);
                 if entry.socket.is_some() && (!requeued || flush) {
                     self.flush_own(key, entry, at, outcome.stop == Stop::Socket);
                 } else if entry.socket.is_none()
@@ -1357,11 +1363,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.record.borrow_mut().end_phase();
     }
 
-    /// Takes the pacing wake on the timerfd due earliest at `at` inside a transmit phase.
+    /// Takes the pacing wake due earliest at `at`, of either kind, inside a transmit phase.
     fn take_pacing_wake(&self, at: Instant, queue: &mut VecDeque<ConnKey>) -> Take {
         #[cfg(test)]
-        let due = self.sched.borrow().timers.next(Kind::Pacing);
-        let Some(index) = self.sched.borrow_mut().timers.pop_due(Kind::Pacing, at) else {
+        let due = self.sched.borrow().timers.next_pacing();
+        let Some(index) = self.sched.borrow_mut().timers.pop_due_pacing(at) else {
             return Take::Nothing;
         };
         self.phase_pacing_wakes
