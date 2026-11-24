@@ -21,6 +21,7 @@
 #include <quic/state/QuicStateFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/QuicStreamUtilities.h>
+#include <algorithm>
 #include <memory>
 
 namespace {
@@ -810,10 +811,7 @@ void QuicTransportBase::invokePeekDataAndCallbacks() {
   std::vector<StreamId> peekableStreamsCopy;
   const auto& peekableStreams = conn_->streamManager->peekableStreams();
   peekableStreamsCopy.reserve(peekableStreams.size());
-  std::copy(
-      peekableStreams.begin(),
-      peekableStreams.end(),
-      std::back_inserter(peekableStreamsCopy));
+  std::ranges::copy(peekableStreams, std::back_inserter(peekableStreamsCopy));
   MVVLOG(10) << __func__
              << " peekableListCopy.size()=" << peekableStreamsCopy.size();
   for (StreamId streamId : peekableStreamsCopy) {
