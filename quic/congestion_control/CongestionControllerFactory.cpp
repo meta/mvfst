@@ -71,6 +71,11 @@ DefaultCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::BBR3:
       congestionController = std::make_unique<Bbr3CongestionController>(conn);
       break;
+    case CongestionControlType::Cuback: {
+      throw QuicInternalException(
+          "Cuback Congestion Controller is not available yet.",
+          LocalErrorCode::INTERNAL_ERROR);
+    }
     case CongestionControlType::None:
       break;
     case CongestionControlType::MAX:

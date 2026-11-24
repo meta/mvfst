@@ -522,6 +522,7 @@ constexpr std::string_view kCongestionControlCustomStr = "custom";
 constexpr std::string_view kCongestionControlNoneStr = "none";
 constexpr std::string_view kCongestionControlC4Str = "c4";
 constexpr std::string_view kCongestionControlBbr3Str = "bbr3";
+constexpr std::string_view kCongestionControlCubackStr = "cuback";
 
 constexpr DurationRep kPersistentCongestionThreshold = 3;
 // Mobile builds log these values as numbers, so existing values must not
@@ -537,6 +538,7 @@ enum class CongestionControlType : uint8_t {
   None,
   C4,
   BBR3,
+  Cuback,
   // NOTE: MAX should always be at the end
   MAX
 };
