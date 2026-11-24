@@ -35,7 +35,9 @@ use crate::config;
 use crate::config::SERVER_NAME;
 use crate::config::SetupError;
 use crate::flags::Flags;
+use crate::flags::Mode;
 use crate::report::Measurement;
+use crate::report::startup_line;
 use crate::report::stats_line;
 use crate::server::Closed;
 use crate::server::Driver;
@@ -48,10 +50,22 @@ const WORKER_COMMANDS: usize = 64;
 /// How long the client waits for its closed connection to drain before stopping its worker.
 const DRAIN_WAIT: Duration = Duration::from_secs(1);
 
+/// The fastest the server is taken to pace, in bytes per second, when sizing for `--txtime`:
+/// 10 Gbit/s, for one connection and for all of them on the socket. That is above a 1 Gbit/s
+/// connection paced at BBR's Startup gain of 2.77.
+const TOP_PACING_RATE: u128 = 10_000_000_000 / 8;
+
+/// Nanoseconds per second.
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+/// The connections the server's send buffer has room for, each with one run beyond the horizon.
+const SIZED_CONNECTIONS: usize = 16;
+
 /// A server running on its own worker until dropped.
 pub(crate) struct RunningServer {
     _worker: ManagedWorker,
     addr: SocketAddr,
+    startup: String,
     closed: mpsc::Receiver<Closed>,
 }
 
@@ -59,6 +73,11 @@ impl RunningServer {
     /// Returns the address the server listens on.
     pub(crate) fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Returns the line with the server's sending setup, as its socket took it.
+    pub(crate) fn startup_line(&self) -> &str {
+        &self.startup
     }
 
     /// Returns the channel that carries each connection that closes, under `--stats`. The
@@ -84,8 +103,10 @@ pub(crate) fn start_server(flags: &Flags) -> Result<RunningServer, RunError> {
 /// Starts a server configured by `flags`, with the socket settings `options`.
 fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServer, RunError> {
     let addr = resolve(flags)?;
-    let endpoint = config::endpoint_config()?;
+    let endpoint = config::endpoint_config(flags)?;
+    let build_horizon = endpoint.build_horizon();
     let server = config::server_config(flags)?;
+    let transport = Arc::clone(server.transport());
     let (closed_tx, closed) = mpsc::channel();
     let settings = Settings::new(flags, closed_tx);
     let segments = max_segments(flags);
@@ -105,6 +126,7 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
                 .and_then(|handle| {
                     let started = handle
                         .local_addr()
+                        .zip(handle.server_caps())
                         .ok_or_else(|| "the server driver has no socket".to_owned());
                     let _ = driver.set(handle);
                     started
@@ -112,13 +134,14 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
             let _ = started_tx.send(started);
         })
         .map_err(|_| RunError::WorkerGone)?;
-    let addr = started
+    let (addr, caps) = started
         .recv()
         .map_err(|_| RunError::WorkerGone)?
         .map_err(RunError::Start)?;
     Ok(RunningServer {
         _worker: worker,
         addr,
+        startup: startup_line(&transport, build_horizon, &caps),
         closed,
     })
 }
@@ -135,7 +158,7 @@ fn run_client_with(
     out: &mut impl Write,
 ) -> Result<(), RunError> {
     let remote = resolve(flags)?;
-    let endpoint = config::endpoint_config()?;
+    let endpoint = config::endpoint_config(flags)?;
     let options = backend_options(flags);
     let name =
         ServerName::try_from(SERVER_NAME).map_err(|error| RunError::Start(error.to_string()))?;
@@ -215,13 +238,44 @@ fn max_segments(flags: &Flags) -> u16 {
 }
 
 /// Returns the socket settings of either side: transmit slots that hold the largest datagram the
-/// connection may send, which `--max_receive_packet_size` bounds.
+/// connection may send, which `--max_receive_packet_size` bounds, and on the server under
+/// `--txtime`, kernel release with room for the runs its connections build ahead.
 fn backend_options(flags: &Flags) -> MmsgOptions {
     let defaults = MmsgOptions::default();
-    MmsgOptions {
+    let mut options = MmsgOptions {
         max_datagram: defaults.max_datagram.max(flags.max_receive_packet_size),
         ..defaults
+    };
+    if flags.mode == Mode::Server && flags.txtime {
+        options.txtime = true;
+        // Room for a wake to build every run due within the horizon, and one more, before the
+        // connection stops on the socket; the transmit pool, which sends on its own once full,
+        // bounds what waits for the transmit phase's flush.
+        let ahead = built_ahead(flags, options.txtime_horizon);
+        let run = run_bytes(flags);
+        options.max_unsent = options
+            .max_unsent
+            .max(u32::try_from(ahead + run).unwrap_or(u32::MAX));
+        // fq keeps each run charged to the socket until it leaves, up to a horizon later, and a
+        // send fails with EAGAIN once the charge reaches SO_SNDBUF. The kernel doubles the value
+        // for its skb overhead, after capping it at net.core.wmem_max.
+        options.socket.send_buffer = Some(ahead + SIZED_CONNECTIONS * run);
     }
+    options
+}
+
+/// Returns the bytes one connection builds ahead of its releases when it paces at
+/// [`TOP_PACING_RATE`] with the endpoint's build horizon, capped by the socket's release horizon.
+fn built_ahead(flags: &Flags, release_horizon: Duration) -> usize {
+    let horizon = config::build_horizon(flags).min(release_horizon);
+    let bytes = (horizon.as_nanos() * TOP_PACING_RATE).div_ceil(NANOS_PER_SEC);
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// Returns the bytes of one run: a maximum pacing burst, `--writes_per_loop`, of the largest
+/// datagrams.
+fn run_bytes(flags: &Flags) -> usize {
+    usize::from(flags.writes_per_loop) * usize::from(flags.max_receive_packet_size)
 }
 
 /// Why a run failed.
@@ -290,7 +344,6 @@ mod tests {
     use mvfstr_proto::TransportConfig;
 
     use super::*;
-    use crate::flags::Mode;
     use crate::flags::QuicVersion;
     use crate::report;
     use crate::report::format_g;
@@ -520,6 +573,109 @@ mod tests {
             ..Flags::default()
         };
         assert_eq!(backend_options(&jumbo).max_datagram, 9000);
+    }
+
+    #[test]
+    fn txtime_turns_on_kernel_release_for_the_server_socket_only() {
+        let paced = Flags {
+            pacing: true,
+            ..Flags::default()
+        };
+        assert!(!backend_options(&paced).txtime);
+        let txtime = Flags {
+            txtime: true,
+            build_horizon_us: Some(5000),
+            ..paced
+        };
+        assert!(backend_options(&txtime).txtime);
+        let client = Flags {
+            mode: Mode::Client,
+            ..txtime
+        };
+        let plain_client = Flags {
+            mode: Mode::Client,
+            ..Flags::default()
+        };
+        assert_eq!(
+            backend_options(&client),
+            backend_options(&plain_client),
+            "server-side flags leave the client's socket alone"
+        );
+    }
+
+    /// Returns server flags for kernel release with a 5 ms horizon.
+    fn building_5_ms_ahead() -> Flags {
+        Flags {
+            pacing: true,
+            txtime: true,
+            build_horizon_us: Some(5000),
+            ..Flags::default()
+        }
+    }
+
+    #[test]
+    fn with_txtime_a_connection_may_build_its_whole_horizon_before_a_flush() {
+        // 5 ms at 10 Gbit/s, and one run of 44 datagrams of 1,452 bytes.
+        assert_eq!(
+            backend_options(&building_5_ms_ahead()).max_unsent,
+            6_250_000 + 63_888
+        );
+        let default = MmsgOptions::default().max_unsent;
+        assert_eq!(backend_options(&Flags::default()).max_unsent, default);
+        let nothing_ahead = Flags {
+            build_horizon_us: None,
+            ..building_5_ms_ahead()
+        };
+        assert_eq!(
+            backend_options(&nothing_ahead).max_unsent,
+            default,
+            "never below the default"
+        );
+    }
+
+    #[test]
+    fn with_txtime_the_send_buffer_holds_the_sockets_horizon_and_a_run_per_connection() {
+        // 5 ms at 10 Gbit/s over the socket, and a run of 44 datagrams of 1,452 bytes for each
+        // of 16 connections.
+        assert_eq!(
+            backend_options(&building_5_ms_ahead()).socket.send_buffer,
+            Some(6_250_000 + 16 * 63_888)
+        );
+        let paced = Flags {
+            pacing: true,
+            ..Flags::default()
+        };
+        assert_eq!(
+            backend_options(&paced).socket.send_buffer,
+            None,
+            "the kernel default without txtime"
+        );
+    }
+
+    #[test]
+    fn the_server_reports_its_sending_setup_as_its_socket_took_it() {
+        let server = start_server(&Flags {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            ..building_5_ms_ahead()
+        })
+        .unwrap();
+        let line = server.startup_line();
+        assert!(
+            line.contains(" txtime=true endpoint_horizon_us=5000 "),
+            "{line}"
+        );
+        // The kernel caps the size asked for at net.core.wmem_max, then doubles it.
+        let wmem_max: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let asked: usize = 6_250_000 + 16 * 63_888;
+        assert!(
+            line.ends_with(&format!(" so_sndbuf={}", 2 * asked.min(wmem_max))),
+            "{line}"
+        );
     }
 
     #[test]

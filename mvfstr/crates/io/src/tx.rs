@@ -26,6 +26,7 @@ use mvfstr_proto::TxReport;
 use mvfstr_proto::TxSeqRange;
 use socket2::SockAddr;
 
+use crate::ReleaseSupport;
 use crate::TxCaps;
 use crate::cmsg::CmsgSpace;
 use crate::cmsg::Encoder;
@@ -64,6 +65,7 @@ struct Msg {
     segments: u16,
     bytes: u32,
     tx: TxSeqRange,
+    release: Release,
 }
 
 pub(crate) struct Tx {
@@ -293,8 +295,13 @@ impl Tx {
                 "TxMeta::segment_size"
             );
         }
-        // The backend does not support timed release, so every run is sent as soon as possible.
-        debug_assert_eq!(meta.release, Release::Asap, "TxMeta::release");
+        // Without release support connections do not build ahead (their build horizon is 0), so
+        // every run is sent as soon as possible.
+        debug_assert!(
+            meta.release == Release::Asap || self.caps.release != ReleaseSupport::None,
+            "TxMeta::release {:?} on a backend without release support",
+            meta.release
+        );
         if !meta.sealed {
             // Unsealed bytes must never leave, and these did not.
             for &slot in &self.open {
@@ -348,6 +355,7 @@ impl Tx {
                     start: next,
                     end: next + u64::from(count),
                 },
+                release: meta.release,
             });
             next += u64::from(count);
         }
@@ -476,8 +484,8 @@ fn did_not_leave(error: &io::Error) -> Option<DropReason> {
     }
 }
 
-/// Writes a message's control data: UDP_SEGMENT for a GSO send, its TOS byte and its source
-/// address. Returns the length.
+/// Writes a message's control data: UDP_SEGMENT for a GSO send, its TOS byte, its source
+/// address and its release. Returns the length.
 fn encode_cmsgs(buf: &mut [u8], msg: &Msg, ipv6_socket: bool) -> usize {
     let mut enc = Encoder::new(buf);
     if msg.segments > 1 {
@@ -502,6 +510,11 @@ fn encode_cmsgs(buf: &mut [u8], msg: &Msg, ipv6_socket: bool) -> usize {
     }
     if let Some(src) = msg.src_ip {
         push_source(&mut enc, ipv4_path, src);
+    }
+    // One stamp covers the whole GSO send, as one release covers the run.
+    if let Release::At(tick) = msg.release {
+        let stamped = enc.push(libc::SOL_SOCKET, sys::SCM_TXTIME, &tick.0.to_ne_bytes());
+        debug_assert!(stamped, "SCM_TXTIME does not fit in the control space");
     }
     enc.len()
 }
@@ -558,5 +571,181 @@ impl SegmentSink for MmsgSink<'_> {
 
     fn end_run(&mut self, meta: TxMeta) {
         self.tx.end_run(self.fd, self.conn, meta);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
+    use std::net::UdpSocket;
+    use std::os::fd::AsFd;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use mvfstr_proto::ClockEpoch;
+    use mvfstr_proto::PathId;
+    use mvfstr_proto::Tick;
+
+    use super::*;
+    use crate::cmsg::Decoder;
+
+    /// Returns a 44-segment GSO send to `dst` from `src` with a DSCP and ECN byte.
+    fn gso_msg(dst: SocketAddr, src: IpAddr, release: Release) -> Msg {
+        Msg {
+            conn: ConnKey {
+                index: 1,
+                generation: 1,
+            },
+            dst,
+            src_ip: Some(src),
+            tos: 0x2e << 2 | 0b10,
+            segment_size: 1452,
+            segments: 44,
+            bytes: 44 * 1452,
+            tx: TxSeqRange { start: 0, end: 44 },
+            release,
+        }
+    }
+
+    fn decoded(msg: &Msg, ipv6_socket: bool) -> Vec<(c_int, c_int, Vec<u8>)> {
+        let mut space = CmsgSpace::default();
+        let len = encode_cmsgs(&mut space.0, msg, ipv6_socket);
+        Decoder::new(&space.0[..len])
+            .map(|(level, ty, data)| (level, ty, data.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn a_release_time_goes_as_an_scm_txtime_stamp_beside_the_other_control_messages() {
+        const SCM_TXTIME: c_int = 61;
+        let tick = 1_795_302_827_123_456_789u64;
+        let v4 = (
+            false,
+            SocketAddr::from((Ipv4Addr::new(10, 77, 2, 2), 6666)),
+            IpAddr::from(Ipv4Addr::new(10, 77, 1, 1)),
+            (libc::IPPROTO_IP, libc::IP_TOS),
+            (libc::IPPROTO_IP, libc::IP_PKTINFO),
+        );
+        let v6 = (
+            true,
+            SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2), 6666)),
+            IpAddr::from(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+            (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO),
+        );
+        // IPv6 with every control message is the largest set a message carries.
+        for (ipv6_socket, dst, src, tos, pktinfo) in [v4, v6] {
+            let stamped = decoded(&gso_msg(dst, src, Release::At(Tick(tick))), ipv6_socket);
+            let kinds: Vec<(c_int, c_int)> = stamped.iter().map(|&(l, t, _)| (l, t)).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    (libc::SOL_UDP, libc::UDP_SEGMENT),
+                    tos,
+                    pktinfo,
+                    (libc::SOL_SOCKET, SCM_TXTIME),
+                ],
+                "{dst}"
+            );
+            assert_eq!(stamped[3].2, tick.to_ne_bytes(), "a u64 of nanoseconds");
+
+            let asap = decoded(&gso_msg(dst, src, Release::Asap), ipv6_socket);
+            assert_eq!(asap, stamped[..3], "Asap adds no stamp: {dst}");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "SCM_TXTIME")]
+    fn a_release_stamp_that_does_not_fit_the_control_space_is_a_bug() {
+        let msg = gso_msg(
+            SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2), 6666)),
+            IpAddr::from(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+            Release::At(Tick(1)),
+        );
+        // One byte short of the 112 bytes the full IPv6 set takes: an unstamped run would leave
+        // at once, ahead of the connection's runs still waiting in fq.
+        let mut buf = [0u8; 111];
+        encode_cmsgs(&mut buf, &msg, true);
+    }
+
+    /// Returns a transmit half whose GSO sends hold at most `max_segments` segments, with
+    /// `release`.
+    fn tx(max_segments: u16, release: ReleaseSupport) -> Tx {
+        let caps = TxCaps {
+            max_segments,
+            max_datagram: 1500,
+            gro: true,
+            ecn: true,
+            pktinfo: true,
+            release,
+            send_buffer: 212_992,
+        };
+        Tx::new(
+            caps,
+            TxConfig {
+                slots: 64,
+                urgent_slots: 4,
+                max_unsent: 128 * 1024,
+                batch: 64,
+                connected: false,
+                ipv6: false,
+            },
+        )
+    }
+
+    #[test]
+    fn every_gso_send_cut_from_a_stamped_run_carries_its_release() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let fd = socket.as_fd();
+        let kernel = ReleaseSupport::Kernel {
+            horizon: Duration::from_millis(100),
+            epoch: ClockEpoch {
+                instant: Instant::now(),
+                tick: Tick(1 << 40),
+            },
+        };
+        let mut tx = tx(4, kernel);
+        let conn = ConnKey {
+            index: 3,
+            generation: 1,
+        };
+        let release = Tick((1 << 40) + 5_000_000);
+        tx.begin_sink(conn);
+        for _ in 0..10 {
+            let (_, slot) = tx.lend(fd, conn, 1452, TxClass::Data).expect("a slot");
+            slot.fill(7);
+            tx.end_segment(conn, 1452);
+        }
+        tx.end_run(
+            fd,
+            conn,
+            TxMeta {
+                path: PathId(0),
+                dst: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+                src_ip: None,
+                tos: 0,
+                segment_size: 1452,
+                segments: 10,
+                release: Release::At(release),
+                class: TxClass::Data,
+                tx: TxSeqRange { start: 0, end: 10 },
+                sealed: true,
+            },
+        );
+        tx.end_sink(conn);
+
+        let n = tx.prepare();
+        assert_eq!(n, 3, "sends of 4, 4 and 2 segments");
+        for (i, hdr) in tx.hdrs.iter().enumerate() {
+            #[allow(clippy::unnecessary_cast, reason = "msg_controllen is u32 on musl")]
+            let control = &tx.control[i].0[..hdr.msg_hdr.msg_controllen as usize];
+            let stamps: Vec<Vec<u8>> = Decoder::new(control)
+                .filter(|&(level, ty, _)| (level, ty) == (libc::SOL_SOCKET, 61))
+                .map(|(_, _, data)| data.to_vec())
+                .collect();
+            assert_eq!(stamps, vec![release.0.to_ne_bytes().to_vec()], "send {i}");
+        }
     }
 }

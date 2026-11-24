@@ -11,8 +11,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use std::time::Instant;
 
+use mvfstr_proto::ClockEpoch;
 use mvfstr_proto::ConnKey;
 use mvfstr_proto::RxMeta;
 use mvfstr_proto::SegmentSink;
@@ -32,6 +34,45 @@ pub struct TxCaps {
     /// Whether the socket reports the local destination address and can choose the source
     /// address per send (IP_PKTINFO, IPV6_RECVPKTINFO).
     pub pktinfo: bool,
+    /// Whether, and how far ahead, the backend holds a datagram until its release.
+    pub release: ReleaseSupport,
+    /// The socket's send buffer (SO_SNDBUF) in bytes, as the kernel reports it, its bookkeeping
+    /// included: every byte handed to the kernel and not yet sent is charged to it.
+    pub send_buffer: usize,
+}
+
+/// How a backend honours [`Release::At`](mvfstr_proto::Release::At).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseSupport {
+    /// Every datagram leaves when flushed, so connections do not build ahead: their build
+    /// horizon is 0.
+    None,
+    /// The kernel holds each datagram until its release (SO_TXTIME), written in the clock of
+    /// `epoch`, for releases up to `horizon` ahead.
+    Kernel {
+        /// The furthest ahead of now a release may be.
+        horizon: Duration,
+        /// The instant and the kernel clock's reading at it, sampled at bind.
+        epoch: ClockEpoch,
+    },
+}
+
+impl ReleaseSupport {
+    /// Returns the furthest ahead of now a release may be; zero without release support.
+    pub fn horizon(&self) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::Kernel { horizon, .. } => *horizon,
+        }
+    }
+
+    /// Returns the clock that releases are written in; `None` without release support.
+    pub fn epoch(&self) -> Option<ClockEpoch> {
+        match self {
+            Self::None => None,
+            Self::Kernel { epoch, .. } => Some(*epoch),
+        }
+    }
 }
 
 /// The result of [`TxBackend::flush`].

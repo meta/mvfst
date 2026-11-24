@@ -6,7 +6,9 @@
  */
 
 //! Timers: one deadline per connection and the pacing wakes, kept by the endpoint, and the one
-//! host wake it arms for the earliest of them.
+//! host wake it arms for the earliest of them. Deadlines and the pacing wakes of connections that
+//! build at least two wheel ticks ahead go on the wheel; other pacing wakes go on the wheel until
+//! shortly before they are due, then on the timerfd.
 
 use std::collections::BTreeSet;
 use std::task::Context;
@@ -31,15 +33,35 @@ const PACING_LEAD: Duration = WHEEL_TICK.saturating_mul(2);
 pub(crate) enum Kind {
     /// The connection's deadline: the earlier of its own and its session's.
     Deadline,
-    /// A pacing release.
+    /// A pacing wake of a connection that builds less than [`PACING_LEAD`] ahead of a release:
+    /// it must not be late, so the timerfd takes its last stretch.
     Pacing,
+    /// A pacing wake of a connection that builds at least [`PACING_LEAD`] ahead of a release:
+    /// the wheel fires at it, at most a tick late, which the build horizon absorbs.
+    Coarse,
 }
 
-/// Every connection's deadline and pacing release, by slot index.
+impl Kind {
+    /// Returns the kind of pacing wake for a connection with build horizon `horizon`, fixed for
+    /// its life.
+    pub(crate) fn pacing(horizon: Duration) -> Self {
+        // At PACING_LEAD or more, the wheel's lateness, under a tick, stays inside the horizon,
+        // and each wake builds about a tick of runs. `horizon` is the connection's own, which may
+        // be shorter than its endpoint's, to keep its advertised max_ack_delay in range, or zero.
+        if horizon >= PACING_LEAD {
+            Kind::Coarse
+        } else {
+            Kind::Pacing
+        }
+    }
+}
+
+/// Every connection's deadline and pacing wake, by slot index.
 #[derive(Debug, Default)]
 pub(crate) struct Timers {
     deadlines: BTreeSet<(Instant, u32)>,
     pacing: BTreeSet<(Instant, u32)>,
+    coarse: BTreeSet<(Instant, u32)>,
 }
 
 impl Timers {
@@ -68,6 +90,7 @@ impl Timers {
         let set = match kind {
             Kind::Deadline => &self.deadlines,
             Kind::Pacing => &self.pacing,
+            Kind::Coarse => &self.coarse,
         };
         set.first().map(|&(at, _)| at)
     }
@@ -87,6 +110,7 @@ impl Timers {
         match kind {
             Kind::Deadline => &mut self.deadlines,
             Kind::Pacing => &mut self.pacing,
+            Kind::Coarse => &mut self.coarse,
         }
     }
 }
@@ -102,20 +126,41 @@ enum Arm {
     Wheel(Instant),
     /// The timerfd, at this time.
     Fine(Instant),
+    /// The worker wheel at `wheel`, for a coarse pacing wake, and the timerfd at the later `fine`.
+    Both { wheel: Instant, fine: Instant },
 }
 
-/// Chooses how to wake at the earlier of `deadline` and the pacing release `pacing`. Deadlines
-/// tolerate the wheel's tick; a pacing release does not, so the wheel brings it within
-/// [`PACING_LEAD`] and the timerfd fires at the release itself.
-fn plan(now: Instant, deadline: Option<Instant>, pacing: Option<Instant>) -> Arm {
-    let Some(target) = deadline.into_iter().chain(pacing).min() else {
+/// Chooses how to wake at the earliest of `deadline`, the pacing wake `pacing` and the coarse
+/// pacing wake `coarse`. Deadlines tolerate the wheel's tick; a pacing wake does not, so the
+/// wheel brings it within [`PACING_LEAD`] and the timerfd fires at the wake itself. A coarse
+/// wake stays on the wheel even while the timerfd holds another connection's pacing wake.
+fn plan(
+    now: Instant,
+    deadline: Option<Instant>,
+    pacing: Option<Instant>,
+    coarse: Option<Instant>,
+) -> Arm {
+    // A coarse pacing wake tolerates the wheel's tick, as a deadline does.
+    let wheel = deadline.into_iter().chain(coarse).min();
+    let Some(target) = wheel.into_iter().chain(pacing).min() else {
         return Arm::Idle;
     };
     if target <= now {
         return Arm::Now;
     }
     match pacing {
-        Some(release) if release - now <= PACING_LEAD => Arm::Fine(target),
+        Some(release) if release - now <= PACING_LEAD => {
+            let fine = deadline.map_or(release, |deadline| deadline.min(release));
+            match coarse {
+                // On the timerfd it would fire at its exact time and build a single run, as at
+                // build horizon 0.
+                Some(coarse) if coarse < fine => Arm::Both {
+                    wheel: coarse,
+                    fine,
+                },
+                _ => Arm::Fine(fine),
+            }
+        }
         Some(release) => Arm::Wheel(target.min(release - PACING_LEAD)),
         None => Arm::Wheel(target),
     }
@@ -128,6 +173,9 @@ pub(crate) struct HostWake {
     wheel: Timeout,
     /// `None` if the timerfd could not be created; pacing wakes then round up to the wheel's tick.
     fine: Option<TimerFd>,
+    /// How many times `arm` chose the timerfd for a pacing wake.
+    #[cfg(test)]
+    fine_plans: u32,
 }
 
 impl HostWake {
@@ -135,17 +183,20 @@ impl HostWake {
         Self {
             wheel: Timeout::new(host),
             fine: TimerFd::new().ok(),
+            #[cfg(test)]
+            fine_plans: 0,
         }
     }
 
-    /// Arms the wake for the earlier of `deadline` and the pacing release `pacing`, and
-    /// registers `cx` for it. Returns `Ready` if either has passed at `now`, so the caller runs
-    /// another turn instead of waiting for a wake.
+    /// Arms the wake for the earliest of `deadline`, the pacing wake `pacing` and the coarse
+    /// pacing wake `coarse` (see [`Kind`]), and registers `cx` for it. Returns `Ready` if any has
+    /// passed at `now`, so the caller runs another turn instead of waiting for a wake.
     pub(crate) fn arm(
         &mut self,
         now: Instant,
         deadline: Option<Instant>,
         pacing: Option<Instant>,
+        coarse: Option<Instant>,
         cx: &mut Context<'_>,
     ) -> Poll<()> {
         // Expiries are taken first, since rescheduling would discard them. Both clocks are the
@@ -156,7 +207,12 @@ impl HostWake {
         if let Some(fine) = self.fine.as_mut() {
             let _ = fine.poll_expired(cx);
         }
-        match plan(now, deadline, pacing) {
+        let arm = plan(now, deadline, pacing, coarse);
+        #[cfg(test)]
+        if matches!(arm, Arm::Fine(_) | Arm::Both { .. }) {
+            self.fine_plans += 1;
+        }
+        match arm {
             Arm::Idle => {
                 self.disarm();
                 Poll::Pending
@@ -176,6 +232,27 @@ impl HostWake {
                 self.wheel_at(target, cx)
             }
             Arm::Wheel(target) => self.wheel_at(target, cx),
+            Arm::Both {
+                wheel,
+                fine: target,
+            } => {
+                if let Some(fine) = self.fine.as_mut()
+                    && (fine.deadline() == Some(target) || fine.arm(target).is_ok())
+                {
+                    if self.wheel.deadline() != Some(wheel) {
+                        self.wheel.schedule_at(wheel, cx.waker());
+                    }
+                    let wheel_fired = self.wheel.poll_expired(cx).is_ready();
+                    let fine_fired = fine.poll_expired(cx).is_ready();
+                    return if wheel_fired || fine_fired {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    };
+                }
+                // Without a timerfd the wheel takes the earlier of the two.
+                self.wheel_at(wheel, cx)
+            }
         }
     }
 
@@ -204,6 +281,18 @@ impl HostWake {
     #[cfg(test)]
     fn fine_deadline(&self) -> Option<Instant> {
         self.fine.as_ref().and_then(TimerFd::deadline)
+    }
+
+    /// Returns the time the wheel is armed for.
+    #[cfg(test)]
+    fn wheel_deadline(&self) -> Option<Instant> {
+        self.wheel.deadline()
+    }
+
+    /// Returns how many times the wake chose the timerfd for a pacing wake.
+    #[cfg(test)]
+    pub(crate) fn fine_plans(&self) -> u32 {
+        self.fine_plans
     }
 }
 
@@ -263,7 +352,7 @@ mod tests {
         let t = Instant::now();
         let ms = Duration::from_millis;
         let release = t + ms(5);
-        let Arm::Wheel(early) = plan(t, None, Some(release)) else {
+        let Arm::Wheel(early) = plan(t, None, Some(release), None) else {
             panic!("a distant release starts on the wheel");
         };
         assert!(
@@ -273,27 +362,119 @@ mod tests {
             release.saturating_duration_since(early)
         );
         assert_eq!(
-            plan(early, None, Some(release)),
+            plan(early, None, Some(release), None),
             Arm::Fine(release),
             "the early wake hands the release to the timerfd"
         );
         assert_eq!(
-            plan(t, None, Some(t + Duration::from_micros(300))),
+            plan(t, None, Some(t + Duration::from_micros(300)), None),
             Arm::Fine(t + Duration::from_micros(300)),
             "a release under a tick away goes to the timerfd at once"
         );
         assert_eq!(
-            plan(t, Some(t + ms(1)), Some(release)),
+            plan(t, Some(t + ms(1)), Some(release), None),
             Arm::Wheel(t + ms(1)),
             "an earlier deadline comes first"
         );
         assert_eq!(
-            plan(t, Some(t + ms(4)), None),
+            plan(t, Some(t + ms(4)), None, None),
             Arm::Wheel(t + ms(4)),
             "deadlines alone use the wheel"
         );
-        assert_eq!(plan(release, None, Some(release)), Arm::Now);
-        assert_eq!(plan(t, None, None), Arm::Idle);
+        assert_eq!(plan(release, None, Some(release), None), Arm::Now);
+        assert_eq!(plan(t, None, None, None), Arm::Idle);
+    }
+
+    /// Returns how the endpoint wakes at `now` for the pacing wakes in `timers`, without deadlines.
+    fn plan_pacing(now: Instant, timers: &Timers) -> Arm {
+        plan(
+            now,
+            None,
+            timers.next(Kind::Pacing),
+            timers.next(Kind::Coarse),
+        )
+    }
+
+    #[test]
+    fn a_connection_building_two_ticks_ahead_wakes_on_the_wheel_at_its_pacing_wake() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        // `pacing_at` is already the release less the connection's horizon.
+        let pacing_at = t + ms(6);
+        for horizon in [ms(2), ms(5)] {
+            let mut timers = Timers::default();
+            timers.set(Kind::pacing(horizon), 1, None, Some(pacing_at));
+            assert_eq!(
+                plan_pacing(t, &timers),
+                Arm::Wheel(pacing_at),
+                "H_conn {horizon:?}: the wheel at the wake itself, no lead"
+            );
+            assert_eq!(
+                plan_pacing(pacing_at - Duration::from_micros(300), &timers),
+                Arm::Wheel(pacing_at),
+                "H_conn {horizon:?}: no timerfd however close the wake"
+            );
+            assert_eq!(plan_pacing(pacing_at, &timers), Arm::Now);
+        }
+
+        // Connections on the same endpoint that build less than two ticks ahead, zero included,
+        // keep the timerfd path for their own wakes.
+        for horizon in [Duration::ZERO, ms(1), ms(2) - Duration::from_nanos(1)] {
+            let mut timers = Timers::default();
+            timers.set(Kind::pacing(ms(5)), 1, None, Some(pacing_at + ms(20)));
+            timers.set(Kind::pacing(horizon), 2, None, Some(pacing_at));
+            assert_eq!(
+                plan_pacing(t, &timers),
+                Arm::Wheel(pacing_at - PACING_LEAD),
+                "H_conn {horizon:?}: the wheel brings the wake within the lead"
+            );
+            assert_eq!(
+                plan_pacing(pacing_at - ms(1), &timers),
+                Arm::Fine(pacing_at),
+                "H_conn {horizon:?}: the timerfd fires at the wake"
+            );
+        }
+    }
+
+    #[test]
+    fn a_coarse_wake_before_another_connections_imminent_pacing_wake_stays_on_the_wheel() {
+        let t = Instant::now();
+        let us = Duration::from_micros;
+        let ms = Duration::from_millis;
+        let mut timers = Timers::default();
+        timers.set(Kind::pacing(ms(5)), 1, None, Some(t + us(300)));
+        timers.set(Kind::pacing(Duration::ZERO), 2, None, Some(t + ms(1)));
+        assert_eq!(
+            plan_pacing(t, &timers),
+            Arm::Both {
+                wheel: t + us(300),
+                fine: t + ms(1),
+            },
+            "the timerfd takes only the imminent pacing wake"
+        );
+        assert_eq!(
+            plan(t, None, Some(t + us(300)), Some(t + ms(1))),
+            Arm::Fine(t + us(300)),
+            "a coarse wake after the imminent pacing wake waits for the next plan"
+        );
+        assert_eq!(
+            plan(t, Some(t + us(300)), Some(t + ms(1)), None),
+            Arm::Fine(t + us(300)),
+            "a deadline before an imminent pacing wake still takes the timerfd"
+        );
+        assert_eq!(
+            plan(t, Some(t + us(200)), Some(t + ms(1)), Some(t + us(300))),
+            Arm::Fine(t + us(200)),
+            "an earlier deadline comes first"
+        );
+        assert_eq!(
+            plan(t, Some(t + us(500)), Some(t + ms(1)), Some(t + us(300))),
+            Arm::Both {
+                wheel: t + us(300),
+                fine: t + us(500),
+            },
+            "a deadline between the two takes the timerfd"
+        );
     }
 
     /// Runs `body` on a Roxygen worker and returns what it sends back.
@@ -329,7 +510,7 @@ mod tests {
                 let mut armed_fine = None;
                 let pacing_fired = std::future::poll_fn(|cx| {
                     let now = host.now();
-                    match wake.arm(now, None, Some(release), cx) {
+                    match wake.arm(now, None, Some(release), None, cx) {
                         Poll::Ready(()) => Poll::Ready(now),
                         Poll::Pending => {
                             armed_fine = armed_fine.or(wake.fine_deadline());
@@ -342,7 +523,7 @@ mod tests {
                 let deadline = host.now() + Duration::from_millis(3);
                 let deadline_fired = std::future::poll_fn(|cx| {
                     let now = host.now();
-                    match wake.arm(now, Some(deadline), None, cx) {
+                    match wake.arm(now, Some(deadline), None, None, cx) {
                         Poll::Ready(()) => Poll::Ready(now),
                         Poll::Pending => {
                             assert_eq!(wake.fine_deadline(), None, "deadlines use the wheel");
@@ -361,5 +542,37 @@ mod tests {
         );
         assert!(pacing_fired >= release, "the pacing wake fired early");
         assert!(deadline_fired >= deadline, "the deadline wake fired early");
+    }
+
+    #[test]
+    fn a_coarse_wake_waits_on_the_wheel_while_the_timerfd_holds_an_imminent_pacing_wake() {
+        let (armed, coarse, pacing, fired) = on_worker(|context| {
+            let host = context.host().clone();
+            Box::pin(async move {
+                let mut wake = HostWake::new(&host);
+                let start = host.now();
+                let coarse = start + Duration::from_micros(1500);
+                let pacing = start + PACING_LEAD;
+                let mut armed = None;
+                let fired = std::future::poll_fn(|cx| {
+                    let now = host.now();
+                    match wake.arm(now, None, Some(pacing), Some(coarse), cx) {
+                        Poll::Ready(()) => Poll::Ready(now),
+                        Poll::Pending => {
+                            armed = armed.or(Some((wake.wheel_deadline(), wake.fine_deadline())));
+                            Poll::Pending
+                        }
+                    }
+                })
+                .await;
+                (armed, coarse, pacing, fired)
+            })
+        });
+        assert_eq!(
+            armed,
+            Some((Some(coarse), Some(pacing))),
+            "the wheel at the coarse wake, the timerfd at the pacing wake"
+        );
+        assert!(fired >= coarse, "the coarse wake fired early");
     }
 }

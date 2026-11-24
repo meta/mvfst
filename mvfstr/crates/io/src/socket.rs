@@ -19,13 +19,18 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 use libc::c_int;
+use mvfstr_proto::ClockEpoch;
+use mvfstr_proto::Tick;
 use socket2::Domain;
 use socket2::Protocol;
 use socket2::Socket;
 use socket2::Type;
 
+use crate::ReleaseSupport;
 use crate::TxCaps;
 use crate::cmsg::CmsgSpace;
 use crate::cmsg::Encoder;
@@ -244,6 +249,57 @@ pub fn probe(socket: &Socket, max_datagram: u16) -> TxCaps {
         gro: flag(libc::SOL_UDP, libc::UDP_GRO),
         ecn,
         pktinfo,
+        release: ReleaseSupport::None,
+        // An unreadable buffer size is reported as 0, as if the socket could not buffer anything.
+        send_buffer: socket.send_buffer_size().unwrap_or(0),
+    }
+}
+
+/// Turns on kernel release for `socket`: SO_TXTIME, with every flag clear, on CLOCK_MONOTONIC, the
+/// clock fq reads stamps in. Returns kernel release support with `horizon` and the clock epoch that
+/// connections write their releases in. Fails when the socket refuses SO_TXTIME.
+pub(crate) fn kernel_release(socket: &Socket, horizon: Duration) -> io::Result<ReleaseSupport> {
+    // Failing here fails the open: unstamped sends would silently stop connections building ahead.
+    sys::set_txtime(socket, libc::CLOCK_MONOTONIC).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            TxtimeError {
+                cause: error,
+                horizon,
+            },
+        )
+    })?;
+    // Rust's `Instant` reads CLOCK_MONOTONIC on Linux too, so the pair is off only by the time
+    // between the two reads, tens of nanoseconds.
+    let instant = Instant::now();
+    let tick = Tick(sys::monotonic_ns());
+    Ok(ReleaseSupport::Kernel {
+        horizon,
+        epoch: ClockEpoch { instant, tick },
+    })
+}
+
+/// A refused SO_TXTIME: the backend cannot hold datagrams until their release.
+#[derive(Debug)]
+struct TxtimeError {
+    cause: io::Error,
+    horizon: Duration,
+}
+
+impl std::fmt::Display for TxtimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "kernel release with a {:?} horizon needs SO_TXTIME on CLOCK_MONOTONIC, which the \
+             socket refused: {}",
+            self.horizon, self.cause
+        )
+    }
+}
+
+impl std::error::Error for TxtimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 

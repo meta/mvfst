@@ -5,10 +5,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The client's result lines, their parser and the `--stats` line. The result lines keep the
-//! format and unit of mvfst's tperf, so the parser reads the output of either tool.
+//! The client's result lines, their parser, the `--stats` line and the line with the server's
+//! sending setup. The result lines keep the format and unit of mvfst's tperf, so the parser reads
+//! the output of either tool.
 
+use std::time::Duration;
+
+use mvfstr_io::ReleaseSupport;
+use mvfstr_io::TxCaps;
+use mvfstr_proto::CongestionControl;
 use mvfstr_proto::ConnStats;
+use mvfstr_proto::TransportConfig;
 
 /// Bytes per megabit in mvfst tperf's unit, which is really a mebibit (2^20 bits).
 const BYTES_PER_MEGABIT: f64 = 131_072.0;
@@ -112,6 +119,33 @@ pub(crate) fn closed_line(stats: &ConnStats, socket_stops: u64, phase_pacing_wak
     )
 }
 
+/// Returns the line with the server's sending setup, logged at startup: its connections'
+/// controller and pacing, its socket's kernel release and send buffer, and the endpoint's build
+/// horizon, capped by the socket's release horizon. A connection may build less far ahead than
+/// the endpoint allows, to keep its advertised max_ack_delay in range.
+pub(crate) fn startup_line(
+    transport: &TransportConfig,
+    build_horizon: Duration,
+    caps: &TxCaps,
+) -> String {
+    let congestion = match transport.congestion_control() {
+        CongestionControl::NewReno => "newreno",
+        CongestionControl::Cubic => "cubic",
+        CongestionControl::Bbr3 => "bbr3",
+    };
+    format!(
+        "Server: congestion={congestion} pacing={} pacing_granularity_us={} pacing_min_burst={} \
+         pacing_max_burst={} txtime={} endpoint_horizon_us={} so_sndbuf={}",
+        transport.pacing(),
+        transport.pacing_granularity().as_micros(),
+        transport.pacing_min_burst(),
+        transport.pacing_max_burst(),
+        caps.release != ReleaseSupport::None,
+        build_horizon.min(caps.release.horizon()).as_micros(),
+        caps.send_buffer,
+    )
+}
+
 /// Formats `value` as a C++ `std::ostream` prints a `double` by default: `%g` with six
 /// significant digits, which is how mvfst's tperf prints its throughput.
 pub(crate) fn format_g(value: f64) -> String {
@@ -166,9 +200,14 @@ fn without_trailing_zeros(number: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::Instant;
+
+    use mvfstr_proto::ClockEpoch;
+    use mvfstr_proto::Tick;
 
     use super::*;
+    use crate::config::server_transport;
+    use crate::flags::Flags;
 
     #[test]
     fn doubles_print_as_cpp_streams_print_them() {
@@ -329,6 +368,49 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             closed_line(&stats, 7, 4_211),
             "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
              srtt_us=150 socket_stops=7 phase_pacing_wakes=4211"
+        );
+    }
+
+    #[test]
+    fn the_startup_line_names_the_controller_the_pacing_and_the_sockets_release_setup() {
+        let caps = |release| TxCaps {
+            max_segments: 64,
+            max_datagram: 1500,
+            gro: true,
+            ecn: true,
+            pktinfo: true,
+            release,
+            send_buffer: 14_544_416,
+        };
+        let kernel = |horizon| ReleaseSupport::Kernel {
+            horizon,
+            epoch: ClockEpoch {
+                instant: Instant::now(),
+                tick: Tick(0),
+            },
+        };
+        let ms = Duration::from_millis;
+        let bbr3 = server_transport(&Flags {
+            congestion: CongestionControl::Bbr3,
+            pacing: true,
+            ..Flags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            startup_line(&bbr3, ms(5), &caps(kernel(ms(100)))),
+            "Server: congestion=bbr3 pacing=true pacing_granularity_us=200 pacing_min_burst=5 \
+             pacing_max_burst=44 txtime=true endpoint_horizon_us=5000 so_sndbuf=14544416"
+        );
+        let capped = startup_line(&bbr3, ms(5), &caps(kernel(ms(2))));
+        assert!(
+            capped.contains(" endpoint_horizon_us=2000 "),
+            "the socket's release horizon caps the endpoint's: {capped}"
+        );
+        let cubic = server_transport(&Flags::default()).unwrap();
+        assert_eq!(
+            startup_line(&cubic, Duration::ZERO, &caps(ReleaseSupport::None)),
+            "Server: congestion=cubic pacing=false pacing_granularity_us=1000 pacing_min_burst=5 \
+             pacing_max_burst=44 txtime=false endpoint_horizon_us=0 so_sndbuf=14544416"
         );
     }
 }

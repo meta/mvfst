@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use mvfstr_io::Backend;
+use mvfstr_io::TxCaps;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::ConnEvent;
 use mvfstr_proto::ConnKey;
@@ -242,6 +243,11 @@ impl<B: Backend> Server<B> {
     pub(crate) fn config(&self) -> &Arc<ServerConfig> {
         &self.config
     }
+
+    /// Returns the server socket's capabilities, fixed at bind.
+    pub(crate) fn caps(&self) -> TxCaps {
+        *self.socket.borrow().caps()
+    }
 }
 
 /// The receive path's reused vectors, empty between batches, so they are not allocated again for
@@ -302,6 +308,8 @@ struct Entry<S, B> {
     served_deadline: Option<Instant>,
     /// The connection's entry in the pacing timers.
     pacing: Option<Instant>,
+    /// Which pacing timers hold `pacing`, from the connection's build horizon.
+    pacing_kind: Kind,
     /// Whether the connection's transport config turns pacing on.
     paces: bool,
     /// The reading the connection's last transmit attempt ran at, to assert that its attempts and
@@ -404,7 +412,8 @@ struct Quiesce {
 /// Which source of intake work waited longest.
 enum Due {
     Deadline,
-    Pacing,
+    /// A pacing wake, of either pacing kind.
+    Pacing(Kind),
     Wake,
 }
 
@@ -541,6 +550,28 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.issued.borrow().clone()
     }
 
+    /// Returns every connection's build horizon and the timers that hold its pacing wakes, in
+    /// slot order.
+    #[cfg(test)]
+    pub(crate) fn build_horizons(&self) -> Vec<(Duration, Kind)> {
+        let slab = self.slab.borrow();
+        (0..slab.end())
+            .filter_map(|index| {
+                let key = slab.key_at(index)?;
+                let slot = slab.slot(index)?;
+                let mut slot = slot.borrow_mut();
+                slot.get(key)
+                    .map(|entry| (entry.conn.build_horizon(), entry.pacing_kind))
+            })
+            .collect()
+    }
+
+    /// Returns how many times the host wake chose the timerfd for a pacing wake.
+    #[cfg(test)]
+    pub(crate) fn fine_plans(&self) -> u32 {
+        self.sched.borrow().host_wake.fine_plans()
+    }
+
     /// Returns what the transmit phases have done so far.
     #[cfg(test)]
     pub(crate) fn tx_record(&self) -> TxRecord {
@@ -572,6 +603,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// Returns the server socket's address.
     pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
         self.server.as_ref().map(|server| server.addr)
+    }
+
+    /// Returns the server socket's capabilities.
+    pub(crate) fn server_caps(&self) -> Option<TxCaps> {
+        self.server.as_ref().map(Server::caps)
     }
 
     /// Opens a client connection on its own connected socket. A connect that fails drops
@@ -724,7 +760,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// application phase, then again for each later application or transmit phase and after each
     /// batch is received, so packet times and RTT samples do not lag by earlier work. A transmit
     /// phase also reads it for each attempt of a paced connection, and before each pop from its
-    /// queue while a pacing wake is armed, until the phase's requeue cap is spent.
+    /// queue while a pacing wake is armed on the timerfd, until the phase's requeue cap is spent.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -876,7 +912,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             .set(Kind::Deadline, key.index, entry.deadline, None);
         sched
             .timers
-            .set(Kind::Pacing, key.index, entry.pacing, None);
+            .set(entry.pacing_kind, key.index, entry.pacing, None);
         drop(sched);
         entry.wake.close();
         self.drop_guarded(entry);
@@ -916,7 +952,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 let due = |kind| sched.timers.next(kind).filter(|&at| at <= now);
                 [
                     due(Kind::Deadline).map(|at| (at, Due::Deadline)),
-                    due(Kind::Pacing).map(|at| (at, Due::Pacing)),
+                    due(Kind::Pacing).map(|at| (at, Due::Pacing(Kind::Pacing))),
+                    due(Kind::Coarse).map(|at| (at, Due::Pacing(Kind::Coarse))),
                     sched.ready.front().map(|&(at, _)| (at, Due::Wake)),
                 ]
                 .into_iter()
@@ -925,7 +962,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             };
             match next {
                 Some((_, Due::Deadline)) => self.serve_deadline(now),
-                Some((_, Due::Pacing)) => self.serve_pacing(now),
+                Some((_, Due::Pacing(kind))) => self.serve_pacing(kind, now),
                 Some((_, Due::Wake)) => self.serve_wake(now),
                 None => return,
             }
@@ -956,11 +993,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         });
     }
 
-    /// Serves the connection whose pacing release came due first.
-    fn serve_pacing(&self, now: Instant) {
+    /// Serves the connection whose pacing wake of `kind` came due first.
+    fn serve_pacing(&self, kind: Kind, now: Instant) {
         #[cfg(test)]
-        let due = self.sched.borrow().timers.next(Kind::Pacing);
-        let Some(index) = self.sched.borrow_mut().timers.pop_due(Kind::Pacing, now) else {
+        let due = self.sched.borrow().timers.next(kind);
+        let Some(index) = self.sched.borrow_mut().timers.pop_due(kind, now) else {
             return;
         };
         #[cfg(test)]
@@ -1166,7 +1203,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             .set(Kind::Deadline, key.index, entry.deadline, None);
         sched
             .timers
-            .set(Kind::Pacing, key.index, entry.pacing, None);
+            .set(entry.pacing_kind, key.index, entry.pacing, None);
         drop(sched);
         entry.wake.close();
         self.drop_guarded(entry);
@@ -1180,13 +1217,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// the end of the phase. A paced connection's attempt runs instead at a reading taken just
     /// before it, and its socket is also flushed right after it if the attempt built a run, so its
     /// runs do not wait in the pool behind a stale reading; these flushes of the server socket stop
-    /// once one meets EAGAIN. While a pacing wake is armed, the phase checks before each pop from
-    /// its queue, including any pop that finds it empty, whether a wake has come due; the earliest
-    /// due wake's connection makes the next attempt at the check's reading unless it waits for the
-    /// next phase, so a wake is late by about an attempt rather than a turn. A pop that finds the
-    /// queue empty ends the phase unless the check before it took a wake that does not give an
-    /// attempt. Serves that give an attempt count against `limits.requeues` with full-batch
-    /// requeues, and the checks stop once that cap is spent.
+    /// once one meets EAGAIN. While a pacing wake is armed on the timerfd, the phase checks before
+    /// each pop from its queue, including any pop that finds it empty, whether such a wake has come
+    /// due; the earliest due wake's connection makes the next attempt at the check's reading unless
+    /// it waits for the next phase, so a wake is late by about an attempt rather than a turn.
+    /// Pacing wakes on the timer wheel wait for the next turn's intake. A pop that finds the queue
+    /// empty ends the phase unless the check before it took a wake that does not give an attempt.
+    /// Serves that give an attempt count against `limits.requeues` with full-batch requeues, and
+    /// the checks stop once that cap is spent.
     fn transmit_phase(&self, now: Instant, cx: &mut Context<'_>) {
         #[cfg(test)]
         self.record.borrow_mut().begin_phase();
@@ -1319,7 +1357,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.record.borrow_mut().end_phase();
     }
 
-    /// Takes the pacing wake due earliest at `at` inside a transmit phase.
+    /// Takes the pacing wake on the timerfd due earliest at `at` inside a transmit phase.
     fn take_pacing_wake(&self, at: Instant, queue: &mut VecDeque<ConnKey>) -> Take {
         #[cfg(test)]
         let due = self.sched.borrow().timers.next(Kind::Pacing);
@@ -1833,7 +1871,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             .chain(quiesce_at)
             .min();
         let pacing = sched.timers.next(Kind::Pacing);
-        match sched.host_wake.arm(now, deadline, pacing, cx) {
+        let coarse = sched.timers.next(Kind::Coarse);
+        match sched.host_wake.arm(now, deadline, pacing, coarse, cx) {
             Poll::Ready(()) => Next::Again,
             Poll::Pending => Next::Park,
         }
@@ -1857,6 +1896,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sched.rx.push(key);
         }
         drop(sched);
+        let pacing_kind = Kind::pacing(conn.build_horizon());
         let entry = Entry {
             conn,
             session,
@@ -1875,6 +1915,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             session_deadline: None,
             served_deadline: None,
             pacing: None,
+            pacing_kind,
             paces,
             #[cfg(debug_assertions)]
             attempted_at: None,
@@ -1946,7 +1987,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             self.sched
                 .borrow_mut()
                 .timers
-                .set(Kind::Pacing, key.index, entry.pacing, at);
+                .set(entry.pacing_kind, key.index, entry.pacing, at);
             entry.pacing = at;
         }
     }
@@ -2030,7 +2071,7 @@ fn attempt<B: Backend>(
         max_segments: caps.max_segments.min(max_segments),
         max_datagram: caps.max_datagram,
         max_bytes: u32::MAX,
-        epoch: None,
+        epoch: caps.release.epoch(),
     };
     let mut sink = backend.sink(key);
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer)

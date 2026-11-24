@@ -16,9 +16,9 @@
 //! monomorphized for it, so per-packet calls are not dispatched dynamically.
 //!
 //! [`MmsgBackend`] is the Linux backend: `sendmmsg` with UDP_SEGMENT, TOS and source-address
-//! control messages, `recvmmsg` with UDP_GRO, and readiness through tokio's `AsyncFd`.
-//! [`socket`] holds the socket setup it uses. Backends do not support building datagrams ahead
-//! for timed release, recalling queued datagrams, or TX timestamps.
+//! control messages, `recvmmsg` with UDP_GRO, readiness through tokio's `AsyncFd`, and optionally
+//! kernel release through SO_TXTIME. [`socket`] holds the socket setup it uses. Backends do not
+//! support userspace or NIC release, recalling queued datagrams, TX timestamps or IP_RECVERR.
 
 pub mod backend;
 #[cfg(target_os = "linux")]
@@ -38,6 +38,7 @@ mod tx;
 
 pub use backend::Backend;
 pub use backend::FlushOutcome;
+pub use backend::ReleaseSupport;
 pub use backend::RxBackend;
 pub use backend::TxBackend;
 pub use backend::TxCaps;

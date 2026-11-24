@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mvfstr_io::Backend;
+use mvfstr_io::TxCaps;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::ConfigError;
 use mvfstr_proto::ConnOptions;
@@ -36,6 +37,8 @@ use rustls::pki_types::ServerName;
 use crate::ConnHandle;
 use crate::QuicApplication;
 use crate::Steering;
+#[cfg(test)]
+use crate::timers::Kind;
 use crate::turn::Core;
 use crate::turn::EndpointStats;
 use crate::turn::Limits;
@@ -179,10 +182,14 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
             Some((ServerSocket::Given(backend), config)) => Some(Server::new(backend, config)?),
             None => None,
         };
-        let endpoint = Endpoint::new(
+        let mut endpoint = Endpoint::new(
             config,
             server.as_ref().map(|server| Arc::clone(server.config())),
         );
+        // Set first: each accepted connection fixes its build horizon from the release horizon.
+        if let Some(server) = &server {
+            endpoint.set_release_horizon(server.caps().release.horizon());
+        }
         let core = Rc::new(Core::new(
             worker,
             endpoint,
@@ -227,6 +234,13 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
     /// Returns the server socket's local address, if the driver accepts connections.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.core.upgrade()?.local_addr()
+    }
+
+    /// Returns the server socket's capabilities, fixed at bind, if the driver accepts connections:
+    /// among them its release horizon, which bounds every accepted connection's build horizon, and
+    /// the send buffer the kernel granted.
+    pub fn server_caps(&self) -> Option<TxCaps> {
+        self.core.upgrade()?.server_caps()
     }
 
     /// Opens a client connection to `remote` with `session` as its application state, on its own
@@ -282,6 +296,21 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
         self.core
             .upgrade()
             .map_or_else(Vec::new, |core| core.issued_cids())
+    }
+
+    /// Returns every connection's build horizon and the timers that hold its pacing wakes, in
+    /// slot order.
+    #[cfg(test)]
+    pub(crate) fn build_horizons(&self) -> Vec<(Duration, Kind)> {
+        self.core
+            .upgrade()
+            .map_or_else(Vec::new, |core| core.build_horizons())
+    }
+
+    /// Returns how many times the driver's host wake chose the timerfd for a pacing wake.
+    #[cfg(test)]
+    pub(crate) fn fine_plans(&self) -> u32 {
+        self.core.upgrade().map_or(0, |core| core.fine_plans())
     }
 
     /// Returns what the driver's transmit phases have done so far.

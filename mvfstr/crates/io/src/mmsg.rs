@@ -20,6 +20,7 @@ use std::pin::pin;
 use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
+use std::time::Duration;
 use std::time::Instant;
 
 use mvfstr_proto::ConnKey;
@@ -41,6 +42,9 @@ use crate::socket;
 use crate::tx::MmsgSink;
 use crate::tx::Tx;
 use crate::tx::TxConfig;
+
+/// The longest [`MmsgOptions::txtime_horizon`].
+const MAX_TXTIME_HORIZON: Duration = Duration::from_secs(1);
 
 /// Settings for every [`MmsgBackend`] a driver opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +73,24 @@ pub struct MmsgOptions {
     /// Bytes per receive buffer. Datagrams that do not fit are discarded; 65,536 holds any
     /// datagram or GRO run. Default 65,536.
     pub rx_buffer: u32,
+    /// Kernel release: the socket gets SO_TXTIME on CLOCK_MONOTONIC, opening the backend fails if
+    /// the kernel refuses it, every run with a [`Release::At`](mvfstr_proto::Release::At) carries
+    /// its release as an SCM_TXTIME stamp, and the backend reports
+    /// [`ReleaseSupport::Kernel`](crate::ReleaseSupport::Kernel). Sockets opened by
+    /// [`Backend::connect`] never set it.
+    ///
+    /// The operator must make sure that an fq qdisc honours the stamps on the sending device: the
+    /// setsockopt also succeeds where the qdisc ignores them, and built-ahead datagrams then leave
+    /// at once. The backend does not set IP_RECVERR, so a datagram the qdisc drops, beyond its
+    /// horizon or a flow's packet limit, is reported flushed; loss detection recovers it, and the
+    /// controller counts it as congestion rather than as a local drop. Production use needs
+    /// IP_RECVERR and an error-queue drain. Every byte waiting in fq stays charged to the socket's
+    /// send buffer, which must hold the connections' built-ahead bytes. Default off.
+    pub txtime: bool,
+    /// With `txtime`, the furthest ahead of now a release may be, which bounds every
+    /// connection's build horizon; at most 1 s, far inside fq's 10 s drop horizon. Default
+    /// 100 ms.
+    pub txtime_horizon: Duration,
 }
 
 impl Default for MmsgOptions {
@@ -82,6 +104,8 @@ impl Default for MmsgOptions {
             max_unsent: 128 * 1024,
             rx_batch: 32,
             rx_buffer: 65_536,
+            txtime: false,
+            txtime_horizon: Duration::from_millis(100),
         }
     }
 }
@@ -99,6 +123,9 @@ impl MmsgOptions {
             "tx_batch must be 1 to 1,024"
         } else if self.rx_batch == 0 || self.rx_buffer == 0 {
             "rx_batch and rx_buffer must be positive"
+        } else if self.txtime_horizon > MAX_TXTIME_HORIZON {
+            // fq drops a packet stamped beyond its own horizon, 10 s by default.
+            "txtime_horizon must be at most 1 s"
         } else {
             return Ok(());
         };
@@ -108,9 +135,10 @@ impl MmsgOptions {
 
 /// The `sendmmsg`/`recvmmsg` backend on one UDP socket, with GSO and GRO.
 ///
-/// The backend does not support timed release: a flush passes queued datagrams to the kernel at
-/// once, until the socket would block. Readiness comes from tokio's `AsyncFd`, so a backend must be
-/// opened on a thread running a tokio runtime with I/O enabled, such as a Roxygen worker.
+/// Without [`MmsgOptions::txtime`] it does not support timed release: every datagram leaves when
+/// flushed, so connections do not build ahead. With it, the kernel holds each run until its
+/// release. Readiness comes from tokio's `AsyncFd`, so a backend must be opened on a thread running
+/// a tokio runtime with I/O enabled, such as a Roxygen worker.
 pub struct MmsgBackend {
     io: AsyncFd<Socket>,
     tx: Tx,
@@ -137,7 +165,10 @@ impl MmsgBackend {
         }
         socket.set_nonblocking(true)?;
         socket::prepare(&socket, options.socket.gro);
-        let caps = socket::probe(&socket, options.max_datagram);
+        let mut caps = socket::probe(&socket, options.max_datagram);
+        if options.txtime {
+            caps.release = socket::kernel_release(&socket, options.txtime_horizon)?;
+        }
         let local = socket.local_addr()?;
         let config = TxConfig {
             slots: options.tx_slots,
@@ -281,7 +312,16 @@ impl Backend for MmsgBackend {
             reuse_port: false,
             ..options.socket.clone()
         };
-        Self::from_socket(socket::open(local, Some(remote), &socket_options)?, options)
+        // Kernel release is the server socket's: a client connection's endpoint cannot give it a
+        // horizon, so its runs are never stamped.
+        let options = MmsgOptions {
+            txtime: false,
+            ..options.clone()
+        };
+        Self::from_socket(
+            socket::open(local, Some(remote), &socket_options)?,
+            &options,
+        )
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {

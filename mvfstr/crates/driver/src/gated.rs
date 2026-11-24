@@ -30,7 +30,9 @@ use mvfstr_io::MmsgSink;
 use mvfstr_io::RxBackend;
 use mvfstr_io::TxBackend;
 use mvfstr_io::TxCaps;
+use mvfstr_proto::ClockEpoch;
 use mvfstr_proto::ConnKey;
+use mvfstr_proto::Release;
 use mvfstr_proto::RxMeta;
 use mvfstr_proto::SegmentSink;
 use mvfstr_proto::SlotId;
@@ -51,7 +53,7 @@ pub(crate) enum Event {
     Flush,
     /// Datagrams arrived.
     Received,
-    /// A run ended; [`Valve::runs`] has its attempt.
+    /// A run ended; [`Valve::runs`] has its attempt and release.
     Run,
 }
 
@@ -60,6 +62,11 @@ pub(crate) enum Event {
 pub(crate) struct Run {
     /// The number of its transmit attempt since the record last started afresh, from 0.
     pub(crate) attempt: usize,
+    /// When it is to leave.
+    pub(crate) release: Release,
+    /// How far its release lay ahead of the start of its attempt, on the socket's clock epoch;
+    /// zero if not ahead, and `None` for a run without a release time.
+    pub(crate) ahead: Option<Duration>,
 }
 
 /// A transmit attempt on a gated socket: its connection and when it began.
@@ -228,8 +235,10 @@ pub(crate) struct GatedSink<'a> {
     inner: MmsgSink<'a>,
     valve: &'a Valve,
     blocked: bool,
-    /// The attempt's number.
+    /// The attempt's number; the attempt began at `started`.
     attempt: usize,
+    started: Instant,
+    epoch: Option<ClockEpoch>,
 }
 
 impl SegmentSink for GatedSink<'_> {
@@ -255,8 +264,16 @@ impl SegmentSink for GatedSink<'_> {
     fn end_run(&mut self, meta: TxMeta) {
         let dropped = {
             let mut state = self.valve.state();
+            let ahead = match (meta.release, self.epoch) {
+                (Release::At(tick), Some(epoch)) => Some(Duration::from_nanos(
+                    tick.0.saturating_sub(epoch.tick_at(self.started).0),
+                )),
+                _ => None,
+            };
             state.runs.push(Run {
                 attempt: self.attempt,
+                release: meta.release,
+                ahead,
             });
             state.events.push(Event::Run);
             let dropped = state
@@ -312,10 +329,12 @@ impl TxBackend for Gated {
             (state.blocked, state.attempts - 1)
         };
         GatedSink {
+            epoch: self.inner.caps().release.epoch(),
             inner: self.inner.sink(conn),
             valve,
             blocked,
             attempt,
+            started,
         }
     }
 

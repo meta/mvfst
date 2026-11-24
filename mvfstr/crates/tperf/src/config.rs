@@ -135,14 +135,22 @@ pub(crate) fn server_config(flags: &Flags) -> Result<Arc<ServerConfig>, SetupErr
     Ok(builder.build()?)
 }
 
-/// Returns an endpoint config with a random stateless reset key.
-pub(crate) fn endpoint_config() -> Result<Arc<EndpointConfig>, SetupError> {
+/// Returns how far ahead of its release a server connection may build: `--build_horizon_us`,
+/// which needs `--txtime`. The server socket's release horizon caps it.
+pub(crate) fn build_horizon(flags: &Flags) -> Duration {
+    Duration::from_micros(flags.build_horizon_us.map_or(0, u64::from))
+}
+
+/// Returns an endpoint config with a random stateless reset key and the [`build_horizon`].
+pub(crate) fn endpoint_config(flags: &Flags) -> Result<Arc<EndpointConfig>, SetupError> {
     let mut reset_key = [0; 32];
     provider()
         .secure_random
         .fill(&mut reset_key)
         .map_err(rustls::Error::from)?;
-    Ok(EndpointConfig::builder(reset_key).build()?)
+    Ok(EndpointConfig::builder(reset_key)
+        .build_horizon(build_horizon(flags))
+        .build()?)
 }
 
 /// Returns mvfstr_crypto's default provider, preferring AES-128-GCM as mvfst's tperf peers do.
@@ -436,9 +444,27 @@ mod tests {
     }
 
     #[test]
+    fn build_horizon_us_sets_how_far_ahead_the_server_may_build() {
+        assert_eq!(
+            endpoint_config(&Flags::default()).unwrap().build_horizon(),
+            Duration::ZERO
+        );
+        let flags = Flags {
+            pacing: true,
+            txtime: true,
+            build_horizon_us: Some(5000),
+            ..Flags::default()
+        };
+        assert_eq!(
+            endpoint_config(&flags).unwrap().build_horizon(),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
     fn every_endpoint_gets_its_own_reset_key() {
-        let first = endpoint_config().unwrap();
-        let second = endpoint_config().unwrap();
+        let first = endpoint_config(&Flags::default()).unwrap();
+        let second = endpoint_config(&Flags::default()).unwrap();
         assert_ne!(first.reset_key(), second.reset_key());
         assert_eq!(first.worker(), (0, 1), "one worker, as mvfst tperf");
     }

@@ -60,6 +60,10 @@ pub(crate) struct Flags {
     pub(crate) pacing_granularity_us: Option<u32>,
     /// With `--pacing`, the minimum burst instead of mvfst's 5.
     pub(crate) pacing_min_burst: Option<u16>,
+    /// Kernel release of the server's runs through SO_TXTIME.
+    pub(crate) txtime: bool,
+    /// With `--txtime`, how far ahead of its release, in µs, a server connection may build.
+    pub(crate) build_horizon_us: Option<u32>,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -94,6 +98,8 @@ impl Default for Flags {
             stats: false,
             pacing_granularity_us: None,
             pacing_min_burst: None,
+            txtime: false,
+            build_horizon_us: None,
         }
     }
 }
@@ -149,6 +155,12 @@ impl Flags {
             if flags.pacing_min_burst.is_some() {
                 return Err(FlagError::NeedsPacing("pacing_min_burst"));
             }
+            if flags.txtime {
+                return Err(FlagError::TxtimeNeedsPacing);
+            }
+        }
+        if flags.build_horizon_us.is_some() && !flags.txtime {
+            return Err(FlagError::BuildHorizonNeedsTxtime);
         }
         // --writes_per_loop, which caps mvfst tperf's GSO sends, is the maximum burst when pacing.
         let min_burst = flags.pacing_min_burst.unwrap_or(MIN_BURST);
@@ -214,6 +226,8 @@ impl Flags {
                 self.pacing_granularity_us = Some(positive(value).ok_or_else(bad)?)
             }
             "pacing_min_burst" => self.pacing_min_burst = Some(positive(value).ok_or_else(bad)?),
+            "txtime" => self.txtime = bool_value()?,
+            "build_horizon_us" => self.build_horizon_us = Some(value.parse().map_err(|_| bad())?),
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -226,10 +240,11 @@ impl Flags {
 }
 
 /// The boolean flags, which gflags also takes as `--flag` and `--noflag`.
-const BOOL_FLAGS: [&str; 8] = [
+const BOOL_FLAGS: [&str; 9] = [
     "pin",
     "autotune_window",
     "pacing",
+    "txtime",
     "gso",
     "override_packet_size",
     "compat_mvfst",
@@ -238,7 +253,7 @@ const BOOL_FLAGS: [&str; 8] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 17] = [
+const VALUE_FLAGS: [&str; 18] = [
     "mode",
     "host",
     "port",
@@ -254,6 +269,7 @@ const VALUE_FLAGS: [&str; 17] = [
     "quic_version",
     "pacing_granularity_us",
     "pacing_min_burst",
+    "build_horizon_us",
     "minloglevel",
     "v",
 ];
@@ -287,6 +303,10 @@ pub(crate) enum FlagError {
     Bbr3ServerSide,
     /// A pacing flag was set without `--pacing`.
     NeedsPacing(&'static str),
+    /// `--build_horizon_us` was set without `--txtime`.
+    BuildHorizonNeedsTxtime,
+    /// `--txtime` was set without `--pacing`.
+    TxtimeNeedsPacing,
     /// With `--pacing`, `--writes_per_loop`, the maximum burst, is below the minimum burst.
     BatchBelowMinimumBurst {
         /// `--writes_per_loop`.
@@ -318,6 +338,16 @@ impl fmt::Display for FlagError {
                 "--congestion=bbr3 is server-side: the client never paces, so it takes newreno or cubic"
             ),
             Self::NeedsPacing(flag) => write!(f, "--{flag} needs --pacing"),
+            Self::TxtimeNeedsPacing => write!(
+                f,
+                "--txtime needs --pacing: an unpaced connection has no release times, so kernel \
+                 release would only add a qdisc hop and a larger max_ack_delay"
+            ),
+            Self::BuildHorizonNeedsTxtime => write!(
+                f,
+                "--build_horizon_us needs --txtime: without kernel release the socket cannot hold \
+                 a datagram until its release, so the server would build nothing ahead"
+            ),
             Self::BatchBelowMinimumBurst {
                 writes_per_loop,
                 min_burst,
@@ -367,6 +397,8 @@ mod tests {
             stats: false,
             pacing_granularity_us: None,
             pacing_min_burst: None,
+            txtime: false,
+            build_horizon_us: None,
         };
         assert_eq!(flags, expected);
     }
@@ -423,6 +455,8 @@ mod tests {
                 stats: true,
                 pacing_granularity_us: None,
                 pacing_min_burst: None,
+                txtime: false,
+                build_horizon_us: None,
             }
         );
         let server = parse(&[
@@ -584,6 +618,46 @@ mod tests {
             (flags.pacing_granularity_us, flags.pacing_min_burst),
             (Some(100), Some(8))
         );
+    }
+
+    #[test]
+    fn txtime_and_build_horizon_us_set_kernel_release_and_the_horizon() {
+        let flags = parse(&["--pacing", "--txtime", "--build_horizon_us=5000"]).unwrap();
+        assert_eq!((flags.txtime, flags.build_horizon_us), (true, Some(5000)));
+        let flags = parse(&["--pacing", "--txtime=true", "--build_horizon_us", "2000"]).unwrap();
+        assert_eq!((flags.txtime, flags.build_horizon_us), (true, Some(2000)));
+        let flags = parse(&["--pacing", "--notxtime"]).unwrap();
+        assert_eq!((flags.txtime, flags.build_horizon_us), (false, None));
+    }
+
+    #[test]
+    fn a_build_horizon_without_txtime_is_refused_rather_than_ignored() {
+        // Without release support connections do not build ahead, whatever the endpoint's setting.
+        for args in [
+            &["--pacing", "--build_horizon_us=5000"][..],
+            &["--pacing", "--build_horizon_us=5000", "--notxtime"],
+        ] {
+            assert_eq!(
+                parse(args),
+                Err(FlagError::BuildHorizonNeedsTxtime),
+                "{args:?}"
+            );
+        }
+        let message = FlagError::BuildHorizonNeedsTxtime.to_string();
+        assert!(message.contains("--txtime"), "{message}");
+    }
+
+    #[test]
+    fn txtime_without_pacing_is_refused() {
+        for args in [
+            &["--txtime"][..],
+            &["--txtime", "--nopacing"],
+            &["--txtime", "--build_horizon_us=5000"],
+        ] {
+            assert_eq!(parse(args), Err(FlagError::TxtimeNeedsPacing), "{args:?}");
+        }
+        let message = FlagError::TxtimeNeedsPacing.to_string();
+        assert!(message.contains("--pacing"), "{message}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ use mvfstr_io::FlushOutcome;
 use mvfstr_io::MmsgBackend;
 use mvfstr_io::MmsgOptions;
 use mvfstr_io::MmsgSink;
+use mvfstr_io::ReleaseSupport;
 use mvfstr_io::RxBackend;
 use mvfstr_io::SocketOptions;
 use mvfstr_io::TxBackend;
@@ -1468,4 +1469,235 @@ fn an_opened_socket_already_asks_for_its_control_messages() {
         let caps = socket::probe(&opened, 1500);
         assert!(caps.pktinfo && caps.ecn && caps.gro, "{local}: {caps:?}");
     }
+}
+
+/// Returns the socket's SO_TXTIME setting: the clock its stamps are read in, and its flags.
+fn txtime_setting(socket: &impl AsRawFd) -> (libc::clockid_t, u32) {
+    let mut value = libc::sock_txtime {
+        clockid: 0,
+        flags: 0,
+    };
+    let mut len = std::mem::size_of::<libc::sock_txtime>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes into `value` and updates `len`, both live.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            61,
+            (&raw mut value).cast(),
+            &raw mut len,
+        )
+    };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    (value.clockid, value.flags)
+}
+
+/// Returns CLOCK_MONOTONIC in nanoseconds, the clock SO_TXTIME stamps are read in.
+fn monotonic_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the kernel writes a `timespec` into `now`, which is live.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    assert_eq!(rc, 0);
+    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+}
+
+/// Returns a bound IPv4 loopback socket and a second handle to it.
+fn socket_and_watch() -> (Socket, Socket) {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    socket.bind(&v4(0).into()).unwrap();
+    let watch = socket.try_clone().unwrap();
+    (socket, watch)
+}
+
+#[test]
+fn txtime_sets_so_txtime_on_the_monotonic_clock_and_reports_kernel_release() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let (socket, watch) = socket_and_watch();
+    let off = MmsgBackend::from_socket(socket, &MmsgOptions::default()).expect("wrap");
+    assert_eq!(off.caps().release, ReleaseSupport::None);
+    assert_eq!(
+        txtime_setting(&watch),
+        (libc::CLOCK_REALTIME, 0),
+        "without txtime the socket keeps the kernel's default"
+    );
+
+    let options = MmsgOptions {
+        txtime: true,
+        txtime_horizon: Duration::from_millis(7),
+        ..MmsgOptions::default()
+    };
+    let (socket, watch) = socket_and_watch();
+    let (before, mono_before) = (Instant::now(), monotonic_ns());
+    let on = MmsgBackend::from_socket(socket, &options).expect("wrap with txtime");
+    let (after, mono_after) = (Instant::now(), monotonic_ns());
+    assert_eq!(txtime_setting(&watch), (libc::CLOCK_MONOTONIC, 0));
+    let ReleaseSupport::Kernel { horizon, epoch } = on.caps().release else {
+        panic!("kernel release: {:?}", on.caps());
+    };
+    assert_eq!(horizon, Duration::from_millis(7));
+    assert!(
+        (before..=after).contains(&epoch.instant),
+        "the epoch is sampled as the backend opens"
+    );
+    assert!(
+        (mono_before..=mono_after).contains(&epoch.tick.0),
+        "the epoch's tick reads CLOCK_MONOTONIC: {} not in {mono_before}..={mono_after}",
+        epoch.tick.0
+    );
+
+    let bound = MmsgBackend::bind(v4(0), &options).expect("bind with txtime");
+    assert_eq!(bound.caps().release.horizon(), Duration::from_millis(7));
+}
+
+#[test]
+fn a_client_socket_never_takes_kernel_release() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let options = MmsgOptions {
+        txtime: true,
+        ..MmsgOptions::default()
+    };
+    let server = MmsgBackend::bind(v4(0), &options).expect("bind");
+    assert_ne!(server.caps().release, ReleaseSupport::None);
+    let client =
+        <MmsgBackend as Backend>::connect(server.local_addr().unwrap(), &options).expect("connect");
+    assert_eq!(
+        client.caps().release,
+        ReleaseSupport::None,
+        "kernel release is server-side: a client connection's horizon is 0"
+    );
+}
+
+#[test]
+fn txtime_that_the_socket_refuses_fails_the_open_with_a_clear_error() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    // Not a socket, so the setsockopt fails, and the open does not fall back to unstamped sends.
+    let (reader, _writer) = std::io::pipe().unwrap();
+    let not_a_socket = Socket::from(std::os::fd::OwnedFd::from(reader));
+    let options = MmsgOptions {
+        txtime: true,
+        ..MmsgOptions::default()
+    };
+    let error = MmsgBackend::from_socket(not_a_socket, &options)
+        .err()
+        .expect("no backend without the kernel release asked for");
+    assert!(error.to_string().contains("SO_TXTIME"), "{error}");
+    assert_eq!(
+        std::error::Error::source(&error)
+            .and_then(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ENOTSOCK),
+        "the kernel's refusal is the cause: {error:?}"
+    );
+}
+
+#[test]
+fn a_txtime_horizon_beyond_one_second_is_refused() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let options = |horizon| MmsgOptions {
+        txtime: true,
+        txtime_horizon: horizon,
+        ..MmsgOptions::default()
+    };
+    let too_far = options(Duration::from_secs(1) + Duration::from_nanos(1));
+    assert_eq!(
+        MmsgBackend::bind(v4(0), &too_far).err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::InvalidInput)
+    );
+    let longest = MmsgBackend::bind(v4(0), &options(Duration::from_secs(1))).expect("1 s");
+    assert_eq!(longest.caps().release.horizon(), Duration::from_secs(1));
+}
+
+#[test]
+fn the_caps_report_the_send_buffer_the_kernel_granted() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let plain = Socket::from(std::os::fd::OwnedFd::from(UdpSocket::bind(v4(0)).unwrap()));
+    let default = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("bind");
+    assert_eq!(
+        default.caps().send_buffer,
+        plain.send_buffer_size().unwrap()
+    );
+    let sized = MmsgOptions {
+        socket: SocketOptions {
+            send_buffer: Some(150_000),
+            ..SocketOptions::default()
+        },
+        ..MmsgOptions::default()
+    };
+    let backend = MmsgBackend::bind(v4(0), &sized).expect("bind");
+    // Linux doubles the value asked for, for its bookkeeping (socket(7)).
+    assert_eq!(backend.caps().send_buffer, 300_000);
+}
+
+#[test]
+fn stamped_44_segment_gso_runs_leave_and_arrive_whole() {
+    // lo is noqueue, so the kernel takes the stamps and sends at once; fq would hold each run
+    // until its stamp.
+    let rt = runtime();
+    let _guard = rt.enter();
+    let options = MmsgOptions {
+        txtime: true,
+        // Room for the three runs, built ahead of one flush.
+        max_unsent: 256 * 1024,
+        ..MmsgOptions::default()
+    };
+    let mut sender = MmsgBackend::bind(v4(0), &options).expect("sender");
+    let mut receiver = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("receiver");
+    let to = receiver.local_addr().unwrap();
+    let epoch = sender.caps().release.epoch().expect("kernel release");
+    let start = Instant::now();
+    let runs: Vec<Vec<Vec<u8>>> = (0..3).map(|i| segments(44, 1452, 1452 - i)).collect();
+    for (i, run) in runs.iter().enumerate() {
+        let release = epoch.tick_at(start + Duration::from_micros(209 * i as u64));
+        let stamped = TxMeta {
+            release: Release::At(release),
+            ..meta(to, run, 44 * i as u64)
+        };
+        send_run(&mut sender, conn(30), run, stamped);
+    }
+    assert_eq!(sender.flush(Instant::now()).datagrams, 3 * 44);
+    assert_eq!(
+        reports(&mut sender),
+        vec![(
+            conn(30),
+            TxReport::Flushed {
+                tx: TxSeqRange { start: 0, end: 132 }
+            }
+        )]
+    );
+
+    let want: Vec<u8> = runs.concat().concat();
+    let mut got = Vec::new();
+    while got.len() < want.len() {
+        for (_, data) in recv_batch(&rt, &mut receiver) {
+            got.extend(data);
+        }
+    }
+    assert_eq!(got, want);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "TxMeta::release")]
+fn a_release_time_on_a_backend_without_release_support_is_a_caller_bug() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut backend = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("bind");
+    let run = segments(1, 100, 100);
+    send_run(
+        &mut backend,
+        conn(31),
+        &run,
+        TxMeta {
+            release: Release::At(mvfstr_proto::Tick(1)),
+            ..meta(v4(9), &run, 0)
+        },
+    );
 }

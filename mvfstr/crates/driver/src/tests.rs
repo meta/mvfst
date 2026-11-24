@@ -39,6 +39,7 @@ use mvfstr_io::Backend;
 use mvfstr_io::MmsgBackend;
 use mvfstr_io::MmsgOptions;
 use mvfstr_io::SocketOptions;
+use mvfstr_io::TxCaps;
 use mvfstr_proto::AckPolicy;
 use mvfstr_proto::AppCode;
 use mvfstr_proto::ClientConfig;
@@ -99,6 +100,7 @@ use crate::steer::INBOX_CAPACITY;
 use crate::steer::handoff_lifetime;
 use crate::test_support::ORDER;
 use crate::test_support::configs;
+use crate::timers::Kind;
 use crate::turn::Limits;
 use crate::turn::POLL_CHARGE;
 use crate::turn::RX_BATCHES;
@@ -414,6 +416,49 @@ where
             .handle()
             .submit(move |_| {
                 let _ = tx.send(with_backend_handle::<S, B, _>(|handle| handle.stats()));
+            })
+            .expect("the worker takes commands");
+        rx.recv_timeout(WAIT).expect("the worker answers")
+    }
+
+    /// Returns the build horizon of every connection of the driver for sessions of type `S` on
+    /// `worker`, with the timers that hold its pacing wakes.
+    fn build_horizons<S: QuicSession>(worker: &ManagedWorker) -> Vec<(Duration, Kind)> {
+        let (tx, rx) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |_| {
+                let _ = tx.send(with_backend_handle::<S, B, _>(|handle| {
+                    handle.build_horizons()
+                }));
+            })
+            .expect("the worker takes commands");
+        rx.recv_timeout(WAIT).expect("the worker answers")
+    }
+
+    /// Returns how many times the server worker's driver for sessions of type `S` chose the
+    /// timerfd for a pacing wake.
+    fn server_fine_plans<S: QuicSession>(&self) -> u32 {
+        let (tx, rx) = mpsc::channel();
+        self.server
+            .handle()
+            .submit(move |_| {
+                let _ = tx.send(with_backend_handle::<S, B, _>(|handle| handle.fine_plans()));
+            })
+            .expect("the worker takes commands");
+        rx.recv_timeout(WAIT).expect("the worker answers")
+    }
+
+    /// Returns the server socket's capabilities as the driver for sessions of type `S` on
+    /// `worker` reports them.
+    fn server_caps<S: QuicSession>(worker: &ManagedWorker) -> Option<TxCaps> {
+        let (tx, rx) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |_| {
+                let _ = tx.send(with_backend_handle::<S, B, _>(|handle| {
+                    handle.server_caps()
+                }));
             })
             .expect("the worker takes commands");
         rx.recv_timeout(WAIT).expect("the worker answers")
@@ -6958,6 +7003,168 @@ fn a_turn_counts_each_poll_by_the_bytes_it_staged() {
     assert!(
         per_turn.values().all(|&staged| staged <= most),
         "a turn staged more than {most} bytes: {per_turn:?}"
+    );
+    harness.shutdown();
+}
+
+/// Returns an endpoint config whose accepted connections may build up to `horizon` ahead.
+fn building_ahead(horizon: Duration) -> Arc<EndpointConfig> {
+    EndpointConfig::builder([7; 32])
+        .build_horizon(horizon)
+        .build()
+        .expect("an endpoint config")
+}
+
+/// Returns socket settings with kernel release up to `horizon` ahead.
+fn kernel_release(horizon: Duration) -> MmsgOptions {
+    MmsgOptions {
+        txtime: true,
+        txtime_horizon: horizon,
+        ..MmsgOptions::default()
+    }
+}
+
+#[test]
+fn accepted_connections_build_within_the_server_sockets_horizon_and_client_connections_do_not() {
+    let ms = Duration::from_millis;
+    // The build horizons of the server's and the client's connections, with a 5 ms endpoint
+    // setting, the server socket's `options` and the server connection's `max_ack_delay`.
+    let horizons = |options: MmsgOptions, max_ack_delay: Duration| {
+        let mut harness = Harness::<MmsgBackend>::with_options(options);
+        harness.endpoint = building_ahead(ms(5));
+        let (tx, rx) = mpsc::channel();
+        let server_reports = tx.clone();
+        let transport = TransportConfig::builder()
+            .ack_policy(AckPolicy {
+                max_ack_delay,
+                ..AckPolicy::default()
+            })
+            .build()
+            .expect("a transport config");
+        let addr = harness.serve(move || {
+            let mut app = App::new(move |_| Ok(Echo::new(server_reports.clone())));
+            app.transport = Some(transport);
+            app
+        });
+        let _conn = harness.connect(addr, move || PushClient::new(1, payload(1000), tx));
+        await_reports(&rx, vec![Report::Echoed(client_bidi(0), true)]);
+        let server = Harness::<MmsgBackend>::build_horizons::<Echo>(&harness.server);
+        let client = Harness::<MmsgBackend>::build_horizons::<PushClient>(&harness.client);
+        harness.shutdown();
+        (server, client)
+    };
+    // A connection that builds at least two wheel ticks ahead has its pacing wakes on the wheel
+    // (`Coarse`); any other keeps the timerfd for the last stretch of each wake (`Pacing`). This
+    // depends on the connection's own horizon, not its endpoint's.
+    let default_ack_delay = AckPolicy::default().max_ack_delay;
+    assert_eq!(
+        horizons(kernel_release(ms(100)), default_ack_delay),
+        (
+            vec![(ms(5), Kind::Coarse)],
+            vec![(Duration::ZERO, Kind::Pacing)]
+        ),
+        "the endpoint's horizon, under the socket's; none for a client connection"
+    );
+    assert_eq!(
+        horizons(kernel_release(ms(3)), default_ack_delay).0,
+        vec![(ms(3), Kind::Coarse)],
+        "the socket's horizon, under the endpoint's"
+    );
+    assert_eq!(
+        horizons(MmsgOptions::default(), default_ack_delay).0,
+        vec![(Duration::ZERO, Kind::Pacing)],
+        "nothing ahead without release support"
+    );
+    assert_eq!(
+        horizons(kernel_release(ms(100)), ms(16_383)).0,
+        vec![(Duration::ZERO, Kind::Pacing)],
+        "a connection whose max_ack_delay leaves no room builds nothing ahead on a 5 ms endpoint, \
+         and its pacing wakes keep the timerfd"
+    );
+}
+
+#[test]
+fn the_handle_reports_the_server_sockets_release_horizon_and_send_buffer() {
+    let mut options = kernel_release(Duration::from_millis(3));
+    options.socket.send_buffer = Some(150_000);
+    let harness = Harness::<MmsgBackend>::with_options(options);
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || App::new(move |_| Ok(Echo::new(server_reports.clone()))));
+    let _conn = harness.connect(addr, move || PushClient::new(1, payload(1000), tx));
+    await_reports(&rx, vec![Report::Echoed(client_bidi(0), true)]);
+    let caps = Harness::<MmsgBackend>::server_caps::<Echo>(&harness.server)
+        .expect("the server driver has a server socket");
+    assert_eq!(caps.release.horizon(), Duration::from_millis(3));
+    // Linux doubles the value asked for, for its bookkeeping (socket(7)).
+    assert_eq!(caps.send_buffer, 300_000);
+    assert_eq!(
+        Harness::<MmsgBackend>::server_caps::<PushClient>(&harness.client),
+        None,
+        "a driver without a server socket"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn with_kernel_release_each_pacing_wake_comes_when_its_run_is_due_within_the_horizon() {
+    // Eight datagrams from the server, within the window, over a link with a round trip of 20 ms.
+    // At a window per round trip and a minimum burst of 1, the pacer releases one datagram every
+    // 1.6 ms; with a 5 ms horizon a wake builds what is due within 5 ms, and the sluggish peers
+    // do not acknowledge anything within the test, so only the pacing wakes move the server on.
+    const LEN: usize = 9_000;
+    let horizon = Duration::from_millis(5);
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: kernel_release(Duration::from_millis(100)),
+        valves: Arc::clone(&valves),
+    });
+    harness.endpoint = building_ahead(horizon);
+    let mut relay = None;
+    let pair = BulkPair::through(&harness, 1, LEN, sluggish_and_paced(), |server| {
+        let link = Relay::delayed(server, Duration::from_millis(10));
+        let addr = link.addr;
+        relay = Some(link);
+        addr
+    });
+    let _link = relay.expect("the client connects through the relay");
+    valves.server.clear();
+    pair.go();
+    await_reports_within(&pair.rx, vec![Report::Received(uni(3), LEN)], STALL);
+    // A command runs between the driver's polls, so the server's last attempt has ended.
+    harness.server_stats::<Bulk>();
+    let runs = valves.server.runs();
+    for run in &runs {
+        let ahead = run
+            .ahead
+            .unwrap_or_else(|| panic!("an unstamped run: {runs:?}"));
+        assert!(ahead <= horizon, "built beyond the horizon: {runs:?}");
+    }
+    let attempts = valves
+        .server
+        .events()
+        .iter()
+        .filter(|&&event| event == Event::Attempt)
+        .count();
+    let first = runs.first().map_or(attempts, |run| run.attempt);
+    let empty: Vec<usize> = (first..attempts)
+        .filter(|&attempt| !runs.iter().any(|run| run.attempt == attempt))
+        .collect();
+    // A wake before its run is due within the horizon, such as one at the release less twice
+    // the horizon, does not build a run.
+    assert!(
+        empty.is_empty(),
+        "attempts {empty:?} of {attempts} built no run: {runs:?}"
+    );
+    assert!(
+        attempts - first >= 2,
+        "the pacing wakes were not exercised: {runs:?}"
+    );
+    // Its only connection builds 5 ms ahead, so the wheel brings every pacing wake.
+    assert_eq!(
+        harness.server_fine_plans::<Bulk>(),
+        0,
+        "the server put a pacing wake on the timerfd: {runs:?}"
     );
     harness.shutdown();
 }

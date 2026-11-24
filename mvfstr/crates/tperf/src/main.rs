@@ -61,6 +61,7 @@ fn main() -> ExitCode {
 fn serve(flags: &Flags) -> Result<(), RunError> {
     let server = run::start_server(flags)?;
     eprintln!("tperf server started at: {}", server.addr());
+    eprintln!("{}", server.startup_line());
     for closed in server.closed_connections() {
         println!(
             "{}",

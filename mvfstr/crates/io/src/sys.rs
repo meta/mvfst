@@ -19,6 +19,14 @@ use std::os::fd::RawFd;
 
 use libc::c_int;
 
+/// SO_TXTIME's number in the kernel's asm-generic socket header, which x86-64 and arm64 use. The
+/// libc crate in use has `sock_txtime` but not this number.
+pub(crate) const SO_TXTIME: c_int = 61;
+
+/// SCM_TXTIME, the control message that carries a send's release in nanoseconds of the clock
+/// set with SO_TXTIME; the kernel defines it as SO_TXTIME.
+pub(crate) const SCM_TXTIME: c_int = SO_TXTIME;
+
 /// Sets an integer socket option.
 pub(crate) fn set_int(
     fd: &impl AsRawFd,
@@ -63,6 +71,41 @@ pub(crate) fn get_int(fd: &impl AsRawFd, level: c_int, name: c_int) -> io::Resul
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Turns on SO_TXTIME with `clockid` and every flag clear, so sends may carry SCM_TXTIME releases.
+pub(crate) fn set_txtime(fd: &impl AsRawFd, clockid: libc::clockid_t) -> io::Result<()> {
+    let value = libc::sock_txtime { clockid, flags: 0 };
+    // SAFETY: the option value points at a live `sock_txtime` and its length is passed with it.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_TXTIME,
+            (&raw const value).cast(),
+            size_of::<libc::sock_txtime>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Returns CLOCK_MONOTONIC's reading in nanoseconds.
+pub(crate) fn monotonic_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the kernel writes one `timespec` into `now`, which is live. CLOCK_MONOTONIC always
+    // exists, so the call cannot fail with a valid pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    // The clock counts from boot, so both fields are non-negative.
+    (now.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(now.tv_nsec as u64)
 }
 
 /// Attaches the classic BPF `program` to the SO_REUSEPORT group of `fd`'s socket

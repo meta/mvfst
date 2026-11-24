@@ -13,7 +13,7 @@ use std::mem::size_of;
 use libc::c_int;
 
 /// The room for one message's control data: enough for UDP_SEGMENT or UDP_GRO, a TOS or traffic
-/// class, and IPV6_PKTINFO, with slack.
+/// class, IPV6_PKTINFO and SCM_TXTIME, 112 bytes together on 64-bit, with slack.
 pub(crate) const SPACE: usize = 128;
 
 /// Control data storage for one message, aligned for `cmsghdr`.
