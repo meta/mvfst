@@ -8,6 +8,7 @@
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <quic/priority/HTTPPriorityQueue.h>
+#include <algorithm>
 #include <list>
 
 namespace {
@@ -336,10 +337,8 @@ TEST_F(HTTPPriorityQueueTest, ToLogFields) {
   auto lookup =
       [](const std::vector<std::pair<std::string, std::string>>& fields,
          const std::string& key) {
-        auto it = std::find_if(
-            fields.begin(),
-            fields.end(),
-            [&key](const std::pair<std::string, std::string>& field) {
+        auto it = std::ranges::find_if(
+            fields, [&key](const std::pair<std::string, std::string>& field) {
               return field.first == key;
             });
         if (it != fields.end()) {
