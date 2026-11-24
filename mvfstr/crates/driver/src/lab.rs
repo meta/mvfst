@@ -49,6 +49,7 @@ use mvfstr_proto::Dir;
 use mvfstr_proto::DropReason;
 use mvfstr_proto::Ecn;
 use mvfstr_proto::EndpointConfig;
+use mvfstr_proto::Release;
 use mvfstr_proto::RxMeta;
 use mvfstr_proto::SegmentSink;
 use mvfstr_proto::ServerConfig;
@@ -132,6 +133,9 @@ pub(crate) enum NetEvent {
     Recv(SocketAddr, usize),
     /// The driver took the received batch's buffers.
     Chunk(SocketAddr),
+    /// A transmit attempt of a connection on the socket at this address ended a run of this many
+    /// datagrams with this release.
+    Run(SocketAddr, ConnKey, Release, usize),
 }
 
 /// Datagrams that reach a socket together: one, or several of `stride` bytes each but the last,
@@ -147,6 +151,10 @@ pub(crate) struct Arrival {
 struct Port {
     inbox: RefCell<VecDeque<Arrival>>,
     waker: RefCell<Option<Waker>>,
+    /// Whether the socket refuses datagrams, as behind an EAGAIN, until it is unblocked.
+    blocked: Cell<bool>,
+    /// The waker to wake when the socket is unblocked.
+    writable: RefCell<Option<Waker>>,
 }
 
 struct NetState {
@@ -230,6 +238,20 @@ impl Net {
             .map_or_else(Vec::new, |(_, held)| held)
     }
 
+    /// Blocks the socket at `addr`, which then refuses datagrams until [`unblock`](Self::unblock).
+    pub(crate) fn block(&self, addr: SocketAddr) {
+        self.port(addr).blocked.set(true);
+    }
+
+    /// Makes the socket at `addr` writable again and wakes the task waiting for that.
+    pub(crate) fn unblock(&self, addr: SocketAddr) {
+        let port = self.port(addr);
+        port.blocked.set(false);
+        if let Some(waker) = port.writable.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+
     /// Hands `arrival` to the socket at `dst` at once.
     pub(crate) fn inject(&self, dst: SocketAddr, arrival: Arrival) {
         let Some(port) = self.0.ports.borrow().get(&dst).cloned() else {
@@ -304,7 +326,7 @@ pub(crate) struct MemOptions {
 
 /// A socket on the lab network. Its runs leave at its flush and arrive [`DELAY`] later, it takes
 /// up to 64 arrivals per receive, it sends up to 64 datagrams at once unless its options set
-/// another limit, and it is always writable.
+/// another limit, and it is writable unless the test blocks it.
 pub(crate) struct MemBackend {
     net: Net,
     addr: SocketAddr,
@@ -378,6 +400,9 @@ impl Drop for MemSink<'_> {
 impl SegmentSink for MemSink<'_> {
     fn next_segment(&mut self, max_len: u16, _class: TxClass) -> Option<(SlotId, &mut [u8])> {
         let backend = &mut *self.backend;
+        if backend.port.blocked.get() {
+            return None;
+        }
         backend.slot.clear();
         backend
             .slot
@@ -395,6 +420,12 @@ impl SegmentSink for MemSink<'_> {
     }
 
     fn end_run(&mut self, meta: TxMeta) {
+        self.backend.net.log(NetEvent::Run(
+            self.backend.addr,
+            self.conn,
+            meta.release,
+            self.run.len(),
+        ));
         self.backend
             .runs
             .push((self.conn, meta, mem::take(&mut self.run)));
@@ -449,11 +480,15 @@ impl TxBackend for MemBackend {
         }
         FlushOutcome {
             datagrams,
-            blocked: false,
+            blocked: self.port.blocked.get(),
         }
     }
 
-    fn poll_writable(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.port.blocked.get() {
+            *self.port.writable.borrow_mut() = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
         Poll::Ready(())
     }
 
@@ -818,6 +853,8 @@ pub(crate) struct Probe {
     pub(crate) sends: Cell<u64>,
     /// Streams to open in the next `poll_session`.
     open: Cell<usize>,
+    /// Whether the connection has closed.
+    pub(crate) closed: Cell<bool>,
 }
 
 impl Probe {
@@ -877,6 +914,9 @@ impl Bulk {
 
 impl QuicSession for Bulk {
     fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if matches!(event, ConnEvent::Closed { .. }) {
+            self.probe.closed.set(true);
+        }
         if event != ConnEvent::Connected {
             return;
         }

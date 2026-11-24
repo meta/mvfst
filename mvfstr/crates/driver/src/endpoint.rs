@@ -308,6 +308,12 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
             .map_or_else(|| self.last.get(), |core| core.stats())
     }
 
+    /// Returns the driver's core while it runs, for tests that reach into its queues.
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> Option<Rc<Core<A, B>>> {
+        self.core.upgrade()
+    }
+
     /// Returns the length of the driver's list of connections waiting for the server socket.
     #[cfg(test)]
     pub(crate) fn parked(&self) -> usize {

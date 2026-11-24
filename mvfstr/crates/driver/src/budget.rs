@@ -14,6 +14,9 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
+/// The leftover wait past which [`BudgetStats::long_leftovers`] counts one.
+const LONG_LEFTOVER: Duration = Duration::from_millis(3);
+
 /// The kind of a unit of driver work. A driver checks its budget before each unit but the first of
 /// a poll, and records how long each unit ran past the slice's deadline under its kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,10 +35,18 @@ pub enum UnitKind {
     IntakeServe,
     /// One Initial kept from an earlier turn, routed again.
     WaitingDatagram,
+    /// Up to 64 stale transmit-queue slots skipped in a row: slots that a pacing serve of their
+    /// connection retired, or slots of connections freed since they were queued.
+    Skips,
+    /// Up to 64 slab entries a quiesce sweep walks.
+    Sweep,
+    /// Up to 64 connections parked on the server socket, marked for another attempt once it is
+    /// writable.
+    Remark,
 }
 
 impl UnitKind {
-    const COUNT: usize = 6;
+    const COUNT: usize = 9;
 
     fn index(self) -> usize {
         match self {
@@ -45,6 +56,9 @@ impl UnitKind {
             Self::AppVisit => 3,
             Self::IntakeServe => 4,
             Self::WaitingDatagram => 5,
+            Self::Skips => 6,
+            Self::Sweep => 7,
+            Self::Remark => 8,
         }
     }
 }
@@ -72,6 +86,11 @@ pub struct BudgetStats {
     pub stops: u64,
     /// Polls that reported [`PollOutcome::Deferred`].
     pub deferrals: u64,
+    /// The longest leftover wait, in µs: the time from a stop in a transmit phase until every slot
+    /// the stop left in the transmit queue has been popped, stale ones included.
+    pub longest_leftover_us: u64,
+    /// Leftover waits longer than 3 ms.
+    pub long_leftovers: u64,
     past_us: [u64; UnitKind::COUNT],
 }
 
@@ -98,6 +117,8 @@ struct State {
     entry: Cell<Option<Instant>>,
     /// Whether the running poll has begun its first unit.
     begun: Cell<bool>,
+    /// The reading of the running poll's last check.
+    checked: Cell<Option<Instant>>,
     /// The running unit and the reading before it, until its time past the deadline is recorded.
     unit: Cell<Option<(UnitKind, Instant)>>,
     outcome: Cell<PollOutcome>,
@@ -139,6 +160,7 @@ impl WorkBudget {
             granted: Cell::new(false),
             entry: Cell::new(None),
             begun: Cell::new(false),
+            checked: Cell::new(None),
             unit: Cell::new(None),
             outcome: Cell::new(PollOutcome::Ran),
             stats: Cell::default(),
@@ -170,6 +192,7 @@ impl WorkBudget {
         state.grant.set(false);
         state.entry.set(Some(now));
         state.begun.set(false);
+        state.checked.set(None);
         state.unit.set(None);
         !blocked || state.granted.get()
     }
@@ -181,6 +204,7 @@ impl WorkBudget {
     pub fn check(&self, now: Instant, kind: UnitKind) -> bool {
         self.observe(now);
         let state = &*self.0;
+        state.checked.set(Some(now));
         if state.granted.get() || state.closed.get() {
             return false;
         }
@@ -248,6 +272,11 @@ impl WorkBudget {
         self.0.begun.get()
     }
 
+    /// Returns the reading of the poll's last check, if it has made one.
+    pub(crate) fn checked_at(&self) -> Option<Instant> {
+        self.0.checked.get()
+    }
+
     /// Ends a poll with `outcome`, which becomes [`PollOutcome::Stopped`] for a poll on a grant.
     pub(crate) fn finish(&self, outcome: PollOutcome) {
         let outcome = match outcome {
@@ -284,6 +313,15 @@ impl WorkBudget {
         self.count(|stats| {
             let longest = &mut stats.past_us[kind.index()];
             *longest = (*longest).max(micros);
+        });
+    }
+
+    /// Records a leftover wait of `wait`.
+    pub(crate) fn leftover(&self, wait: Duration) {
+        let micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
+        self.count(|stats| {
+            stats.longest_leftover_us = stats.longest_leftover_us.max(micros);
+            stats.long_leftovers += u64::from(wait > LONG_LEFTOVER);
         });
     }
 

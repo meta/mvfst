@@ -181,6 +181,13 @@ impl Default for Limits {
 /// The most datagrams of one transmit attempt, and of one receive chunk, under a work budget.
 const BUDGET_BATCH: usize = 64;
 
+/// The most stale transmit slots one unit of work skips, slab entries one walks in a quiesce
+/// sweep, and parked connections one marks for another attempt, under a work budget.
+const BUDGET_STEP: usize = 64;
+
+/// The most slab entries the quiesce sweeps walk in one turn, under a work budget.
+const SWEEP_PER_TURN: u32 = 1024;
+
 /// The phases of a turn, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -262,6 +269,12 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     rx_owed: Cell<bool>,
     /// Whether a check has stopped the running poll.
     stopped: Cell<bool>,
+    /// Whether the transmit queue has the turn under a work budget: while it holds slots, its next
+    /// slot goes before a due pacing wake. Serves and pops take turns, across stops.
+    queue_turn: Cell<bool>,
+    /// Under a work budget, the leftover wait being measured: the reading of the stop that began
+    /// it, and the transmit queue's pop count at which the last slot the stop left pops.
+    leftover: Cell<Option<(Instant, u64)>>,
     /// Makes the next turn panic outside every connection's guard.
     #[cfg(test)]
     fail_turn: Cell<bool>,
@@ -343,8 +356,11 @@ struct Entry<S, B> {
     tx_blocked: bool,
     /// On the list of connections the server socket refused.
     parked: bool,
-    /// Queued for a transmit attempt.
+    /// Queued for a transmit attempt, with a live slot.
     dirty: bool,
+    /// The generation of the connection's transmit slot. Under a work budget a pacing serve bumps
+    /// it, and a slot pushed with an older one is stale.
+    slot_generation: u32,
     /// Queued for an application phase.
     app_queued: bool,
     /// `poll_session` is due.
@@ -378,8 +394,8 @@ struct Entry<S, B> {
 
 /// The queues of the turn.
 struct Sched {
-    /// Connections due a transmit attempt in the next transmit phase.
-    dirty: Vec<ConnKey>,
+    /// The slots of the connections due a transmit attempt in the next transmit phase.
+    dirty: Vec<Slot>,
     /// Connections due an application phase.
     app: KeyQueue,
     /// Connections due an application phase in the next turn: streams stayed pull-ready after
@@ -395,14 +411,15 @@ struct Sched {
     /// Initials for new connections that came after their turn's connection attempts ran out,
     /// oldest first.
     waiting: VecDeque<Waiting>,
-    /// Connections whose attempt the server socket refused, waiting for it to take runs again.
-    parked: Vec<ConnKey>,
+    /// Connections whose attempt the server socket refused, waiting for it to take runs again,
+    /// oldest first.
+    parked: VecDeque<ConnKey>,
     /// The server socket holds runs behind an EAGAIN until it is writable.
     server_blocked: bool,
     reports: Vec<(ConnKey, TxReport)>,
     /// The transmit phase's queue, empty between phases unless a stop left the rest of it for the
     /// next transmit phase.
-    tx_queue: KeyQueue,
+    tx_queue: SlotQueue,
     /// An empty list whose allocation the next list taken whole reuses.
     spare: Vec<ConnKey>,
     timers: Timers,
@@ -412,6 +429,8 @@ struct Sched {
     /// A quiesce requested through the handle, with its grace period.
     quiesce_request: Option<Duration>,
     quiesce: Option<Quiesce>,
+    /// Under a work budget, the quiesce sweeps not finished.
+    sweeps: Sweeps,
     /// Connections taken from the ready queue and not yet served, oldest first, each with the
     /// time the intake took it.
     ready: VecDeque<(Instant, ConnKey)>,
@@ -483,6 +502,68 @@ struct Quiesce {
     abort_at: Option<Instant>,
 }
 
+/// The action a quiesce sweep takes on each connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepKind {
+    /// Notifies the connection's session of the quiesce.
+    Notify,
+    /// Closes the connection with NO_ERROR.
+    Close,
+    /// Aborts the connection.
+    Abort,
+}
+
+impl SweepKind {
+    const ALL: [SweepKind; 3] = [SweepKind::Notify, SweepKind::Close, SweepKind::Abort];
+
+    fn bit(self) -> u8 {
+        match self {
+            SweepKind::Notify => 1,
+            SweepKind::Close => 2,
+            SweepKind::Abort => 4,
+        }
+    }
+}
+
+/// The quiesce sweeps not finished under a work budget. A quiesce starts each kind at most once,
+/// in the order of [`SweepKind::ALL`], so the sweeps walk in that order and only the first has
+/// walked any of the slab.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sweeps {
+    /// The kinds not finished, as [`SweepKind::bit`]s.
+    pending: u8,
+    /// The next slab index the first of them walks.
+    next: u32,
+}
+
+impl Sweeps {
+    fn push(&mut self, kind: SweepKind) {
+        debug_assert!(
+            self.pending < kind.bit(),
+            "a quiesce starts its sweeps in kind order, each once"
+        );
+        self.pending |= kind.bit();
+    }
+
+    /// Returns the first sweep not finished, with the next slab index it walks.
+    fn front(&self) -> Option<(SweepKind, u32)> {
+        SweepKind::ALL
+            .into_iter()
+            .find(|kind| self.pending & kind.bit() != 0)
+            .map(|kind| (kind, self.next))
+    }
+
+    /// Finishes the first sweep not finished.
+    fn pop_front(&mut self) {
+        self.pending &= self.pending.wrapping_sub(1);
+        self.next = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending == 0
+    }
+}
+
 /// Which source of intake work waited longest.
 enum Due {
     Deadline,
@@ -499,8 +580,8 @@ enum Take {
     /// A wake whose connection makes the next attempt, out of the phase's queue if it waited
     /// there.
     Serve(ConnKey),
-    /// A wake whose connection waits in [`Sched::dirty`] for the next phase, dirtied again after
-    /// its attempt in this one, or whose slot is empty.
+    /// A wake whose slot is empty or, without a work budget, whose connection waits in
+    /// [`Sched::dirty`] for the next phase, dirtied again after its attempt in this one.
     Deferred,
 }
 
@@ -561,16 +642,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 rx: KeyQueue::default(),
                 rx_more: false,
                 waiting: VecDeque::new(),
-                parked: Vec::new(),
+                parked: VecDeque::new(),
                 server_blocked: false,
                 reports: Vec::new(),
-                tx_queue: KeyQueue::default(),
+                tx_queue: SlotQueue::default(),
                 spare: Vec::new(),
                 timers: Timers::default(),
                 host_wake: HostWake::new(worker.host(), timers),
                 quiescing: Some(worker.quiescing()),
                 quiesce_request: None,
                 quiesce: None,
+                sweeps: Sweeps::default(),
                 ready: VecDeque::new(),
                 fresh: Vec::new(),
                 rx_resume: None,
@@ -599,6 +681,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             resume: Cell::new(Phase::Intake),
             rx_owed: Cell::new(false),
             stopped: Cell::new(false),
+            queue_turn: Cell::new(false),
+            leftover: Cell::new(None),
             #[cfg(test)]
             fail_turn: Cell::new(false),
             #[cfg(test)]
@@ -629,6 +713,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     #[cfg(test)]
     pub(crate) fn parked(&self) -> usize {
         self.sched.borrow().parked.len()
+    }
+
+    /// Returns the slab indices of the connections parked on the server socket, in order.
+    #[cfg(test)]
+    pub(crate) fn parked_indices(&self) -> Vec<u32> {
+        self.sched
+            .borrow()
+            .parked
+            .iter()
+            .map(|key| key.index)
+            .collect()
     }
 
     /// Returns one past the highest slab index handed out so far.
@@ -677,6 +772,61 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     pub(crate) fn queued_keys(&self) -> (usize, usize) {
         let sched = self.sched.borrow();
         (sched.app.len(), sched.tx_queue.len())
+    }
+
+    /// Marks the connection in slot `index` dirty, as receive or application work does, and wakes
+    /// the driver.
+    #[cfg(test)]
+    pub(crate) fn mark_dirty_at(&self, index: u32) {
+        let key = self.slab.borrow().key_at(index);
+        if let Some(key) = key {
+            self.with_entry(key, "test", |entry| self.mark_dirty(key, entry));
+        }
+        self.shared.wake_task();
+    }
+
+    /// Arms the pacing wake of the connection in slot `index` for `at`, as its last attempt
+    /// would, and wakes the driver.
+    #[cfg(test)]
+    pub(crate) fn arm_pacing_at(&self, index: u32, at: Instant) {
+        let key = self.slab.borrow().key_at(index);
+        if let Some(key) = key {
+            self.with_entry(key, "test", |entry| self.set_pacing(key, entry, Some(at)));
+        }
+        self.shared.wake_task();
+    }
+
+    /// Returns how many slots in the transmit queue and the dirty list carry the current slot
+    /// generation of the connection in slot `index`.
+    #[cfg(test)]
+    pub(crate) fn live_slots(&self, index: u32) -> usize {
+        let Some(key) = self.slab.borrow().key_at(index) else {
+            return 0;
+        };
+        let Some(generation) = self.with_entry(key, "test", |entry| entry.slot_generation) else {
+            return 0;
+        };
+        let sched = self.sched.borrow();
+        let live = Slot { key, generation };
+        sched
+            .tx_queue
+            .slots
+            .iter()
+            .chain(&sched.dirty)
+            .filter(|&&slot| slot == live)
+            .count()
+    }
+
+    /// Returns the slab indices of the transmit queue's slots, from its head.
+    #[cfg(test)]
+    pub(crate) fn tx_queue_indices(&self) -> Vec<u32> {
+        let sched = self.sched.borrow();
+        sched
+            .tx_queue
+            .slots
+            .iter()
+            .map(|slot| slot.key.index)
+            .collect()
     }
 
     /// Returns how many Initials wait for a later turn, and whether a connection attempt is kept
@@ -893,10 +1043,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let start = self.resume.replace(Phase::Intake);
         let now = entry.unwrap_or_else(|| self.clock());
         if start == Phase::Intake {
+            #[cfg(test)]
+            self.record.borrow_mut().marks.push(Mark::Turn);
             self.turns.set(self.turns.get() + 1);
             self.turn_polls.set(0);
             self.turn_handshakes.set(0);
-            self.quiesce_steps(now);
         }
         for phase in Phase::ALL.into_iter().skip_while(|&phase| phase != start) {
             if phase == Phase::FirstTransmit && self.rx_owed.get() {
@@ -908,7 +1059,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             // phase does after the intake.
             let at = || if phase == start { now } else { self.clock() };
             match phase {
-                Phase::Intake => self.intake(now, cx),
+                Phase::Intake => {
+                    self.quiesce_steps(now);
+                    if !self.stopped.get() {
+                        self.intake(now, cx);
+                    }
+                }
                 Phase::FirstApp => self.app_phase(now),
                 Phase::FirstTransmit | Phase::SecondTransmit => self.transmit_phase(at(), cx),
                 Phase::Receive => {
@@ -946,17 +1102,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if !budget.begun() {
             budget.first(kind);
             #[cfg(test)]
-            {
-                self.record.borrow_mut().units += 1;
-            }
+            self.record.borrow_mut().unit(kind);
             return true;
         }
         let now = reading.unwrap_or_else(|| self.clock());
         if budget.check(now, kind) {
             #[cfg(test)]
-            {
-                self.record.borrow_mut().units += 1;
-            }
+            self.record.borrow_mut().unit(kind);
             return true;
         }
         self.stopped.set(true);
@@ -968,8 +1120,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// batch is received, so packet times and RTT samples do not lag by earlier work. A transmit
     /// phase also reads it for each attempt on a socket with kernel release and each attempt of a
     /// paced connection, and before each pop from its queue while a pacing wake is armed, until
-    /// the phase's requeue cap is spent. Under a work budget, a poll reads it as it begins, for
-    /// the budget and its first turn, and a check reads it only when it cannot reuse one of these.
+    /// the phase's requeue cap is spent; under a work budget, only before the pops on the wakes'
+    /// turn, and once per 64 pops inside a run of stale slots. Under a work budget, a poll also
+    /// reads it as it begins, for the budget and its first turn, and a check reads it only when it
+    /// cannot reuse one of these.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -1036,34 +1190,94 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             {
                 self.contain(ContainedPanicScope::Connection, "quiesce", payload);
             }
-            self.for_each_entry("quiesce", |key, entry| {
-                entry.quiesce_due = true;
-                self.queue_app(key, entry);
-            });
+            self.sweep(SweepKind::Notify, now);
         }
         let Some(mut quiesce) = self.sched.borrow().quiesce else {
             return;
         };
         if quiesce.close_at.is_some_and(|at| now >= at) {
             quiesce.close_at = None;
+            self.sweep(SweepKind::Close, now);
+        }
+        if quiesce.abort_at.is_some_and(|at| now >= at) {
+            quiesce.abort_at = None;
+            self.sweep(SweepKind::Abort, now);
+        }
+        self.sched.borrow_mut().quiesce = Some(quiesce);
+        self.walk_sweeps(now);
+    }
+
+    /// Sweeps every connection with `kind`. Under a work budget the sweep is queued, and
+    /// [`walk_sweeps`](Self::walk_sweeps) walks it over as many turns as it takes.
+    fn sweep(&self, kind: SweepKind, now: Instant) {
+        if self.budget.is_some() {
+            self.sched.borrow_mut().sweeps.push(kind);
+        } else {
             self.for_each_entry("quiesce", |key, entry| {
+                self.sweep_entry(kind, now, key, entry);
+            });
+        }
+    }
+
+    /// Walks the queued quiesce sweeps on from their cursor, oldest first: at most
+    /// [`SWEEP_PER_TURN`] slab entries a turn, in steps of [`BUDGET_STEP`] that are units of work.
+    #[cold]
+    fn walk_sweeps(&self, now: Instant) {
+        let mut walked = 0;
+        while walked < SWEEP_PER_TURN {
+            let Some((kind, next)) = self.sched.borrow().sweeps.front() else {
+                return;
+            };
+            let end = self.slab.borrow().end();
+            if next >= end {
+                self.sched.borrow_mut().sweeps.pop_front();
+                continue;
+            }
+            if !self.gate(UnitKind::Sweep, None) {
+                return;
+            }
+            let stop = end.min(next + (BUDGET_STEP as u32).min(SWEEP_PER_TURN - walked));
+            for index in next..stop {
+                let Some(key) = self.slab.borrow().key_at(index) else {
+                    continue;
+                };
+                self.with_entry(key, "quiesce", |entry| {
+                    self.sweep_entry(kind, now, key, entry);
+                });
+            }
+            walked += stop - next;
+            self.sched.borrow_mut().sweeps.next = stop;
+        }
+    }
+
+    fn sweep_entry(
+        &self,
+        kind: SweepKind,
+        now: Instant,
+        key: ConnKey,
+        entry: &mut Entry<A::Session, B>,
+    ) {
+        #[cfg(test)]
+        self.record.borrow_mut().marks.push(Mark::Swept(key));
+        match kind {
+            SweepKind::Notify => {
+                entry.quiesce_due = true;
+                self.queue_app(key, entry);
+            }
+            SweepKind::Close => {
                 entry
                     .conn
                     .close_transport(now, TransportErrorCode::NO_ERROR, Bytes::new());
                 self.mark_dirty(key, entry);
                 self.queue_app(key, entry);
                 self.after_transport(key, entry);
-            });
-        }
-        if quiesce.abort_at.is_some_and(|at| now >= at) {
-            quiesce.abort_at = None;
-            self.for_each_entry("quiesce", |key, entry| {
+            }
+            SweepKind::Abort => {
                 entry.conn.abort();
                 self.queue_app(key, entry);
                 self.after_transport(key, entry);
-            });
+            }
         }
-        self.sched.borrow_mut().quiesce = Some(quiesce);
     }
 
     /// Runs `f` on every connection.
@@ -1130,6 +1344,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// Takes the wakes and the timers that came due.
     fn intake(&self, now: Instant, cx: &mut Context<'_>) {
         self.server_writable(now, cx);
+        if self.stopped.get() {
+            return;
+        }
         {
             // What the poll cap passed over goes ahead of what the last transmit phase queued, so
             // the connections polled in one turn cannot take the cap again in the next.
@@ -1154,15 +1371,18 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
         // What the cap leaves waits in age order, a timer since it came due and a wake since the
         // intake took it, so timers that come due in every turn cannot starve the wakes, nor a
-        // full ready queue the timers.
+        // full ready queue the timers. Under a work budget, the transmit phases take the pacing
+        // wakes, in turn with their queue.
+        let pacing = self.budget.is_none();
         for _ in 0..self.limits.intake {
             let next = {
                 let sched = self.sched.borrow();
                 let due = |kind| sched.timers.next(kind).filter(|&at| at <= now);
+                let paced = |kind| due(kind).filter(|_| pacing);
                 [
                     due(Kind::Deadline).map(|at| (at, Due::Deadline)),
-                    due(Kind::Pacing).map(|at| (at, Due::Pacing(Kind::Pacing))),
-                    due(Kind::Coarse).map(|at| (at, Due::Pacing(Kind::Coarse))),
+                    paced(Kind::Pacing).map(|at| (at, Due::Pacing(Kind::Pacing))),
+                    paced(Kind::Coarse).map(|at| (at, Due::Pacing(Kind::Coarse))),
                     sched.ready.front().map(|&(at, _)| (at, Due::Wake)),
                 ]
                 .into_iter()
@@ -1448,6 +1668,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// phase unless the check before it took a wake that does not give an attempt. Serves that give
     /// an attempt count against `limits.requeues` with full-batch requeues, and the checks stop
     /// once that cap is spent.
+    ///
+    /// Under a work budget, while the queue holds slots, a serve and a pop take turns, and the
+    /// turn carries across stops; the pacing check runs only on the wakes' turn, and a due wake is
+    /// taken only once the budget lets its attempt run. A serve retires the connection's slot
+    /// wherever it waits by bumping its slot generation. A popped slot with an older generation, or
+    /// of a connection since freed, is skipped without an attempt or a change of turn, and each 64
+    /// skips in a row are a unit of work. Inside such a run the pacing check runs only with each
+    /// unit's check, which shares its reading.
     // Inlining it into `turn`, its one caller, slows paced tperf by about 3% at equal instruction
     // counts.
     #[inline(never)]
@@ -1470,30 +1698,66 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let mut requeues = 0;
         // Serves that gave an attempt plus full-batch requeues, at most `limits.requeues`.
         let mut spent = 0;
+        let budgeted = self.budget.is_some();
+        // Stale slots popped since the last attempt.
+        let mut skips = 0;
         loop {
             let mut reading = None;
             let mut take = Take::Nothing;
-            if spent < self.limits.requeues && self.sched.borrow().timers.next_pacing().is_some() {
+            // Under a work budget, while the queue holds slots, the wakes are checked on their
+            // turn, and inside a run of stale slots only with each step's check, as an attempt has
+            // not run since the previous check.
+            let check_wakes = !(budgeted
+                && !queue.is_empty()
+                && (self.queue_turn.get() || skips % BUDGET_STEP != 0));
+            if check_wakes
+                && spent < self.limits.requeues
+                && self.sched.borrow().timers.next_pacing().is_some()
+            {
                 let at = self.clock();
                 latest = at;
                 reading = Some(at);
+                // Under a work budget, a due wake is taken only once its attempt may run, so a
+                // stop leaves it armed and its connection where it waits.
+                if budgeted
+                    && self
+                        .sched
+                        .borrow()
+                        .timers
+                        .next_pacing()
+                        .is_some_and(|wake| wake <= at)
+                    && !self.gate(UnitKind::Attempt, reading)
+                {
+                    break;
+                }
                 take = self.take_pacing_wake(at, &mut queue);
             }
+            let served = matches!(take, Take::Serve(_));
             let next = match take {
                 Take::Serve(key) => {
                     spent += 1;
-                    Some(key)
+                    Some((key, None))
                 }
-                Take::Deferred | Take::Nothing => queue.pop_front(),
+                Take::Deferred | Take::Nothing => queue
+                    .pop_front()
+                    .map(|slot| (slot.key, Some(slot.generation))),
             };
-            let Some(key) = next else {
+            let Some((key, generation)) = next else {
                 if take == Take::Deferred {
                     continue;
                 }
                 break;
             };
-            let mut stopped = false;
-            self.with_entry(key, "transmit", |entry| {
+            let mut stopped = None;
+            let mut ran = false;
+            let mut stale = None;
+            let found = self.with_entry(key, "transmit", |entry| {
+                if let Some(generation) =
+                    generation.filter(|&generation| generation != entry.slot_generation)
+                {
+                    stale = Some(generation);
+                    return;
+                }
                 let release = entry.socket.as_deref().map_or(server_release, |socket| {
                     socket.caps().release.epoch().is_some()
                 });
@@ -1512,12 +1776,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 } else {
                     reading
                 };
-                if !self.gate(UnitKind::Attempt, check) {
+                if !(budgeted && served) && !self.gate(UnitKind::Attempt, check) {
                     // The connection stays dirty and goes back to the head of the queue.
                     entry.dirty = true;
-                    stopped = true;
+                    stopped = Some(entry.slot_generation);
                     return;
                 }
+                ran = true;
                 entry.dirty = false;
                 #[cfg(debug_assertions)]
                 {
@@ -1559,14 +1824,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                         requeues += 1;
                         spent += 1;
                         entry.dirty = true;
-                        queue.push_back(key);
+                        queue.push_back(Slot {
+                            key,
+                            generation: entry.slot_generation,
+                        });
                     }
                     Stop::BatchFull => self.mark_dirty(key, entry),
                     Stop::Socket => {
                         self.socket_stops.set(self.socket_stops.get() + 1);
                         if entry.socket.is_none() && !entry.parked {
                             entry.parked = true;
-                            self.sched.borrow_mut().parked.push(key);
+                            self.sched.borrow_mut().parked.push_back(key);
                         }
                     }
                     _ => {}
@@ -1587,10 +1855,43 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 }
                 self.after_transport(key, entry);
             });
-            if stopped {
-                queue.push_front(key);
+            if found.is_none() && !ran {
+                stale = generation;
+            }
+            if let Some(generation) = stale {
+                // A serve retired the slot, or its connection is gone, so the slot is skipped
+                // without an attempt and the queue keeps its turn. Each 64 skips in a row are a
+                // unit, checked before the next at the wakes' reading if they took one; a run that
+                // begins a poll is the poll's first unit.
+                let step = if skips == 0 {
+                    self.budget.as_ref().is_some_and(|budget| !budget.begun())
+                } else {
+                    skips % BUDGET_STEP == 0
+                };
+                if step && !self.gate(UnitKind::Skips, reading) {
+                    queue.unpop(Slot { key, generation });
+                    break;
+                }
+                skips += 1;
+                #[cfg(test)]
+                self.record.borrow_mut().marks.push(Mark::Skip(key));
+                self.end_leftover(queue.pops, latest);
+                continue;
+            }
+            skips = 0;
+            if let Some(generation) = stopped {
+                queue.unpop(Slot { key, generation });
                 break;
             }
+            if budgeted && ran {
+                self.queue_turn.set(served);
+            }
+            if budgeted && generation.is_some() {
+                self.end_leftover(queue.pops, latest);
+            }
+        }
+        if budgeted && self.stopped.get() && !queue.is_empty() {
+            self.begin_leftover(&queue);
         }
         self.sched.borrow_mut().tx_queue = queue;
         self.requeues.set(self.requeues.get() + requeues);
@@ -1603,8 +1904,45 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.record.borrow_mut().end_phase();
     }
 
+    /// Begins measuring the leftover wait of the slots a transmit stop left in `queue`, at the
+    /// reading of the check that stopped, unless one is already being measured.
+    #[cold]
+    fn begin_leftover(&self, queue: &SlotQueue) {
+        if self.leftover.get().is_none()
+            && let Some(at) = self.budget.as_ref().and_then(WorkBudget::checked_at)
+        {
+            self.leftover
+                .set(Some((at, queue.pops + queue.len() as u64)));
+        }
+    }
+
+    /// Ends the leftover wait being measured if `pops`, the transmit queue's pop count, has reached
+    /// the count at which the last slot its stop left pops.
+    #[inline]
+    fn end_leftover(&self, pops: u64, latest: Instant) {
+        if let Some((stop, last)) = self.leftover.get()
+            && pops >= last
+        {
+            self.record_leftover(stop, latest);
+        }
+    }
+
+    /// Records the leftover wait that began at `stop` and ends at the later of the poll's last
+    /// check's reading and `latest`.
+    #[cold]
+    fn record_leftover(&self, stop: Instant, latest: Instant) {
+        self.leftover.set(None);
+        let Some(budget) = &self.budget else {
+            return;
+        };
+        let at = budget
+            .checked_at()
+            .map_or(latest, |checked| checked.max(latest));
+        budget.leftover(at.saturating_duration_since(stop));
+    }
+
     /// Takes the pacing wake due earliest at `at`, of either kind, inside a transmit phase.
-    fn take_pacing_wake(&self, at: Instant, queue: &mut KeyQueue) -> Take {
+    fn take_pacing_wake(&self, at: Instant, queue: &mut SlotQueue) -> Take {
         #[cfg(test)]
         let due = self.sched.borrow().timers.next_pacing();
         let Some(index) = self.sched.borrow_mut().timers.pop_due_pacing(at) else {
@@ -1619,7 +1957,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             self.with_entry(key, "pacing", |entry| {
                 entry.pacing = None;
                 if entry.dirty {
-                    queue.remove(key)?;
+                    if self.budget.is_some() {
+                        // Retires the connection's slot wherever it waits.
+                        entry.slot_generation = entry.slot_generation.wrapping_add(1);
+                    } else {
+                        queue.remove(key)?;
+                    }
                 }
                 Some(key)
             })?
@@ -1664,14 +2007,29 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if blocked {
             return;
         }
-        let parked = self.take_list(|sched| &mut sched.parked);
-        for &key in &parked {
-            self.with_entry(key, "transmit", |entry| {
-                entry.parked = false;
-                self.mark_dirty(key, entry);
-            });
+        self.remark_parked();
+    }
+
+    /// Marks the connections parked on the writable server socket for another attempt, oldest
+    /// first, in steps of [`BUDGET_STEP`] that are units of work. A stop leaves the rest parked.
+    #[cold]
+    fn remark_parked(&self) {
+        while !self.sched.borrow().parked.is_empty() {
+            if !self.gate(UnitKind::Remark, None) {
+                return;
+            }
+            for _ in 0..BUDGET_STEP {
+                let Some(key) = self.sched.borrow_mut().parked.pop_front() else {
+                    break;
+                };
+                #[cfg(test)]
+                self.record.borrow_mut().marks.push(Mark::Remarked(key));
+                self.with_entry(key, "transmit", |entry| {
+                    entry.parked = false;
+                    self.mark_dirty(key, entry);
+                });
+            }
         }
-        self.give_back(parked);
     }
 
     /// Retries the server socket's backlog once it is writable.
@@ -1679,9 +2037,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let Some(server) = &self.server else {
             return;
         };
-        if !self.sched.borrow().server_blocked
-            || server.socket.borrow_mut().poll_writable(cx).is_pending()
-        {
+        if !self.sched.borrow().server_blocked {
+            // Under a work budget, a stop can leave connections parked on the writable socket.
+            if self.budget.is_some() {
+                self.remark_parked();
+            }
+            return;
+        }
+        if server.socket.borrow_mut().poll_writable(cx).is_pending() {
             return;
         }
         self.flush_server(now, cx);
@@ -2243,6 +2606,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             || !sched.waiting.is_empty()
             || mem::take(&mut sched.rx_more)
             || sched.quiesce_request.is_some()
+            || !sched.sweeps.is_empty()
+            || (!sched.parked.is_empty() && !sched.server_blocked)
         {
             return Next::Again;
         }
@@ -2278,7 +2643,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     ) -> Arc<ConnWake> {
         let wake = ConnWake::new(Arc::clone(&self.shared), key);
         let mut sched = self.sched.borrow_mut();
-        sched.dirty.push(key);
+        sched.dirty.push(Slot { key, generation: 0 });
         sched.app.push_back(key);
         if socket.is_some() {
             sched.rx.push_back(key);
@@ -2300,6 +2665,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             wake: Arc::clone(&wake),
             socket,
             dirty: true,
+            slot_generation: 0,
             app_queued: true,
             app_due: true,
             quiesce_due: self.sched.borrow().quiesce.is_some(),
@@ -2340,7 +2706,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     fn mark_dirty(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
         if !entry.dirty {
             entry.dirty = true;
-            self.sched.borrow_mut().dirty.push(key);
+            self.sched.borrow_mut().dirty.push(Slot {
+                key,
+                generation: entry.slot_generation,
+            });
         }
     }
 
@@ -2514,6 +2883,17 @@ pub(crate) enum Mark {
     },
     /// The driver took up a connection attempt from this address.
     Accept(SocketAddr),
+    /// The budget let a unit of this kind run.
+    Unit(UnitKind),
+    /// A transmit phase popped a slot of this connection that a serve had retired, or that outlived
+    /// the connection, and skipped it.
+    Skip(ConnKey),
+    /// A turn began at its intake.
+    Turn,
+    /// A quiesce sweep walked this connection.
+    Swept(ConnKey),
+    /// The connection, parked on the server socket, was marked for another attempt.
+    Remarked(ConnKey),
     /// The batch of this connection's own socket was delivered from datagram `start` to datagram
     /// `end`, counted from 0.
     Receive {
@@ -2565,6 +2945,11 @@ impl TxRecord {
         }
     }
 
+    fn unit(&mut self, kind: UnitKind) {
+        self.units += 1;
+        self.marks.push(Mark::Unit(kind));
+    }
+
     fn attempt(&mut self, key: ConnKey, at: Instant) {
         let phase = self.phase.expect("attempts run inside transmit phases");
         self.attempts.push(AttemptRecord { key, phase, at });
@@ -2606,29 +2991,74 @@ impl KeyQueue {
         key
     }
 
-    fn extend(&mut self, keys: impl ExactSizeIterator<Item = ConnKey>) {
-        moved(keys.len());
-        self.0.extend(keys);
-    }
-
-    /// Removes `key`; returns `None` if it is not queued.
-    fn remove(&mut self, key: ConnKey) -> Option<ConnKey> {
-        let place = self.0.iter().position(|&queued| queued == key)?;
-        moved(place.min(self.0.len() - place));
-        self.0.remove(place)
-    }
-
-    #[cfg(test)]
-    fn contains(&self, key: &ConnKey) -> bool {
-        self.0.contains(key)
-    }
-
     fn len(&self) -> usize {
         self.0.len()
     }
 
     fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+/// A connection's place in the transmit queue or in [`Sched::dirty`], with the connection's slot
+/// generation when it was pushed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slot {
+    key: ConnKey,
+    generation: u32,
+}
+
+/// The transmit queue: slots oldest first.
+#[derive(Default)]
+struct SlotQueue {
+    slots: VecDeque<Slot>,
+    /// The number of slots popped and not put back.
+    pops: u64,
+}
+
+impl SlotQueue {
+    fn push_back(&mut self, slot: Slot) {
+        moved(1);
+        self.slots.push_back(slot);
+    }
+
+    fn pop_front(&mut self) -> Option<Slot> {
+        let slot = self.slots.pop_front();
+        moved(usize::from(slot.is_some()));
+        self.pops += u64::from(slot.is_some());
+        slot
+    }
+
+    /// Puts back at the head the slot popped last.
+    fn unpop(&mut self, slot: Slot) {
+        moved(1);
+        self.slots.push_front(slot);
+        self.pops -= 1;
+    }
+
+    fn extend(&mut self, slots: impl ExactSizeIterator<Item = Slot>) {
+        moved(slots.len());
+        self.slots.extend(slots);
+    }
+
+    /// Removes the slot of `key`; returns `None` if it is not queued.
+    fn remove(&mut self, key: ConnKey) -> Option<Slot> {
+        let place = self.slots.iter().position(|slot| slot.key == key)?;
+        moved(place.min(self.slots.len() - place));
+        self.slots.remove(place)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &ConnKey) -> bool {
+        self.slots.iter().any(|slot| slot.key == *key)
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
     }
 }
 
