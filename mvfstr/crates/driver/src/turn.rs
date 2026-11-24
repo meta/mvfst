@@ -77,11 +77,14 @@ use crate::Conn;
 use crate::ConnHandle;
 use crate::ConnInfo;
 use crate::DriverConnectError;
+use crate::PollOutcome;
 use crate::QuicApplication;
 use crate::QuicSession;
 use crate::Refusal;
 use crate::SendSink;
 use crate::Steering;
+use crate::UnitKind;
+use crate::WorkBudget;
 use crate::slab::Slab;
 use crate::steer::Member;
 use crate::steer::Steer;
@@ -175,6 +178,43 @@ impl Default for Limits {
     }
 }
 
+/// The most datagrams of one transmit attempt, and of one receive chunk, under a work budget.
+const BUDGET_BATCH: usize = 64;
+
+/// The phases of a turn, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Intake,
+    FirstApp,
+    FirstTransmit,
+    Receive,
+    SecondApp,
+    SecondTransmit,
+}
+
+impl Phase {
+    const ALL: [Phase; 6] = [
+        Phase::Intake,
+        Phase::FirstApp,
+        Phase::FirstTransmit,
+        Phase::Receive,
+        Phase::SecondApp,
+        Phase::SecondTransmit,
+    ];
+
+    /// Returns the phase after this one; a turn ends after its second transmit phase.
+    fn next(self) -> Phase {
+        match self {
+            Phase::Intake => Phase::FirstApp,
+            Phase::FirstApp => Phase::FirstTransmit,
+            Phase::FirstTransmit => Phase::Receive,
+            Phase::Receive => Phase::SecondApp,
+            Phase::SecondApp => Phase::SecondTransmit,
+            Phase::SecondTransmit => Phase::Intake,
+        }
+    }
+}
+
 /// The endpoint: what the driver task and the [`EndpointHandle`](crate::EndpointHandle) share.
 pub(crate) struct Core<A: QuicApplication, B: Backend> {
     worker: WorkerContext,
@@ -214,6 +254,14 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     /// The driver's place in the group that steers new connections over the workers sharing its
     /// server address.
     steering: Option<Member>,
+    /// The work budget the driver's polls run under, if any.
+    budget: Option<WorkBudget>,
+    /// The phase the next turn starts at: the intake, or the phase after the one a check stopped.
+    resume: Cell<Phase>,
+    /// Whether a transmit phase has stopped since the last receive phase began.
+    rx_owed: Cell<bool>,
+    /// Whether a check has stopped the running poll.
+    stopped: Cell<bool>,
     /// Makes the next turn panic outside every connection's guard.
     #[cfg(test)]
     fail_turn: Cell<bool>,
@@ -333,7 +381,7 @@ struct Sched {
     /// Connections due a transmit attempt in the next transmit phase.
     dirty: Vec<ConnKey>,
     /// Connections due an application phase.
-    app: Vec<ConnKey>,
+    app: KeyQueue,
     /// Connections due an application phase in the next turn: streams stayed pull-ready after
     /// their pull step.
     app_next: Vec<ConnKey>,
@@ -341,7 +389,7 @@ struct Sched {
     /// turn serves them before every other. Each keeps its `app_queued` flag meanwhile.
     app_first: Vec<ConnKey>,
     /// Connections whose own socket may be readable.
-    rx: Vec<ConnKey>,
+    rx: KeyQueue,
     /// The server socket may hold more datagrams than the turn took.
     rx_more: bool,
     /// Initials for new connections that came after their turn's connection attempts ran out,
@@ -352,8 +400,9 @@ struct Sched {
     /// The server socket holds runs behind an EAGAIN until it is writable.
     server_blocked: bool,
     reports: Vec<(ConnKey, TxReport)>,
-    /// The transmit phase's queue, empty between phases.
-    tx_queue: VecDeque<ConnKey>,
+    /// The transmit phase's queue, empty between phases unless a stop left the rest of it for the
+    /// next transmit phase.
+    tx_queue: KeyQueue,
     /// An empty list whose allocation the next list taken whole reuses.
     spare: Vec<ConnKey>,
     timers: Timers,
@@ -368,6 +417,27 @@ struct Sched {
     ready: VecDeque<(Instant, ConnKey)>,
     /// The connections the intake takes from the ready queue at once, empty between turns.
     fresh: Vec<ConnKey>,
+    /// Where a stop left the server socket's last batch; the next receive phase routes the rest
+    /// before it reads the socket again.
+    rx_resume: Option<BatchCursor>,
+    /// The connection attempt a stop came before, which the next receive phase takes up before
+    /// its other work.
+    kept_accept: Option<Incoming>,
+    /// The connection a stop left at the head of `rx` inside the batch of its own socket, and its
+    /// place there; the connection's next receive delivers the rest before it reads the socket.
+    own_resume: Option<(ConnKey, BatchCursor)>,
+}
+
+/// A place in a socket's last batch, from which routing or delivery goes on without stepping over
+/// the datagrams before it.
+#[derive(Clone, Copy, Debug, Default)]
+struct BatchCursor {
+    /// The number of datagrams handled, counted from the batch's first.
+    handled: usize,
+    /// The number of buffers whose datagrams have all been handled.
+    buffers: usize,
+    /// The number of datagrams of the next buffer that have been handled.
+    within: usize,
 }
 
 /// Counters of one endpoint driver, from [`EndpointHandle::stats`](crate::EndpointHandle::stats).
@@ -440,6 +510,8 @@ enum Next {
     Park,
     /// Run another turn.
     Again,
+    /// A check of the work budget stopped the poll; the next poll continues the turn.
+    Stop,
     /// The driver has finished.
     Done,
 }
@@ -483,16 +555,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             limits,
             sched: RefCell::new(Sched {
                 dirty: Vec::new(),
-                app: Vec::new(),
+                app: KeyQueue::default(),
                 app_next: Vec::new(),
                 app_first: Vec::new(),
-                rx: Vec::new(),
+                rx: KeyQueue::default(),
                 rx_more: false,
                 waiting: VecDeque::new(),
                 parked: Vec::new(),
                 server_blocked: false,
                 reports: Vec::new(),
-                tx_queue: VecDeque::new(),
+                tx_queue: KeyQueue::default(),
                 spare: Vec::new(),
                 timers: Timers::default(),
                 host_wake: HostWake::new(worker.host(), timers),
@@ -501,6 +573,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 quiesce: None,
                 ready: VecDeque::new(),
                 fresh: Vec::new(),
+                rx_resume: None,
+                kept_accept: None,
+                own_resume: None,
             }),
             turns: Cell::new(0),
             turn_polls: Cell::new(0),
@@ -520,6 +595,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             pull_ids: RefCell::new(Vec::new()),
             rx_scratch: RefCell::default(),
             steering,
+            budget: None,
+            resume: Cell::new(Phase::Intake),
+            rx_owed: Cell::new(false),
+            stopped: Cell::new(false),
             #[cfg(test)]
             fail_turn: Cell::new(false),
             #[cfg(test)]
@@ -527,6 +606,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             #[cfg(test)]
             record: RefCell::default(),
         }
+    }
+
+    /// Runs the driver's polls under `budget`, which also caps every transmit attempt at
+    /// [`BUDGET_BATCH`] datagrams.
+    pub(crate) fn with_budget(mut self, budget: Option<WorkBudget>) -> Self {
+        if budget.is_some() {
+            self.limits.max_segments = self.limits.max_segments.min(BUDGET_BATCH as u16);
+        }
+        self.budget = budget;
+        self
     }
 
     /// Makes the next turn panic outside every connection's guard.
@@ -581,6 +670,21 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     #[cfg(test)]
     pub(crate) fn tx_record(&self) -> TxRecord {
         self.record.borrow().clone()
+    }
+
+    /// Returns the lengths of the application queue and of the transmit queue.
+    #[cfg(test)]
+    pub(crate) fn queued_keys(&self) -> (usize, usize) {
+        let sched = self.sched.borrow();
+        (sched.app.len(), sched.tx_queue.len())
+    }
+
+    /// Returns how many Initials wait for a later turn, and whether a connection attempt is kept
+    /// for the next receive phase.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> (usize, bool) {
+        let sched = self.sched.borrow();
+        (sched.waiting.len(), sched.kept_accept.is_some())
     }
 
     /// Returns the endpoint's counters.
@@ -715,30 +819,69 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.shared.wake_task();
     }
 
-    /// Polls the driver task.
+    /// Polls the driver task. With a work budget, a poll the budget does not admit does not run a
+    /// turn and wakes the task again, unless the driver is ending.
     pub(crate) fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.shared.register(cx.waker());
+        #[cfg(test)]
+        self.record.borrow_mut().marks.push(Mark::Poll);
+        let mut entry = None;
+        if let Some(budget) = &self.budget {
+            let now = self.clock();
+            if !budget.enter(now) && !self.aborted.get() && !self.worker.is_cancelled() {
+                budget.finish(PollOutcome::Deferred);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            entry = Some(now);
+        }
         for _ in 0..TURN_BUDGET {
             // A panic outside every connection's own guard leaves state that cannot be trusted,
             // so the driver ends with every connection in it.
-            match catch_unwind(AssertUnwindSafe(|| self.turn(cx))) {
-                Ok(Next::Park) => return Poll::Pending,
+            match catch_unwind(AssertUnwindSafe(|| self.turn(cx, entry.take()))) {
+                Ok(Next::Park) => {
+                    self.finish_poll(PollOutcome::Ran);
+                    return Poll::Pending;
+                }
                 Ok(Next::Again) => {}
-                Ok(Next::Done) => return Poll::Ready(()),
+                Ok(Next::Stop) => {
+                    self.finish_poll(PollOutcome::Stopped);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Ok(Next::Done) => {
+                    self.finish_poll(PollOutcome::Ran);
+                    return Poll::Ready(());
+                }
                 Err(payload) => {
                     self.contain(ContainedPanicScope::Driver, "turn", payload);
                     self.abort_all();
+                    self.finish_poll(PollOutcome::Ran);
                     return Poll::Ready(());
                 }
             }
         }
+        self.finish_poll(PollOutcome::Ran);
         cx.waker().wake_by_ref();
         Poll::Pending
     }
 
+    /// Ends the poll on the work budget, if any, with `outcome`.
+    fn finish_poll(&self, outcome: PollOutcome) {
+        if let Some(budget) = &self.budget {
+            budget.finish(outcome);
+        }
+    }
+
     /// Runs one turn: intake, application phase, transmit, receive, application phase and
-    /// transmit, then decides between another turn, waiting for a wake and finishing.
-    fn turn(&self, cx: &mut Context<'_>) -> Next {
+    /// transmit, then decides between another turn, waiting for a wake and finishing. `entry` is
+    /// the reading a poll with a work budget took as it began, which its first turn runs at.
+    ///
+    /// After a check stops a turn, the next turn starts at the phase after the one that stopped,
+    /// and only a turn that starts at the intake counts as a new turn. After a transmit phase
+    /// stops, turns skip their first transmit phase until a receive phase has begun, so a receive
+    /// phase runs before the next transmit phase.
+    fn turn(&self, cx: &mut Context<'_>, entry: Option<Instant>) -> Next {
         if self.stopping(cx) || self.aborted.get() {
             self.abort_all();
             return Next::Done;
@@ -747,18 +890,77 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if self.fail_turn.take() {
             panic!("an injected driver bug");
         }
-        self.turns.set(self.turns.get() + 1);
-        self.turn_polls.set(0);
-        self.turn_handshakes.set(0);
-        let now = self.clock();
-        self.quiesce_steps(now);
-        self.intake(now, cx);
-        self.app_phase(now);
-        self.transmit_phase(self.clock(), cx);
-        self.receive(cx);
-        self.app_phase(self.clock());
-        self.transmit_phase(self.clock(), cx);
+        let start = self.resume.replace(Phase::Intake);
+        let now = entry.unwrap_or_else(|| self.clock());
+        if start == Phase::Intake {
+            self.turns.set(self.turns.get() + 1);
+            self.turn_polls.set(0);
+            self.turn_handshakes.set(0);
+            self.quiesce_steps(now);
+        }
+        for phase in Phase::ALL.into_iter().skip_while(|&phase| phase != start) {
+            if phase == Phase::FirstTransmit && self.rx_owed.get() {
+                continue;
+            }
+            #[cfg(test)]
+            self.record.borrow_mut().marks.push(Mark::Phase(phase));
+            // The phase a turn starts at runs at the turn's reading, as the first application
+            // phase does after the intake.
+            let at = || if phase == start { now } else { self.clock() };
+            match phase {
+                Phase::Intake => self.intake(now, cx),
+                Phase::FirstApp => self.app_phase(now),
+                Phase::FirstTransmit | Phase::SecondTransmit => self.transmit_phase(at(), cx),
+                Phase::Receive => {
+                    self.rx_owed.set(false);
+                    self.receive(cx);
+                }
+                Phase::SecondApp => self.app_phase(at()),
+            }
+            if self.stopped.take() {
+                #[cfg(test)]
+                self.record.borrow_mut().marks.push(Mark::Stop(phase));
+                if matches!(phase, Phase::FirstTransmit | Phase::SecondTransmit) {
+                    self.rx_owed.set(true);
+                }
+                self.resume.set(phase.next());
+                return Next::Stop;
+            }
+        }
+        // A turn that resumed after its intake has not taken the wakes, which only the intake
+        // takes, so another turn runs before the task may wait.
+        if start != Phase::Intake {
+            return Next::Again;
+        }
         self.park(cx)
+    }
+
+    /// Returns whether a unit of `kind` may run. Without a work budget, and for a poll's first
+    /// unit, it may; otherwise the budget is checked at `reading`, a reading the caller took after
+    /// the previous unit, or at a fresh reading if `reading` is `None`. A unit that may not run
+    /// stops the poll.
+    fn gate(&self, kind: UnitKind, reading: Option<Instant>) -> bool {
+        let Some(budget) = &self.budget else {
+            return true;
+        };
+        if !budget.begun() {
+            budget.first(kind);
+            #[cfg(test)]
+            {
+                self.record.borrow_mut().units += 1;
+            }
+            return true;
+        }
+        let now = reading.unwrap_or_else(|| self.clock());
+        if budget.check(now, kind) {
+            #[cfg(test)]
+            {
+                self.record.borrow_mut().units += 1;
+            }
+            return true;
+        }
+        self.stopped.set(true);
+        false
     }
 
     /// Returns the host's time. A turn reads it once for its quiesce steps, intake and first
@@ -766,7 +968,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// batch is received, so packet times and RTT samples do not lag by earlier work. A transmit
     /// phase also reads it for each attempt on a socket with kernel release and each attempt of a
     /// paced connection, and before each pop from its queue while a pacing wake is armed, until
-    /// the phase's requeue cap is spent.
+    /// the phase's requeue cap is spent. Under a work budget, a poll reads it as it begins, for
+    /// the budget and its first turn, and a check reads it only when it cannot reuse one of these.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -932,9 +1135,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             // the connections polled in one turn cannot take the cap again in the next.
             let mut sched = self.sched.borrow_mut();
             let sched = &mut *sched;
-            let mut first = mem::take(&mut sched.app_first);
-            first.append(&mut sched.app);
-            sched.app_first = mem::replace(&mut sched.app, first);
+            while let Some(key) = sched.app_first.pop() {
+                sched.app.push_front(key);
+            }
         }
         let next = self.take_list(|sched| &mut sched.app_next);
         for &key in &next {
@@ -966,11 +1169,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 .flatten()
                 .min_by_key(|&(at, _)| at)
             };
-            match next {
-                Some((_, Due::Deadline)) => self.serve_deadline(now),
-                Some((_, Due::Pacing(kind))) => self.serve_pacing(kind, now),
-                Some((_, Due::Wake)) => self.serve_wake(now),
-                None => return,
+            let Some((_, due)) = next else {
+                return;
+            };
+            if !self.gate(UnitKind::IntakeServe, None) {
+                return;
+            }
+            match due {
+                Due::Deadline => self.serve_deadline(now),
+                Due::Pacing(kind) => self.serve_pacing(kind, now),
+                Due::Wake => self.serve_wake(now),
             }
         }
     }
@@ -1032,7 +1240,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 self.queue_app(key, entry);
             }
             if bits & wake::RX != 0 {
-                self.sched.borrow_mut().rx.push(key);
+                self.sched.borrow_mut().rx.push_back(key);
             }
             if bits & wake::CMD != 0 {
                 while let Some(command) = entry.wake.take_command() {
@@ -1055,10 +1263,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         });
     }
 
-    /// Runs the sessions of the connections queued for the application phase.
+    /// Runs the sessions of the connections queued as the application phase starts, from the
+    /// front of the queue; those queued during the phase wait for the next.
     fn app_phase(&self, now: Instant) {
-        let queue = self.take_list(|sched| &mut sched.app);
-        for &key in &queue {
+        let queued = self.sched.borrow().app.len();
+        for _ in 0..queued {
+            if !self.gate(UnitKind::AppVisit, None) {
+                return;
+            }
+            let Some(key) = self.sched.borrow_mut().app.pop_front() else {
+                return;
+            };
             let drained = self.with_entry(key, "session", |entry| {
                 entry.app_queued = false;
                 self.run_app(now, key, entry)
@@ -1067,7 +1282,6 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 self.free(key);
             }
         }
-        self.give_back(queue);
     }
 
     /// Delivers a connection's events and readiness edges, runs `poll_session` if due, and
@@ -1216,7 +1430,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     }
 
     /// Makes one transmit attempt for each dirty connection, re-queueing full batches at the
-    /// tail, then flushes the sockets used and takes their reports.
+    /// tail, then flushes the sockets used and takes their reports. Under a work budget, a stop
+    /// before an attempt leaves that connection and the rest of the queue for the next transmit
+    /// phase. The server socket is still flushed then, but if the phase re-queued a connection
+    /// after a full batch without flushing its own socket, that batch waits for a later phase.
     ///
     /// Attempts run at `now`, read as the phase starts. A connection's own socket is flushed after
     /// its last attempt of the phase, and the server socket, which the other connections share, at
@@ -1231,6 +1448,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// phase unless the check before it took a wake that does not give an attempt. Serves that give
     /// an attempt count against `limits.requeues` with full-batch requeues, and the checks stop
     /// once that cap is spent.
+    // Inlining it into `turn`, its one caller, slows paced tperf by about 3% at equal instruction
+    // counts.
+    #[inline(never)]
     fn transmit_phase(&self, now: Instant, cx: &mut Context<'_>) {
         #[cfg(test)]
         self.record.borrow_mut().begin_phase();
@@ -1272,8 +1492,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 }
                 break;
             };
+            let mut stopped = false;
             self.with_entry(key, "transmit", |entry| {
-                entry.dirty = false;
                 let release = entry.socket.as_deref().map_or(server_release, |socket| {
                     socket.caps().release.epoch().is_some()
                 });
@@ -1287,6 +1507,18 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                         latest
                     }
                 };
+                let check = if release || entry.paces {
+                    Some(at)
+                } else {
+                    reading
+                };
+                if !self.gate(UnitKind::Attempt, check) {
+                    // The connection stays dirty and goes back to the head of the queue.
+                    entry.dirty = true;
+                    stopped = true;
+                    return;
+                }
+                entry.dirty = false;
                 #[cfg(debug_assertions)]
                 {
                     debug_assert!(
@@ -1355,10 +1587,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 }
                 self.after_transport(key, entry);
             });
+            if stopped {
+                queue.push_front(key);
+                break;
+            }
         }
         self.sched.borrow_mut().tx_queue = queue;
         self.requeues.set(self.requeues.get() + requeues);
         if flush_server {
+            #[cfg(test)]
+            self.record.borrow_mut().marks.push(Mark::Flush);
             self.flush_server(latest, cx);
         }
         #[cfg(test)]
@@ -1366,7 +1604,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     }
 
     /// Takes the pacing wake due earliest at `at`, of either kind, inside a transmit phase.
-    fn take_pacing_wake(&self, at: Instant, queue: &mut VecDeque<ConnKey>) -> Take {
+    fn take_pacing_wake(&self, at: Instant, queue: &mut KeyQueue) -> Take {
         #[cfg(test)]
         let due = self.sched.borrow().timers.next_pacing();
         let Some(index) = self.sched.borrow_mut().timers.pop_due_pacing(at) else {
@@ -1381,8 +1619,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             self.with_entry(key, "pacing", |entry| {
                 entry.pacing = None;
                 if entry.dirty {
-                    let place = queue.iter().position(|&queued| queued == key)?;
-                    queue.remove(place);
+                    queue.remove(key)?;
                 }
                 Some(key)
             })?
@@ -1494,12 +1731,20 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     fn receive(&self, cx: &mut Context<'_>) {
         if let Some(server) = &self.server {
             self.receive_server(server, cx);
+            if self.stopped.get() {
+                return;
+            }
         }
-        let own = self.take_list(|sched| &mut sched.rx);
-        for &key in &own {
+        let queued = self.sched.borrow().rx.len();
+        for _ in 0..queued {
+            let Some(key) = self.sched.borrow_mut().rx.pop_front() else {
+                return;
+            };
             self.with_entry(key, "receive", |entry| self.receive_own(key, entry));
+            if self.stopped.get() {
+                return;
+            }
         }
-        self.give_back(own);
     }
 
     /// Receives up to [`RX_BATCHES`] batches from the server socket.
@@ -1525,9 +1770,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         cx: &mut Context<'_>,
         replies: &mut Vec<StatelessReply>,
     ) {
+        self.accept_kept(server, replies);
+        if self.stopped.get() {
+            return;
+        }
         self.serve_waiting(server, replies);
+        if self.stopped.get() {
+            return;
+        }
         let mut batches = 0;
-        let mut resume = None;
+        let mut resume = self.sched.borrow_mut().rx_resume.take();
         loop {
             let start = match resume.take() {
                 Some(start) => start,
@@ -1538,26 +1790,60 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     }
                     batches += 1;
                     match server.socket.borrow_mut().poll_recv(cx) {
-                        Poll::Ready(Ok(_)) => 0,
+                        Poll::Ready(Ok(_)) => BatchCursor::default(),
                         Poll::Ready(Err(_)) => continue,
                         Poll::Pending => return,
                     }
                 }
             };
             let now = self.clock();
-            let (handled, incoming) = self.route_batch(server, now, start, replies);
+            if !self.gate(UnitKind::ReceiveChunk, Some(now)) {
+                self.sched.borrow_mut().rx_resume = Some(start);
+                return;
+            }
+            let (stopped_at, incoming, more) = self.route_batch(server, now, start, replies);
             let Some(incoming) = incoming else {
+                if more {
+                    resume = Some(stopped_at);
+                }
                 continue;
             };
+            if !self.gate(UnitKind::Accept, None) {
+                let mut sched = self.sched.borrow_mut();
+                sched.rx_resume = Some(stopped_at);
+                sched.kept_accept = Some(incoming);
+                return;
+            }
             self.turn_handshakes.set(self.turn_handshakes.get() + 1);
             replies.extend(self.accept(server, now, incoming));
-            resume = Some(handled);
+            resume = Some(stopped_at);
         }
+    }
+
+    /// Takes up the connection attempt a stop came before, if any. It comes before the receive
+    /// phase's other work, as it would have without the stop, so the Initials routed after it
+    /// find its connection, and it is the phase's first attempt, within the turn's cap.
+    fn accept_kept(&self, server: &Server<B>, replies: &mut Vec<StatelessReply>) {
+        let Some(incoming) = self.sched.borrow_mut().kept_accept.take() else {
+            return;
+        };
+        let now = self.clock();
+        if !self.gate(UnitKind::Accept, Some(now)) {
+            self.sched.borrow_mut().kept_accept = Some(incoming);
+            return;
+        }
+        debug_assert!(
+            self.turn_handshakes.get() < self.limits.handshakes,
+            "a turn's first connection attempt is within its cap"
+        );
+        self.turn_handshakes.set(self.turn_handshakes.get() + 1);
+        replies.extend(self.accept(server, now, incoming));
     }
 
     /// Takes the Initials kept from earlier turns, oldest first, while this turn's connection
     /// attempts last. Each is routed again: one may now belong to a connection an earlier one
-    /// created, as the second datagram of a client's first flight does.
+    /// created, as the second datagram of a client's first flight does. A stop before an accept
+    /// keeps the attempt for the next receive phase.
     fn serve_waiting(&self, server: &Server<B>, replies: &mut Vec<StatelessReply>) {
         if let Some(steering) = &self.steering {
             steering.take(|waiting| {
@@ -1566,10 +1852,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             });
         }
         let now = self.clock();
+        let mut reading = Some(now);
         while self.turn_handshakes.get() < self.limits.handshakes {
             let Some(mut waiting) = self.sched.borrow_mut().waiting.pop_front() else {
                 return;
             };
+            if !self.gate(UnitKind::WaitingDatagram, reading.take()) {
+                self.sched.borrow_mut().waiting.push_front(waiting);
+                return;
+            }
             let route = self
                 .endpoint
                 .borrow_mut()
@@ -1586,6 +1877,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     });
                 }
                 Route::Accept(incoming) => {
+                    if !self.gate(UnitKind::Accept, None) {
+                        self.sched.borrow_mut().kept_accept = Some(incoming);
+                        return;
+                    }
                     self.turn_handshakes.set(self.turn_handshakes.get() + 1);
                     replies.extend(self.accept(server, now, incoming));
                 }
@@ -1619,32 +1914,48 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         sched.waiting.push_back(waiting);
     }
 
-    /// Routes the server socket's last batch from datagram `start` on, and hands each connection
-    /// its datagrams in one `recv_batch`. Stops at an Initial for a new connection while this
-    /// turn's connection attempts last, so the datagrams after it route to that connection once it
-    /// exists; returns the datagrams handled and the Initial. Later Initials wait for a later turn,
-    /// and the rest of the batch goes on to the connections it is for.
+    /// Routes the server socket's last batch from `start` on, and hands each connection its
+    /// datagrams in one `recv_batch`. Under a work budget a call routes at most [`BUDGET_BATCH`]
+    /// datagrams. Stops at an Initial for a new connection while this turn's connection attempts
+    /// last, so the datagrams after it route to that connection once it exists. Later Initials
+    /// wait for a later turn, and the rest of the batch goes on to the connections it is for.
+    /// Returns where it stopped, the Initial, and whether the cap stopped it with datagrams left.
     fn route_batch(
         &self,
         server: &Server<B>,
         now: Instant,
-        start: usize,
+        start: BatchCursor,
         replies: &mut Vec<StatelessReply>,
-    ) -> (usize, Option<Incoming>) {
+    ) -> (BatchCursor, Option<Incoming>, bool) {
         let mut socket = server.socket.borrow_mut();
         let mut endpoint = self.endpoint.borrow_mut();
         let mut scratch = mem::take(&mut *self.rx_scratch.borrow_mut());
         let mut routed: Vec<Routed<'_>> = recycle(mem::take(&mut scratch.routed));
-        let mut handled = 0;
+        let end = match self.budget {
+            Some(_) => start.handled.saturating_add(BUDGET_BATCH),
+            None => usize::MAX,
+        };
+        let mut at = start;
         let mut incoming = None;
-        'buffers: for (meta, buffer) in socket.buffers() {
-            for datagram in buffer.chunks_mut(usize::from(meta.stride).max(1)) {
-                handled += 1;
-                if handled <= start {
-                    continue;
+        let mut more = false;
+        #[cfg(test)]
+        let mut walked = 0;
+        'buffers: for (meta, buffer) in socket.buffers().skip(start.buffers) {
+            let stride = usize::from(meta.stride).max(1);
+            let rest = buffer.get_mut(at.within * stride..).unwrap_or_default();
+            for datagram in rest.chunks_mut(stride) {
+                if at.handled == end {
+                    more = true;
+                    break 'buffers;
                 }
+                #[cfg(test)]
+                {
+                    walked += 1;
+                }
+                at.handled += 1;
+                at.within += 1;
                 match endpoint.route(now, meta, datagram) {
-                    Route::Existing(key) => routed.push((key, handled, meta, datagram)),
+                    Route::Existing(key) => routed.push((key, at.handled, meta, datagram)),
                     Route::Accept(new) => {
                         if self.steer(now, meta, datagram, true) {
                             continue;
@@ -1662,6 +1973,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     Route::Drop(_) => {}
                 }
             }
+            at.buffers += 1;
+            at.within = 0;
         }
         drop(endpoint);
         by_connection(&mut routed);
@@ -1682,7 +1995,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         scratch.datagrams = recycle(datagrams);
         scratch.routed = recycle(routed);
         *self.rx_scratch.borrow_mut() = scratch;
-        (handled, incoming)
+        #[cfg(test)]
+        self.record.borrow_mut().marks.push(Mark::Route {
+            start: start.handled,
+            end: at.handled,
+            walked,
+        });
+        (at, incoming, more)
     }
 
     /// Hands a datagram to the worker steering picks for it: a datagram of a new connection
@@ -1718,6 +2037,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         now: Instant,
         incoming: Incoming,
     ) -> Option<StatelessReply> {
+        #[cfg(test)]
+        self.record
+            .borrow_mut()
+            .marks
+            .push(Mark::Accept(incoming.remote_address()));
         let info = ConnInfo {
             remote: incoming.remote_address(),
             local_ip: incoming.local_ip(),
@@ -1785,7 +2109,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         None
     }
 
-    /// Receives from a connection's own socket.
+    /// Receives from a connection's own socket. Under a work budget, a receive with the first
+    /// [`BUDGET_BATCH`] datagrams of its batch is a unit of work, and so is each later chunk of
+    /// that many. A stop leaves the connection at the head of the receive queue. A stop inside a
+    /// batch also keeps the place in it, and the connection's next receive delivers the rest of
+    /// the batch before it reads the socket again.
     fn receive_own(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
         let Entry {
             conn,
@@ -1799,33 +2127,79 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let mut cx = Context::from_waker(rx_waker);
         let mut received = false;
         let mut drained = false;
+        let mut stopped = false;
         let mut spare = mem::take(&mut self.rx_scratch.borrow_mut().datagrams);
-        for _ in 0..RX_BATCHES {
-            match socket.poll_recv(&mut cx) {
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(_)) => continue,
-                Poll::Pending => {
-                    drained = true;
-                    break;
+        let mut resume = self.take_own_resume(key);
+        let mut batches = 0;
+        loop {
+            let (start, now) = match resume.take() {
+                Some(start) => {
+                    let now = self.clock();
+                    if !self.gate(UnitKind::ReceiveChunk, Some(now)) {
+                        self.sched.borrow_mut().own_resume = Some((key, start));
+                        stopped = true;
+                        break;
+                    }
+                    (start, now)
                 }
-            }
-            let now = self.clock();
+                None => {
+                    if batches == RX_BATCHES {
+                        break;
+                    }
+                    if !self.gate(UnitKind::ReceiveChunk, None) {
+                        stopped = true;
+                        break;
+                    }
+                    batches += 1;
+                    match socket.poll_recv(&mut cx) {
+                        Poll::Ready(Ok(_)) => {}
+                        Poll::Ready(Err(_)) => continue,
+                        Poll::Pending => {
+                            drained = true;
+                            break;
+                        }
+                    }
+                    (BatchCursor::default(), self.clock())
+                }
+            };
+            let end = match self.budget {
+                Some(_) => start.handled.saturating_add(BUDGET_BATCH),
+                None => usize::MAX,
+            };
             let mut datagrams: Vec<RxDatagram<'_>> = recycle(spare);
-            for (meta, buffer) in socket.buffers() {
-                for data in buffer.chunks_mut(usize::from(meta.stride).max(1)) {
-                    datagrams.push(RxDatagram { meta, data });
-                }
-            }
+            let (at, more) = take_chunk(socket.buffers(), start, end, &mut datagrams);
+            #[cfg(test)]
+            self.record.borrow_mut().marks.push(Mark::Receive {
+                key,
+                start: start.handled,
+                end: at.handled,
+            });
             conn.recv_batch(now, &mut datagrams);
             spare = recycle(datagrams);
             received = true;
+            if more {
+                resume = Some(at);
+            }
         }
         self.rx_scratch.borrow_mut().datagrams = spare;
-        if !drained {
-            self.sched.borrow_mut().rx.push(key);
+        if stopped {
+            self.sched.borrow_mut().rx.push_front(key);
+        } else if !drained {
+            self.sched.borrow_mut().rx.push_back(key);
         }
         if received {
             self.after_receive(key, entry);
+        }
+    }
+
+    /// Takes the place a stop left in the batch of `key`'s own socket, if any. A place kept for
+    /// another connection is dropped: that connection was at the head of the receive queue, so it
+    /// has been freed.
+    fn take_own_resume(&self, key: ConnKey) -> Option<BatchCursor> {
+        self.budget.as_ref()?;
+        match self.sched.borrow_mut().own_resume.take() {
+            Some((kept, at)) if kept == key => Some(at),
+            _ => None,
         }
     }
 
@@ -1852,9 +2226,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// before waiting.
     fn park(&self, cx: &mut Context<'_>) -> Next {
         let now = self.clock();
+        if let Some(budget) = &self.budget {
+            budget.observe(now);
+        }
         let mut sched = self.sched.borrow_mut();
         let sched = &mut *sched;
         if !sched.dirty.is_empty()
+            || !sched.tx_queue.is_empty()
+            || sched.rx_resume.is_some()
+            || sched.kept_accept.is_some()
             || !sched.app.is_empty()
             || !sched.app_next.is_empty()
             || !sched.app_first.is_empty()
@@ -1899,9 +2279,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let wake = ConnWake::new(Arc::clone(&self.shared), key);
         let mut sched = self.sched.borrow_mut();
         sched.dirty.push(key);
-        sched.app.push(key);
+        sched.app.push_back(key);
         if socket.is_some() {
-            sched.rx.push(key);
+            sched.rx.push_back(key);
         }
         drop(sched);
         let pacing_kind = self
@@ -1967,7 +2347,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     fn queue_app(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
         if !entry.app_queued {
             entry.app_queued = true;
-            self.sched.borrow_mut().app.push(key);
+            self.sched.borrow_mut().app.push_back(key);
         }
     }
 
@@ -2099,10 +2479,48 @@ pub(crate) struct TxRecord {
     phase: Option<u64>,
     /// Clock reads inside transmit phases.
     pub(crate) phase_clock_reads: u64,
+    /// Clock reads.
+    pub(crate) clock_reads: u64,
     /// Every transmit attempt, in order.
     pub(crate) attempts: Vec<AttemptRecord>,
     /// Every pacing wake taken, in order.
     pub(crate) wakes: Vec<WakeRecord>,
+    /// The steps of the driver's polls, in order.
+    pub(crate) marks: Vec<Mark>,
+    /// Units of work the budget let run.
+    pub(crate) units: u64,
+}
+
+/// A step of a driver's poll, as tests record it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// A poll began.
+    Poll,
+    /// A phase began.
+    Phase(Phase),
+    /// A check stopped the poll in this phase.
+    Stop(Phase),
+    /// A transmit attempt of this connection.
+    Attempt(ConnKey),
+    /// A transmit phase flushed the server socket at its end.
+    Flush,
+    /// The server socket's batch was routed from datagram `start` to datagram `end`, counted
+    /// from 0, stepping over `walked` datagrams.
+    Route {
+        start: usize,
+        end: usize,
+        walked: usize,
+    },
+    /// The driver took up a connection attempt from this address.
+    Accept(SocketAddr),
+    /// The batch of this connection's own socket was delivered from datagram `start` to datagram
+    /// `end`, counted from 0.
+    Receive {
+        key: ConnKey,
+        start: usize,
+        end: usize,
+    },
 }
 
 /// A transmit attempt: its connection, its transmit phase, and the clock reading it ran at.
@@ -2141,6 +2559,7 @@ impl TxRecord {
     }
 
     fn clock_read(&mut self) {
+        self.clock_reads += 1;
         if self.phase.is_some() {
             self.phase_clock_reads += 1;
         }
@@ -2149,6 +2568,7 @@ impl TxRecord {
     fn attempt(&mut self, key: ConnKey, at: Instant) {
         let phase = self.phase.expect("attempts run inside transmit phases");
         self.attempts.push(AttemptRecord { key, phase, at });
+        self.marks.push(Mark::Attempt(key));
     }
 
     /// Records a wake of slot `index` due at `due` and taken at `taken`; `queued` if its
@@ -2165,6 +2585,66 @@ impl TxRecord {
     }
 }
 
+/// A queue of connection keys that counts, in tests, the keys it moves.
+#[derive(Default)]
+pub(crate) struct KeyQueue(VecDeque<ConnKey>);
+
+impl KeyQueue {
+    fn push_back(&mut self, key: ConnKey) {
+        moved(1);
+        self.0.push_back(key);
+    }
+
+    fn push_front(&mut self, key: ConnKey) {
+        moved(1);
+        self.0.push_front(key);
+    }
+
+    fn pop_front(&mut self) -> Option<ConnKey> {
+        let key = self.0.pop_front();
+        moved(usize::from(key.is_some()));
+        key
+    }
+
+    fn extend(&mut self, keys: impl ExactSizeIterator<Item = ConnKey>) {
+        moved(keys.len());
+        self.0.extend(keys);
+    }
+
+    /// Removes `key`; returns `None` if it is not queued.
+    fn remove(&mut self, key: ConnKey) -> Option<ConnKey> {
+        let place = self.0.iter().position(|&queued| queued == key)?;
+        moved(place.min(self.0.len() - place));
+        self.0.remove(place)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &ConnKey) -> bool {
+        self.0.contains(key)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of connection keys moved into, out of or within queues on this thread, in tests.
+    pub(crate) static KEYS_MOVED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Counts `keys` moved into, out of or within a queue, in tests.
+#[cfg_attr(not(test), expect(unused_variables, reason = "only tests count"))]
+fn moved(keys: usize) {
+    #[cfg(test)]
+    KEYS_MOVED.with(|moved| moved.set(moved.get() + keys as u64));
+}
+
 /// Empties `v` and hands back its allocation for elements of another lifetime, so scratch
 /// vectors of borrowed datagrams outlive the borrows of each batch.
 fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
@@ -2174,6 +2654,42 @@ fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
     v.into_iter()
         .map(|_| -> U { unreachable!("the vector is empty") })
         .collect()
+}
+
+/// Pushes onto `datagrams` the datagrams of a received batch from `start` up to, but not including,
+/// datagram `end`, counted from 0. Returns where it stopped and whether the batch holds more.
+fn take_chunk<'a>(
+    buffers: impl Iterator<Item = (&'a RxMeta, &'a mut [u8])>,
+    start: BatchCursor,
+    end: usize,
+    datagrams: &mut Vec<RxDatagram<'a>>,
+) -> (BatchCursor, bool) {
+    let mut at = start;
+    for (meta, buffer) in buffers.skip(start.buffers) {
+        let stride = usize::from(meta.stride).max(1);
+        let rest = buffer.get_mut(at.within * stride..).unwrap_or_default();
+        let left = end - at.handled;
+        let count = rest.len().div_ceil(stride);
+        if count > left {
+            let chunk = &mut rest[..left * stride];
+            datagrams.extend(
+                chunk
+                    .chunks_mut(stride)
+                    .map(|data| RxDatagram { meta, data }),
+            );
+            at.handled += left;
+            at.within += left;
+            return (at, true);
+        }
+        datagrams.extend(
+            rest.chunks_mut(stride)
+                .map(|data| RxDatagram { meta, data }),
+        );
+        at.handled += count;
+        at.buffers += 1;
+        at.within = 0;
+    }
+    (at, false)
 }
 
 #[cfg(test)]
@@ -2200,6 +2716,81 @@ mod tests {
         let empty: Vec<RxDatagram<'static>> = recycle(full);
         assert!(empty.is_empty());
         assert_eq!(empty.capacity(), 8, "the allocation is reused");
+    }
+
+    /// Takes a batch in chunks of `size` datagrams and returns, for each chunk, the first bytes of
+    /// its datagrams and the place and flag that `take_chunk` returned.
+    fn chunks_of(
+        batch: &mut [(RxMeta, Vec<u8>)],
+        size: usize,
+    ) -> Vec<(Vec<u8>, (usize, usize, usize), bool)> {
+        let mut chunks = Vec::new();
+        let mut start = BatchCursor::default();
+        loop {
+            let mut datagrams = Vec::new();
+            let buffers = batch.iter_mut().map(|(meta, data)| (&*meta, &mut data[..]));
+            let (at, more) = take_chunk(
+                buffers,
+                start,
+                start.handled.saturating_add(size),
+                &mut datagrams,
+            );
+            let firsts = datagrams.iter().map(|datagram| datagram.data[0]).collect();
+            chunks.push((firsts, (at.handled, at.buffers, at.within), more));
+            if !more {
+                return chunks;
+            }
+            assert!(chunks.len() < 20, "the batch does not end: {chunks:?}");
+            start = at;
+        }
+    }
+
+    #[test]
+    fn a_batch_taken_in_chunks_resumes_inside_and_across_buffers() {
+        let meta = |stride| RxMeta {
+            src: SocketAddr::from(([127, 0, 0, 1], 1)),
+            dst_ip: None,
+            ecn: Ecn::NotEct,
+            stride,
+            rx_time: Instant::now(),
+        };
+        // Datagram n starts with byte n: three of 10 bytes and a short one of 4, two of 5, three
+        // of 1.
+        let mut first: Vec<u8> = (0..34).map(|i| (i / 10) as u8).collect();
+        first[30..].fill(3);
+        let mut batch = vec![
+            (meta(10), first),
+            (meta(5), vec![4, 4, 4, 4, 4, 5, 5, 5, 5, 5]),
+            (meta(1), vec![6, 7, 8]),
+        ];
+        assert_eq!(
+            chunks_of(&mut batch, usize::MAX),
+            [((0..9).collect::<Vec<u8>>(), (9, 3, 0), false)],
+            "without a cap, the whole batch"
+        );
+        assert_eq!(
+            chunks_of(&mut batch, 4),
+            [
+                (vec![0, 1, 2, 3], (4, 1, 0), true),
+                (vec![4, 5, 6, 7], (8, 2, 2), true),
+                (vec![8], (9, 3, 0), false),
+            ],
+            "a chunk that ends with its buffer leaves the next buffer's first for the next chunk"
+        );
+        assert_eq!(
+            chunks_of(&mut batch, 3),
+            [
+                (vec![0, 1, 2], (3, 0, 3), true),
+                (vec![3, 4, 5], (6, 2, 0), true),
+                (vec![6, 7, 8], (9, 3, 0), false),
+            ],
+            "a chunk that ends inside a buffer goes on from there, short datagram included"
+        );
+        let ones: Vec<Vec<u8>> = chunks_of(&mut batch, 1)
+            .into_iter()
+            .map(|(firsts, ..)| firsts)
+            .collect();
+        assert_eq!(ones, (0..9_u8).map(|n| vec![n]).collect::<Vec<_>>());
     }
 
     #[test]

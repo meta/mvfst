@@ -76,6 +76,8 @@ pub struct Flags {
     pub(crate) build_horizon_us: Option<u32>,
     /// The event loop of this side's worker.
     pub(crate) host_loop: HostLoop,
+    /// The server driver's work budget per poll, in µs; 0 runs it without one.
+    pub(crate) work_budget_us: u32,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -113,6 +115,7 @@ impl Default for Flags {
             txtime: false,
             build_horizon_us: None,
             host_loop: HostLoop::Tokio,
+            work_budget_us: 0,
         }
     }
 }
@@ -248,6 +251,7 @@ impl Flags {
                     _ => return Err(bad()),
                 }
             }
+            "work_budget_us" => self.work_budget_us = value.parse().map_err(|_| bad())?,
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -273,7 +277,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 19] = [
+const VALUE_FLAGS: [&str; 20] = [
     "mode",
     "host",
     "port",
@@ -291,6 +295,7 @@ const VALUE_FLAGS: [&str; 19] = [
     "pacing_min_burst",
     "build_horizon_us",
     "host_loop",
+    "work_budget_us",
     "minloglevel",
     "v",
 ];
@@ -421,6 +426,7 @@ mod tests {
             txtime: false,
             build_horizon_us: None,
             host_loop: HostLoop::Tokio,
+            work_budget_us: 0,
         };
         assert_eq!(flags, expected);
     }
@@ -480,6 +486,7 @@ mod tests {
                 txtime: false,
                 build_horizon_us: None,
                 host_loop: HostLoop::Tokio,
+                work_budget_us: 0,
             }
         );
         let server = parse(&[
@@ -498,6 +505,20 @@ mod tests {
                 ..Flags::default()
             }
         );
+    }
+
+    #[test]
+    fn the_work_budget_takes_its_slice_in_microseconds_and_zero_turns_it_off() {
+        assert_eq!(Flags::default().work_budget_us, 0, "off by default");
+        assert_eq!(
+            parse(&["--work_budget_us=250"]).unwrap().work_budget_us,
+            250
+        );
+        assert_eq!(
+            parse(&["--work_budget_us", "100"]).unwrap().work_budget_us,
+            100
+        );
+        assert_eq!(parse(&["--work_budget_us=0"]).unwrap().work_budget_us, 0);
     }
 
     #[test]

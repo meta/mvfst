@@ -297,6 +297,27 @@ fn a_gro_receive_splits_by_its_stride_into_the_datagrams_sent() {
 }
 
 #[test]
+fn a_batch_of_only_empty_datagrams_arrives_at_once_as_an_empty_batch() {
+    let host = ManualHost::new().unwrap();
+    let mut backend = HostBackend::bind(v4(0), &options(&host)).expect("bind");
+    let to = backend.local_addr().unwrap();
+    let sender = UdpSocket::bind(v4(0)).unwrap();
+    for _ in 0..3 {
+        sender.send_to(&[], to).unwrap();
+    }
+    let got = recv_batch(&host, &mut backend);
+    assert!(
+        got.is_empty(),
+        "the empty datagrams hold no packet: {got:?}"
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        backend.poll_recv(&mut cx).is_pending(),
+        "the one receive took all three"
+    );
+}
+
+#[test]
 fn a_run_leaves_as_one_gso_send() {
     let host = ManualHost::new().unwrap();
     let mut sender = HostBackend::bind(v4(0), &options(&host)).expect("sender");

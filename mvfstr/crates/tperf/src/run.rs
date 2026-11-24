@@ -21,6 +21,7 @@ use std::time::Duration;
 use mvfstr_driver::EndpointDriver;
 use mvfstr_driver::EndpointDriverBuilder;
 use mvfstr_driver::HostTimers;
+use mvfstr_driver::WorkBudget;
 use mvfstr_io::Backend;
 use mvfstr_io::HostBackend;
 use mvfstr_io::HostOptions;
@@ -399,11 +400,13 @@ fn spawn_server<B: Backend>(
     ) -> EndpointDriverBuilder<ServerApp<B>, B>,
 ) -> Result<(SocketAddr, TxCaps), String> {
     let driver = Driver::<B>::default();
+    let budget = settings.work_budget;
     let app = ServerApp::new(settings, Rc::clone(&driver));
-    let handle = socket(EndpointDriver::<_, B>::builder(endpoint, app))
-        .max_segments(segments)
-        .spawn(worker)
-        .map_err(|error| error.to_string())?;
+    let mut builder = socket(EndpointDriver::<_, B>::builder(endpoint, app)).max_segments(segments);
+    if let Some(slice) = budget {
+        builder = builder.work_budget(WorkBudget::per_poll(slice));
+    }
+    let handle = builder.spawn(worker).map_err(|error| error.to_string())?;
     let started = handle
         .local_addr()
         .zip(handle.server_caps())

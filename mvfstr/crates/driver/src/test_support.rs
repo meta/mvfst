@@ -35,9 +35,18 @@ pub(crate) const ORDER: SendOrder = SendOrder {
 /// with ALPN `h3`, and an endpoint config.
 pub(crate) fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
     let key = rcgen::KeyPair::generate().expect("rcgen makes a key");
-    let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-        .and_then(|params| params.self_signed(&key))
-        .expect("rcgen makes a certificate");
+    let params =
+        rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("rcgen takes the name");
+    configs_with(params, &key)
+}
+
+/// Returns the configs of [`configs`] for the certificate that `params` describes, signed by
+/// `key`.
+pub(crate) fn configs_with(
+    params: rcgen::CertificateParams,
+    key: &rcgen::KeyPair,
+) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
+    let cert = params.self_signed(key).expect("rcgen makes a certificate");
     let provider = || {
         let mut provider = mvfstr_crypto::default_provider();
         provider

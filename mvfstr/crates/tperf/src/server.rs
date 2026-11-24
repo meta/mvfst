@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 
 use mvfstr_driver::Conn;
 use mvfstr_driver::ConnHandle;
@@ -66,6 +67,8 @@ pub(crate) struct Settings {
     stats: bool,
     /// Where closed connections go under `--stats`.
     closed: mpsc::Sender<Closed>,
+    /// The driver's work budget per poll, from `--work_budget_us`.
+    pub(crate) work_budget: Option<Duration>,
 }
 
 impl Settings {
@@ -77,6 +80,8 @@ impl Settings {
             block: Bytes::from(vec![0; flags.block_size]),
             stats: flags.stats,
             closed,
+            work_budget: (flags.work_budget_us > 0)
+                .then(|| Duration::from_micros(u64::from(flags.work_budget_us))),
         }
     }
 }
@@ -242,6 +247,17 @@ impl Producer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_work_budget_flag_gives_the_driver_a_slice_per_poll_unless_zero() {
+        let (closed, _) = mpsc::channel();
+        let flags = Flags::parse(["--work_budget_us=250".to_owned()]).unwrap();
+        assert_eq!(
+            Settings::new(&flags, closed.clone()).work_budget,
+            Some(Duration::from_micros(250))
+        );
+        assert_eq!(Settings::new(&Flags::default(), closed).work_budget, None);
+    }
 
     #[test]
     fn a_stream_sends_blocks_within_its_allowance_up_to_its_byte_limit() {

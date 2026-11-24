@@ -38,6 +38,7 @@ use crate::ConnHandle;
 use crate::HostTimers;
 use crate::QuicApplication;
 use crate::Steering;
+use crate::WorkBudget;
 #[cfg(test)]
 use crate::timers::Kind;
 use crate::turn::Core;
@@ -68,6 +69,7 @@ impl<A: QuicApplication, B: Backend> EndpointDriver<A, B> {
             worker: None,
             steering: None,
             host_timers: None,
+            budget: None,
         }
     }
 }
@@ -96,6 +98,7 @@ pub struct EndpointDriverBuilder<A: QuicApplication, B: Backend> {
     worker: Option<(u16, u16)>,
     steering: Option<Arc<Steering>>,
     host_timers: Option<HostTimers>,
+    budget: Option<WorkBudget>,
 }
 
 impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
@@ -160,6 +163,20 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
         self
     }
 
+    /// Runs the driver's polls under `budget`, which the drivers of one host share. The work of a
+    /// poll then comes in units: one transmit attempt, one receive chunk of up to 64 datagrams,
+    /// one accept, one application visit, one intake serve, one waiting Initial. The driver checks
+    /// the budget before each unit of a poll but the first. Once the slice has closed, the poll
+    /// ends with the rest of the work left in place and the driver's task woken again, so the
+    /// next poll continues where this one ended. A poll entered while the slice is closed or the
+    /// budget held does not run any work, unless the budget has a grant pending, which lets it run
+    /// one unit. A budget also caps each transmit attempt at 64 datagrams. Without a budget, each
+    /// poll runs whole turns.
+    pub fn work_budget(mut self, budget: WorkBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
     /// Sets the socket settings of every backend the driver opens. Default `B::Options::default()`.
     pub fn backend_options(mut self, options: B::Options) -> Self {
         self.backend_options = options;
@@ -200,16 +217,19 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
         if let Some(server) = &server {
             endpoint.set_release_horizon(server.caps().release.horizon());
         }
-        let core = Rc::new(Core::new(
-            worker,
-            endpoint,
-            self.application,
-            server,
-            self.backend_options,
-            self.limits,
-            steering,
-            self.host_timers.unwrap_or_else(HostTimers::tokio),
-        ));
+        let core = Rc::new(
+            Core::new(
+                worker,
+                endpoint,
+                self.application,
+                server,
+                self.backend_options,
+                self.limits,
+                steering,
+                self.host_timers.unwrap_or_else(HostTimers::tokio),
+            )
+            .with_budget(self.budget),
+        );
         let task = Rc::clone(&core);
         worker
             .register_scope(poll_fn(move |cx| task.poll(cx)))?
@@ -330,6 +350,23 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
         self.core
             .upgrade()
             .map_or_else(TxRecord::default, |core| core.tx_record())
+    }
+
+    /// Returns the lengths of the driver's application queue and of its transmit queue.
+    #[cfg(test)]
+    pub(crate) fn queued_keys(&self) -> (usize, usize) {
+        self.core
+            .upgrade()
+            .map_or((0, 0), |core| core.queued_keys())
+    }
+
+    /// Returns how many Initials wait for a later turn, and whether a connection attempt is kept
+    /// for the next receive phase.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> (usize, bool) {
+        self.core
+            .upgrade()
+            .map_or((0, false), |core| core.waiting())
     }
 
     /// Makes the driver's next turn panic outside every connection's guard.
