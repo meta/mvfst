@@ -35,11 +35,11 @@ class TestAsyncTransportServer : public QuicAsyncTransportServer {
  public:
   using QuicAsyncTransportServer::QuicAsyncTransportServer;
 
-  size_t numWorkerThreads() const {
+  [[nodiscard]] size_t numWorkerThreads() const {
     return workerEvbs_.size();
   }
 
-  size_t numAcceptors() const {
+  [[nodiscard]] size_t numAcceptors() const {
     return acceptors_.size();
   }
 };
