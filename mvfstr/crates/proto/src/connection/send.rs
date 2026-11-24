@@ -165,13 +165,30 @@ enum Outcome {
     Empty,
     /// The sealer failed; the CRYPTO bytes written went back to their buffers as lost.
     Unsealed,
-    /// The datagram was sealed and committed; `paced` if it carries a paced packet but not a probe.
+    /// The datagram was sealed and committed; `paced` if the connection is configured to pace
+    /// and the datagram carries a paced packet but not a probe.
     Sent { len: u16, paced: bool },
 }
 
 impl Connection {
     /// Makes one transmit attempt, as the module docs describe.
     pub(super) fn transmit<S: SegmentSink, Z: Sealer>(
+        &mut self,
+        lim: &TxLimits,
+        sink: &mut S,
+        sealer: &mut Z,
+    ) -> TxOutcome {
+        // A connection configured without pacing never paces, so its attempts run an instance whose
+        // pacing checks fold away at compile time.
+        if self.config.pacing() {
+            self.attempt::<true, S, Z>(lim, sink, sealer)
+        } else {
+            self.attempt::<false, S, Z>(lim, sink, sealer)
+        }
+    }
+
+    /// Makes the transmit attempt, with `PACES` true if the connection is configured to pace.
+    fn attempt<const PACES: bool, S: SegmentSink, Z: Sealer>(
         &mut self,
         lim: &TxLimits,
         sink: &mut S,
@@ -190,18 +207,24 @@ impl Connection {
         let mut skipped = Skipped::default();
         let mut run: Option<Run> = None;
         let seg_max = self.mtu.min(lim.max_datagram);
-        let pacing = self.pacing_active();
+        let pacing = PACES && self.pacing_active();
         loop {
             // A paced run holds the pacer's current burst: a send can change the rate (BBR3's
-            // restart from idle) after the run opened.
-            if run.is_some_and(|open| open.is_full(self.pacer.burst())) {
+            // restart from idle) after the run opened. Only a pacing attempt opens paced runs.
+            if pacing
+                && run
+                    .as_ref()
+                    .is_some_and(|open| open.is_full(self.pacer.burst()))
+            {
                 self.end_run(sink, &mut run);
             }
-            let in_paced_run = run.is_some_and(|open| open.paced);
+            let in_paced_run = pacing && run.as_ref().is_some_and(|open| open.paced);
             let joins = JoinLimits {
                 skipped,
                 grant: u64::from(out.bytes) + u64::from(seg_max) <= u64::from(lim.max_bytes),
-                pacing: if in_paced_run {
+                // Only a connection configured to pace can become pacing-active during the
+                // attempt (BBR3 once its initial window is out).
+                pacing: if in_paced_run || !PACES {
                     None
                 } else {
                     self.pacing_gate(lim.now)
@@ -229,11 +252,11 @@ impl Connection {
             };
             // A run goes to one address. A paced run's scan skipped the pacing gate, so the next
             // run's start is looked for again.
-            if let Some(open) = run
-                && open.path != start.path
+            if let Some(&Run { path, paced, .. }) = run.as_ref()
+                && path != start.path
             {
                 self.end_run(sink, &mut run);
-                if open.paced {
+                if paced {
                     continue;
                 }
             }
@@ -271,7 +294,7 @@ impl Connection {
                 out.stop = Stop::Socket;
                 break;
             };
-            match self.build(lim.now, start, joins, slot, buf, sealer) {
+            match self.build::<PACES, Z>(lim.now, start, joins, slot, buf, sealer) {
                 Outcome::Empty => {
                     sink.end_segment(0);
                     skipped.0[start.source.index()] = true;
@@ -608,8 +631,8 @@ impl Connection {
         plan
     }
 
-    /// Builds one datagram into `buf` and commits it once sealed.
-    fn build<Z: Sealer>(
+    /// Builds one datagram into `buf` and commits it once sealed, with `PACES` as in `attempt`.
+    fn build<const PACES: bool, Z: Sealer>(
         &mut self,
         now: Instant,
         start: StartCand,
@@ -717,7 +740,7 @@ impl Connection {
         if pos == 0 {
             return Outcome::Empty;
         }
-        self.commit(now, start.path, slot, buf, &built, pos, sealer)
+        self.commit::<PACES, Z>(now, start.path, slot, buf, &built, pos, sealer)
     }
 
     /// Seals the datagram's packets, then records them: packet numbers, sent-frame records, the
@@ -726,7 +749,7 @@ impl Connection {
         clippy::too_many_arguments,
         reason = "one call site, all inputs of the datagram"
     )]
-    fn commit<Z: Sealer>(
+    fn commit<const PACES: bool, Z: Sealer>(
         &mut self,
         now: Instant,
         path: PathId,
@@ -762,7 +785,12 @@ impl Connection {
         let mut ack_eliciting = false;
         let mut handshake_sent = false;
         let mut challenge = false;
+        // ACK-only and probe datagrams do not take pacing tokens.
+        let mut carries_paced = false;
+        let mut carries_probe = false;
         for packet in built.iter().flatten() {
+            carries_paced |= packet.packet.paced;
+            carries_probe |= packet.probe;
             let mut flags = SentFlags::empty();
             if packet.ack_eliciting {
                 flags = flags | SentFlags::ACK_ELICITING | SentFlags::IN_FLIGHT;
@@ -816,10 +844,6 @@ impl Connection {
         if self.cc.take_pacer_refresh() {
             self.refresh_pacing_rate();
         }
-        // ACK-only and probe datagrams do not take pacing tokens.
-        let mut packets = built.iter().flatten();
-        let paced = packets.clone().any(|packet| packet.packet.paced)
-            && !packets.any(|packet| packet.probe);
         self.stats.sent_bytes += len as u64;
         self.charge_path(now, path, len, challenge);
         // The first ack-eliciting packet sent after a received one restarts the idle timer
@@ -836,7 +860,7 @@ impl Connection {
         Outcome::Sent {
             // The datagram fits its slot, whose length is a u16.
             len: u16::try_from(len).unwrap_or(u16::MAX),
-            paced,
+            paced: PACES && carries_paced && !carries_probe,
         }
     }
 
