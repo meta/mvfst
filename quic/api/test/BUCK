@@ -205,7 +205,7 @@ mvfst_cpp_test(
         "fbsource//xplat/folly:move_wrapper",
         "fbsource//xplat/folly/container:f14_hash",
         "fbsource//xplat/folly/futures:core",
-        "fbsource//xplat/folly/io/async/test:mocks",
+        "fbsource//xplat/folly/io/async/testing:mocks",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/quic:config",

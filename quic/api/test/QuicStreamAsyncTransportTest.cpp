@@ -8,7 +8,7 @@
 #include <folly/MoveWrapper.h>
 #include <folly/container/F14Map.h>
 #include <folly/futures/Future.h>
-#include <folly/io/async/test/MockAsyncTransport.h>
+#include <folly/io/async/testing/MockAsyncTransport.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 

@@ -28,7 +28,7 @@ fb_dirsync_cpp_unittest(
         "fbsource//xplat/folly/futures:core",
         "fbsource//xplat/folly/io:iobuf",
         "fbsource//xplat/folly/io/async:async_base",
-        "fbsource//xplat/folly/io/async/test:mocks",
+        "fbsource//xplat/folly/io/async/testing:mocks",
         "fbsource//xplat/folly/portability:gmock",
         "fbsource//xplat/folly/portability:gtest",
         "fbsource//xplat/folly/system:hardware_concurrency",

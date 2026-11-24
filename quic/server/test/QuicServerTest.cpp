@@ -12,7 +12,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/futures/Promise.h>
 #include <folly/io/IOBuf.h>
-#include <folly/io/async/test/MockAsyncUDPSocket.h>
+#include <folly/io/async/testing/MockAsyncUDPSocket.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <folly/system/HardwareConcurrency.h>

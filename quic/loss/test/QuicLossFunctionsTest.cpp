@@ -10,7 +10,7 @@
 #include <quic/codec/Types.h>
 #include <quic/state/AckEvent.h>
 
-#include <folly/io/async/test/MockTimeoutManager.h>
+#include <folly/io/async/testing/MockTimeoutManager.h>
 #include <quic/api/QuicTransportFunctions.h>
 #include <quic/api/test/MockQuicSocket.h>
 #include <quic/api/test/Mocks.h>
