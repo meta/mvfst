@@ -35,6 +35,7 @@ use roxygen_runtime::worker::WorkerContext;
 use rustls::pki_types::ServerName;
 
 use crate::ConnHandle;
+use crate::HostTimers;
 use crate::QuicApplication;
 use crate::Steering;
 #[cfg(test)]
@@ -66,6 +67,7 @@ impl<A: QuicApplication, B: Backend> EndpointDriver<A, B> {
             limits: Limits::default(),
             worker: None,
             steering: None,
+            host_timers: None,
         }
     }
 }
@@ -93,6 +95,7 @@ pub struct EndpointDriverBuilder<A: QuicApplication, B: Backend> {
     limits: Limits,
     worker: Option<(u16, u16)>,
     steering: Option<Arc<Steering>>,
+    host_timers: Option<HostTimers>,
 }
 
 impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
@@ -150,6 +153,13 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
         self
     }
 
+    /// Sets the timers that wake the driver. Default [`HostTimers::tokio`], the timers of a
+    /// Roxygen worker on Tokio; a host without a Tokio reactor passes its own.
+    pub fn host_timers(mut self, timers: HostTimers) -> Self {
+        self.host_timers = Some(timers);
+        self
+    }
+
     /// Sets the socket settings of every backend the driver opens. Default `B::Options::default()`.
     pub fn backend_options(mut self, options: B::Options) -> Self {
         self.backend_options = options;
@@ -198,6 +208,7 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
             self.backend_options,
             self.limits,
             steering,
+            self.host_timers.unwrap_or_else(HostTimers::tokio),
         ));
         let task = Rc::clone(&core);
         worker
@@ -307,7 +318,7 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
             .map_or_else(Vec::new, |core| core.build_horizons())
     }
 
-    /// Returns how many times the driver's host wake chose the timerfd for a pacing wake.
+    /// Returns how many times the driver's host wake chose the fine timer for a pacing wake.
     #[cfg(test)]
     pub(crate) fn fine_plans(&self) -> u32 {
         self.core.upgrade().map_or(0, |core| core.fine_plans())

@@ -50,4 +50,6 @@ pub use endpoint::EndpointDriverBuilder;
 pub use endpoint::EndpointHandle;
 pub use roxygen_runtime::worker::SubmitError;
 pub use steer::Steering;
+pub use timers::FineTimer;
+pub use timers::HostTimers;
 pub use turn::EndpointStats;

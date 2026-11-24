@@ -12,6 +12,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
+use std::panic::catch_unwind;
 use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
@@ -29,13 +30,12 @@ pub struct TimerFd {
 }
 
 impl TimerFd {
-    /// Creates a disarmed timer. Fails when the thread is not running a tokio runtime.
+    /// Creates a disarmed timer. Fails with [`io::ErrorKind::Unsupported`] on a thread without a
+    /// tokio runtime with I/O enabled, where `AsyncFd` would panic.
     pub fn new() -> io::Result<Self> {
         // Registering with the reactor panics without a runtime, so return an error instead.
         if tokio::runtime::Handle::try_current().is_err() {
-            return Err(io::Error::other(
-                "TimerFd needs a tokio runtime with I/O enabled on this thread",
-            ));
+            return Err(no_reactor());
         }
         // SAFETY: plain system call with constant flags.
         let fd = unsafe {
@@ -49,9 +49,17 @@ impl TimerFd {
         }
         // SAFETY: `fd` is a new descriptor that nothing else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        // SAFETY: `fd` owns its descriptor, which stays open until the `AsyncFd` drops it, and
-        // `as_raw_fd` always returns that descriptor.
-        let io = unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)?;
+        // Tokio does not expose whether a runtime has I/O enabled, so a runtime without it shows
+        // only as a panic when registering; the panic hook still reports it, and the unwind closes
+        // the descriptor.
+        let registered = catch_unwind(move || {
+            // SAFETY: `fd` owns its descriptor, which stays open until the `AsyncFd` drops it, and
+            // `as_raw_fd` always returns that descriptor.
+            unsafe { AsyncFd::register(fd) }
+        });
+        let io = registered
+            .map_err(|_| no_reactor())?
+            .map_err(io::Error::from)?;
         Ok(Self { io, deadline: None })
     }
 
@@ -146,6 +154,14 @@ impl TimerFd {
     }
 }
 
+/// Returns the error of [`TimerFd::new`] on a thread without a tokio runtime with I/O enabled.
+fn no_reactor() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a timerfd needs a tokio runtime with I/O enabled on this thread",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
@@ -168,6 +184,26 @@ mod tests {
     fn without_a_tokio_runtime_creating_a_timer_fails() {
         assert!(tokio::runtime::Handle::try_current().is_err());
         assert!(TimerFd::new().is_err());
+    }
+
+    #[test]
+    fn creating_one_fails_on_a_thread_without_a_tokio_reactor() {
+        match TimerFd::new() {
+            Ok(_) => panic!("a timer without a reactor to wake it"),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}"),
+        }
+    }
+
+    #[test]
+    fn creating_one_fails_in_a_tokio_runtime_without_io() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let _entered = runtime.enter();
+        match TimerFd::new() {
+            Ok(_) => panic!("a timer without a reactor to wake it"),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}"),
+        }
     }
 
     #[test]

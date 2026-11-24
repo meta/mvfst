@@ -86,6 +86,7 @@ use crate::slab::Slab;
 use crate::steer::Member;
 use crate::steer::Steer;
 use crate::steer::handoff_lifetime;
+use crate::timers::HostTimers;
 use crate::timers::HostWake;
 use crate::timers::Kind;
 use crate::timers::Timers;
@@ -463,6 +464,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         options: B::Options,
         limits: Limits,
         steering: Option<(Arc<Steering>, u16)>,
+        timers: HostTimers,
     ) -> Self {
         let shared = Arc::new(Shared::default());
         let lifetime = server
@@ -493,7 +495,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 tx_queue: VecDeque::new(),
                 spare: Vec::new(),
                 timers: Timers::default(),
-                host_wake: HostWake::new(worker.host()),
+                host_wake: HostWake::new(worker.host(), timers),
                 quiescing: Some(worker.quiescing()),
                 quiesce_request: None,
                 quiesce: None,
@@ -1902,7 +1904,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sched.rx.push(key);
         }
         drop(sched);
-        let pacing_kind = Kind::pacing(conn.build_horizon());
+        let pacing_kind = self
+            .sched
+            .borrow()
+            .host_wake
+            .pacing_kind(conn.build_horizon());
         let entry = Entry {
             conn,
             session,

@@ -39,6 +39,7 @@ use mvfstr_io::Backend;
 use mvfstr_io::MmsgBackend;
 use mvfstr_io::MmsgOptions;
 use mvfstr_io::SocketOptions;
+use mvfstr_io::TimerFd;
 use mvfstr_io::TxCaps;
 use mvfstr_proto::AckPolicy;
 use mvfstr_proto::AppCode;
@@ -86,6 +87,8 @@ use crate::DriverConnectError;
 use crate::DriverError;
 use crate::EndpointDriver;
 use crate::EndpointHandle;
+use crate::FineTimer;
+use crate::HostTimers;
 use crate::QuicApplication;
 use crate::QuicSession;
 use crate::Refusal;
@@ -248,6 +251,9 @@ struct Harness<B: Backend = MmsgBackend> {
     options: B::Options,
     /// The worker index and count the server driver is built with, if any.
     worker: Option<(u16, u16)>,
+    /// A function, run on the server worker, that makes the server driver's timers in place of the
+    /// default ones, if any.
+    server_timers: Option<Arc<dyn Fn() -> HostTimers + Send + Sync>>,
 }
 
 impl Harness {
@@ -286,6 +292,7 @@ where
             limits: Limits::default(),
             options,
             worker: None,
+            server_timers: None,
         }
     }
 
@@ -295,6 +302,7 @@ where
         let (tx, rx) = mpsc::channel();
         let (endpoint, config) = (self.endpoint.clone(), self.server_config.clone());
         let (limits, options, index) = (self.limits, self.options.clone(), self.worker);
+        let timers = self.server_timers.clone();
         self.server
             .handle()
             .submit(move |worker| {
@@ -304,6 +312,9 @@ where
                     .limits(limits);
                 if let Some((index, count)) = index {
                     builder = builder.worker(index, count);
+                }
+                if let Some(timers) = timers {
+                    builder = builder.host_timers(timers());
                 }
                 let handle = builder.spawn(worker).expect("the server driver starts");
                 let _ = tx.send(handle.local_addr().expect("the server is bound"));
@@ -5690,6 +5701,65 @@ fn a_paced_sender_resumes_at_each_release_without_other_input() {
     assert!(
         attempts <= 20,
         "the client made {attempts} transmit attempts for {LEN} paced bytes"
+    );
+    harness.shutdown();
+}
+
+/// A host's fine timer: a timerfd that counts its armings.
+struct CountingFine {
+    timer: TimerFd,
+    arms: Arc<AtomicUsize>,
+}
+
+impl FineTimer for CountingFine {
+    fn arm(&mut self, deadline: Instant) -> io::Result<()> {
+        self.arms.fetch_add(1, Ordering::SeqCst);
+        self.timer.arm(deadline)
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.timer.disarm();
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.timer.deadline()
+    }
+
+    fn poll_expired(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.timer.poll_expired(cx)
+    }
+}
+
+#[test]
+fn a_paced_connections_wakes_reach_the_fine_timer_its_host_gives_the_driver() {
+    // As in `a_paced_sender_resumes_at_each_release_without_other_input`, the server's releases
+    // come 1.6 ms apart, inside the lead of a 1 ms wheel, so each ends on the fine timer.
+    const LEN: usize = 9_000;
+    let arms = Arc::new(AtomicUsize::new(0));
+    let mut harness = Harness::new();
+    let counted = Arc::clone(&arms);
+    harness.server_timers = Some(Arc::new(move || {
+        HostTimers::new(
+            Duration::from_millis(1),
+            Some(Box::new(CountingFine {
+                timer: TimerFd::new().expect("a timerfd on the worker's reactor"),
+                arms: Arc::clone(&counted),
+            })),
+        )
+    }));
+    let mut relay = None;
+    let pair = BulkPair::through(&harness, 1, LEN, sluggish_and_paced(), |server| {
+        let link = Relay::delayed(server, Duration::from_millis(10));
+        let addr = link.addr;
+        relay = Some(link);
+        addr
+    });
+    let _link = relay.expect("the client connects through the relay");
+    pair.go();
+    await_reports_within(&pair.rx, vec![Report::Received(uni(3), LEN)], STALL);
+    assert!(
+        arms.load(Ordering::SeqCst) > 0,
+        "the server's pacing wakes never reached its host's fine timer"
     );
     harness.shutdown();
 }
