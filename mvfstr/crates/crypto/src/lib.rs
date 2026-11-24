@@ -27,6 +27,7 @@
 //! chosen by Cargo feature. The `aws-lc-rs` feature is on by default, and aws-lc-rs is used
 //! whenever it is on, even with `ring` on too. With only `ring` on, ring is used. At least one of
 //! the two must be on. The default provider offers post-quantum key exchange only with aws-lc-rs.
+//! Builds for Android or iOS that do not have aws-lc-rs can turn on only `ring`.
 
 mod algorithm;
 mod backend;
