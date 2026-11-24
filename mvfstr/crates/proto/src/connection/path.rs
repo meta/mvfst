@@ -215,8 +215,13 @@ impl Connection {
         if let Some(from) = self.migrated_from.take() {
             if from.ip() != self.remote.ip() {
                 self.recovery.reset_for_new_path();
-                (self.cc, self.pacer) =
-                    congestion_state(&self.config, self.mtu, &self.recovery, &mut self.rng);
+                (self.cc, self.pacer) = congestion_state(
+                    &self.config,
+                    self.mtu,
+                    self.horizon,
+                    &self.recovery,
+                    &mut self.rng,
+                );
                 self.app_limited = false;
             }
             self.drop_alt();

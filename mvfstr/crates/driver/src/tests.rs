@@ -6074,6 +6074,7 @@ fn transmit(conn: &mut Connection, now: Instant) -> Vec<Vec<u8>> {
         max_segments: 1,
         max_datagram: 1500,
         max_bytes: u32::MAX,
+        epoch: None,
     };
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
     sink.take().into_iter().map(|sent| sent.data).collect()

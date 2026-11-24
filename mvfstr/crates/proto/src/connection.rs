@@ -22,6 +22,8 @@
 
 #[cfg(test)]
 mod cc_tests;
+#[cfg(test)]
+mod horizon_tests;
 mod key_update;
 #[cfg(test)]
 mod manage_tests;
@@ -242,6 +244,20 @@ pub(crate) struct ConnSetup {
     pub(crate) cids: CidGenerator,
     /// The seed of the connection's random source.
     pub(crate) rng_seed: [u8; 32],
+    /// How far ahead of now the connection may build paced runs.
+    pub(crate) horizon: Duration,
+}
+
+impl ConnSetup {
+    /// Returns the setup with its horizon lowered so that the advertised max_ack_delay stays below
+    /// 2^14 ms, as RFC 9000 requires.
+    fn with_capped_horizon(self) -> Self {
+        let max_ack_delay = self.transport.ack_policy().max_ack_delay;
+        Self {
+            horizon: params::capped_horizon(self.horizon, max_ack_delay),
+            ..self
+        }
+    }
 }
 
 /// One QUIC connection, client or server, created by
@@ -279,6 +295,8 @@ pub struct Connection {
     /// not grow it.
     app_limited: bool,
     pacer: Pacer,
+    /// H_conn, how far ahead of now paced runs are built, fixed at creation.
+    horizon: Duration,
     path: PathCredit,
     alt: Option<AltPath>,
     /// The address a migration not yet validated left.
@@ -323,8 +341,10 @@ impl Connection {
         tls: Arc<rustls::ClientConfig>,
         server_name: ServerName<'static>,
     ) -> Result<Self, TlsError> {
+        let setup = setup.with_capped_horizon();
         let params = params::local_params(
             &setup.transport,
+            setup.horizon,
             params::LocalIds {
                 initial_scid: setup.local_cid,
                 original_dcid: None,
@@ -349,8 +369,10 @@ impl Connection {
         tls: Arc<rustls::ServerConfig>,
         without_alpn: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<Self, TlsError> {
+        let setup = setup.with_capped_horizon();
         let params = params::local_params(
             &setup.transport,
+            setup.horizon,
             params::LocalIds {
                 initial_scid: setup.local_cid,
                 original_dcid: Some(setup.original_dcid),
@@ -385,7 +407,8 @@ impl Connection {
         let recovery = LossRecovery::new(recovery_config, side, setup.now, [0; 3])
             .expect("should accept the RTT a validated transport config holds");
         let mut rng = ConnRng::new(setup.rng_seed);
-        let (cc, pacer) = congestion_state(&config, MIN_DATAGRAM, &recovery, &mut rng);
+        let (cc, pacer) =
+            congestion_state(&config, MIN_DATAGRAM, setup.horizon, &recovery, &mut rng);
         let integrity_limit = initial.remote.integrity_limit();
         let mut spaces: [PacketSpace; 3] = Default::default();
         spaces[Space::Initial.index()].keys = Some(initial);
@@ -415,6 +438,7 @@ impl Connection {
             cc,
             app_limited: false,
             pacer,
+            horizon: setup.horizon,
             path: PathCredit::default(),
             alt: None,
             migrated_from: None,
@@ -468,6 +492,10 @@ impl Connection {
         sink: &mut S,
         sealer: &mut Z,
     ) -> TxOutcome {
+        debug_assert!(
+            limits.epoch.is_some() || self.horizon.is_zero(),
+            "a connection with a build horizon was given no clock epoch"
+        );
         self.now = self.now.max(limits.now);
         let outcome = self.transmit(limits, sink, sealer);
         self.wake_writable();
@@ -733,6 +761,12 @@ impl Connection {
     /// Returns the negotiated ALPN protocol, once the handshake has agreed on one.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.tls.alpn()
+    }
+
+    /// Returns the build horizon H_conn: how far ahead of now the connection builds paced runs,
+    /// fixed at creation. A driver can choose its pacing wakes by it.
+    pub fn build_horizon(&self) -> Duration {
+        self.horizon
     }
 
     /// Returns counters and current values for logs and benchmarks.
@@ -1029,12 +1063,14 @@ impl Connection {
 }
 
 /// Returns the state a path starts with: `config`'s congestion controller for datagrams of
-/// `max_datagram_size` bytes, and a pacer with `config`'s bursts at its rate for `recovery`'s
-/// smoothed RTT. A controller that takes rate samples starts from `recovery`'s counts, and BBR3
-/// draws its seed from `rng`; NewReno and CUBIC leave `rng` untouched.
+/// `max_datagram_size` bytes on a connection with build horizon `horizon`, and a pacer with
+/// `config`'s bursts at its rate for `recovery`'s smoothed RTT. A controller that takes rate
+/// samples starts from `recovery`'s counts, and BBR3 draws its seed from `rng`; NewReno and CUBIC
+/// leave `rng` untouched.
 fn congestion_state(
     config: &TransportConfig,
     max_datagram_size: u16,
+    horizon: Duration,
     recovery: &LossRecovery,
     rng: &mut ConnRng,
 ) -> (Cc, Pacer) {
@@ -1055,7 +1091,7 @@ fn congestion_state(
         srtt: rtt.first_sample_time().map(|_| rtt.smoothed()),
         total_sent: recovery.total_sent(),
         pacing_granularity: config.pacing_granularity(),
-        horizon: Duration::ZERO,
+        horizon,
     };
     let cc = Cc::start(kind, &windows, max_datagram_size, &start)
         .expect("should accept a validated config's windows and datagrams of at least 1,200 bytes");

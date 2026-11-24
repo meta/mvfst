@@ -86,6 +86,7 @@ pub struct EndpointConfig {
     reset_key: [u8; 32],
     worker_index: u16,
     worker_count: u16,
+    build_horizon: Duration,
 }
 
 impl EndpointConfig {
@@ -98,6 +99,7 @@ impl EndpointConfig {
                 reset_key,
                 worker_index: 0,
                 worker_count: 1,
+                build_horizon: Duration::ZERO,
             },
         }
     }
@@ -117,6 +119,12 @@ impl EndpointConfig {
         (self.worker_index, self.worker_count)
     }
 
+    /// Returns how far ahead of its release a server connection may build a datagram, before the
+    /// backend's release horizon caps it.
+    pub fn build_horizon(&self) -> Duration {
+        self.build_horizon
+    }
+
     /// Returns a builder that starts from these settings, for a config that changes only a few of
     /// them, such as one per worker.
     pub fn to_builder(&self) -> EndpointConfigBuilder {
@@ -132,6 +140,7 @@ impl fmt::Debug for EndpointConfig {
             .field("local_cid_len", &self.local_cid_len)
             .field("worker_index", &self.worker_index)
             .field("worker_count", &self.worker_count)
+            .field("build_horizon", &self.build_horizon)
             .finish_non_exhaustive()
     }
 }
@@ -156,6 +165,16 @@ impl EndpointConfigBuilder {
     pub fn worker(mut self, index: u16, count: u16) -> Self {
         self.config.worker_index = index;
         self.config.worker_count = count;
+        self
+    }
+
+    /// Sets how far ahead of its release a connection this endpoint accepts may build a datagram.
+    /// Each accepted connection fixes the smaller of this and the release horizon its backend
+    /// supports, set with [`Endpoint::set_release_horizon`](crate::Endpoint::set_release_horizon),
+    /// at creation, lowered if needed to keep its advertised max_ack_delay below 2^14 ms; without
+    /// release support it is 0. Default 0: datagrams are built once due.
+    pub fn build_horizon(mut self, horizon: Duration) -> Self {
+        self.config.build_horizon = horizon;
         self
     }
 
@@ -1338,6 +1357,19 @@ mod tests {
             let config = EndpointConfig::builder([0; 32]).local_cid_len(len).build();
             assert_eq!(config.unwrap_err(), out_of_range("local_cid_len"), "{len}");
         }
+    }
+
+    #[test]
+    fn the_build_horizon_defaults_to_zero_and_survives_a_rebuild() {
+        let config = EndpointConfig::builder([0; 32]).build().unwrap();
+        assert_eq!(config.build_horizon(), Duration::ZERO);
+        let config = EndpointConfig::builder([0; 32])
+            .build_horizon(Duration::from_millis(2))
+            .build()
+            .unwrap();
+        assert_eq!(config.build_horizon(), Duration::from_millis(2));
+        let worker = config.to_builder().worker(1, 2).build().unwrap();
+        assert_eq!(worker.build_horizon(), Duration::from_millis(2));
     }
 
     #[test]

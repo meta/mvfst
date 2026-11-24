@@ -520,6 +520,18 @@ fn the_send_quantum_follows_the_granularity_and_the_offload_budget_adds_rate_tim
 }
 
 #[test]
+fn the_offload_budget_saturates_at_any_rate_and_horizon() {
+    // In UP, where the budget also gains two datagrams.
+    let mut sim = Sim::new();
+    sim.to_probe_bw_up();
+    let bbr = sim.bbr_mut();
+    bbr.pacing_rate = u64::MAX;
+    bbr.horizon = Duration::from_secs(16);
+    assert_eq!(sim.bbr().offload_budget(), u64::MAX);
+    assert_eq!(sim.bbr().max_inflight(), u64::MAX);
+}
+
+#[test]
 fn pacing_waits_for_a_control_update_after_the_initial_window_is_sent() {
     // The initial window goes out unpaced.
     let mut sim = Sim::new();

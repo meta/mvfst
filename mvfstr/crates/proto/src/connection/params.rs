@@ -22,13 +22,31 @@ use mvfstr_wire::VarInt;
 use mvfstr_wire::Version;
 
 use super::ConnError;
+use super::GRANULARITY;
 use crate::config::TransportConfig;
 
-/// Returns max_ack_delay as advertised: whole milliseconds rounded up, so the ACK timer never
-/// runs past it. The config builder keeps the result below 2^14.
-pub(crate) fn advertised_max_ack_delay(delay: Duration) -> u64 {
+/// Returns max_ack_delay as advertised for an ACK timer of `delay` on a connection with build
+/// horizon `horizon`: whole milliseconds rounded up, so the ACK timer never runs past it. With a
+/// horizon, an ACK leaves up to the horizon after it is built, and the advertised value adds
+/// the horizon and the timer granularity. The config builder and [`capped_horizon`] keep the
+/// result below 2^14.
+pub(crate) fn advertised_max_ack_delay(delay: Duration, horizon: Duration) -> u64 {
+    let delay = if horizon.is_zero() {
+        delay
+    } else {
+        delay.saturating_add(horizon).saturating_add(GRANULARITY)
+    };
     let millis = delay.as_nanos().div_ceil(1_000_000);
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+/// Returns `horizon`, lowered so that the max_ack_delay advertised with an ACK timer of
+/// `max_ack_delay` stays below 2^14 ms, as RFC 9000 requires.
+pub(crate) fn capped_horizon(horizon: Duration, max_ack_delay: Duration) -> Duration {
+    let room = Duration::from_millis((1 << 14) - 1)
+        .saturating_sub(GRANULARITY)
+        .saturating_sub(max_ack_delay);
+    horizon.min(room)
 }
 
 /// The connection IDs a connection's own parameters name.
@@ -42,8 +60,12 @@ pub(crate) struct LocalIds {
     pub(crate) reset_token: Option<ResetToken>,
 }
 
-/// Returns the parameters a connection with `config` advertises.
-pub(crate) fn local_params(config: &TransportConfig, ids: LocalIds) -> TransportParameters {
+/// Returns the parameters a connection with `config` and build horizon `horizon` advertises.
+pub(crate) fn local_params(
+    config: &TransportConfig,
+    horizon: Duration,
+    ids: LocalIds,
+) -> TransportParameters {
     let varint = |value: u64| VarInt::from_u64(value).unwrap_or(VarInt::MAX);
     let ack = config.ack_policy();
     TransportParameters {
@@ -61,7 +83,7 @@ pub(crate) fn local_params(config: &TransportConfig, ids: LocalIds) -> Transport
         initial_max_streams_bidi: varint(config.max_streams_bidi()),
         initial_max_streams_uni: varint(config.max_streams_uni()),
         ack_delay_exponent: VarInt::from_u32(u32::from(ack.ack_delay_exponent)),
-        max_ack_delay: varint(advertised_max_ack_delay(ack.max_ack_delay)),
+        max_ack_delay: varint(advertised_max_ack_delay(ack.max_ack_delay, horizon)),
         active_connection_id_limit: varint(config.active_connection_id_limit()),
         initial_source_connection_id: Some(ids.initial_scid),
         stateless_reset_token: ids.reset_token,
@@ -167,6 +189,7 @@ mod tests {
     fn server_params() -> TransportParameters {
         local_params(
             &TransportConfig::default(),
+            Duration::ZERO,
             LocalIds {
                 initial_scid: cid(2),
                 original_dcid: Some(cid(1)),
@@ -177,9 +200,16 @@ mod tests {
 
     #[test]
     fn max_ack_delay_is_advertised_in_whole_milliseconds_rounded_up() {
-        assert_eq!(advertised_max_ack_delay(Duration::from_millis(25)), 25);
-        assert_eq!(advertised_max_ack_delay(Duration::from_micros(2_001)), 3);
-        assert_eq!(advertised_max_ack_delay(Duration::ZERO), 0);
+        let zero = Duration::ZERO;
+        assert_eq!(
+            advertised_max_ack_delay(Duration::from_millis(25), zero),
+            25
+        );
+        assert_eq!(
+            advertised_max_ack_delay(Duration::from_micros(2_001), zero),
+            3
+        );
+        assert_eq!(advertised_max_ack_delay(zero, zero), 0);
         let config = TransportConfig::builder()
             .ack_policy(crate::AckPolicy {
                 max_ack_delay: Duration::from_micros(10_500),
@@ -189,6 +219,7 @@ mod tests {
             .unwrap();
         let params = local_params(
             &config,
+            Duration::ZERO,
             LocalIds {
                 initial_scid: cid(1),
                 original_dcid: None,
@@ -196,6 +227,33 @@ mod tests {
             },
         );
         assert_eq!(params.max_ack_delay, VarInt::from_u32(11));
+    }
+
+    #[test]
+    fn a_horizon_adds_itself_and_the_timer_granularity_to_max_ack_delay_below_2_14_ms() {
+        let ms = Duration::from_millis;
+        assert_eq!(advertised_max_ack_delay(ms(25), Duration::ZERO), 25);
+        assert_eq!(advertised_max_ack_delay(ms(25), ms(2)), 28);
+        assert_eq!(
+            advertised_max_ack_delay(ms(25), Duration::from_micros(2_500)),
+            29
+        );
+        // The horizon is capped so that the sum stays below 2^14 ms.
+        let bound = ms((1 << 14) - 1);
+        assert_eq!(capped_horizon(ms(2), bound), Duration::ZERO);
+        assert_eq!(capped_horizon(ms(2), bound - ms(2)), ms(1));
+        assert_eq!(capped_horizon(ms(2), ms(25)), ms(2));
+        let max_ack_delay = Duration::from_micros(16_381_500);
+        let horizon = capped_horizon(ms(2), max_ack_delay);
+        assert_eq!(horizon, Duration::from_micros(500));
+        assert_eq!(advertised_max_ack_delay(max_ack_delay, horizon), 16_383);
+        let ids = LocalIds {
+            initial_scid: cid(1),
+            original_dcid: None,
+            reset_token: None,
+        };
+        let params = local_params(&TransportConfig::default(), ms(2), ids);
+        assert_eq!(params.max_ack_delay, VarInt::from_u32(28));
     }
 
     #[test]
@@ -259,6 +317,7 @@ mod tests {
         };
         let mut client = local_params(
             &TransportConfig::default(),
+            Duration::ZERO,
             LocalIds {
                 initial_scid: cid(2),
                 original_dcid: None,

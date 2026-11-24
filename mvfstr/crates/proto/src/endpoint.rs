@@ -27,6 +27,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -287,6 +288,9 @@ pub struct Endpoint {
     token_of: HashMap<ConnKey, [Option<(SocketAddr, ResetToken)>; 2]>,
     cids: CidGenerator,
     limiter: ReplyLimiter,
+    /// The longest the backend holds a datagram until its release; zero without release
+    /// support.
+    release_horizon: Duration,
 }
 
 /// A token bucket for stateless replies: RFC 9000 lets a server limit the Version Negotiation
@@ -342,6 +346,7 @@ impl Endpoint {
             peer_tokens: HashMap::new(),
             token_of: HashMap::new(),
             limiter: ReplyLimiter::default(),
+            release_horizon: Duration::ZERO,
         }
     }
 
@@ -482,6 +487,14 @@ impl Endpoint {
         })
     }
 
+    /// Sets the longest the endpoint's backend holds a datagram until its release. Connections
+    /// accepted afterwards build up to the smaller of it and [`EndpointConfig::build_horizon`]
+    /// ahead; zero, the default, is for a backend without release support. Set it once, before
+    /// any connection.
+    pub fn set_release_horizon(&mut self, horizon: Duration) {
+        self.release_horizon = horizon;
+    }
+
     /// Creates and routes the server connection for an Initial, to be stored by the driver under
     /// `key`. Fails with [`AcceptError::Undecryptable`] unless a packet of its datagram decrypts.
     pub fn accept<R: Random>(
@@ -515,6 +528,7 @@ impl Endpoint {
             original_dcid: incoming.dcid,
             cids: self.cids.clone(),
             rng_seed,
+            horizon: self.config.build_horizon().min(self.release_horizon),
         };
         let mut conn = Connection::server(setup, config.tls().clone(), without_alpn.cloned())
             .map_err(|e| AcceptError::Tls(rustls_error(e)))?;
@@ -573,6 +587,8 @@ impl Endpoint {
             original_dcid: dcid,
             cids: self.cids.clone(),
             rng_seed,
+            // The client's socket is not the endpoint's, so its release support is unknown.
+            horizon: Duration::ZERO,
         };
         let conn = Connection::client(setup, config.tls().clone(), server_name)
             .map_err(|e| ConnectError::Tls(rustls_error(e)))?;
@@ -787,6 +803,7 @@ mod tests {
             max_segments: 1,
             max_datagram: 1500,
             max_bytes: u32::MAX,
+            epoch: None,
         };
         conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
         let datagram = sink.take().remove(0).data;

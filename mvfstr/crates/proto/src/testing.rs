@@ -14,6 +14,7 @@
 //! pair advances from one event (a delivery, a connection deadline or a pacing release) to the
 //! next, so a run does not take real time. Not for production use.
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -25,6 +26,7 @@ use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
 
 use crate::ClientConfig;
+use crate::ClockEpoch;
 use crate::ConnEvent;
 use crate::ConnKey;
 use crate::ConnOptions;
@@ -35,6 +37,7 @@ use crate::EndpointConfig;
 use crate::InlineSealer;
 use crate::Inputs;
 use crate::Random;
+use crate::Release;
 use crate::Route;
 use crate::RxDatagram;
 use crate::RxDropReason;
@@ -43,6 +46,7 @@ use crate::SegmentSink;
 use crate::ServerConfig;
 use crate::SlotId;
 use crate::Stop;
+use crate::Tick;
 use crate::TxClass;
 use crate::TxLimits;
 use crate::TxMeta;
@@ -265,6 +269,8 @@ pub struct Link {
     in_flight: Vec<(Instant, usize, Vec<u8>)>,
     /// When the bottleneck finishes serializing the datagrams it has taken.
     busy_until: Option<Instant>,
+    /// Datagrams the sender's backend holds until their release, in the order sent.
+    held: VecDeque<(Instant, Vec<u8>)>,
 }
 
 impl Link {
@@ -283,6 +289,32 @@ impl Link {
             newest_delivered: None,
             in_flight: Vec::new(),
             busy_until: None,
+            held: VecDeque::new(),
+        }
+    }
+
+    /// Sends a datagram at `now` that the sender's backend holds until `release`, and behind
+    /// every datagram held before it, as fq holds a flow's packets until their time.
+    pub fn send_at(&mut self, now: Instant, release: Instant, data: Vec<u8>) {
+        let after = self.held.back().map_or(now, |(last, _)| now.max(*last));
+        let release = release.max(after);
+        if release <= now {
+            self.send(now, data);
+        } else {
+            self.held.push_back((release, data));
+        }
+    }
+
+    /// Hands the link the held datagrams whose release has come by `now`.
+    fn release_held(&mut self, now: Instant) {
+        while self
+            .held
+            .front()
+            .is_some_and(|(release, _)| *release <= now)
+        {
+            if let Some((release, data)) = self.held.pop_front() {
+                self.send(release, data);
+            }
         }
     }
 
@@ -331,13 +363,20 @@ impl Link {
         self.config.loss = loss;
     }
 
-    /// Returns when the next datagram arrives.
+    /// Returns when the next datagram arrives or the next held one enters the link.
     pub fn next_arrival(&self) -> Option<Instant> {
-        self.in_flight.iter().map(|(at, _, _)| *at).min()
+        let held = self.held.front().map(|(release, _)| *release);
+        self.in_flight
+            .iter()
+            .map(|(at, _, _)| *at)
+            .chain(held)
+            .min()
     }
 
-    /// Takes the datagrams that have arrived by `now`, in arrival order.
+    /// Takes the datagrams that have arrived by `now`, in arrival order, after handing the link
+    /// the held datagrams due by then.
     pub fn deliver(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        self.release_held(now);
         let (mut due, waiting) = std::mem::take(&mut self.in_flight)
             .into_iter()
             .partition::<Vec<_>, _>(|(at, _, _)| *at <= now);
@@ -393,7 +432,7 @@ pub struct Peer {
     pub addr: SocketAddr,
     /// Every connection event, in order.
     pub events: Vec<ConnEvent>,
-    /// Every datagram sent, with the time it was sent.
+    /// Every datagram sent, with the time it left: its release, or the attempt's time.
     pub sent: Vec<(Instant, SentDatagram)>,
     /// Every attempt's outcome.
     pub outcomes: Vec<TxOutcome>,
@@ -458,6 +497,9 @@ pub struct PairConfig {
     pub max_datagram: u16,
     /// [`TxLimits::max_segments`] of both sides.
     pub max_segments: u16,
+    /// The longest both sides' backends hold a datagram until its release; zero, the default,
+    /// for backends without release support.
+    pub release_horizon: Duration,
     /// The seed of the connection IDs, loss and jitter.
     pub seed: u64,
 }
@@ -478,6 +520,7 @@ impl PairConfig {
             to_client: LinkConfig::default(),
             max_datagram: 1500,
             max_segments: 16,
+            release_horizon: Duration::ZERO,
             seed: 1,
         }
     }
@@ -498,6 +541,8 @@ pub struct Pair {
     pub to_client: Link,
     config: PairConfig,
     unix_now: UnixTime,
+    /// The backends' clock epoch, with release support.
+    clock: Option<ClockEpoch>,
 }
 
 /// The number of rounds after which a step still making progress at one instant is a livelock.
@@ -508,14 +553,17 @@ impl Pair {
     pub fn new(epoch: Instant, unix_now: UnixTime, config: PairConfig) -> Self {
         let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 50_000);
         let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 4433);
-        let client_endpoint = Endpoint::new(
+        let mut client_endpoint = Endpoint::new(
             config
                 .client_endpoint
                 .clone()
                 .unwrap_or_else(|| config.endpoint.clone()),
             None,
         );
-        let server_endpoint = Endpoint::new(config.endpoint.clone(), Some(config.server.clone()));
+        let mut server_endpoint =
+            Endpoint::new(config.endpoint.clone(), Some(config.server.clone()));
+        client_endpoint.set_release_horizon(config.release_horizon);
+        server_endpoint.set_release_horizon(config.release_horizon);
         let mut pair = Self {
             now: epoch,
             client: Peer::new(
@@ -534,6 +582,10 @@ impl Pair {
             ),
             to_server: Link::new(config.to_server.clone(), config.seed.wrapping_add(2)),
             to_client: Link::new(config.to_client.clone(), config.seed.wrapping_add(3)),
+            clock: (!config.release_horizon.is_zero()).then_some(ClockEpoch {
+                instant: epoch,
+                tick: Tick(1 << 40),
+            }),
             config,
             unix_now,
         };
@@ -565,6 +617,18 @@ impl Pair {
             max_segments: self.config.max_segments,
             max_datagram: self.config.max_datagram,
             max_bytes: u32::MAX,
+            epoch: self.clock,
+        }
+    }
+
+    /// Returns when a datagram with `release` leaves if sent at `now`.
+    pub fn leaves(&self, now: Instant, release: Release) -> Instant {
+        match (release, self.clock) {
+            (Release::At(tick), Some(clock)) => {
+                clock.instant + Duration::from_nanos(tick.0.saturating_sub(clock.tick.0))
+            }
+            (Release::At(_), None) => panic!("a release time with no release support"),
+            (Release::Asap, _) => now,
         }
     }
 
@@ -736,16 +800,20 @@ impl Pair {
         }
         let datagrams = peer.sink.take();
         let sent = !datagrams.is_empty();
+        let leaves: Vec<Instant> = datagrams
+            .iter()
+            .map(|datagram| self.leaves(now, datagram.meta.release))
+            .collect();
         let (peer, link, to) = match side {
             Side::Client => (&mut self.client, &mut self.to_server, self.server.addr),
             Side::Server => (&mut self.server, &mut self.to_client, self.client.addr),
         };
-        for datagram in datagrams {
+        for (datagram, leaves) in datagrams.into_iter().zip(leaves) {
             // A datagram to an address the other peer no longer has is lost.
             if datagram.meta.dst == to {
-                link.send(now, datagram.data.clone());
+                link.send_at(now, leaves, datagram.data.clone());
             }
-            peer.sent.push((now, datagram));
+            peer.sent.push((leaves, datagram));
         }
         sent
     }
@@ -989,6 +1057,29 @@ mod tests {
     use crate::recovery::test_epoch;
 
     const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_held_datagram_enters_the_link_at_its_release_behind_those_sent_before_it() {
+        let t0 = test_epoch();
+        let mut link = Link::new(LinkConfig::default(), 1);
+        link.send_at(t0, t0 + 2 * MS, vec![1]);
+        link.send_at(t0, t0 + 2 * MS, vec![2]);
+        // A later datagram with an earlier release waits behind them, as in fq's flow queue.
+        link.send_at(t0 + MS, t0 + MS, vec![3]);
+        // The release is the next event; the datagrams then take the 10 ms delay.
+        assert_eq!(link.next_arrival(), Some(t0 + 2 * MS));
+        assert!(
+            link.deliver(t0 + 2 * MS - Duration::from_nanos(1))
+                .is_empty()
+        );
+        assert!(link.deliver(t0 + 2 * MS).is_empty());
+        assert_eq!(link.next_arrival(), Some(t0 + 12 * MS));
+        assert_eq!(link.deliver(t0 + 12 * MS), [vec![1], vec![2], vec![3]]);
+        // A datagram due now goes at once.
+        link.send_at(t0 + 20 * MS, t0 + 20 * MS, vec![4]);
+        assert_eq!(link.next_arrival(), Some(t0 + 30 * MS));
+        assert_eq!(link.reordered(), 0);
+    }
 
     #[test]
     fn a_link_with_a_rate_serializes_datagrams_one_after_another() {

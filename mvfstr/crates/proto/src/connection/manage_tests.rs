@@ -44,6 +44,7 @@ use super::tests::open_own_one_rtt;
 use super::tests::server_addr;
 use super::tests::start;
 use crate::AppCode;
+use crate::ClockEpoch;
 use crate::CloseReason;
 use crate::CongestionControl;
 use crate::ConnEvent;
@@ -63,6 +64,7 @@ use crate::Sealer;
 use crate::SendOrder;
 use crate::SlotId;
 use crate::StreamReady;
+use crate::Tick;
 use crate::TransportConfig;
 use crate::TxLimits;
 use crate::cc::Cc;
@@ -72,6 +74,7 @@ use crate::cid::CidGenerator;
 use crate::cid::PeerCids;
 use crate::recovery::Space;
 use crate::testing::Pair;
+use crate::testing::PairConfig;
 use crate::testing::SentDatagram;
 use crate::testing::VecSink;
 use crate::testing::fixtures::Setup;
@@ -85,7 +88,12 @@ fn transport(active_connection_id_limit: u64) -> Arc<TransportConfig> {
 
 /// Returns a pair past the handshake that has had time to exchange its connection IDs.
 fn settled(setup: &Setup) -> Pair {
-    let (_, mut pair) = handshake(setup.pair());
+    settled_pair(setup.pair())
+}
+
+/// Returns a pair of `config` past the handshake that has had time to exchange its connection IDs.
+fn settled_pair(config: PairConfig) -> Pair {
+    let (_, mut pair) = handshake(config);
     let quiet = pair.now + Duration::from_millis(500);
     pair.run(quiet);
     pair
@@ -156,6 +164,7 @@ fn sent_frames(conn: &mut Connection) -> Vec<(ConnectionId, Vec<String>)> {
         max_segments: 16,
         max_datagram: 1500,
         max_bytes: u32::MAX,
+        epoch: None,
     };
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
     frames_of(conn, &sink.take())
@@ -442,6 +451,7 @@ fn a_reset_counts_only_from_the_peers_address() {
         max_segments: 16,
         max_datagram: 1500,
         max_bytes: u32::MAX,
+        epoch: None,
     };
     client.poll_transmit(&limits, &mut sink, &mut InlineSealer);
     assert!(sink.take().is_empty(), "a reset connection drains silently");
@@ -576,7 +586,8 @@ fn rebound_port() -> SocketAddr {
     SocketAddr::new(client_addr().ip(), 50_001)
 }
 
-/// Returns the datagrams `conn` sends now.
+/// Returns the datagrams `conn` sends now, to a backend with release support, which a connection
+/// with a build horizon needs.
 fn transmit(conn: &mut Connection, now: Instant) -> Vec<SentDatagram> {
     let mut sink = VecSink::new(1500);
     let limits = TxLimits {
@@ -584,6 +595,10 @@ fn transmit(conn: &mut Connection, now: Instant) -> Vec<SentDatagram> {
         max_segments: 16,
         max_datagram: 1500,
         max_bytes: u32::MAX,
+        epoch: Some(ClockEpoch {
+            instant: crate::recovery::test_epoch(),
+            tick: Tick(0),
+        }),
     };
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
     sink.take()
@@ -882,7 +897,16 @@ fn migrate_after_congestion_in(
     to: SocketAddr,
     before: impl FnOnce(&mut Connection),
 ) -> (u64, Duration, Pair) {
-    let mut pair = settled(setup);
+    migrate_after_congestion_with(setup.pair(), to, before)
+}
+
+/// Does what [`migrate_after_congestion_in`] does, on a pair of `config`.
+fn migrate_after_congestion_with(
+    config: PairConfig,
+    to: SocketAddr,
+    before: impl FnOnce(&mut Connection),
+) -> (u64, Duration, Pair) {
+    let mut pair = settled_pair(config);
     let now = pair.now;
     let moved = from_client(&pair, 10, &[Frame::Ping, Frame::Padding { len: 1200 }]);
     let server = pair.server.conn_mut();
@@ -1540,8 +1564,9 @@ fn a_bbr3_controller_rebuilt_on_a_move_to_a_new_ip_is_seeded_and_ready_to_pace_a
 }
 
 #[test]
-fn bbr3_takes_the_pacing_granularity_at_creation_and_after_a_move() {
+fn bbr3_takes_the_pacing_granularity_and_the_build_horizon_at_creation_and_after_a_move() {
     let tick = Duration::from_micros(200);
+    let horizon = Duration::from_millis(2);
     let setup = Setup::default().transport(
         TransportConfig::builder()
             .congestion_control(CongestionControl::Bbr3)
@@ -1550,15 +1575,27 @@ fn bbr3_takes_the_pacing_granularity_at_creation_and_after_a_move() {
             .build()
             .unwrap(),
     );
+    let mut config = setup.pair();
+    config.endpoint = EndpointConfig::builder([7; 32])
+        .build_horizon(horizon)
+        .build()
+        .unwrap();
+    config.release_horizon = horizon;
     let mut created = None;
-    let (_, _, pair) = migrate_after_congestion_in(&setup, stranger(), |server| {
-        created = Some(server.cc.bbr3().pacing_inputs());
+    let (_, _, pair) = migrate_after_congestion_with(config, stranger(), |server| {
+        let bbr = server.cc.bbr3();
+        // The offload budget: three send quanta plus the pacing rate times the 2 ms horizon.
+        let rate = server.cc.pacing_rate(Duration::ZERO).get();
+        assert_eq!(
+            bbr.offload_budget(),
+            3 * bbr.send_quantum() + rate * 2 / 1000
+        );
+        created = Some(bbr.pacing_inputs());
     });
-    let zero = Duration::ZERO;
-    assert_eq!(created, Some((tick, zero)));
+    assert_eq!(created, Some((tick, horizon)));
     assert_eq!(
         pair.server.conn().cc.bbr3().pacing_inputs(),
-        (tick, zero),
+        (tick, horizon),
         "the rebuilt controller"
     );
 }
@@ -2378,6 +2415,7 @@ fn ping(conn: &mut Connection, now: Instant) -> Vec<Vec<u8>> {
         max_segments: 16,
         max_datagram: 1500,
         max_bytes: u32::MAX,
+        epoch: None,
     };
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
     sink.take()

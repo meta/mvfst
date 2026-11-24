@@ -120,6 +120,7 @@ pub use streams::SendError;
 pub use streams::SendOrder;
 pub use streams::StreamError;
 pub use streams::StreamMut;
+pub use transmit::ClockEpoch;
 pub use transmit::DropReason;
 pub use transmit::PathId;
 pub use transmit::Release;

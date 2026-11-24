@@ -13,10 +13,12 @@
 //! whose [`Stop`] names the limit that ended the attempt, and so the wake the driver must arm.
 //! Backends later report what happened to each datagram with a [`TxReport`].
 //!
-//! Packets are not built ahead of their release, so every datagram carries [`Release::Asap`] and
-//! backends do not hold packets for a release time. Backends do not report TX timestamps,
-//! datagrams cannot be recalled, and the egress grant is carried only in
-//! [`TxLimits::max_bytes`].
+//! Each GSO run has one release. A connection with build horizon H_conn = 0 builds a paced run
+//! only once it is due, and every run carries [`Release::Asap`]. With H_conn > 0, a backend with
+//! release support holds datagrams until their release: the connection builds paced runs up to
+//! H_conn ahead and stamps every run with [`Release::At`] in the backend's clock, given by
+//! [`TxLimits::epoch`]. Backends do not report TX timestamps, datagrams cannot be recalled, and
+//! the egress grant is carried only in [`TxLimits::max_bytes`].
 //!
 //! The attempt runs in the connection. Its admission table, which decides whether a frame
 //! source's candidate may start or join a packet, and the ranking of the limits that refuse
@@ -27,6 +29,7 @@ pub(crate) mod admission;
 use std::fmt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::time::Instant;
 
 pub use mvfstr_crypto::SlotId;
@@ -39,11 +42,32 @@ pub struct PathId(pub u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tick(pub u64);
 
+/// A backend's clock epoch: an instant and the backend clock's reading at it, so that a release
+/// is written in the clock the backend hands the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockEpoch {
+    /// An instant on the endpoint's monotonic clock.
+    pub instant: Instant,
+    /// The backend clock's reading at `instant`.
+    pub tick: Tick,
+}
+
+impl ClockEpoch {
+    /// Returns the backend clock's reading at `at`, saturating at both ends of `u64`.
+    pub fn tick_at(&self, at: Instant) -> Tick {
+        let nanos = |span: Duration| u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
+        Tick(match at.checked_duration_since(self.instant) {
+            Some(after) => self.tick.0.saturating_add(nanos(after)),
+            None => self.tick.0.saturating_sub(nanos(self.instant - at)),
+        })
+    }
+}
+
 /// When a datagram may leave. Backends may defer a release, never advance it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
-    /// As soon as possible. Every datagram carries this: the pacer holds packets back by not
-    /// building them.
+    /// As soon as possible. With a build horizon of 0, every datagram carries this: the pacer
+    /// holds packets back by not building them.
     Asap,
     /// Not before this time.
     At(Tick),
@@ -185,7 +209,8 @@ pub enum Stop {
     Idle,
     /// The congestion window is full. Wake on an ACK, or the PTO in `next_deadline`.
     Cwnd,
-    /// The pacer releases the next packet at this time. Wake then.
+    /// The pacer holds the next paced run until this time, its release less the build horizon,
+    /// when an attempt can build it. Wake then.
     Pacing(Instant),
     /// The path's anti-amplification credit is used up. Wake on ingress on that path.
     Amplification,
@@ -219,6 +244,9 @@ pub struct TxLimits {
     pub max_datagram: u16,
     /// The egress grant in bytes; `u32::MAX` when unlimited.
     pub max_bytes: u32,
+    /// The backend's clock epoch if it holds datagrams until their [`Release::At`]; `None`
+    /// without release support.
+    pub epoch: Option<ClockEpoch>,
 }
 
 /// The result of an attempt.
@@ -230,7 +258,8 @@ pub struct TxOutcome {
     pub bytes: u32,
     /// Why the attempt stopped.
     pub stop: Stop,
-    /// The earliest release of any pacing-blocked candidate, whatever the stop, always after `now`.
+    /// When an attempt can next build a pacing-blocked candidate, whatever the stop: its
+    /// release less the build horizon; always later than `now`.
     pub pacing_at: Option<Instant>,
 }
 
@@ -240,7 +269,8 @@ pub struct TxOutcome {
 pub struct TxExplain {
     /// The stop the attempt would report.
     pub stop: Stop,
-    /// The earliest release of any pacing-blocked candidate.
+    /// When an attempt can next build a pacing-blocked candidate: its release less the build
+    /// horizon.
     pub pacing_at: Option<Instant>,
     /// One line per frame source with a candidate: its space, class and the limit that admits
     /// or refuses it.
@@ -251,5 +281,31 @@ impl fmt::Debug for TxExplain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "stop: {:?}, pacing_at: {:?}", self.stop, self.pacing_at)?;
         f.write_str(&self.detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clock_epoch_maps_instants_to_the_backends_ticks_and_saturates() {
+        let t0 = crate::recovery::test_epoch() + Duration::from_secs(1);
+        let epoch = ClockEpoch {
+            instant: t0,
+            tick: Tick(1_000_000),
+        };
+        assert_eq!(epoch.tick_at(t0), Tick(1_000_000));
+        assert_eq!(
+            epoch.tick_at(t0 + Duration::from_micros(209)),
+            Tick(1_209_000)
+        );
+        assert_eq!(epoch.tick_at(t0 - Duration::from_nanos(5)), Tick(999_995));
+        assert_eq!(epoch.tick_at(t0 - Duration::from_millis(2)), Tick(0));
+        let late = ClockEpoch {
+            instant: t0,
+            tick: Tick(u64::MAX - 1),
+        };
+        assert_eq!(late.tick_at(t0 + Duration::from_secs(1)), Tick(u64::MAX));
     }
 }

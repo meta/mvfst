@@ -2030,6 +2030,7 @@ fn attempt<B: Backend>(
         max_segments: caps.max_segments.min(max_segments),
         max_datagram: caps.max_datagram,
         max_bytes: u32::MAX,
+        epoch: None,
     };
     let mut sink = backend.sink(key);
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer)

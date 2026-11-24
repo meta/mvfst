@@ -212,6 +212,8 @@ pub(crate) trait FrameSource {
 pub(crate) struct SendCx<'a> {
     /// The time of the attempt.
     pub(crate) now: Instant,
+    /// When the packet leaves: its run's release, `now` or later.
+    pub(crate) release: Instant,
     /// The packet's space.
     pub(crate) space: Space,
     /// The packet's path: the current one, or the alternate one, which takes only Path frames.
@@ -591,6 +593,7 @@ mod tests {
         let mut sent = Vec::new();
         let mut cx = SendCx {
             now: test_epoch() + Duration::from_millis(5),
+            release: test_epoch() + Duration::from_millis(5),
             space,
             path: crate::PathId(0),
             probes_due: 1,
@@ -674,6 +677,7 @@ mod tests {
         let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
         let mut cx = SendCx {
             now: test_epoch(),
+            release: test_epoch(),
             space: Space::Handshake,
             path: crate::PathId(0),
             probes_due: 0,
@@ -729,6 +733,7 @@ mod tests {
         let mut sent = Vec::new();
         let cx = SendCx {
             now: test_epoch(),
+            release: test_epoch(),
             space: Space::Data,
             path: crate::PathId(0),
             probes_due: 0,
@@ -828,6 +833,7 @@ mod tests {
         let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
         let mut cx = SendCx {
             now: test_epoch(),
+            release: test_epoch(),
             space: Space::Data,
             path: crate::PathId(0),
             probes_due: 0,
@@ -882,6 +888,7 @@ mod tests {
         let mut sent = Vec::new();
         let mut cx = SendCx {
             now: test_epoch(),
+            release: test_epoch(),
             space: Space::Data,
             path: crate::PathId(0),
             probes_due: 0,
@@ -953,6 +960,7 @@ mod tests {
         let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
         let mut cx = SendCx {
             now: test_epoch(),
+            release: test_epoch(),
             space: Space::Data,
             path: crate::PathId(0),
             probes_due: 0,

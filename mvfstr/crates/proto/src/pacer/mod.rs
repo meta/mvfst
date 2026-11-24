@@ -9,8 +9,7 @@
 //!
 //! The clock has a burst credit, never releases a run before `now` or the previous release,
 //! restarts after idle and takes its rate, which sizes its runs, from the congestion controller.
-//! Its next release time is behind `Stop::Pacing(t)` and `TxOutcome::pacing_at`. The connection
-//! holds packets back for the pacer by not building them.
+//! Its next release time is behind `Stop::Pacing(t)` and `TxOutcome::pacing_at`.
 //!
 //! Runs follow mvfst BBR3's pacing arithmetic: N datagrams every T, from the rate r, the datagram
 //! size D, the pacing granularity and the minimum and maximum bursts. Per path, with `v` the
@@ -63,6 +62,8 @@ pub struct Pacer {
     clock: Option<Instant>,
     /// The latest release stamped, paced or not; the next release is never earlier.
     last_release: Option<Instant>,
+    /// The latest release of a run with paced bytes.
+    last_paced: Option<Instant>,
 }
 
 impl Pacer {
@@ -79,6 +80,7 @@ impl Pacer {
             credit: Duration::ZERO,
             clock: None,
             last_release: None,
+            last_paced: None,
         };
         pacer.set_rate(rate);
         pacer
@@ -134,8 +136,15 @@ impl Pacer {
         if paced_bytes > 0 {
             let clock = self.clock.map_or(release, |clock| clock.max(release));
             self.clock = Some(clock + self.duration_of(paced_bytes));
+            self.last_paced = Some(release);
         }
         self.last_release = Some(self.last_release.map_or(release, |last| last.max(release)));
+    }
+
+    /// Returns whether paced bytes released later than `now` wait below the transport, which
+    /// draft-ietf-ccwg-bbr-07 counts in C.pending_transmissions.
+    pub fn has_pending(&self, now: Instant) -> bool {
+        self.last_paced.is_some_and(|release| release > now)
     }
 
     /// Stamps a paced run of `bytes` built at `now` and returns its release.
@@ -334,6 +343,29 @@ mod tests {
         assert_eq!(p.clock, Some(t0 + 31_944 * NS));
         p.on_paced(t0, 1452);
         assert_eq!(p.clock, Some(t0 + 32_670 * NS));
+    }
+
+    #[test]
+    fn a_run_is_debited_once_from_its_release_and_its_bytes_are_pending_until_then() {
+        let t0 = crate::recovery::test_epoch();
+        let (full, t) = (18 * 1452, 209 * US);
+        let mut p = Pacer::new(1452, tperf(), mbit(1000));
+        // A run released 100 µs ahead of the attempt that built it.
+        let release = t0 + 100 * US;
+        assert_eq!(p.next_release(t0), t0);
+        p.on_run(release, full);
+        assert_eq!(p.clock, Some(release + t));
+        assert!(p.has_pending(t0) && p.has_pending(release - NS));
+        assert!(!p.has_pending(release));
+        // An unpaced run waits for it but does not take tokens or leave bytes pending.
+        assert_eq!(p.unpaced_release(t0), release);
+        p.on_run(release, 0);
+        assert_eq!(p.clock, Some(release + t));
+        let later = t0 + 10 * t;
+        assert_eq!(p.unpaced_release(later), later);
+        p.on_run(later, 0);
+        assert!(!p.has_pending(t0 + t));
+        assert_eq!(p.next_release(later), later);
     }
 
     #[test]

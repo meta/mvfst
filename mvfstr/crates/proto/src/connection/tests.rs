@@ -131,6 +131,7 @@ pub(super) fn limits(now: Instant) -> TxLimits {
         max_segments: 16,
         max_datagram: 1500,
         max_bytes: u32::MAX,
+        epoch: None,
     }
 }
 

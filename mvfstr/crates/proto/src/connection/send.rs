@@ -23,6 +23,7 @@
 //! PADDING in the datagram's last packet; earlier packets leave room for the later ones.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 use std::time::Instant;
 
 use mvfstr_crypto::SealJob;
@@ -39,6 +40,7 @@ use mvfstr_wire::packet_number_len;
 use super::Connection;
 use super::MIN_DATAGRAM;
 use super::State;
+use crate::ClockEpoch;
 use crate::PathId;
 use crate::Release;
 use crate::SegmentSink;
@@ -65,6 +67,13 @@ use crate::transmit::admission::may_start;
 
 /// The alternate path, which carries only Path frames.
 const ALT_PATH: PathId = PathId(1);
+
+/// When a datagram is built, and when its run leaves.
+#[derive(Clone, Copy, Debug)]
+struct Times {
+    now: Instant,
+    release: Instant,
+}
 
 /// The candidate that starts a datagram; it fixes the datagram's path and first packet's space.
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +217,9 @@ impl Connection {
         let mut run: Option<Run> = None;
         let seg_max = self.mtu.min(lim.max_datagram);
         let pacing = PACES && self.pacing_active();
+        let horizon = self.horizon_within(lim);
+        // With a horizon, every run carries its release in the backend's clock.
+        let stamps = lim.epoch.filter(|_| !horizon.is_zero());
         loop {
             // A paced run holds the pacer's current burst: a send can change the rate (BBR3's
             // restart from idle) after the run opened. Only a pacing attempt opens paced runs.
@@ -216,7 +228,7 @@ impl Connection {
                     .as_ref()
                     .is_some_and(|open| open.is_full(self.pacer.burst()))
             {
-                self.end_run(sink, &mut run);
+                self.end_run(sink, &mut run, stamps);
             }
             let in_paced_run = pacing && run.as_ref().is_some_and(|open| open.paced);
             let joins = JoinLimits {
@@ -227,7 +239,7 @@ impl Connection {
                 pacing: if in_paced_run || !PACES {
                     None
                 } else {
-                    self.pacing_gate(lim.now)
+                    self.pacing_gate(lim.now, horizon)
                 },
             };
             let predict = pacing && !in_paced_run;
@@ -255,7 +267,7 @@ impl Connection {
             if let Some(&Run { path, paced, .. }) = run.as_ref()
                 && path != start.path
             {
-                self.end_run(sink, &mut run);
+                self.end_run(sink, &mut run, stamps);
                 if paced {
                     continue;
                 }
@@ -263,7 +275,7 @@ impl Connection {
             // A paced datagram never joins an unpaced run.
             let paced = predict && scan.paced && !self.probing();
             if paced {
-                self.end_run(sink, &mut run);
+                self.end_run(sink, &mut run, stamps);
             }
             if run.is_none() {
                 let room = lim.max_segments - out.datagrams;
@@ -294,7 +306,11 @@ impl Connection {
                 out.stop = Stop::Socket;
                 break;
             };
-            match self.build::<PACES, Z>(lim.now, start, joins, slot, buf, sealer) {
+            let times = Times {
+                now: lim.now,
+                release: run.as_ref().map_or(lim.now, |open| open.release),
+            };
+            match self.build::<PACES, Z>(times, start, joins, slot, buf, sealer) {
                 Outcome::Empty => {
                     sink.end_segment(0);
                     skipped.0[start.source.index()] = true;
@@ -318,17 +334,22 @@ impl Connection {
                     out.bytes += u32::from(len);
                     // A segment shorter than the slot ends its run (the sink's slot contract).
                     if len < seg_max {
-                        self.end_run(sink, &mut run);
+                        self.end_run(sink, &mut run, stamps);
                     }
                 }
             }
         }
-        self.end_run(sink, &mut run);
+        self.end_run(sink, &mut run, stamps);
         if out.datagrams == 0 && skipped.any() {
             out.stop = Stop::Inconsistent;
         }
         self.app_limited = self.is_app_limited(out.stop);
-        if self.recovery.takes_rate_samples() && self.limited_by_app() {
+        // Paced bytes that the backend still holds are pending transmissions, which keep the
+        // connection from being marked application-limited, as in draft-ietf-ccwg-bbr-07.
+        if self.recovery.takes_rate_samples()
+            && self.limited_by_app()
+            && !self.pacer.has_pending(lim.now)
+        {
             self.recovery.mark_app_limited();
         }
         // Unless sealing failed, an attempt that did not send a datagram must not change the
@@ -352,7 +373,7 @@ impl Connection {
         let joins = JoinLimits {
             skipped: Skipped::default(),
             grant: u64::from(self.mtu.min(lim.max_datagram)) <= u64::from(lim.max_bytes),
-            pacing: self.pacing_gate(lim.now),
+            pacing: self.pacing_gate(lim.now, self.horizon_within(lim)),
         };
         let scan = self.scan(lim.now, PathId(0), joins, false, Some(&mut detail));
         let (stop, pacing_at) = self.classify(&scan.blocked);
@@ -392,7 +413,8 @@ impl Connection {
             if self.spaces[space.index()].discarded || self.header_dcid(space, path).is_none() {
                 continue;
             }
-            let cx = self.send_cx(now, space, path, &mut scratch);
+            let times = Times { now, release: now };
+            let cx = self.send_cx(times, space, path, &mut scratch);
             for id in SourceId::ORDER {
                 if joins.skipped.contains(id) || !self.source_active(id, path, &cx.packet) {
                     continue;
@@ -494,13 +516,14 @@ impl Connection {
     /// Returns the context of an empty packet in `space` on `path`.
     fn send_cx<'a>(
         &self,
-        now: Instant,
+        times: Times,
         space: Space,
         path: PathId,
         sent: &'a mut Vec<crate::recovery::SentFrame>,
     ) -> SendCx<'a> {
         SendCx {
-            now,
+            now: times.now,
+            release: times.release,
             space,
             path,
             probes_due: self.recovery.probes_due(space),
@@ -551,13 +574,25 @@ impl Connection {
             && self.cc.pacing_ready()
     }
 
-    /// Returns the pacer's next release, if it holds paced candidates back at `now`.
-    fn pacing_gate(&self, now: Instant) -> Option<Instant> {
+    /// Returns the build horizon of an attempt within `lim`: H_conn, or zero without the backend's
+    /// clock epoch, which a connection with a horizon needs (`poll_transmit` debug-asserts it).
+    fn horizon_within(&self, lim: &TxLimits) -> Duration {
+        if lim.epoch.is_some() {
+            self.horizon
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Returns when paced candidates may start again, if the pacer holds them back at `now`: the
+    /// next release less `horizon`, since a run is built once its release is at most `horizon`
+    /// away.
+    fn pacing_gate(&self, now: Instant, horizon: Duration) -> Option<Instant> {
         if !self.pacing_active() {
             return None;
         }
         let release = self.pacer.next_release(now);
-        (release > now).then_some(release)
+        (release > now + horizon).then(|| release - horizon)
     }
 
     /// Returns whether probes are due in any space, which the next datagram would carry.
@@ -595,7 +630,7 @@ impl Connection {
     /// one needs.
     fn plan(
         &self,
-        now: Instant,
+        times: Times,
         start: StartCand,
         joins: JoinLimits,
         room: u64,
@@ -609,7 +644,7 @@ impl Connection {
             if !self.has_keys(space) || self.header_dcid(space, start.path).is_none() {
                 continue;
             }
-            let cx = self.send_cx(now, space, start.path, &mut scratch);
+            let cx = self.send_cx(times, space, start.path, &mut scratch);
             let gate = self.join_gate(space, room, joins);
             let probe = cx.probes_due > 0;
             let smallest = SourceId::ORDER
@@ -634,7 +669,7 @@ impl Connection {
     /// Builds one datagram into `buf` and commits it once sealed, with `PACES` as in `attempt`.
     fn build<const PACES: bool, Z: Sealer>(
         &mut self,
-        now: Instant,
+        times: Times,
         start: StartCand,
         joins: JoinLimits,
         slot: SlotId,
@@ -645,7 +680,7 @@ impl Connection {
             .unwrap_or(usize::MAX)
             .min(buf.len());
         let buf = &mut buf[..room];
-        let plan = self.plan(now, start, joins, room as u64);
+        let plan = self.plan(times, start, joins, room as u64);
         let planned = |space: Space| plan[space.index()].is_some();
         let mut built: [Option<Built>; 3] = [None; 3];
         let mut pos = 0;
@@ -685,7 +720,8 @@ impl Connection {
             let mut sent = std::mem::take(&mut self.sent_frames[space.index()]);
             sent.clear();
             let mut cx = SendCx {
-                now,
+                now: times.now,
+                release: times.release,
                 space,
                 path: start.path,
                 probes_due: gate.probes_due,
@@ -740,18 +776,19 @@ impl Connection {
         if pos == 0 {
             return Outcome::Empty;
         }
-        self.commit::<PACES, Z>(now, start.path, slot, buf, &built, pos, sealer)
+        self.commit::<PACES, Z>(times, start.path, slot, buf, &built, pos, sealer)
     }
 
     /// Seals the datagram's packets, then records them: packet numbers, sent-frame records, the
-    /// frames each source no longer has to send, the credit of `path` and the idle timer.
+    /// frames each source no longer has to send, the credit of `path` and the idle timer. Loss
+    /// recovery and congestion control take the packets as sent at their run's release.
     #[expect(
         clippy::too_many_arguments,
         reason = "one call site, all inputs of the datagram"
     )]
     fn commit<const PACES: bool, Z: Sealer>(
         &mut self,
-        now: Instant,
+        times: Times,
         path: PathId,
         slot: SlotId,
         buf: &mut [u8],
@@ -817,11 +854,11 @@ impl Connection {
                 .contains(SentFlags::IN_FLIGHT)
                 .then(|| self.recovery.bytes_in_flight());
             self.recovery
-                .on_packet_sent(packet.space, packet.pn, now, size, flags, tx)
+                .on_packet_sent(packet.space, packet.pn, times.release, size, flags, tx)
                 .expect("should record the packet number it peeked");
             if let Some(bytes_in_flight) = in_flight_before {
                 self.cc.on_sent(&SentEvent {
-                    time_sent: now,
+                    time_sent: times.release,
                     bytes_in_flight,
                     size,
                     total_sent: self.recovery.total_sent(),
@@ -845,6 +882,7 @@ impl Connection {
             self.refresh_pacing_rate();
         }
         self.stats.sent_bytes += len as u64;
+        let now = times.now;
         self.charge_path(now, path, len, challenge);
         // The first ack-eliciting packet sent after a received one restarts the idle timer
         // (RFC 9000).
@@ -865,8 +903,13 @@ impl Connection {
     }
 
     /// Closes the open run, if any, with its metadata, and debits the pacer once with its paced
-    /// bytes.
-    fn end_run<S: SegmentSink>(&mut self, sink: &mut S, run: &mut Option<Run>) {
+    /// bytes. With `stamps`, the run carries its release in the backend's clock.
+    fn end_run<S: SegmentSink>(
+        &mut self,
+        sink: &mut S,
+        run: &mut Option<Run>,
+        stamps: Option<ClockEpoch>,
+    ) {
         let Some(run) = run.take() else {
             return;
         };
@@ -881,7 +924,9 @@ impl Connection {
             tos: 0,
             segment_size: run.segment_size,
             segments: run.segments,
-            release: Release::Asap,
+            release: stamps.map_or(Release::Asap, |epoch| {
+                Release::At(epoch.tick_at(run.release))
+            }),
             class: run.class,
             tx: TxSeqRange {
                 start: run.first_tx,

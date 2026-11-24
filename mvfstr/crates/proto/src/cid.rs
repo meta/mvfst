@@ -882,6 +882,7 @@ mod tests {
     fn send_cx(sent: &mut Vec<SentFrame>) -> SendCx<'_> {
         SendCx {
             now: crate::recovery::test_epoch(),
+            release: crate::recovery::test_epoch(),
             space: Space::Data,
             path: crate::PathId(0),
             probes_due: 0,

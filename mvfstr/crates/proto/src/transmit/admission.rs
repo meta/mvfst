@@ -69,7 +69,8 @@ pub(crate) struct Gate {
     pub(crate) bytes_in_flight: u64,
     /// The congestion window.
     pub(crate) cwnd: u64,
-    /// When the pacer releases the next packet, if it holds it now.
+    /// When an attempt can build the next paced run, if the pacer holds it now: its release
+    /// less the build horizon.
     pub(crate) pacing: Option<Instant>,
     /// Connection flow control credit for new stream bytes.
     pub(crate) conn_credit: u64,
@@ -86,7 +87,7 @@ pub(crate) enum Block {
     KeysPending,
     /// The congestion window is full.
     Cwnd,
-    /// The pacer releases the packet at this time.
+    /// The pacer holds the packet until this time, its release less the build horizon.
     Pacing(Instant),
     /// Connection credit for new stream bytes is used up.
     ConnFlowControl,
@@ -203,7 +204,7 @@ impl Blocked {
         }
     }
 
-    /// Returns the earliest release of any pacing-blocked candidate, whatever the stop.
+    /// Returns when an attempt can next build a pacing-blocked candidate, whatever the stop.
     pub(crate) fn pacing_at(&self) -> Option<Instant> {
         self.pacing
     }

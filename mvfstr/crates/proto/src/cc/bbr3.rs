@@ -1251,13 +1251,20 @@ impl Bbr3 {
         self.bdp_multiple(self.bw, 100).min(self.window.cwnd)
     }
 
+    /// Returns the offload budget: three send quanta plus the pacing rate times the pacing horizon.
+    pub(crate) fn offload_budget(&self) -> u64 {
+        (OFFLOAD_SEND_QUANTA * self.send_quantum)
+            .saturating_add(bdp(self.pacing_rate, self.horizon))
+    }
+
     /// Returns `inflight_cap` with the draft's QuantizationBudget(), using an offload budget of
     /// three send quanta plus the pacing rate times the pacing horizon.
     fn quantization_budget(&self, inflight_cap: u64) -> u64 {
-        let offload = OFFLOAD_SEND_QUANTA * self.send_quantum + bdp(self.pacing_rate, self.horizon);
-        let budget = inflight_cap.max(offload).max(self.min_pipe_cwnd());
+        let budget = inflight_cap
+            .max(self.offload_budget())
+            .max(self.min_pipe_cwnd());
         if self.state == State::ProbeBwUp {
-            budget + 2 * self.window.mss
+            budget.saturating_add(2 * self.window.mss)
         } else {
             budget
         }
@@ -1302,6 +1309,11 @@ impl Bbr3 {
     #[cfg(test)]
     pub(crate) fn pacing_inputs(&self) -> (Duration, Duration) {
         (self.granularity, self.horizon)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_quantum(&self) -> u64 {
+        self.send_quantum
     }
 
     #[cfg(test)]

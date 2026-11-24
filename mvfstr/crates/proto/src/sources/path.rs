@@ -280,6 +280,7 @@ mod tests {
         let mut sent = Vec::new();
         let mut cx = SendCx {
             now: test_epoch(),
+            release: test_epoch(),
             space: Space::Data,
             path: PathId(slot as u16),
             probes_due: 0,

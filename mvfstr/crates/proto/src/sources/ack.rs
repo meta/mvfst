@@ -129,12 +129,13 @@ impl AckSource {
         (self.due, self.rearmed)
     }
 
-    /// Returns the fields of the ACK frame sent at `cx.now` besides the older ranges: the largest
-    /// range, the ACK Delay and the ECN counts; `None` if the space has not received a packet.
+    /// Returns the fields of the ACK frame released at `cx.release` besides the older ranges: the
+    /// largest range, the ACK Delay and the ECN counts; `None` before the space receives a packet.
     fn fields(&self, cx: &SendCx<'_>) -> Option<AckFields> {
         let largest = self.received.ranges().next()?;
         // The time since the largest packet arrived, in units of 2^ack_delay_exponent microseconds.
-        let micros = u64::try_from(self.received.ack_delay(cx.now).as_micros()).unwrap_or(u64::MAX);
+        let micros =
+            u64::try_from(self.received.ack_delay(cx.release).as_micros()).unwrap_or(u64::MAX);
         let delay = VarInt::from_u64(micros >> cx.ack_delay_exponent).unwrap_or(VarInt::MAX);
         let counts = self.received.ecn_counts();
         let ecn = (counts.ect0 + counts.ect1 + counts.ce > 0).then(|| EcnCounts {

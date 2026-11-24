@@ -315,6 +315,7 @@ mod tests {
     fn cx(now: Instant, sent: &mut Vec<SentFrame>) -> SendCx<'_> {
         SendCx {
             now,
+            release: now,
             space: Space::Data,
             path: crate::PathId(0),
             probes_due: 0,
