@@ -55,6 +55,8 @@ use mvfstr_proto::RxDropReason;
 use mvfstr_proto::RxMeta;
 use mvfstr_proto::SegmentSink;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::SrcPortBlocklist;
+use mvfstr_proto::SrcPortDrops;
 use mvfstr_proto::StatelessReply;
 use mvfstr_proto::Stop;
 use mvfstr_proto::StreamId;
@@ -252,6 +254,9 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     sent_packets: Cell<u64>,
     sent_datagrams: Cell<u64>,
     phase_pacing_wakes: Cell<u64>,
+    /// The endpoint's count of datagrams dropped for their source port, read without borrowing
+    /// the endpoint, because a certificate resolver running inside it may read the counters.
+    src_port_drops: SrcPortDrops,
     /// The counters as the driver ends, for its handles to read afterwards.
     last: Rc<Cell<EndpointStats>>,
     /// Set by [`EndpointHandle::abort`](crate::EndpointHandle::abort): the next turn ends the
@@ -495,6 +500,10 @@ pub struct EndpointStats {
     pub sent_datagrams: u64,
     /// Pacing wakes taken inside transmit phases, between attempts.
     pub phase_pacing_wakes: u64,
+    /// Datagrams dropped without a reply for a blocklisted source port: those for unknown
+    /// connections, and those that would have moved a server connection to a blocked port
+    /// (mvfst's `INVALID_SRC_PORT`).
+    pub invalid_src_port: u64,
 }
 
 /// A graceful shutdown in progress. A step's time is `None` once the step is taken, or when it lies
@@ -630,6 +639,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             .and_then(|server| handoff_lifetime(server.config().transport()));
         let steering =
             steering.map(|(group, index)| group.join(index, Arc::clone(&shared), lifetime));
+        let src_port_drops = endpoint.src_port_drops();
         Self {
             worker: worker.clone(),
             shared,
@@ -677,6 +687,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sent_packets: Cell::new(0),
             sent_datagrams: Cell::new(0),
             phase_pacing_wakes: Cell::new(0),
+            src_port_drops,
             last: Rc::default(),
             aborted: Cell::new(false),
             pull_ids: RefCell::new(Vec::new()),
@@ -857,7 +868,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sent_packets: self.sent_packets.get(),
             sent_datagrams: self.sent_datagrams.get(),
             phase_pacing_wakes: self.phase_pacing_wakes.get(),
+            invalid_src_port: self.src_port_drops.get(),
         }
+    }
+
+    /// Replaces the source ports the endpoint refuses.
+    pub(crate) fn set_src_port_blocklist(&self, blocklist: Option<Arc<SrcPortBlocklist>>) {
+        self.endpoint.borrow_mut().set_src_port_blocklist(blocklist);
     }
 
     /// Returns where the counters are kept once the driver has ended.
@@ -2254,6 +2271,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let Some(incoming) = self.sched.borrow_mut().kept_accept.take() else {
             return;
         };
+        // A blocklist posted since the attempt was routed applies to it.
+        let Some(incoming) = self.endpoint.borrow().recheck_src_port(incoming) else {
+            return;
+        };
         let now = self.clock();
         if !self.gate(UnitKind::Accept, Some(now)) {
             self.sched.borrow_mut().kept_accept = Some(incoming);
@@ -2495,6 +2516,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 );
             }
             Ok(Err(Refusal::Ignore)) => return None,
+            Ok(Err(Refusal::VersionNegotiation)) => {
+                return self
+                    .endpoint
+                    .borrow_mut()
+                    .refuse_by_negotiation(now, incoming);
+            }
             Err(payload) => {
                 self.contain(ContainedPanicScope::Connection, "accept", payload);
                 return None;

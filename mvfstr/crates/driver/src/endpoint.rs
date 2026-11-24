@@ -29,6 +29,7 @@ use mvfstr_proto::ConnectError;
 use mvfstr_proto::Endpoint;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::SrcPortBlocklist;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::worker::CleanupRegistrationError;
 use roxygen_runtime::worker::WorkerContext;
@@ -299,6 +300,15 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
             )));
         };
         core.connect(remote, server_name, config, options, session)
+    }
+
+    /// Replaces the source ports the driver's endpoint refuses, as
+    /// [`Endpoint::set_src_port_blocklist`] describes; the next connection attempt is checked
+    /// against it. Once the driver has stopped, the call is ignored.
+    pub fn set_src_port_blocklist(&self, blocklist: Option<Arc<SrcPortBlocklist>>) {
+        if let Some(core) = self.core.upgrade() {
+            core.set_src_port_blocklist(blocklist);
+        }
     }
 
     /// Returns the driver's counters, or their last values once the driver has finished.

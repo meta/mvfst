@@ -40,6 +40,10 @@ pub enum Refusal {
     Refuse,
     /// Drop the Initial silently.
     Ignore,
+    /// Answer with Version Negotiation that lists only
+    /// [`MVFST_INVALID`](mvfstr_proto::MVFST_INVALID), so the client does not find a version in
+    /// common and gives up.
+    VersionNegotiation,
 }
 
 /// The application of one endpoint driver: it decides which connections to accept and creates

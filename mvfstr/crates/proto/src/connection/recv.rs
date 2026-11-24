@@ -116,9 +116,15 @@ impl Connection {
             }
             self.stats.recv_bytes += len;
             // As RFC 9000 requires, a client takes packets only from the server's address, and a
-            // peer does not migrate before the handshake is confirmed.
+            // peer does not migrate before the handshake is confirmed. A server also refuses a move
+            // to a source port the endpoint blocks.
             let stranger = datagram.meta.src != self.remote
-                && (self.side == Side::Client || !self.handshake.confirmed);
+                && (self.side == Side::Client
+                    || !self.handshake.confirmed
+                    || self
+                        .src_ports
+                        .as_ref()
+                        .is_some_and(|ports| ports.refuses(datagram.meta.src.port())));
             if self.state == State::Drained || stranger {
                 summary.dropped += 1;
                 continue;

@@ -27,6 +27,10 @@ use std::fmt;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -124,6 +128,87 @@ pub enum RxDropReason {
     RateLimited,
     /// A short-header packet for an unknown connection ID that names another worker.
     OtherWorker,
+    /// A datagram for an unknown connection from a source port on the endpoint's
+    /// [`SrcPortBlocklist`].
+    InvalidSrcPort,
+}
+
+/// The source ports a server does not accept connections from or move connections to: every port
+/// below a bound, and a sorted list of others. The endpoint checks the list before it routes a
+/// datagram for an unknown connection, and a server connection checks it when its peer's address
+/// changes, so a connection accepted before an update keeps its port. mvfst servers block such
+/// ports, typically those of well-known services, so that a spoofed source address cannot aim their
+/// replies at a service.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SrcPortBlocklist {
+    below: u16,
+    select: Box<[u16]>,
+}
+
+impl SrcPortBlocklist {
+    /// Returns a list that blocks every port below `below` and each port in `select`.
+    pub fn new(below: u16, select: impl IntoIterator<Item = u16>) -> Self {
+        let mut select: Vec<u16> = select.into_iter().filter(|&port| port >= below).collect();
+        select.sort_unstable();
+        select.dedup();
+        Self {
+            below,
+            select: select.into(),
+        }
+    }
+
+    /// Returns whether `port` is blocked.
+    pub fn blocks(&self, port: u16) -> bool {
+        port < self.below || self.select.binary_search(&port).is_ok()
+    }
+}
+
+/// The source port blocklist an endpoint has in force and the count of datagrams dropped under it.
+/// Each server connection the endpoint accepts shares it and checks it when its peer's address
+/// changes, so a list posted after the accept applies to that connection too.
+#[derive(Debug, Default)]
+pub(crate) struct SrcPortState {
+    list: Mutex<Option<Arc<SrcPortBlocklist>>>,
+    drops: AtomicU64,
+}
+
+impl SrcPortState {
+    /// Returns whether the list in force blocks `port`, and counts the datagram from it as
+    /// dropped if so.
+    pub(crate) fn refuses(&self, port: u16) -> bool {
+        let blocked = self
+            .list
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|list| list.blocks(port));
+        if blocked {
+            self.count_drop();
+        }
+        blocked
+    }
+
+    fn set(&self, blocklist: Option<Arc<SrcPortBlocklist>>) {
+        *self.list.lock().unwrap_or_else(PoisonError::into_inner) = blocklist;
+    }
+
+    fn count_drop(&self) {
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A handle, from [`Endpoint::src_port_drops`], to the count of datagrams an endpoint dropped for
+/// their source port: those dropped as [`RxDropReason::InvalidSrcPort`], and those that would have
+/// moved one of its server connections to a blocked port. [`get`](Self::get) reads the live count,
+/// also while the endpoint is in use.
+#[derive(Clone, Debug)]
+pub struct SrcPortDrops(Arc<SrcPortState>);
+
+impl SrcPortDrops {
+    /// Returns the count.
+    pub fn get(&self) -> u64 {
+        self.0.drops.load(Ordering::Relaxed)
+    }
 }
 
 /// An Initial that may start a connection, from [`Route::Accept`]. It holds what
@@ -174,6 +259,8 @@ pub enum StatelessKind {
     Reset,
     /// An Initial carrying CONNECTION_CLOSE, refusing a connection.
     Refusal,
+    /// "OK", the answer to the endpoint's health check token.
+    HealthCheck,
 }
 
 /// A datagram to send without a connection.
@@ -291,6 +378,11 @@ pub struct Endpoint {
     /// The longest the backend holds a datagram until its release; zero without release
     /// support.
     release_horizon: Duration,
+    /// The source port blocklist in force, which `route` checks once both lookups miss.
+    src_ports: Option<Arc<SrcPortBlocklist>>,
+    /// The same list and the drop count, shared with the server connections, which check the list
+    /// when their peer moves.
+    shared_src_ports: Arc<SrcPortState>,
 }
 
 /// A token bucket for stateless replies: RFC 9000 lets a server limit the Version Negotiation
@@ -322,6 +414,13 @@ impl ReplyLimiter {
     }
 }
 
+/// The version that mvfst lists alone in Version Negotiation to refuse a connection; endpoints do
+/// not support it.
+pub const MVFST_INVALID: Version = Version(0xface_b00f);
+
+/// The datagram a server answers its health check token with.
+pub(crate) const HEALTH_CHECK_ANSWER: &[u8] = b"OK";
+
 /// How many random connection IDs to try before giving up; only zero-length IDs or a broken
 /// random source get there.
 pub(crate) const CID_ATTEMPTS: usize = 16;
@@ -347,6 +446,8 @@ impl Endpoint {
             token_of: HashMap::new(),
             limiter: ReplyLimiter::default(),
             release_horizon: Duration::ZERO,
+            src_ports: None,
+            shared_src_ports: Arc::default(),
         }
     }
 
@@ -367,8 +468,13 @@ impl Endpoint {
         {
             return Route::Existing(key);
         }
+        // The check runs only on a miss. A known connection checks the list only when its peer
+        // moves, and drops what would move it to a blocked port.
+        if self.refuses_src_port(meta.src.port()) {
+            return Route::Drop(RxDropReason::InvalidSrcPort);
+        }
         let Ok(header) = header else {
-            return Route::Drop(RxDropReason::Malformed);
+            return self.health_check(meta, datagram);
         };
         match header {
             Header::Protected(h) if h.ty() == PacketType::Initial => {
@@ -423,6 +529,21 @@ impl Endpoint {
         }
     }
 
+    /// Answers the health check token, a datagram that is not a QUIC packet, with "OK", and drops
+    /// anything else that does not parse. The answer is no longer than the token, so it does not
+    /// need a rate limit.
+    fn health_check(&self, meta: &RxMeta, datagram: &[u8]) -> Route {
+        if self.server.is_none() || self.config.health_check_token() != Some(datagram) {
+            return Route::Drop(RxDropReason::Malformed);
+        }
+        Route::Stateless(StatelessReply {
+            dst: meta.src,
+            src_ip: meta.dst_ip,
+            kind: StatelessKind::HealthCheck,
+            datagram: Bytes::from_static(HEALTH_CHECK_ANSWER),
+        })
+    }
+
     /// Answers a long-header packet of a version this server does not accept with Version
     /// Negotiation (RFC 9000). Only a datagram large enough for an Initial is answered, so the
     /// reply never amplifies.
@@ -444,19 +565,10 @@ impl Endpoint {
             return Route::Drop(RxDropReason::RateLimited);
         }
         let versions = server.versions();
-        let mut out = vec![0; 7 + dcid.len() + scid.len() + 4 * versions.len()];
-        // The reply swaps the packet's connection IDs, as RFC 9000 requires; its unused bits are
-        // arbitrary.
-        let Ok(written) = encode_version_negotiation(&mut out, 0x2a, scid, dcid, versions) else {
-            return Route::Drop(RxDropReason::Malformed);
-        };
-        out.truncate(written);
-        Route::Stateless(StatelessReply {
-            dst: meta.src,
-            src_ip: meta.dst_ip,
-            kind: StatelessKind::VersionNegotiation,
-            datagram: Bytes::from(out),
-        })
+        match version_negotiation(meta, dcid, scid, versions) {
+            Some(reply) => Route::Stateless(reply),
+            None => Route::Drop(RxDropReason::Malformed),
+        }
     }
 
     /// Answers a short-header packet for an unknown connection ID with a stateless reset: a short
@@ -495,6 +607,43 @@ impl Endpoint {
         self.release_horizon = horizon;
     }
 
+    /// Replaces the source ports the endpoint refuses; with `None`, the default, it does not refuse
+    /// any. A datagram from a blocked port for an unknown connection is dropped, so it does not
+    /// start a connection or get a reply. A server connection, whenever accepted, checks the list
+    /// in force when its peer's address changes and drops datagrams that would move it to a blocked
+    /// port; those from its current address are not checked.
+    pub fn set_src_port_blocklist(&mut self, blocklist: Option<Arc<SrcPortBlocklist>>) {
+        self.shared_src_ports.set(blocklist.clone());
+        self.src_ports = blocklist;
+    }
+
+    /// Returns a handle whose [`SrcPortDrops::get`] reads the count of datagrams dropped for their
+    /// source port.
+    pub fn src_port_drops(&self) -> SrcPortDrops {
+        SrcPortDrops(Arc::clone(&self.shared_src_ports))
+    }
+
+    /// Checks a connection attempt that [`route`](Self::route) returned before the latest
+    /// [`set_src_port_blocklist`](Self::set_src_port_blocklist) against the list in force:
+    /// returns it unless its source port is blocked, in which case it is dropped and counted as
+    /// [`RxDropReason::InvalidSrcPort`].
+    pub fn recheck_src_port(&self, incoming: Incoming) -> Option<Incoming> {
+        (!self.refuses_src_port(incoming.meta.src.port())).then_some(incoming)
+    }
+
+    /// Returns whether the list in force blocks `port`, and counts the datagram from it as
+    /// dropped if so.
+    fn refuses_src_port(&self, port: u16) -> bool {
+        let blocked = self
+            .src_ports
+            .as_ref()
+            .is_some_and(|ports| ports.blocks(port));
+        if blocked {
+            self.shared_src_ports.count_drop();
+        }
+        blocked
+    }
+
     /// Creates and routes the server connection for an Initial, to be stored by the driver under
     /// `key`. Fails with [`AcceptError::Undecryptable`] unless a packet of its datagram decrypts.
     pub fn accept<R: Random>(
@@ -529,6 +678,7 @@ impl Endpoint {
             cids: self.cids.clone(),
             rng_seed,
             horizon: self.config.build_horizon().min(self.release_horizon),
+            src_ports: Some(Arc::clone(&self.shared_src_ports)),
         };
         let mut conn = Connection::server(setup, config.tls().clone(), without_alpn.cloned())
             .map_err(|e| AcceptError::Tls(rustls_error(e)))?;
@@ -589,6 +739,7 @@ impl Endpoint {
             rng_seed,
             // The client's socket is not the endpoint's, so its release support is unknown.
             horizon: Duration::ZERO,
+            src_ports: None,
         };
         let conn = Connection::client(setup, config.tls().clone(), server_name)
             .map_err(|e| ConnectError::Tls(rustls_error(e)))?;
@@ -640,6 +791,24 @@ impl Endpoint {
             kind: StatelessKind::Refusal,
             datagram: Bytes::from(out),
         })
+    }
+
+    /// Refuses an Initial with Version Negotiation that lists only [`MVFST_INVALID`], so the client
+    /// does not find a version in common and gives up. Subject to the stateless reply rate limit.
+    pub fn refuse_by_negotiation(
+        &mut self,
+        now: Instant,
+        incoming: Incoming,
+    ) -> Option<StatelessReply> {
+        if !self.limiter.allow(now) {
+            return None;
+        }
+        version_negotiation(
+            &incoming.meta,
+            &incoming.dcid,
+            &incoming.scid,
+            &[MVFST_INVALID],
+        )
     }
 
     /// Applies a routing change reported by the connection stored under `key`.
@@ -707,6 +876,27 @@ impl Endpoint {
     pub(crate) fn route_count(&self) -> usize {
         self.routes.len()
     }
+}
+
+/// Returns a Version Negotiation packet listing `versions` that answers a long header with
+/// connection IDs `dcid` and `scid`, or `None` if an ID is too long to encode.
+fn version_negotiation(
+    meta: &RxMeta,
+    dcid: &[u8],
+    scid: &[u8],
+    versions: &[Version],
+) -> Option<StatelessReply> {
+    let mut out = vec![0; 7 + dcid.len() + scid.len() + 4 * versions.len()];
+    // The reply swaps the packet's connection IDs, as RFC 9000 requires; its unused bits are
+    // arbitrary.
+    let written = encode_version_negotiation(&mut out, 0x2a, scid, dcid, versions).ok()?;
+    out.truncate(written);
+    Some(StatelessReply {
+        dst: meta.src,
+        src_ip: meta.dst_ip,
+        kind: StatelessKind::VersionNegotiation,
+        datagram: Bytes::from(out),
+    })
 }
 
 /// Returns the rustls error behind a failure to create a TLS session.
@@ -1379,6 +1569,238 @@ mod tests {
                 initiator: Initiator::Peer,
             })
         );
+    }
+
+    #[test]
+    fn a_blocklist_blocks_the_ports_below_its_bound_and_those_it_selects() {
+        // A typical setting: every port below 1,024, and 1,024 itself selected.
+        let production = SrcPortBlocklist::new(1024, [1024]);
+        for port in [0, 53, 1023, 1024] {
+            assert!(production.blocks(port), "{port}");
+        }
+        for port in [1025, 4433, 50_000, u16::MAX] {
+            assert!(!production.blocks(port), "{port}");
+        }
+        let unsorted = SrcPortBlocklist::new(0, [8080, 443, 8080, 53]);
+        for port in [53, 443, 8080] {
+            assert!(unsorted.blocks(port), "{port}");
+        }
+        for port in [0, 54, 444, 8079, 8081] {
+            assert!(!unsorted.blocks(port), "{port}");
+        }
+        assert!(!SrcPortBlocklist::default().blocks(0), "blocks nothing");
+    }
+
+    /// Returns the metadata of a datagram from `port` of the client's IP.
+    fn from_port(now: Instant, port: u16) -> RxMeta {
+        RxMeta {
+            src: SocketAddr::new(client_addr().ip(), port),
+            ..meta(now)
+        }
+    }
+
+    #[test]
+    fn an_initial_from_a_blocklisted_source_port_starts_no_connection() {
+        let now = test_epoch();
+        let setup = Setup::default();
+        let mut endpoint = server(&setup);
+        let (_, datagram) = client(&setup, now);
+        endpoint.set_src_port_blocklist(Some(Arc::new(SrcPortBlocklist::new(1024, [1024]))));
+        for port in [53, 1024] {
+            let route = endpoint.route(now, &from_port(now, port), &datagram);
+            assert!(
+                matches!(route, Route::Drop(RxDropReason::InvalidSrcPort)),
+                "{port}: {route:?}"
+            );
+        }
+        incoming(endpoint.route(now, &from_port(now, 1025), &datagram));
+    }
+
+    /// Returns a server endpoint whose health check token is `token`; proxygen's is "health".
+    fn health_checked(token: &[u8]) -> Endpoint {
+        let config = EndpointConfig::builder([7; 32])
+            .health_check_token(Bytes::copy_from_slice(token))
+            .build()
+            .unwrap();
+        Endpoint::new(config, Some(Setup::default().pair().server))
+    }
+
+    #[test]
+    fn the_health_check_token_is_answered_with_ok() {
+        let now = test_epoch();
+        let mut endpoint = health_checked(b"health");
+        let answer = reply(endpoint.route(now, &meta(now), b"health"));
+        assert_eq!(answer.kind(), StatelessKind::HealthCheck);
+        assert_eq!(answer.dst(), client_addr());
+        assert_eq!(answer.src_ip(), Some(server_addr().ip()));
+        assert_eq!(answer.datagram(), b"OK", "the two bytes mvfst sends");
+
+        for other in [&b"healt"[..], b"healthy", b"HEALTH"] {
+            let route = endpoint.route(now, &meta(now), other);
+            assert!(
+                matches!(route, Route::Drop(RxDropReason::Malformed)),
+                "{other:?}: {route:?}"
+            );
+        }
+        let mut unchecked = server(&Setup::default());
+        assert!(matches!(
+            unchecked.route(now, &meta(now), b"health"),
+            Route::Drop(RxDropReason::Malformed)
+        ));
+        // Only a datagram that does not parse is a health check: a token that parses as a short
+        // header for an unknown connection gets the stateless reset any such packet gets.
+        let parses = short_header([1; 8], 100);
+        let answer = reply(health_checked(&parses).route(now, &meta(now), &parses));
+        assert_eq!(answer.kind(), StatelessKind::Reset);
+        endpoint.set_src_port_blocklist(Some(Arc::new(SrcPortBlocklist::new(1024, []))));
+        let route = endpoint.route(now, &from_port(now, 80), b"health");
+        assert!(
+            matches!(route, Route::Drop(RxDropReason::InvalidSrcPort)),
+            "{route:?}"
+        );
+    }
+
+    #[test]
+    fn the_blocklist_does_not_touch_datagrams_of_known_connections() {
+        let now = test_epoch();
+        let setup = Setup::default();
+        let mut endpoint = server(&setup);
+        let (_, datagram) = client(&setup, now);
+        let incoming = incoming(endpoint.route(now, &meta(now), &datagram));
+        let mut rng = TestRng::new(2);
+        let mut cx = Inputs {
+            now,
+            unix_now: unix_now(),
+            rng: &mut rng,
+        };
+        let config = setup.pair().server;
+        endpoint
+            .accept(&mut cx, KEY, incoming, &config, ConnOptions::default())
+            .unwrap();
+        let blocklist = SrcPortBlocklist::new(0, [client_addr().port()]);
+        endpoint.set_src_port_blocklist(Some(Arc::new(blocklist)));
+        assert!(matches!(
+            endpoint.route(now, &meta(now), &datagram),
+            Route::Existing(KEY)
+        ));
+        assert_eq!(endpoint.src_port_drops().get(), 0);
+    }
+
+    #[test]
+    fn datagrams_dropped_for_their_source_port_are_counted() {
+        let now = test_epoch();
+        let mut endpoint = server(&Setup::default());
+        endpoint.set_src_port_blocklist(Some(Arc::new(SrcPortBlocklist::new(1024, []))));
+        for trigger in [initial(1200, 8), unknown_version(1200), b"junk".to_vec()] {
+            endpoint.route(now, &from_port(now, 1023), &trigger);
+            endpoint.route(now, &from_port(now, 1024), &trigger);
+        }
+        assert_eq!(
+            endpoint.src_port_drops().get(),
+            3,
+            "one of each from port 1023"
+        );
+    }
+
+    #[test]
+    fn a_client_endpoint_does_not_answer_the_health_check_token() {
+        let now = test_epoch();
+        let config = EndpointConfig::builder([7; 32])
+            .health_check_token(&b"health"[..])
+            .build()
+            .unwrap();
+        let route = Endpoint::new(config, None).route(now, &meta(now), b"health");
+        assert!(
+            matches!(route, Route::Drop(RxDropReason::Malformed)),
+            "{route:?}"
+        );
+    }
+
+    #[test]
+    fn a_blocklisted_source_port_gets_no_stateless_reply() {
+        let now = test_epoch();
+        let mut endpoint = server(&Setup::default());
+        endpoint.set_src_port_blocklist(Some(Arc::new(SrcPortBlocklist::new(1024, [1024]))));
+        let triggers = [
+            ("Version Negotiation", unknown_version(1200)),
+            ("stateless reset", short_header([1; 8], 100)),
+        ];
+        for (kind, trigger) in &triggers {
+            let route = endpoint.route(now, &from_port(now, 1024), trigger);
+            assert!(
+                matches!(route, Route::Drop(RxDropReason::InvalidSrcPort)),
+                "{kind}: {route:?}"
+            );
+            reply(endpoint.route(now, &from_port(now, 1025), trigger));
+        }
+    }
+
+    #[test]
+    fn a_refusal_by_negotiation_lists_only_the_invalid_version_and_turns_the_client_away() {
+        let now = test_epoch();
+        let setup = Setup::default();
+        let mut endpoint = server(&setup);
+        let (mut conn, datagram) = client(&setup, now);
+        let Ok(Header::Protected(initial)) = Header::parse(&datagram, 8) else {
+            panic!("not an Initial");
+        };
+        let (client_dcid, client_scid) = (initial.dcid().to_vec(), initial.scid().to_vec());
+        let incoming = incoming(endpoint.route(now, &meta(now), &datagram));
+        let reply = endpoint
+            .refuse_by_negotiation(now, incoming)
+            .expect("a refusal");
+        assert_eq!(reply.kind(), StatelessKind::VersionNegotiation);
+        assert_eq!(reply.dst(), client_addr());
+        assert_eq!(reply.src_ip(), Some(server_addr().ip()));
+        let Ok(Header::VersionNegotiation(vn)) = Header::parse(reply.datagram(), 8) else {
+            panic!("not a Version Negotiation packet");
+        };
+        // The connection IDs are swapped, as RFC 9000 requires.
+        assert_eq!(vn.dcid(), &client_scid[..]);
+        assert_eq!(vn.scid(), &client_dcid[..]);
+        assert_eq!(vn.versions().collect::<Vec<_>>(), [MVFST_INVALID]);
+
+        let mut data = reply.datagram().to_vec();
+        let server_meta = RxMeta {
+            src: server_addr(),
+            dst_ip: None,
+            ..meta(now)
+        };
+        conn.recv_batch(
+            now,
+            &mut [RxDatagram {
+                meta: &server_meta,
+                data: &mut data,
+            }],
+        );
+        assert_eq!(
+            conn.poll_event(),
+            Some(ConnEvent::Closed {
+                reason: CloseReason::NoCommonVersion,
+                initiator: Initiator::Peer,
+            })
+        );
+    }
+
+    #[test]
+    fn refusals_by_negotiation_share_the_stateless_reply_rate_limit() {
+        let now = test_epoch();
+        let mut endpoint = server(&Setup::default());
+        let trigger = initial(1200, 8);
+        let refuse = |endpoint: &mut Endpoint, at: Instant| {
+            let incoming = incoming(endpoint.route(at, &meta(at), &trigger));
+            endpoint.refuse_by_negotiation(at, incoming)
+        };
+        for _ in 0..ReplyLimiter::BURST {
+            assert!(refuse(&mut endpoint, now).is_some());
+        }
+        assert!(refuse(&mut endpoint, now).is_none(), "the burst is spent");
+        assert!(matches!(
+            endpoint.route(now, &meta(now), &unknown_version(1200)),
+            Route::Drop(RxDropReason::RateLimited)
+        ));
+        let later = now + Duration::from_millis(1);
+        assert!(refuse(&mut endpoint, later).is_some(), "a token refilled");
     }
 
     #[test]

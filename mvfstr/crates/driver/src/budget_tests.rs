@@ -27,6 +27,7 @@ use mvfstr_proto::ConnOptions;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::Release;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::SrcPortBlocklist;
 use mvfstr_proto::Tick;
 use mvfstr_proto::TransportConfig;
 use rustls::pki_types::ServerName;
@@ -1112,6 +1113,32 @@ fn a_stop_before_an_accept_in_route_batch_keeps_the_attempt_for_a_later_polls_fi
         "the accept was the poll's one unit: {second:?}"
     );
     assert_eq!(scene.servers().len(), 1);
+}
+
+#[test]
+fn a_kept_attempt_from_a_port_blocked_since_it_was_routed_is_dropped() {
+    let budget = WorkBudget::new(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        budget: Some(budget.clone()),
+        ..ServerPlan::default()
+    });
+    scene.connect(0, Some(0));
+    scene.lab.settle_except(Some(scene.server_task));
+    scene.lab.advance(DELAY);
+    budget.set_hold(true);
+    budget.grant();
+    let first = scene.poll_server();
+    assert_eq!(scene.server.waiting(), (0, true), "{first:?}");
+    let blocklist = SrcPortBlocklist::new(0, [nth_socket(0).port()]);
+    scene
+        .server
+        .set_src_port_blocklist(Some(Arc::new(blocklist)));
+    budget.grant();
+    let second = scene.poll_server();
+    assert!(accepts_per_turn(&second).is_empty(), "{second:?}");
+    assert_eq!(scene.server.waiting(), (0, false), "{second:?}");
+    assert!(scene.servers().is_empty());
+    assert_eq!(scene.server.stats().invalid_src_port, 1);
 }
 
 #[test]

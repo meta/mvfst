@@ -104,6 +104,7 @@ use crate::cid::ConnRng;
 use crate::cid::LocalCids;
 use crate::cid::MAX_LOCAL_CIDS;
 use crate::cid::PeerCids;
+use crate::endpoint::SrcPortState;
 use crate::pacer::Bursts;
 use crate::pacer::Pacer;
 use crate::recovery::LossRecovery;
@@ -246,6 +247,9 @@ pub(crate) struct ConnSetup {
     pub(crate) rng_seed: [u8; 32],
     /// How far ahead of now the connection may build paced runs.
     pub(crate) horizon: Duration,
+    /// The endpoint's source port blocklist, which a server connection checks when its peer
+    /// moves.
+    pub(crate) src_ports: Option<Arc<SrcPortState>>,
 }
 
 impl ConnSetup {
@@ -301,6 +305,9 @@ pub struct Connection {
     alt: Option<AltPath>,
     /// The address a migration not yet validated left.
     migrated_from: Option<SocketAddr>,
+    /// The endpoint's source port blocklist, which a server connection checks when its peer
+    /// moves.
+    src_ports: Option<Arc<SrcPortState>>,
     /// The largest 1-RTT packet number received in a packet with a non-probing frame.
     largest_non_probing: Option<u64>,
     /// The Destination Connection ID of the peer's latest such packet on the current path.
@@ -442,6 +449,7 @@ impl Connection {
             path: PathCredit::default(),
             alt: None,
             migrated_from: None,
+            src_ports: setup.src_ports,
             largest_non_probing: None,
             rx_dcid: setup.local_cid,
             handshake: Handshake::default(),

@@ -60,6 +60,7 @@ use mvfstr_proto::Inputs;
 use mvfstr_proto::PathEvent;
 use mvfstr_proto::SendOrder;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::SrcPortBlocklist;
 use mvfstr_proto::StreamId;
 use mvfstr_proto::StreamReady;
 use mvfstr_proto::TransportConfig;
@@ -1590,6 +1591,101 @@ fn a_refused_connection_attempt_hears_connection_refused() {
 }
 
 #[test]
+fn a_connection_attempt_refused_by_version_negotiation_finds_no_common_version() {
+    let harness = Harness::new();
+    let (tx, rx) = mpsc::channel();
+    let addr = harness.serve(|| App::<Recorder>::new(|_| Err(Refusal::VersionNegotiation)));
+    let _conn = harness.connect(addr, move || Recorder {
+        name: "client",
+        reports: tx,
+    });
+    await_reports(
+        &rx,
+        vec![Report::Event(
+            "client",
+            ConnEvent::Closed {
+                reason: CloseReason::NoCommonVersion,
+                initiator: Initiator::Peer,
+            },
+        )],
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn a_source_port_blocklist_applies_from_the_next_connection_attempt() {
+    let harness = Harness::new();
+    let addr = harness.serve(|| App::<Recorder>::new(|_| Err(Refusal::Refuse)));
+    let (_client, initial) = client_initial(&harness, addr, |_| true);
+    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
+    let port = peer.local_addr().expect("a bound socket").port();
+    assert!(
+        answers(&harness, addr, &peer, &initial),
+        "no list blocks the port yet"
+    );
+    set_src_port_blocklist::<Recorder>(&harness, Some(SrcPortBlocklist::new(0, [port])));
+    assert!(
+        !answers(&harness, addr, &peer, &initial),
+        "the new list blocks the port"
+    );
+    set_src_port_blocklist::<Recorder>(&harness, None);
+    assert!(
+        answers(&harness, addr, &peer, &initial),
+        "the port is let in again once the list is cleared"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn datagrams_dropped_for_their_source_port_are_counted() {
+    let harness = Harness::new();
+    let addr = harness.serve(|| App::<Recorder>::new(|_| Err(Refusal::Refuse)));
+    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
+    let port = peer.local_addr().expect("a bound socket").port();
+    set_src_port_blocklist::<Recorder>(&harness, Some(SrcPortBlocklist::new(0, [port])));
+    for datagram in [forged_initial(), unknown_version(), short_header(0xee, 100)] {
+        assert!(!answers(&harness, addr, &peer, &datagram), "{datagram:?}");
+    }
+    assert_eq!(harness.server_stats::<Recorder>().invalid_src_port, 3);
+    harness.shutdown();
+}
+
+/// Gives the server driver for sessions of type `S` the source port blocklist `blocklist`.
+fn set_src_port_blocklist<S: QuicSession>(harness: &Harness, blocklist: Option<SrcPortBlocklist>) {
+    let (tx, rx) = mpsc::channel();
+    harness
+        .server
+        .handle()
+        .submit(move |_| {
+            with_handle::<S, _>(|handle| handle.set_src_port_blocklist(blocklist.map(Arc::new)));
+            let _ = tx.send(());
+        })
+        .expect("the server worker takes commands");
+    rx.recv_timeout(WAIT).expect("the server worker answers");
+}
+
+/// Sends `datagram` to the `Recorder` server at `addr` from `peer`, and returns whether the server
+/// answered it. Any answer has gone out once the server has answered a later probe from another
+/// socket and ended that turn.
+fn answers(harness: &Harness, addr: SocketAddr, peer: &UdpSocket, datagram: &[u8]) -> bool {
+    peer.send_to(datagram, addr).expect("the datagram goes out");
+    let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
+    probe.set_read_timeout(Some(WAIT)).expect("a read timeout");
+    probe
+        .send_to(&unknown_version(), addr)
+        .expect("the probe goes out");
+    probe
+        .recv_from(&mut [0; 1500])
+        .expect("the probe is answered");
+    // A command runs between the driver's turns.
+    let _ = harness.server_stats::<Recorder>();
+    peer.set_nonblocking(true).expect("a nonblocking socket");
+    let answered = peer.recv_from(&mut [0; 1500]).is_ok();
+    peer.set_nonblocking(false).expect("a blocking socket");
+    answered
+}
+
+#[test]
 fn a_quiesced_server_refuses_newcomers_and_closes_the_rest_after_its_grace() {
     const GRACE: Duration = Duration::from_millis(500);
     let harness = Harness::new();
@@ -2148,6 +2244,18 @@ impl ResolvesServerCert for DoomedResolver {
         if hello.server_name() == Some("doomed") {
             panic!("an application bug in a certificate resolver");
         }
+        self.0.resolve(hello)
+    }
+}
+
+/// A certificate resolver that reads the counters of the driver for `Recorder` sessions on its
+/// worker, as an application's resolver may, and then defers to the resolver it wraps.
+#[derive(Debug)]
+struct CountingResolver(Arc<dyn ResolvesServerCert>);
+
+impl ResolvesServerCert for CountingResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        with_handle::<Recorder, _>(|handle| handle.stats());
         self.0.resolve(hello)
     }
 }
@@ -3056,6 +3164,33 @@ fn a_panic_while_an_initial_creates_its_connection_ends_only_that_attempt() {
         .close(AppCode::from_u32(4), Bytes::new())
         .expect("the connection is live");
     await_reports(&rx, vec![Report::Event("server", closed_by_peer(4))]);
+    harness.shutdown();
+}
+
+#[test]
+fn a_certificate_resolver_reads_the_endpoint_counters_while_a_connection_is_created() {
+    let mut harness = Harness::new();
+    let mut tls = rustls::ServerConfig::clone(harness.server_config.tls());
+    tls.cert_resolver = Arc::new(CountingResolver(Arc::clone(&tls.cert_resolver)));
+    harness.server_config = ServerConfig::builder(Arc::new(tls))
+        .build()
+        .expect("a server config");
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || {
+        App::new(move |_| {
+            Ok(Recorder {
+                name: "server",
+                reports: server_reports.clone(),
+            })
+        })
+    });
+    let _conn = harness.connect(addr, move || Recorder {
+        name: "client",
+        reports: tx,
+    });
+    await_reports(&rx, vec![Report::Event("server", ConnEvent::Connected)]);
+    assert_eq!(harness.server_stats::<Recorder>().contained_panics, 0);
     harness.shutdown();
 }
 

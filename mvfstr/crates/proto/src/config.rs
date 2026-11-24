@@ -15,11 +15,13 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use mvfstr_wire::ConnectionId;
 use mvfstr_wire::VarInt;
 use mvfstr_wire::Version;
 use rustls::pki_types::ServerName;
 
+use crate::endpoint::HEALTH_CHECK_ANSWER;
 use crate::recovery::RecoveryConfig;
 
 /// Why a builder refused its values.
@@ -87,6 +89,7 @@ pub struct EndpointConfig {
     worker_index: u16,
     worker_count: u16,
     build_horizon: Duration,
+    health_check_token: Option<Bytes>,
 }
 
 impl EndpointConfig {
@@ -100,6 +103,7 @@ impl EndpointConfig {
                 worker_index: 0,
                 worker_count: 1,
                 build_horizon: Duration::ZERO,
+                health_check_token: None,
             },
         }
     }
@@ -125,6 +129,11 @@ impl EndpointConfig {
         self.build_horizon
     }
 
+    /// Returns the datagram a server endpoint answers with "OK", if any.
+    pub fn health_check_token(&self) -> Option<&[u8]> {
+        self.health_check_token.as_deref()
+    }
+
     /// Returns a builder that starts from these settings, for a config that changes only a few of
     /// them, such as one per worker.
     pub fn to_builder(&self) -> EndpointConfigBuilder {
@@ -141,6 +150,7 @@ impl fmt::Debug for EndpointConfig {
             .field("worker_index", &self.worker_index)
             .field("worker_count", &self.worker_count)
             .field("build_horizon", &self.build_horizon)
+            .field("health_check_token", &self.health_check_token)
             .finish_non_exhaustive()
     }
 }
@@ -178,6 +188,15 @@ impl EndpointConfigBuilder {
         self
     }
 
+    /// Makes a server endpoint answer `token`, sent as a datagram that is not a QUIC packet, with
+    /// a datagram of "OK", as mvfst servers answer their health check token; proxygen's is
+    /// "health". The token must be at least as long as the answer, so that the answer never
+    /// amplifies. By default, the endpoint does not answer health checks.
+    pub fn health_check_token(mut self, token: impl Into<Bytes>) -> Self {
+        self.config.health_check_token = Some(token.into());
+        self
+    }
+
     /// Validates the settings.
     pub fn build(self) -> Result<Arc<EndpointConfig>, ConfigError> {
         if self.config.local_cid_len() > ConnectionId::MAX_LEN {
@@ -205,6 +224,16 @@ impl EndpointConfigBuilder {
         if local_cid_len > 0 && random_bytes < MIN_RANDOM_CID_BYTES {
             return Err(ConfigError::OutOfRange {
                 field: "local_cid_len",
+            });
+        }
+        if self
+            .config
+            .health_check_token
+            .as_ref()
+            .is_some_and(|token| token.len() < HEALTH_CHECK_ANSWER.len())
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "health_check_token",
             });
         }
         Ok(Arc::new(self.config))
@@ -1439,6 +1468,33 @@ mod tests {
         for (len, count) in [(0, 1), (6, 1), (7, 2), (7, 256), (20, 256)] {
             assert!(build(len, count).is_ok(), "{len} bytes, {count} workers");
         }
+    }
+
+    #[test]
+    fn a_health_check_token_is_at_least_as_long_as_its_answer() {
+        let config = EndpointConfig::builder([0; 32]).build().unwrap();
+        assert_eq!(config.health_check_token(), None);
+        let config = EndpointConfig::builder([0; 32])
+            .health_check_token(&b"health"[..])
+            .build()
+            .unwrap();
+        assert_eq!(config.health_check_token(), Some(&b"health"[..]));
+        let worker = config.to_builder().worker(1, 2).build().unwrap();
+        assert_eq!(worker.health_check_token(), Some(&b"health"[..]));
+        for short in [&b""[..], b"h"] {
+            let config = EndpointConfig::builder([0; 32])
+                .health_check_token(short)
+                .build();
+            assert_eq!(
+                config.unwrap_err(),
+                out_of_range("health_check_token"),
+                "{short:?} is shorter than the two-byte answer"
+            );
+        }
+        let two = EndpointConfig::builder([0; 32])
+            .health_check_token(&b"hi"[..])
+            .build();
+        assert!(two.is_ok());
     }
 
     #[test]

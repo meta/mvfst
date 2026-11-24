@@ -63,6 +63,7 @@ use crate::SealJob;
 use crate::Sealer;
 use crate::SendOrder;
 use crate::SlotId;
+use crate::SrcPortBlocklist;
 use crate::StreamReady;
 use crate::Tick;
 use crate::TransportConfig;
@@ -858,6 +859,101 @@ fn after_a_rebinding_a_reset_from_the_previous_address_ending_in_the_shared_toke
     assert!(
         was_reset(server),
         "the previous path shares the ID in use and so its token"
+    );
+}
+
+#[test]
+fn a_server_does_not_move_to_a_blocklisted_source_port() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let blocked = rebound_port();
+    let blocklist = SrcPortBlocklist::new(1024, [blocked.port()]);
+    pair.server
+        .endpoint
+        .set_src_port_blocklist(Some(Arc::new(blocklist)));
+    assert!(pair.handshake(epoch + LIMIT), "no handshake");
+    let quiet = pair.now + Duration::from_millis(500);
+    pair.run(quiet);
+    let now = pair.now;
+    let padding = Frame::Padding { len: 1200 };
+    let rebound = from_client(&pair, 10, &[Frame::Ping, padding]);
+    let probe = from_client(&pair, 11, &[Frame::PathChallenge([7; 8]), padding]);
+    let moved = from_client(&pair, 12, &[Frame::Ping, padding]);
+    let server = pair.server.conn_mut();
+    for datagram in [rebound, probe] {
+        let summary = deliver(server, now, blocked, datagram);
+        assert_eq!((summary.packets, summary.dropped), (0, 1));
+    }
+    assert_eq!(server.remote_address(), client_addr());
+    assert!(
+        dcids_to(&transmit(server, now), blocked).is_empty(),
+        "nothing goes to the blocked port"
+    );
+    let elsewhere = SocketAddr::new(client_addr().ip(), 50_002);
+    deliver(server, now, elsewhere, moved);
+    assert_eq!(
+        server.remote_address(),
+        elsewhere,
+        "a port the list does not block"
+    );
+}
+
+#[test]
+fn a_server_checks_a_move_against_the_blocklist_posted_last() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let first = SrcPortBlocklist::new(1024, [rebound_port().port()]);
+    pair.server
+        .endpoint
+        .set_src_port_blocklist(Some(Arc::new(first)));
+    assert!(pair.handshake(epoch + LIMIT), "no handshake");
+    let quiet = pair.now + Duration::from_millis(500);
+    pair.run(quiet);
+    let later = SocketAddr::new(client_addr().ip(), 50_002);
+    let second = SrcPortBlocklist::new(1024, [later.port()]);
+    pair.server
+        .endpoint
+        .set_src_port_blocklist(Some(Arc::new(second)));
+    let now = pair.now;
+    let padding = Frame::Padding { len: 1200 };
+    let to_later = from_client(&pair, 10, &[Frame::Ping, padding]);
+    let to_rebound = from_client(&pair, 11, &[Frame::Ping, padding]);
+    let server = pair.server.conn_mut();
+    let summary = deliver(server, now, later, to_later);
+    assert_eq!(
+        (summary.packets, summary.dropped),
+        (0, 1),
+        "the list posted after the accept blocks the port"
+    );
+    assert_eq!(server.remote_address(), client_addr());
+    deliver(server, now, rebound_port(), to_rebound);
+    assert_eq!(
+        server.remote_address(),
+        rebound_port(),
+        "the list in force at the accept no longer applies"
+    );
+}
+
+#[test]
+fn datagrams_refused_a_move_for_their_source_port_are_counted() {
+    let mut pair = settled(&Setup::default());
+    let ports = [rebound_port().port(), client_addr().port()];
+    pair.server
+        .endpoint
+        .set_src_port_blocklist(Some(Arc::new(SrcPortBlocklist::new(1024, ports))));
+    let now = pair.now;
+    let padding = Frame::Padding { len: 1200 };
+    let rebound = from_client(&pair, 10, &[Frame::Ping, padding]);
+    let probe = from_client(&pair, 11, &[Frame::PathChallenge([7; 8]), padding]);
+    let current = from_client(&pair, 12, &[Frame::Ping, padding]);
+    let server = pair.server.conn_mut();
+    for datagram in [rebound, probe] {
+        deliver(server, now, rebound_port(), datagram);
+    }
+    let summary = deliver(server, now, client_addr(), current);
+    assert_eq!(summary.packets, 1, "the current address is not checked");
+    assert_eq!(
+        pair.server.endpoint.src_port_drops().get(),
+        2,
+        "the two from the new address"
     );
 }
 
