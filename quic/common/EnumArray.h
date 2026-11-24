@@ -21,7 +21,7 @@ namespace quic {
 template <class K, class V>
 class EnumArray : public std::array<V, size_t(K::MAX) + 1> {
  public:
-  using IntType = typename std::underlying_type<K>::type;
+  using IntType = std::underlying_type_t<K>;
   static constexpr IntType ArraySize = IntType(K::MAX) + 1;
 
   constexpr const V& operator[](K key) const {

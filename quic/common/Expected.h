@@ -82,8 +82,8 @@ namespace quic {
 // a simple namespace replacement.
 
 template <class T>
-constexpr Expected<typename std::decay<T>::type, int> make_expected(T&& value) {
-  return Expected<typename std::decay<T>::type, int>(std::forward<T>(value));
+constexpr Expected<std::decay_t<T>, int> make_expected(T&& value) {
+  return Expected<std::decay_t<T>, int>(std::forward<T>(value));
 }
 
 template <class E>
