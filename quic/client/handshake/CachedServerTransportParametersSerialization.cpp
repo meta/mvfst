@@ -49,7 +49,7 @@ void writeCachedServerTransportParameters(
   FIZZ_THROW_ON_ERROR(
       fizz::detail::write(err, params.extendedAckFeatures, appender), err);
   // draft-ietf-quic-receive-ts-02 trailer.
-  uint8_t cachedReceiveTimestampsVersion =
+  auto cachedReceiveTimestampsVersion =
       static_cast<uint8_t>(params.cachedReceiveTimestampsVersion);
   FIZZ_THROW_ON_ERROR(
       fizz::detail::write(err, cachedReceiveTimestampsVersion, appender), err);
