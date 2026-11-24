@@ -117,6 +117,8 @@ pub(crate) struct Costs {
     pub(crate) visit: Duration,
     /// A read of the host clock.
     pub(crate) read: Duration,
+    /// A datagram a flush sends, charged at the flush.
+    pub(crate) flush: Duration,
 }
 
 /// An event on a lab socket, logged in order.
@@ -478,6 +480,7 @@ impl TxBackend for MemBackend {
             }
             self.reports.push((conn, TxReport::Flushed { tx: meta.tx }));
         }
+        self.net.charge(self.net.costs().flush * datagrams);
         FlushOutcome {
             datagrams,
             blocked: self.port.blocked.get(),

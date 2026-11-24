@@ -18,9 +18,12 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use mvfstr_driver::DriverError;
 use mvfstr_driver::EndpointDriver;
 use mvfstr_driver::EndpointDriverBuilder;
+use mvfstr_driver::EndpointHandle;
 use mvfstr_driver::HostTimers;
+use mvfstr_driver::QuicApplication;
 use mvfstr_driver::WorkBudget;
 use mvfstr_io::Backend;
 use mvfstr_io::HostBackend;
@@ -191,6 +194,28 @@ impl fmt::Debug for HostedServer {
     }
 }
 
+/// A way to start a hosted server's driver from the builder tperf configured, for a host that sets
+/// up each driver it runs, such as one that gives every driver its work budget.
+pub trait SpawnDriver {
+    /// Starts the driver `builder` describes, on the thread that runs the host's worker.
+    fn spawn<A: QuicApplication, B: Backend>(
+        self,
+        builder: EndpointDriverBuilder<A, B>,
+    ) -> Result<EndpointHandle<A, B>, DriverError>;
+}
+
+/// A spawner that starts each driver on one worker, as tperf configured it.
+struct OnWorker<'a>(&'a WorkerContext);
+
+impl SpawnDriver for OnWorker<'_> {
+    fn spawn<A: QuicApplication, B: Backend>(
+        self,
+        builder: EndpointDriverBuilder<A, B>,
+    ) -> Result<EndpointHandle<A, B>, DriverError> {
+        builder.spawn(self.0)
+    }
+}
+
 /// Starts a server configured by `flags`, which must be a server's, on `worker`, from the
 /// worker's thread. `open` returns the server's socket and the timers its driver paces with, for
 /// the address and the socket settings that the flags give.
@@ -198,6 +223,16 @@ pub fn start_hosted_server<B: Backend>(
     worker: &WorkerContext,
     flags: &Flags,
     open: impl FnOnce(SocketAddr, &MmsgOptions) -> io::Result<(B, HostTimers)>,
+) -> Result<HostedServer, RunError> {
+    start_hosted_server_with(flags, open, OnWorker(worker))
+}
+
+/// Starts a server as [`start_hosted_server`] does, but with its driver started by `spawn`, on
+/// the thread that runs the host's worker.
+pub fn start_hosted_server_with<B: Backend>(
+    flags: &Flags,
+    open: impl FnOnce(SocketAddr, &MmsgOptions) -> io::Result<(B, HostTimers)>,
+    spawn: impl SpawnDriver,
 ) -> Result<HostedServer, RunError> {
     if flags.mode != Mode::Server {
         return Err(RunError::Start(
@@ -208,7 +243,7 @@ pub fn start_hosted_server<B: Backend>(
     let (backend, timers) = open(setup.addr, &backend_options(flags))
         .map_err(|error| RunError::Start(error.to_string()))?;
     let (addr, caps) = spawn_server(
-        worker,
+        spawn,
         setup.endpoint,
         setup.settings,
         setup.segments,
@@ -381,17 +416,17 @@ fn serve<B: TperfBackend>(
     options: MmsgOptions,
     segments: u16,
 ) -> Result<(SocketAddr, TxCaps), String> {
-    spawn_server::<B>(worker, endpoint, settings, segments, |builder| {
+    spawn_server::<B>(OnWorker(worker), endpoint, settings, segments, |builder| {
         builder
             .bind_server(addr, server)
             .backend_options(B::options(options))
     })
 }
 
-/// Starts the server's driver on `worker`, on backend `B`, after `socket` sets up its server
+/// Starts the server's driver with `spawn`, on backend `B`, after `socket` sets up its server
 /// socket on the builder, and returns the socket's address and capabilities.
 fn spawn_server<B: Backend>(
-    worker: &WorkerContext,
+    spawn: impl SpawnDriver,
     endpoint: Arc<EndpointConfig>,
     settings: Settings,
     segments: u16,
@@ -406,7 +441,7 @@ fn spawn_server<B: Backend>(
     if let Some(slice) = budget {
         builder = builder.work_budget(WorkBudget::per_poll(slice));
     }
-    let handle = builder.spawn(worker).map_err(|error| error.to_string())?;
+    let handle = spawn.spawn(builder).map_err(|error| error.to_string())?;
     let started = handle
         .local_addr()
         .zip(handle.server_caps())
@@ -688,6 +723,45 @@ mod tests {
             server.closed_lines(),
             Vec::<String>::new(),
             "one connection"
+        );
+    }
+
+    /// A spawner that starts each driver on a worker as tperf configured it, and counts them.
+    struct Counting<'a>(&'a WorkerContext, Rc<std::cell::Cell<u32>>);
+
+    impl SpawnDriver for Counting<'_> {
+        fn spawn<A: QuicApplication, B: Backend>(
+            self,
+            builder: EndpointDriverBuilder<A, B>,
+        ) -> Result<EndpointHandle<A, B>, DriverError> {
+            self.1.set(self.1.get() + 1);
+            builder.spawn(self.0)
+        }
+    }
+
+    #[test]
+    fn a_hosted_server_starts_its_driver_through_the_spawner_it_is_given() {
+        let worker = ManagedWorker::new(WORKER_COMMANDS).unwrap();
+        let (started_tx, started) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |context| {
+                let spawned = Rc::new(std::cell::Cell::new(0));
+                let open = |addr, options: &MmsgOptions| {
+                    Ok((MmsgBackend::bind(addr, options)?, HostTimers::tokio()))
+                };
+                let server = start_hosted_server_with(
+                    &loopback(Mode::Server, 0),
+                    open,
+                    Counting(context, Rc::clone(&spawned)),
+                );
+                let _ = started_tx.send((server.is_ok(), spawned.get()));
+            })
+            .unwrap();
+        assert_eq!(
+            started.recv().unwrap(),
+            (true, 1),
+            "the one driver, through the spawner"
         );
     }
 

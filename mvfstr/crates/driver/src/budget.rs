@@ -43,10 +43,14 @@ pub enum UnitKind {
     /// Up to 64 connections parked on the server socket, marked for another attempt once it is
     /// writable.
     Remark,
+    /// A transmit phase's end-of-phase flush of the server socket, which sends the runs still
+    /// queued there, as many as the socket accepts. It runs even after a stop, and is not preceded
+    /// by a check.
+    TransmitFlush,
 }
 
 impl UnitKind {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     fn index(self) -> usize {
         match self {
@@ -59,6 +63,7 @@ impl UnitKind {
             Self::Skips => 6,
             Self::Sweep => 7,
             Self::Remark => 8,
+            Self::TransmitFlush => 9,
         }
     }
 }
@@ -91,6 +96,15 @@ pub struct BudgetStats {
     pub longest_leftover_us: u64,
     /// Leftover waits longer than 3 ms.
     pub long_leftovers: u64,
+    /// End-of-phase transmit flushes timed.
+    pub flushes: u64,
+    /// The datagrams those flushes sent.
+    pub flushed_datagrams: u64,
+    /// Their total time, in µs.
+    pub flush_us: u64,
+    /// Transmit phases stopped before an attempt because the time left in the slice was less than
+    /// the predicted cost of flushing what they had staged, capped at half the slice.
+    pub reserve_stops: u64,
     past_us: [u64; UnitKind::COUNT],
 }
 
@@ -122,6 +136,8 @@ struct State {
     /// The running unit and the reading before it, until its time past the deadline is recorded.
     unit: Cell<Option<(UnitKind, Instant)>>,
     outcome: Cell<PollOutcome>,
+    /// Whether a poll has ended since the last [`WorkBudget::take_report`].
+    reported: Cell<bool>,
     stats: Cell<BudgetStats>,
 }
 
@@ -163,6 +179,7 @@ impl WorkBudget {
             checked: Cell::new(None),
             unit: Cell::new(None),
             outcome: Cell::new(PollOutcome::Ran),
+            reported: Cell::new(false),
             stats: Cell::default(),
         }))
     }
@@ -179,11 +196,7 @@ impl WorkBudget {
     pub fn admit(&self, now: Instant) -> bool {
         let state = &*self.0;
         match state.deadline.get() {
-            None => {
-                state.deadline.set(Some(now + state.slice));
-                state.closed.set(false);
-                self.count(|stats| stats.slices += 1);
-            }
+            None => self.open(now),
             Some(deadline) if now > deadline => state.closed.set(true),
             Some(_) => {}
         }
@@ -202,14 +215,50 @@ impl WorkBudget {
     /// passed, and returns whether the unit of `kind` may run: the slice is open and the poll is
     /// not running on a grant.
     pub fn check(&self, now: Instant, kind: UnitKind) -> bool {
+        self.check_reserving(now, kind, Duration::ZERO)
+    }
+
+    /// Checks the slice at `now` as [`check`](Self::check) does, and also refuses the unit when
+    /// less than `reserve` is left of it, with the reserve capped at half the slice. A transmit
+    /// phase reserves the predicted cost of flushing what it has staged, and a refusal for the
+    /// reserve closes the slice, leaving the rest of it to the flush.
+    pub(crate) fn check_reserving(&self, now: Instant, kind: UnitKind, reserve: Duration) -> bool {
         self.observe(now);
         let state = &*self.0;
         state.checked.set(Some(now));
         if state.granted.get() || state.closed.get() {
             return false;
         }
+        if let Some(deadline) = state.deadline.get()
+            && now + reserve.min(state.slice / 2) > deadline
+        {
+            state.closed.set(true);
+            self.count(|stats| stats.reserve_stops += 1);
+            return false;
+        }
         state.unit.set(Some((kind, now)));
         true
+    }
+
+    /// Begins an end-of-phase transmit flush at `before`, a reading taken after the unit before
+    /// it: records that unit's time past the deadline, as a check does, and makes the flush the
+    /// running unit. A flush always runs, so the slice is not checked.
+    pub(crate) fn begin_flush(&self, before: Instant) {
+        self.observe(before);
+        self.0.unit.set(Some((UnitKind::TransmitFlush, before)));
+    }
+
+    /// Ends the flush begun at `before`, which sent `datagrams`, at `after`, a reading taken after
+    /// it: records its time past the deadline, closes the slice once the deadline has passed, and
+    /// counts the flush in the stats.
+    pub(crate) fn end_flush(&self, before: Instant, after: Instant, datagrams: u32) {
+        self.observe(after);
+        let took = micros(after.saturating_duration_since(before));
+        self.count(|stats| {
+            stats.flushes += 1;
+            stats.flushed_datagrams += u64::from(datagrams);
+            stats.flush_us = stats.flush_us.saturating_add(took);
+        });
     }
 
     /// Makes the next [`admit`](Self::admit) succeed even on a closed slice or a held budget. That
@@ -251,6 +300,31 @@ impl WorkBudget {
         self.0.stats.get()
     }
 
+    /// Returns the outcome of the last poll if one has ended since the last call, and `None`
+    /// otherwise. A host that calls it after each task it polls thus gets an outcome after each
+    /// poll of a task that calls [`finish`](Self::finish), such as a driver on this budget, and
+    /// `None` after other tasks.
+    pub fn take_report(&self) -> Option<PollOutcome> {
+        self.0.reported.replace(false).then(|| self.0.outcome.get())
+    }
+
+    /// Returns whether the budget is held.
+    pub fn is_held(&self) -> bool {
+        self.0.hold.get()
+    }
+
+    /// Opens the slice at `now` unless one has opened since the refill, as the first
+    /// [`admit`](Self::admit) after a refill does, without admitting a poll. A host calls it for
+    /// its own work when that work takes the first turn of an iteration.
+    pub fn open(&self, now: Instant) {
+        let state = &*self.0;
+        if state.deadline.get().is_none() {
+            state.deadline.set(Some(now + state.slice));
+            state.closed.set(false);
+            self.count(|stats| stats.slices += 1);
+        }
+    }
+
     /// Starts a driver's poll at `now`: refills a per-poll budget and admits the poll.
     pub(crate) fn enter(&self, now: Instant) -> bool {
         if self.0.per_poll {
@@ -277,8 +351,11 @@ impl WorkBudget {
         self.0.checked.get()
     }
 
-    /// Ends a poll with `outcome`, which becomes [`PollOutcome::Stopped`] for a poll on a grant.
-    pub(crate) fn finish(&self, outcome: PollOutcome) {
+    /// Ends a poll with `outcome`, which [`take_report`](Self::take_report) then returns once. A
+    /// driver calls it at the end of each poll, and so does any other participant that admits its
+    /// polls with [`admit`](Self::admit). For a poll that a grant admitted while the slice was
+    /// closed or the budget held, [`PollOutcome::Ran`] becomes [`PollOutcome::Stopped`].
+    pub fn finish(&self, outcome: PollOutcome) {
         let outcome = match outcome {
             PollOutcome::Ran if self.0.granted.get() => PollOutcome::Stopped,
             outcome => outcome,
@@ -287,6 +364,7 @@ impl WorkBudget {
         self.0.begun.set(false);
         self.0.granted.set(false);
         self.0.outcome.set(outcome);
+        self.0.reported.set(true);
         match outcome {
             PollOutcome::Ran => {}
             PollOutcome::Deferred => self.count(|stats| stats.deferrals += 1),
@@ -295,8 +373,8 @@ impl WorkBudget {
     }
 
     /// Records the running unit's time past the deadline at `now`, a reading after it, and closes
-    /// the slice once the deadline has passed.
-    pub(crate) fn observe(&self, now: Instant) {
+    /// the slice once the deadline has passed. Outside a poll it only closes the slice.
+    pub fn observe(&self, now: Instant) {
         let state = &*self.0;
         let Some(deadline) = state.deadline.get() else {
             return;
@@ -308,19 +386,18 @@ impl WorkBudget {
         let Some((kind, before)) = state.unit.take() else {
             return;
         };
-        let past = now.duration_since(deadline.max(before));
-        let micros = u64::try_from(past.as_micros()).unwrap_or(u64::MAX);
+        let past = micros(now.duration_since(deadline.max(before)));
         self.count(|stats| {
             let longest = &mut stats.past_us[kind.index()];
-            *longest = (*longest).max(micros);
+            *longest = (*longest).max(past);
         });
     }
 
     /// Records a leftover wait of `wait`.
     pub(crate) fn leftover(&self, wait: Duration) {
-        let micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
+        let waited = micros(wait);
         self.count(|stats| {
-            stats.longest_leftover_us = stats.longest_leftover_us.max(micros);
+            stats.longest_leftover_us = stats.longest_leftover_us.max(waited);
             stats.long_leftovers += u64::from(wait > LONG_LEFTOVER);
         });
     }
@@ -329,6 +406,53 @@ impl WorkBudget {
         let mut stats = self.0.stats.get();
         f(&mut stats);
         self.0.stats.set(stats);
+    }
+}
+
+/// Returns `duration` in whole µs.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// A running average of what an end-of-phase transmit flush costs per datagram it sends, from
+/// which a driver predicts what flushing the datagrams a transmit phase has staged will cost.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FlushCost {
+    /// Eight times the running averages of a timed flush's time, in ns, and of the datagrams it
+    /// sent. Each flush moves both an eighth of the way to its own figures, so their ratio weighs
+    /// flushes by the datagrams they sent.
+    time_ns: u64,
+    datagrams: u64,
+}
+
+impl FlushCost {
+    /// The running averages keep `WEIGHT - 1` parts in `WEIGHT` of their value at each flush.
+    const WEIGHT: u64 = 8;
+
+    /// Adds a flush that took `time` to send `datagrams`, unless it did not send any.
+    pub(crate) fn record(&mut self, time: Duration, datagrams: u32) {
+        if datagrams == 0 {
+            return;
+        }
+        let time_ns = u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+        let datagrams = u64::from(datagrams);
+        if self.datagrams == 0 {
+            self.time_ns = time_ns.saturating_mul(Self::WEIGHT);
+            self.datagrams = datagrams * Self::WEIGHT;
+            return;
+        }
+        self.time_ns = (self.time_ns - self.time_ns / Self::WEIGHT).saturating_add(time_ns);
+        self.datagrams = self.datagrams - self.datagrams / Self::WEIGHT + datagrams;
+    }
+
+    /// Returns the predicted time to flush `staged` datagrams: the average cost per datagram
+    /// times `staged`, or zero until a flush has been timed.
+    pub(crate) fn predict(&self, staged: u32) -> Duration {
+        if self.datagrams == 0 {
+            return Duration::ZERO;
+        }
+        let ns = u128::from(self.time_ns) * u128::from(staged) / u128::from(self.datagrams);
+        Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
     }
 }
 
@@ -385,6 +509,36 @@ mod tests {
     }
 
     #[test]
+    fn open_opens_the_slice_once_per_refill_and_keeps_a_pending_grant() {
+        let budget = WorkBudget::new(us(1_000));
+        let start = Instant::now();
+        budget.grant();
+        budget.open(start);
+        assert_eq!(budget.deadline(), Some(start + us(1_000)));
+        assert_eq!(budget.stats().slices, 1);
+        budget.open(start + us(100));
+        assert_eq!(
+            budget.deadline(),
+            Some(start + us(1_000)),
+            "a slice opened since the refill stays"
+        );
+        assert_eq!(budget.stats().slices, 1);
+        assert!(
+            budget.admit(start + us(1_100)),
+            "the grant open left pending admits a poll on the closed slice"
+        );
+        assert!(budget.is_closed());
+        budget.finish(PollOutcome::Stopped);
+        assert!(!budget.admit(start + us(1_200)), "the grant is used up");
+        budget.finish(PollOutcome::Deferred);
+        budget.refill();
+        budget.open(start + us(2_000));
+        assert_eq!(budget.deadline(), Some(start + us(3_000)));
+        assert!(!budget.is_closed());
+        assert_eq!(budget.stats().slices, 2);
+    }
+
+    #[test]
     fn an_admit_closes_a_slice_whose_deadline_has_passed() {
         let budget = WorkBudget::new(us(1_000));
         let start = Instant::now();
@@ -411,6 +565,16 @@ mod tests {
         budget.set_hold(false);
         assert!(budget.admit(start));
         assert_eq!(budget.hold_flag(), flag, "the flag stays put");
+    }
+
+    #[test]
+    fn is_held_reads_the_hold_flag() {
+        let budget = WorkBudget::new(us(1_000));
+        assert!(!budget.is_held());
+        budget.clone().set_hold(true);
+        assert!(budget.is_held(), "every handle sees the one flag");
+        budget.set_hold(false);
+        assert!(!budget.is_held());
     }
 
     #[test]
@@ -517,6 +681,22 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_reports_its_outcome_once_after_it_ends() {
+        let budget = WorkBudget::new(us(1_000));
+        let start = Instant::now();
+        assert_eq!(budget.take_report(), None, "no poll has ended");
+        assert!(budget.admit(start));
+        assert_eq!(budget.take_report(), None, "the poll has not ended");
+        budget.finish(PollOutcome::Ran);
+        assert_eq!(budget.take_report(), Some(PollOutcome::Ran));
+        assert_eq!(budget.take_report(), None, "reported once");
+        budget.set_hold(true);
+        assert!(!budget.admit(start + us(10)));
+        budget.finish(PollOutcome::Deferred);
+        assert_eq!(budget.take_report(), Some(PollOutcome::Deferred));
+    }
+
+    #[test]
     fn a_per_poll_budget_refills_at_each_poll_and_counts_the_outcomes() {
         let budget = WorkBudget::per_poll(us(1_000));
         let start = Instant::now();
@@ -540,6 +720,147 @@ mod tests {
             (stats.slices, stats.stops, stats.deferrals),
             (3, 1, 1),
             "three slices opened, one poll stopped and one deferred"
+        );
+    }
+
+    #[test]
+    fn a_flush_cost_predicts_nothing_until_a_flush_is_timed_then_its_average_per_datagram() {
+        let mut cost = FlushCost::default();
+        assert_eq!(cost.predict(100), Duration::ZERO, "no flush timed yet");
+        cost.record(us(100), 0);
+        assert_eq!(
+            cost.predict(100),
+            Duration::ZERO,
+            "a flush that sent nothing teaches nothing"
+        );
+        cost.record(us(100), 20);
+        assert_eq!(cost.predict(10), us(50), "5 µs per datagram");
+        assert_eq!(cost.predict(0), Duration::ZERO);
+        cost.record(us(300), 20);
+        assert_eq!(
+            cost.predict(10),
+            Duration::from_nanos(62_500),
+            "the average moves an eighth of the way from 5 µs to 15 µs per datagram"
+        );
+        let mut weighted = FlushCost::default();
+        weighted.record(us(100), 20);
+        weighted.record(us(20), 2);
+        assert_eq!(
+            weighted.predict(1),
+            Duration::from_nanos(720_000 / 142),
+            "the averages of time and of datagrams each move an eighth of the way, so a small \
+             flush moves the cost per datagram little: (700 + 20) µs per (140 + 2) datagrams"
+        );
+    }
+
+    #[test]
+    fn a_check_with_a_reserve_stops_and_closes_the_slice_when_less_than_the_reserve_is_left() {
+        let budget = WorkBudget::new(us(1_000));
+        let start = Instant::now();
+        assert!(budget.admit(start));
+        budget.first(UnitKind::Attempt);
+        assert!(
+            budget.check_reserving(start + us(600), UnitKind::Attempt, us(400)),
+            "400 µs left covers a 400 µs reserve"
+        );
+        assert!(
+            !budget.check_reserving(start + us(601), UnitKind::Attempt, us(400)),
+            "399 µs left does not"
+        );
+        assert!(
+            budget.is_closed(),
+            "a reserve stop closes the slice: what is left of it is the flush's"
+        );
+        assert_eq!(budget.stats().reserve_stops, 1);
+        assert_eq!(
+            budget.stats().longest_past_us(UnitKind::Attempt),
+            0,
+            "the attempts ended before the deadline"
+        );
+        budget.finish(PollOutcome::Stopped);
+        assert_eq!(budget.outcome(), PollOutcome::Stopped);
+
+        budget.refill();
+        let second = start + us(5_000);
+        assert!(budget.admit(second));
+        budget.first(UnitKind::Attempt);
+        assert!(
+            budget.check_reserving(second + us(500), UnitKind::Attempt, us(10_000)),
+            "a reserve is at most half the slice"
+        );
+        assert!(!budget.check_reserving(second + us(501), UnitKind::Attempt, us(10_000)));
+        assert_eq!(budget.stats().reserve_stops, 2);
+        budget.finish(PollOutcome::Stopped);
+
+        budget.refill();
+        let third = start + us(10_000);
+        assert!(budget.admit(third));
+        budget.first(UnitKind::Attempt);
+        assert!(!budget.check_reserving(third + us(1_100), UnitKind::Attempt, us(100)));
+        assert_eq!(
+            budget.stats().reserve_stops,
+            2,
+            "a check past the deadline stops without the reserve"
+        );
+        assert_eq!(budget.stats().longest_past_us(UnitKind::Attempt), 100);
+    }
+
+    #[test]
+    fn an_end_of_phase_flush_records_its_time_past_the_deadline_under_its_own_kind() {
+        let budget = WorkBudget::new(us(1_000));
+        let start = Instant::now();
+        assert!(budget.admit(start));
+        budget.first(UnitKind::Attempt);
+        assert!(!budget.check(start + us(1_100), UnitKind::Attempt));
+        budget.begin_flush(start + us(1_100));
+        budget.end_flush(start + us(1_100), start + us(1_400), 120);
+        let stats = budget.stats();
+        assert_eq!(
+            stats.longest_past_us(UnitKind::TransmitFlush),
+            300,
+            "the flush after the stop ran wholly past the deadline"
+        );
+        assert_eq!(stats.longest_past_us(UnitKind::Attempt), 100);
+        assert_eq!(
+            (stats.flushes, stats.flushed_datagrams, stats.flush_us),
+            (1, 120, 300)
+        );
+        budget.finish(PollOutcome::Stopped);
+
+        budget.refill();
+        let second = start + us(5_000);
+        assert!(budget.admit(second));
+        budget.first(UnitKind::Attempt);
+        budget.begin_flush(second + us(900));
+        budget.end_flush(second + us(900), second + us(1_600), 10);
+        let stats = budget.stats();
+        assert_eq!(
+            stats.longest_past_us(UnitKind::TransmitFlush),
+            600,
+            "a flush begun before the deadline counts from it"
+        );
+        assert_eq!(
+            stats.longest_past_us(UnitKind::Attempt),
+            100,
+            "the reading before the flush ends the attempt before it, inside the slice"
+        );
+        assert!(budget.is_closed());
+        assert_eq!(
+            (stats.flushes, stats.flushed_datagrams, stats.flush_us),
+            (2, 130, 1_000)
+        );
+        budget.finish(PollOutcome::Ran);
+
+        budget.refill();
+        let third = start + us(10_000);
+        assert!(budget.admit(third));
+        budget.first(UnitKind::Attempt);
+        budget.begin_flush(third + us(1_300));
+        budget.end_flush(third + us(1_300), third + us(1_350), 1);
+        assert_eq!(
+            budget.stats().longest_past_us(UnitKind::Attempt),
+            300,
+            "the reading before a flush records the unit before it"
         );
     }
 }

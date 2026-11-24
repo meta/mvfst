@@ -34,7 +34,9 @@ use crate::flags::Mode;
 use crate::report::closed_line;
 pub use crate::run::HostedServer;
 pub use crate::run::RunError;
+pub use crate::run::SpawnDriver;
 pub use crate::run::start_hosted_server;
+pub use crate::run::start_hosted_server_with;
 
 /// Runs tperf with `args`, the arguments after the program name, and returns its exit status.
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> ExitCode {

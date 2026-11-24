@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use mvfstr_io::Backend;
+use mvfstr_io::FlushOutcome;
 use mvfstr_io::TxCaps;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::ConnEvent;
@@ -85,6 +86,7 @@ use crate::SendSink;
 use crate::Steering;
 use crate::UnitKind;
 use crate::WorkBudget;
+use crate::budget::FlushCost;
 use crate::slab::Slab;
 use crate::steer::Member;
 use crate::steer::Steer;
@@ -275,6 +277,9 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     /// Under a work budget, the leftover wait being measured: the reading of the stop that began
     /// it, and the transmit queue's pop count at which the last slot the stop left pops.
     leftover: Cell<Option<(Instant, u64)>>,
+    /// Under a work budget, what the end-of-phase flush of the server socket has cost per
+    /// datagram, from which a transmit phase predicts the cost of flushing what it has staged.
+    flush_cost: Cell<FlushCost>,
     /// Makes the next turn panic outside every connection's guard.
     #[cfg(test)]
     fail_turn: Cell<bool>,
@@ -683,6 +688,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             stopped: Cell::new(false),
             queue_turn: Cell::new(false),
             leftover: Cell::new(None),
+            flush_cost: Cell::default(),
             #[cfg(test)]
             fail_turn: Cell::new(false),
             #[cfg(test)]
@@ -1096,6 +1102,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// the previous unit, or at a fresh reading if `reading` is `None`. A unit that may not run
     /// stops the poll.
     fn gate(&self, kind: UnitKind, reading: Option<Instant>) -> bool {
+        self.gate_staged(kind, reading, 0)
+    }
+
+    /// Returns whether a unit of `kind` may run, as [`gate`](Self::gate) does, for a transmit phase
+    /// that has built `staged` datagrams on the server socket for its end-of-phase flush. The check
+    /// also stops the poll when less time is left than the predicted cost of flushing them, capped
+    /// at half the budget's slice.
+    fn gate_staged(&self, kind: UnitKind, reading: Option<Instant>, staged: u32) -> bool {
         let Some(budget) = &self.budget else {
             return true;
         };
@@ -1106,7 +1120,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             return true;
         }
         let now = reading.unwrap_or_else(|| self.clock());
-        if budget.check(now, kind) {
+        let reserve = self.flush_cost.get().predict(staged);
+        if budget.check_reserving(now, kind, reserve) {
             #[cfg(test)]
             self.record.borrow_mut().unit(kind);
             return true;
@@ -1123,7 +1138,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// the phase's requeue cap is spent; under a work budget, only before the pops on the wakes'
     /// turn, and once per 64 pops inside a run of stale slots. Under a work budget, a poll also
     /// reads it as it begins, for the budget and its first turn, and a check reads it only when it
-    /// cannot reuse one of these.
+    /// cannot reuse one of these. Under a work budget, a transmit phase also reads it after its
+    /// end-of-phase flush, and before the flush unless a check stopped the phase.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -1653,7 +1669,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// tail, then flushes the sockets used and takes their reports. Under a work budget, a stop
     /// before an attempt leaves that connection and the rest of the queue for the next transmit
     /// phase. The server socket is still flushed then, but if the phase re-queued a connection
-    /// after a full batch without flushing its own socket, that batch waits for a later phase.
+    /// after a full batch without flushing its own socket, that batch waits for a later phase. The
+    /// check before an attempt also stops the phase when less time is left than the predicted cost
+    /// of flushing what the phase has built on the server socket, capped at half the budget's slice
+    /// (see [`Self::phase_flush`]).
     ///
     /// Attempts run at `now`, read as the phase starts. A connection's own socket is flushed after
     /// its last attempt of the phase, and the server socket, which the other connections share, at
@@ -1701,6 +1720,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let budgeted = self.budget.is_some();
         // Stale slots popped since the last attempt.
         let mut skips = 0;
+        // Datagrams built on the server socket that wait for the end-of-phase flush.
+        let mut staged = 0;
         loop {
             let mut reading = None;
             let mut take = Take::Nothing;
@@ -1726,7 +1747,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                         .timers
                         .next_pacing()
                         .is_some_and(|wake| wake <= at)
-                    && !self.gate(UnitKind::Attempt, reading)
+                    && !self.gate_staged(UnitKind::Attempt, reading, staged)
                 {
                     break;
                 }
@@ -1776,7 +1797,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 } else {
                     reading
                 };
-                if !(budgeted && served) && !self.gate(UnitKind::Attempt, check) {
+                if !(budgeted && served) && !self.gate_staged(UnitKind::Attempt, check, staged) {
                     // The connection stays dirty and goes back to the head of the queue.
                     entry.dirty = true;
                     stopped = Some(entry.slot_generation);
@@ -1813,6 +1834,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                         )
                     }
                 };
+                if entry.socket.is_none() {
+                    staged += u32::from(outcome.datagrams);
+                }
                 // Read once per attempt, off the per-packet path.
                 let sent = entry.conn.stats().sent_packets - sent_before;
                 self.sent_packets.set(self.sent_packets.get() + sent);
@@ -1848,6 +1872,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     && let Some(server) = &self.server
                 {
                     server_flushes = !server.socket.borrow_mut().flush(at).blocked;
+                    if server_flushes {
+                        staged = 0;
+                    }
                 }
                 self.set_pacing(key, entry, outcome.pacing_at);
                 if outcome.datagrams > 0 {
@@ -1898,10 +1925,38 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if flush_server {
             #[cfg(test)]
             self.record.borrow_mut().marks.push(Mark::Flush);
-            self.flush_server(latest, cx);
+            self.phase_flush(latest, cx);
         }
         #[cfg(test)]
         self.record.borrow_mut().end_phase();
+    }
+
+    /// Makes a transmit phase's end-of-phase flush of the server socket at `now`. Under a work
+    /// budget the flush is a unit of its own kind, not preceded by a check. It is timed from the
+    /// reading of the check that stopped the phase, or else from a fresh reading, to a reading
+    /// after it, and its time per datagram sent feeds the driver's running average.
+    fn phase_flush(&self, now: Instant, cx: &mut Context<'_>) {
+        let Some(budget) = &self.budget else {
+            self.flush_server(now, cx);
+            return;
+        };
+        let before = self
+            .stopped
+            .get()
+            .then(|| budget.checked_at())
+            .flatten()
+            .unwrap_or_else(|| self.clock());
+        budget.begin_flush(before);
+        let flushed = self.send_server(now, cx);
+        let after = self.clock();
+        let datagrams = flushed.map_or(0, |flushed| flushed.datagrams);
+        budget.end_flush(before, after, datagrams);
+        let mut cost = self.flush_cost.get();
+        cost.record(after.saturating_duration_since(before), datagrams);
+        self.flush_cost.set(cost);
+        if flushed.is_some_and(|flushed| !flushed.blocked) {
+            self.remark_parked();
+        }
     }
 
     /// Begins measuring the leftover wait of the slots a transmit stop left in `queue`, at the
@@ -1979,11 +2034,21 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// Flushes the server socket, applies its reports, and gives the connections it refused
     /// another attempt once it takes runs again.
     fn flush_server(&self, now: Instant, cx: &mut Context<'_>) {
-        let Some(server) = &self.server else {
-            return;
-        };
+        if self
+            .send_server(now, cx)
+            .is_some_and(|flushed| !flushed.blocked)
+        {
+            self.remark_parked();
+        }
+    }
+
+    /// Flushes the server socket, if there is one, and applies its reports. Returns the datagrams
+    /// the flush sent and whether runs still wait behind an EAGAIN with the socket not writable.
+    fn send_server(&self, now: Instant, cx: &mut Context<'_>) -> Option<FlushOutcome> {
+        let server = self.server.as_ref()?;
         let mut socket = server.socket.borrow_mut();
-        let blocked = socket.flush(now).blocked && socket.poll_writable(cx).is_pending();
+        let flushed = socket.flush(now);
+        let blocked = flushed.blocked && socket.poll_writable(cx).is_pending();
         let mut reports = mem::take(&mut self.sched.borrow_mut().reports);
         socket.drain_reports(|key, report| reports.push((key, report)));
         drop(socket);
@@ -2003,11 +2068,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let mut sched = self.sched.borrow_mut();
         sched.reports = reports;
         sched.server_blocked = blocked;
-        drop(sched);
-        if blocked {
-            return;
-        }
-        self.remark_parked();
+        Some(FlushOutcome {
+            datagrams: flushed.datagrams,
+            blocked,
+        })
     }
 
     /// Marks the connections parked on the writable server socket for another attempt, oldest

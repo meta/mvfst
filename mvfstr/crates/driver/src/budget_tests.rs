@@ -2317,3 +2317,218 @@ fn a_paced_continuation_a_stop_leaves_keeps_its_place_and_its_releases_go_on_wit
         "the third attempt filled to the horizon: {releases:?} {filled}"
     );
 }
+
+/// Returns a server scene and its per-poll budget of [`SLICE`]: one established connection that
+/// opens four long streams and sends them in attempts of ten datagrams, on a socket with kernel
+/// release if `release`. Each attempt costs 100 µs and each datagram a flush sends costs `flush`.
+fn streaming(release: bool, flush: Duration) -> (Scene, WorkBudget) {
+    let budget = WorkBudget::per_poll(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        release,
+        len: Some(1 << 20),
+        segments: 10,
+        budget: Some(budget.clone()),
+        ..ServerPlan::default()
+    });
+    scene.establish(1);
+    scene.lab.net.set_costs(Costs {
+        attempt: us(100),
+        flush,
+        ..Costs::default()
+    });
+    scene.servers()[0].open_streams(4);
+    (scene, budget)
+}
+
+/// Returns how many end-of-phase flushes `budget` has timed, the datagrams they sent and their µs.
+fn flushes(budget: &WorkBudget) -> (u64, u64, u64) {
+    let stats = budget.stats();
+    (stats.flushes, stats.flushed_datagrams, stats.flush_us)
+}
+
+/// Returns `after` less `before`, field by field.
+fn since(after: (u64, u64, u64), before: (u64, u64, u64)) -> (u64, u64, u64) {
+    (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+}
+
+/// Returns the datagrams each attempt on the server's socket built since the events were last
+/// cleared.
+fn built_on_server(scene: &Scene) -> Vec<u16> {
+    scene
+        .lab
+        .net
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            NetEvent::Built(addr, _, datagrams) if addr == SERVER => Some(datagrams),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_end_of_phase_flush_after_a_stop_is_timed_under_its_own_kind() {
+    let (scene, budget) = streaming(false, us(5));
+    scene.lab.net.clear_events();
+    let before = flushes(&budget);
+    let marks = scene.poll_server();
+    assert_eq!(
+        attempted(&marks).len(),
+        11,
+        "nothing staged was flushed at a cost yet, so nothing is reserved: {marks:?}"
+    );
+    assert_eq!(stop(&marks), Some(Phase::FirstTransmit), "{marks:?}");
+    assert_eq!(built_on_server(&scene), [10; 11]);
+    let stats = budget.stats();
+    assert_eq!(
+        stats.longest_past_us(UnitKind::Attempt),
+        100,
+        "the eleventh attempt began at the deadline"
+    );
+    assert_eq!(
+        stats.longest_past_us(UnitKind::TransmitFlush),
+        550,
+        "the flush after the stop sent 110 datagrams at 5 µs each, wholly past the deadline"
+    );
+    assert_eq!(since(flushes(&budget), before), (1, 110, 550));
+}
+
+#[test]
+fn an_end_of_phase_flush_after_a_phase_without_a_stop_is_timed_apart_from_its_last_attempt() {
+    let budget = WorkBudget::per_poll(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        len: Some(5_000),
+        budget: Some(budget.clone()),
+        ..ServerPlan::default()
+    });
+    scene.establish(1);
+    scene.lab.net.set_costs(Costs {
+        attempt: us(900),
+        flush: us(100),
+        ..Costs::default()
+    });
+    scene.servers()[0].open_streams(1);
+    scene.lab.net.clear_events();
+    let before = flushes(&budget);
+    let marks = scene.poll_server();
+    assert_eq!(attempted(&marks), [0], "{marks:?}");
+    let sent: u16 = built_on_server(&scene).iter().sum();
+    assert!(sent >= 2, "the stream takes a few datagrams: {sent}");
+    assert_eq!(
+        stop(&marks),
+        Some(Phase::SecondApp),
+        "the attempt sent the whole stream and the phase ended without a stop; the flush closed \
+         the slice: {marks:?}"
+    );
+    let stats = budget.stats();
+    assert_eq!(
+        stats.longest_past_us(UnitKind::Attempt),
+        0,
+        "the attempt ended at 900 µs, inside the slice"
+    );
+    assert_eq!(
+        stats.longest_past_us(UnitKind::TransmitFlush),
+        100 * u64::from(sent) - 100,
+        "the flush began at 900 µs and took 100 µs a datagram"
+    );
+    let (timed, datagrams, _) = since(flushes(&budget), before);
+    assert_eq!((timed, datagrams), (1, u64::from(sent)));
+}
+
+#[test]
+fn a_transmit_phase_stops_before_an_attempt_once_less_is_left_than_its_predicted_flush() {
+    for (flush, attempts, took, why) in [
+        (
+            us(5),
+            7,
+            us(1_050),
+            "after seven attempts 300 µs are left, and flushing their 70 datagrams is predicted \
+             at 350 µs from the first poll's 5 µs a datagram",
+        ),
+        (
+            us(100),
+            6,
+            us(6_600),
+            "the reserve is at most half the slice: after six attempts 400 µs are left",
+        ),
+        (
+            us(0),
+            11,
+            us(1_100),
+            "flushes that cost nothing reserve nothing",
+        ),
+    ] {
+        let (scene, budget) = streaming(false, flush);
+        let before = flushes(&budget);
+        let first = scene.poll_server();
+        assert_eq!(attempted(&first).len(), 11, "{why}: {first:?}");
+        assert_eq!(budget.stats().reserve_stops, 0);
+        scene.lab.net.clear_events();
+        let start = scene.lab.net.now();
+        let second = scene.poll_server();
+        assert_eq!(attempted(&second).len(), attempts, "{why}: {second:?}");
+        assert_eq!(
+            stop(&second),
+            Some(Phase::SecondTransmit),
+            "{why}: {second:?}"
+        );
+        assert_eq!(built_on_server(&scene), vec![10; attempts], "{why}");
+        assert_eq!(
+            scene.lab.net.now() - start,
+            took,
+            "the poll's attempts and its flush: {why}"
+        );
+        let stats = budget.stats();
+        assert_eq!(stats.reserve_stops, u64::from(attempts < 11), "{why}");
+        assert_eq!(budget.outcome(), PollOutcome::Stopped);
+        assert!(
+            scene.lab.queued(scene.server_task),
+            "a stop wakes the driver"
+        );
+        assert_eq!(
+            since(flushes(&budget), before).1,
+            110 + 10 * attempts as u64,
+            "each poll's end-of-phase flush sent what its phase built"
+        );
+    }
+}
+
+#[test]
+fn a_per_attempt_flush_on_a_release_socket_is_part_of_its_attempt_and_leaves_nothing_reserved() {
+    let (scene, budget) = streaming(true, us(5));
+    for _ in 0..2 {
+        scene.lab.net.clear_events();
+        let before = flushes(&budget);
+        let marks = scene.poll_server();
+        assert_eq!(
+            attempted(&marks).len(),
+            7,
+            "each attempt and its flush take 150 µs, and nothing waits for the phase's flush, \
+             so nothing is reserved: {marks:?}"
+        );
+        let events = scene.lab.net.events();
+        let sends = events
+            .iter()
+            .filter(|event| **event == NetEvent::Flush(SERVER))
+            .count();
+        assert!(
+            sends > 7,
+            "a flush after each attempt, then the phase's: {events:?}"
+        );
+        let stats = budget.stats();
+        assert_eq!(
+            stats.longest_past_us(UnitKind::Attempt),
+            50,
+            "the seventh attempt began at 900 µs and its flush ended at 1,050 µs: the budget \
+             charges a flush inside an attempt to the attempt"
+        );
+        assert_eq!(stats.reserve_stops, 0);
+        let (timed, datagrams, _) = since(flushes(&budget), before);
+        assert_eq!(
+            (timed, datagrams),
+            (1, 0),
+            "the phase's own flush finds nothing left"
+        );
+        assert_eq!(stats.longest_past_us(UnitKind::TransmitFlush), 0);
+    }
+}
