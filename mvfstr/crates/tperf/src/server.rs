@@ -24,7 +24,7 @@ use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
 use mvfstr_driver::Refusal;
 use mvfstr_driver::SendSink;
-use mvfstr_io::MmsgBackend;
+use mvfstr_io::Backend;
 use mvfstr_proto::Bytes;
 use mvfstr_proto::ConnEvent;
 use mvfstr_proto::ConnOptions;
@@ -81,31 +81,32 @@ impl Settings {
     }
 }
 
-/// The server's driver, set once it runs, which keeps the counters of the server socket.
-pub(crate) type Driver = Rc<OnceCell<EndpointHandle<ServerApp, MmsgBackend>>>;
+/// The server's driver on backend `B`, set once it runs, which keeps the counters of the server
+/// socket.
+pub(crate) type Driver<B> = Rc<OnceCell<EndpointHandle<ServerApp<B>, B>>>;
 
 /// The server application: it takes every connection.
 #[derive(Debug)]
-pub(crate) struct ServerApp {
+pub(crate) struct ServerApp<B: Backend> {
     settings: Settings,
-    driver: Driver,
+    driver: Driver<B>,
 }
 
-impl ServerApp {
+impl<B: Backend> ServerApp<B> {
     /// Creates an application whose connections run with `settings` on `driver`.
-    pub(crate) fn new(settings: Settings, driver: Driver) -> Self {
+    pub(crate) fn new(settings: Settings, driver: Driver<B>) -> Self {
         Self { settings, driver }
     }
 }
 
-impl QuicApplication for ServerApp {
-    type Session = ServerSession;
+impl<B: Backend> QuicApplication for ServerApp<B> {
+    type Session = ServerSession<B>;
 
     fn accept(
         &mut self,
         _info: &ConnInfo,
         _options: &mut ConnOptions,
-    ) -> Result<ServerSession, Refusal> {
+    ) -> Result<ServerSession<B>, Refusal> {
         Ok(ServerSession {
             settings: self.settings.clone(),
             driver: Rc::clone(&self.driver),
@@ -118,9 +119,9 @@ impl QuicApplication for ServerApp {
 
 /// One connection of the server.
 #[derive(Debug)]
-pub(crate) struct ServerSession {
+pub(crate) struct ServerSession<B: Backend> {
     settings: Settings,
-    driver: Driver,
+    driver: Driver<B>,
     producers: HashMap<StreamId, Producer>,
     /// Streams not opened yet, for want of stream credit or of a `Conn` to open them on.
     to_open: u32,
@@ -128,7 +129,7 @@ pub(crate) struct ServerSession {
     handle: Option<ConnHandle>,
 }
 
-impl ServerSession {
+impl<B: Backend> ServerSession<B> {
     /// Opens the pending streams while the client's stream limit allows.
     fn open_streams(&mut self, conn: &mut Conn<'_>) {
         while self.to_open > 0 {
@@ -143,7 +144,7 @@ impl ServerSession {
     }
 }
 
-impl QuicSession for ServerSession {
+impl<B: Backend> QuicSession for ServerSession<B> {
     fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
         match event {
             ConnEvent::Connected => {

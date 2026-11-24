@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The transmit half of [`MmsgBackend`](crate::MmsgBackend).
+//! The transmit half of [`MmsgBackend`](crate::MmsgBackend) and
+//! [`HostBackend`](crate::HostBackend).
 
 use std::collections::VecDeque;
 use std::io;
@@ -540,7 +541,8 @@ fn push_source(enc: &mut Encoder<'_>, ipv4_path: bool, src: IpAddr) {
     }
 }
 
-/// [`MmsgBackend`](crate::MmsgBackend)'s [`SegmentSink`] for one connection.
+/// The [`SegmentSink`] of [`MmsgBackend`](crate::MmsgBackend) and
+/// [`HostBackend`](crate::HostBackend) for one connection.
 pub struct MmsgSink<'a> {
     tx: &'a mut Tx,
     fd: BorrowedFd<'a>,

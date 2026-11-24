@@ -15,6 +15,7 @@
 mod client;
 mod config;
 mod flags;
+mod manual;
 mod pin;
 mod report;
 mod run;

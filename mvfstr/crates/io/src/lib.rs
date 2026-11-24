@@ -17,12 +17,17 @@
 //!
 //! [`MmsgBackend`] is the Linux backend: `sendmmsg` with UDP_SEGMENT, TOS and source-address
 //! control messages, `recvmmsg` with UDP_GRO, readiness through tokio's `AsyncFd`, and optionally
-//! kernel release through SO_TXTIME. [`socket`] holds the socket setup it uses. Backends do not
-//! support userspace or NIC release, recalling queued datagrams, TX timestamps or IP_RECVERR.
+//! kernel release through SO_TXTIME. [`HostBackend`] makes the same system calls but takes its
+//! readiness from an [`IoHost`], the event loop of the thread it runs on, so it does not need a
+//! tokio runtime; [`ManualHost`] is an epoll host run by hand. [`socket`] holds the socket setup
+//! both use. Backends do not support userspace or NIC release, recalling queued datagrams, TX
+//! timestamps or IP_RECVERR.
 
 pub mod backend;
 #[cfg(target_os = "linux")]
 mod cmsg;
+#[cfg(target_os = "linux")]
+mod host;
 #[cfg(target_os = "linux")]
 mod mmsg;
 #[cfg(target_os = "linux")]
@@ -42,6 +47,22 @@ pub use backend::ReleaseSupport;
 pub use backend::RxBackend;
 pub use backend::TxBackend;
 pub use backend::TxCaps;
+#[cfg(target_os = "linux")]
+pub use host::HostBackend;
+#[cfg(target_os = "linux")]
+pub use host::HostOptions;
+#[cfg(target_os = "linux")]
+pub use host::Interest;
+#[cfg(target_os = "linux")]
+pub use host::IoHost;
+#[cfg(target_os = "linux")]
+pub use host::ManualHost;
+#[cfg(target_os = "linux")]
+pub use host::ManualRegistration;
+#[cfg(target_os = "linux")]
+pub use host::Notifier;
+#[cfg(target_os = "linux")]
+pub use host::Readiness;
 #[cfg(target_os = "linux")]
 pub use mmsg::MmsgBackend;
 #[cfg(target_os = "linux")]

@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Running either side: one Roxygen worker per side with one endpoint driver on it.
+//! Running either side: one Roxygen worker per side with one endpoint driver on it, on the event
+//! loop `--host_loop` chooses.
 
 use std::fmt;
 use std::io;
@@ -18,14 +19,22 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use mvfstr_driver::EndpointDriver;
+use mvfstr_io::Backend;
+use mvfstr_io::HostBackend;
+use mvfstr_io::HostOptions;
+use mvfstr_io::ManualHost;
 use mvfstr_io::MmsgBackend;
 use mvfstr_io::MmsgOptions;
+use mvfstr_io::TxCaps;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::CloseReason;
 use mvfstr_proto::ConnOptions;
 use mvfstr_proto::ConnStats;
+use mvfstr_proto::EndpointConfig;
+use mvfstr_proto::ServerConfig;
 use roxygen_runtime::tokio_host::ManagedWorker;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
+use roxygen_runtime::worker::WorkerContext;
 use rustls::pki_types::ServerName;
 
 use crate::client::ClientApp;
@@ -35,7 +44,10 @@ use crate::config;
 use crate::config::SERVER_NAME;
 use crate::config::SetupError;
 use crate::flags::Flags;
+use crate::flags::HostLoop;
 use crate::flags::Mode;
+use crate::manual::ManualWorker;
+use crate::manual::io_host;
 use crate::report::Measurement;
 use crate::report::startup_line;
 use crate::report::stats_line;
@@ -61,9 +73,46 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 /// The connections the server's send buffer has room for, each with one run beyond the horizon.
 const SIZED_CONNECTIONS: usize = 16;
 
+/// The worker of one side, on the event loop `--host_loop` chooses.
+enum Worker {
+    Tokio(ManagedWorker),
+    Manual(ManualWorker),
+}
+
+impl Worker {
+    fn new(host_loop: HostLoop) -> Result<Self, RunError> {
+        Ok(match host_loop {
+            HostLoop::Tokio => Self::Tokio(ManagedWorker::new(WORKER_COMMANDS)?),
+            HostLoop::Manual => {
+                Self::Manual(ManualWorker::new(WORKER_COMMANDS).map_err(RunError::Loop)?)
+            }
+        })
+    }
+
+    /// Runs `command` on the worker.
+    fn submit(
+        &self,
+        command: impl FnOnce(&WorkerContext) + Send + 'static,
+    ) -> Result<(), RunError> {
+        let submitted = match self {
+            Self::Tokio(worker) => worker.handle().submit(command),
+            Self::Manual(worker) => worker.handle().submit(command),
+        };
+        submitted.map_err(|_| RunError::WorkerGone)
+    }
+
+    /// Stops the worker once its work has drained.
+    fn shutdown(self) -> Result<(), RunError> {
+        match self {
+            Self::Tokio(worker) => Ok(worker.shutdown()?),
+            Self::Manual(worker) => worker.shutdown().map_err(RunError::Loop),
+        }
+    }
+}
+
 /// A server running on its own worker until dropped.
 pub(crate) struct RunningServer {
-    _worker: ManagedWorker,
+    _worker: Worker,
     addr: SocketAddr,
     startup: String,
     closed: mpsc::Receiver<Closed>,
@@ -110,30 +159,18 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
     let (closed_tx, closed) = mpsc::channel();
     let settings = Settings::new(flags, closed_tx);
     let segments = max_segments(flags);
-    let worker = ManagedWorker::new(WORKER_COMMANDS)?;
+    let worker = Worker::new(flags.host_loop)?;
     let (started_tx, started) = mpsc::channel();
-    worker
-        .handle()
-        .submit(move |worker| {
-            let driver = Driver::default();
-            let app = ServerApp::new(settings, Rc::clone(&driver));
-            let started = EndpointDriver::<_, MmsgBackend>::builder(endpoint, app)
-                .bind_server(addr, server)
-                .backend_options(options)
-                .max_segments(segments)
-                .spawn(worker)
-                .map_err(|error| error.to_string())
-                .and_then(|handle| {
-                    let started = handle
-                        .local_addr()
-                        .zip(handle.server_caps())
-                        .ok_or_else(|| "the server driver has no socket".to_owned());
-                    let _ = driver.set(handle);
-                    started
-                });
-            let _ = started_tx.send(started);
-        })
-        .map_err(|_| RunError::WorkerGone)?;
+    let host_loop = flags.host_loop;
+    worker.submit(move |worker| {
+        let serve = match host_loop {
+            HostLoop::Tokio => serve::<MmsgBackend>,
+            HostLoop::Manual => serve::<HostBackend<ManualHost>>,
+        };
+        let _ = started_tx.send(serve(
+            worker, endpoint, settings, addr, server, options, segments,
+        ));
+    })?;
     let (addr, caps) = started
         .recv()
         .map_err(|_| RunError::WorkerGone)?
@@ -163,26 +200,20 @@ fn run_client_with(
     let name =
         ServerName::try_from(SERVER_NAME).map_err(|error| RunError::Start(error.to_string()))?;
     let duration_secs = flags.duration_secs;
-    let worker = ManagedWorker::new(WORKER_COMMANDS)?;
+    let worker = Worker::new(flags.host_loop)?;
     let (outcomes_tx, outcomes) = mpsc::channel();
     let (started_tx, started) = mpsc::channel();
-    worker
-        .handle()
-        .submit(move |worker| {
-            let started = EndpointDriver::<_, MmsgBackend>::builder(endpoint, ClientApp)
-                .backend_options(options)
-                .spawn(worker)
-                .map_err(|error| error.to_string())
-                .and_then(|driver| {
-                    let session = ClientSession::new(duration_secs, outcomes_tx);
-                    driver
-                        .connect(remote, name, client, ConnOptions::default(), session)
-                        .map(drop)
-                        .map_err(|error| error.to_string())
-                });
-            let _ = started_tx.send(started);
-        })
-        .map_err(|_| RunError::WorkerGone)?;
+    let host_loop = flags.host_loop;
+    worker.submit(move |worker| {
+        let connect = match host_loop {
+            HostLoop::Tokio => connect::<MmsgBackend>,
+            HostLoop::Manual => connect::<HostBackend<ManualHost>>,
+        };
+        let session = ClientSession::new(duration_secs, outcomes_tx);
+        let _ = started_tx.send(connect(
+            worker, endpoint, options, remote, name, client, session,
+        ));
+    })?;
     started
         .recv()
         .map_err(|_| RunError::WorkerGone)?
@@ -202,6 +233,75 @@ fn run_client_with(
     }
     worker.shutdown()?;
     result
+}
+
+/// A backend tperf runs an endpoint on.
+trait TperfBackend: Backend {
+    /// Returns the options that open this backend with the socket settings `mmsg`, on the
+    /// worker's thread.
+    fn options(mmsg: MmsgOptions) -> Self::Options;
+}
+
+impl TperfBackend for MmsgBackend {
+    fn options(mmsg: MmsgOptions) -> MmsgOptions {
+        mmsg
+    }
+}
+
+impl TperfBackend for HostBackend<ManualHost> {
+    fn options(mmsg: MmsgOptions) -> HostOptions<ManualHost> {
+        HostOptions {
+            host: io_host(),
+            mmsg,
+        }
+    }
+}
+
+/// Starts the server's driver on `worker`, on backend `B`, and returns its address and its
+/// socket's capabilities.
+fn serve<B: TperfBackend>(
+    worker: &WorkerContext,
+    endpoint: Arc<EndpointConfig>,
+    settings: Settings,
+    addr: SocketAddr,
+    server: Arc<ServerConfig>,
+    options: MmsgOptions,
+    segments: u16,
+) -> Result<(SocketAddr, TxCaps), String> {
+    let driver = Driver::<B>::default();
+    let app = ServerApp::new(settings, Rc::clone(&driver));
+    let handle = EndpointDriver::<_, B>::builder(endpoint, app)
+        .bind_server(addr, server)
+        .backend_options(B::options(options))
+        .max_segments(segments)
+        .spawn(worker)
+        .map_err(|error| error.to_string())?;
+    let started = handle
+        .local_addr()
+        .zip(handle.server_caps())
+        .ok_or_else(|| "the server driver has no socket".to_owned());
+    let _ = driver.set(handle);
+    started
+}
+
+/// Starts a client driver on `worker`, on backend `B`, and opens its connection to `remote`.
+fn connect<B: TperfBackend>(
+    worker: &WorkerContext,
+    endpoint: Arc<EndpointConfig>,
+    options: MmsgOptions,
+    remote: SocketAddr,
+    name: ServerName<'static>,
+    client: Arc<ClientConfig>,
+    session: ClientSession,
+) -> Result<(), String> {
+    let driver = EndpointDriver::<_, B>::builder(endpoint, ClientApp)
+        .backend_options(B::options(options))
+        .spawn(worker)
+        .map_err(|error| error.to_string())?;
+    driver
+        .connect(remote, name, client, ConnOptions::default(), session)
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
 /// Writes the result lines, then the stats line if `stats` is given.
@@ -292,6 +392,8 @@ pub(crate) enum RunError {
     Setup(SetupError),
     /// The worker could not start or stop.
     Worker(ManagedWorkerError),
+    /// The manual loop could not start, or failed.
+    Loop(io::Error),
     /// The driver or the connection could not start.
     Start(String),
     /// The connection closed before the measured window ended.
@@ -308,6 +410,7 @@ impl fmt::Display for RunError {
             Self::Resolve { host, error } => write!(f, "cannot resolve {host}: {error}"),
             Self::Setup(error) => write!(f, "setup failed: {error}"),
             Self::Worker(error) => write!(f, "worker failed: {error}"),
+            Self::Loop(error) => write!(f, "the manual loop failed: {error}"),
             Self::Start(error) => write!(f, "cannot start: {error}"),
             Self::Closed(reason) => write!(f, "the connection closed early: {reason:?}"),
             Self::WorkerGone => f.write_str("the worker stopped without a result"),
@@ -319,7 +422,7 @@ impl fmt::Display for RunError {
 impl std::error::Error for RunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Resolve { error, .. } | Self::Output(error) => Some(error),
+            Self::Resolve { error, .. } | Self::Loop(error) | Self::Output(error) => Some(error),
             Self::Setup(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Start(_) | Self::Closed(_) | Self::WorkerGone => None,
@@ -393,6 +496,37 @@ mod tests {
             !output.contains("Stats:"),
             "no stats line without --stats: {output}"
         );
+    }
+
+    #[test]
+    fn a_server_on_the_manual_loop_serves_clients_on_either_loop() {
+        let server = start_server(&Flags {
+            stats: true,
+            host_loop: HostLoop::Manual,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        for host_loop in [HostLoop::Manual, HostLoop::Tokio] {
+            let output = client_output(
+                &server,
+                Flags {
+                    duration_secs: 1,
+                    host_loop,
+                    ..loopback(Mode::Client, 0)
+                },
+            );
+            let parsed = report::parse(&output)
+                .unwrap_or_else(|| panic!("{host_loop:?}: no result lines in {output:?}"));
+            assert!(parsed.bytes > 0, "{host_loop:?}: {output}");
+            let Closed { stats, .. } = server
+                .closed_connections()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the closed connection's counters");
+            assert!(
+                stats.sent_packets > 0 && stats.recv_packets > 0,
+                "{host_loop:?}: {stats:?}"
+            );
+        }
     }
 
     #[test]

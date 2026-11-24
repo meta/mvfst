@@ -33,6 +33,16 @@ pub(crate) enum QuicVersion {
     Mvfst,
 }
 
+/// The event loop each side's worker runs on, and so the backend its endpoint uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HostLoop {
+    /// A Roxygen managed worker on a tokio runtime, with `MmsgBackend`.
+    #[default]
+    Tokio,
+    /// tperf's own epoll loop without a tokio runtime, with `HostBackend` on a `ManualHost`.
+    Manual,
+}
+
 /// The parsed flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Flags {
@@ -64,6 +74,8 @@ pub(crate) struct Flags {
     pub(crate) txtime: bool,
     /// With `--txtime`, how far ahead of its release, in µs, a server connection may build.
     pub(crate) build_horizon_us: Option<u32>,
+    /// The event loop of this side's worker.
+    pub(crate) host_loop: HostLoop,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -100,6 +112,7 @@ impl Default for Flags {
             pacing_min_burst: None,
             txtime: false,
             build_horizon_us: None,
+            host_loop: HostLoop::Tokio,
         }
     }
 }
@@ -228,6 +241,13 @@ impl Flags {
             "pacing_min_burst" => self.pacing_min_burst = Some(positive(value).ok_or_else(bad)?),
             "txtime" => self.txtime = bool_value()?,
             "build_horizon_us" => self.build_horizon_us = Some(value.parse().map_err(|_| bad())?),
+            "host_loop" => {
+                self.host_loop = match value {
+                    "tokio" => HostLoop::Tokio,
+                    "manual" => HostLoop::Manual,
+                    _ => return Err(bad()),
+                }
+            }
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -253,7 +273,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 18] = [
+const VALUE_FLAGS: [&str; 19] = [
     "mode",
     "host",
     "port",
@@ -270,6 +290,7 @@ const VALUE_FLAGS: [&str; 18] = [
     "pacing_granularity_us",
     "pacing_min_burst",
     "build_horizon_us",
+    "host_loop",
     "minloglevel",
     "v",
 ];
@@ -399,6 +420,7 @@ mod tests {
             pacing_min_burst: None,
             txtime: false,
             build_horizon_us: None,
+            host_loop: HostLoop::Tokio,
         };
         assert_eq!(flags, expected);
     }
@@ -457,6 +479,7 @@ mod tests {
                 pacing_min_burst: None,
                 txtime: false,
                 build_horizon_us: None,
+                host_loop: HostLoop::Tokio,
             }
         );
         let server = parse(&[
@@ -693,6 +716,25 @@ mod tests {
         );
         assert!(parse(&["--writes_per_loop=4"]).is_ok(), "unpaced");
         assert!(parse(&["--pacing", "--pacing_min_burst=4", "--writes_per_loop=4"]).is_ok());
+    }
+
+    #[test]
+    fn host_loop_chooses_the_workers_event_loop() {
+        assert_eq!(
+            parse(&["--host_loop=manual"]).map(|flags| flags.host_loop),
+            Ok(HostLoop::Manual)
+        );
+        assert_eq!(
+            parse(&["--host_loop=manual", "--host_loop", "tokio"]).map(|flags| flags.host_loop),
+            Ok(HostLoop::Tokio)
+        );
+        assert_eq!(
+            parse(&["--host_loop=epoll"]),
+            Err(FlagError::BadValue {
+                flag: "host_loop".to_owned(),
+                value: "epoll".to_owned(),
+            })
+        );
     }
 
     #[test]

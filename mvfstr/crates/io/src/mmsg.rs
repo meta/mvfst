@@ -111,7 +111,7 @@ impl Default for MmsgOptions {
 }
 
 impl MmsgOptions {
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         let problem = if !(1..=65_527).contains(&self.max_datagram) {
             "max_datagram must be 1 to 65,527 bytes"
         } else if self.tx_slots <= u32::from(self.urgent_slots) {
@@ -163,29 +163,11 @@ impl MmsgBackend {
                 "MmsgBackend needs a tokio runtime with I/O enabled on this thread",
             ));
         }
-        socket.set_nonblocking(true)?;
-        socket::prepare(&socket, options.socket.gro);
-        let mut caps = socket::probe(&socket, options.max_datagram);
-        if options.txtime {
-            caps.release = socket::kernel_release(&socket, options.txtime_horizon)?;
-        }
-        let local = socket.local_addr()?;
-        let config = TxConfig {
-            slots: options.tx_slots,
-            urgent_slots: options.urgent_slots,
-            max_unsent: options.max_unsent,
-            batch: usize::from(options.tx_batch),
-            connected: socket.peer_addr().is_ok(),
-            ipv6: local.is_ipv6(),
-        };
+        let (tx, rx) = ready(&socket, options)?;
         // SAFETY: the socket owns its descriptor, which stays open until the `AsyncFd` drops it,
         // and `as_raw_fd` always returns that descriptor.
         let io = unsafe { AsyncFd::register(socket) }.map_err(io::Error::from)?;
-        Ok(Self {
-            io,
-            tx: Tx::new(caps, config),
-            rx: Rx::new(options.rx_batch as usize, options.rx_buffer as usize),
-        })
+        Ok(Self { io, tx, rx })
     }
 
     /// Returns the local address the socket is bound to.
@@ -295,6 +277,54 @@ fn poll_io<R>(
     }
 }
 
+/// Readies a socket for a backend opened with valid `options`, as
+/// [`MmsgBackend::from_socket`] describes, and builds the backend's transmit and receive halves
+/// for its capabilities.
+pub(crate) fn ready(socket: &Socket, options: &MmsgOptions) -> io::Result<(Tx, Rx)> {
+    socket.set_nonblocking(true)?;
+    socket::prepare(socket, options.socket.gro);
+    let mut caps = socket::probe(socket, options.max_datagram);
+    if options.txtime {
+        caps.release = socket::kernel_release(socket, options.txtime_horizon)?;
+    }
+    let config = TxConfig {
+        slots: options.tx_slots,
+        urgent_slots: options.urgent_slots,
+        max_unsent: options.max_unsent,
+        batch: usize::from(options.tx_batch),
+        connected: socket.peer_addr().is_ok(),
+        ipv6: socket.local_addr()?.is_ipv6(),
+    };
+    Ok((
+        Tx::new(caps, config),
+        Rx::new(options.rx_batch as usize, options.rx_buffer as usize),
+    ))
+}
+
+/// Opens the socket of a client connection to `remote`, on an ephemeral port, and returns it with
+/// the options to open its backend with.
+pub(crate) fn open_connected(
+    remote: SocketAddr,
+    options: &MmsgOptions,
+) -> io::Result<(Socket, MmsgOptions)> {
+    let local = match remote {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    // An ephemeral port is never shared.
+    let socket_options = SocketOptions {
+        reuse_port: false,
+        ..options.socket.clone()
+    };
+    // Kernel release is the server socket's: a client connection's endpoint cannot give it a
+    // horizon, so its runs are never stamped.
+    let options = MmsgOptions {
+        txtime: false,
+        ..options.clone()
+    };
+    Ok((socket::open(local, Some(remote), &socket_options)?, options))
+}
+
 impl Backend for MmsgBackend {
     type Options = MmsgOptions;
 
@@ -303,25 +333,8 @@ impl Backend for MmsgBackend {
     }
 
     fn connect(remote: SocketAddr, options: &MmsgOptions) -> io::Result<Self> {
-        let local = match remote {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        // An ephemeral port is never shared.
-        let socket_options = SocketOptions {
-            reuse_port: false,
-            ..options.socket.clone()
-        };
-        // Kernel release is the server socket's: a client connection's endpoint cannot give it a
-        // horizon, so its runs are never stamped.
-        let options = MmsgOptions {
-            txtime: false,
-            ..options.clone()
-        };
-        Self::from_socket(
-            socket::open(local, Some(remote), &socket_options)?,
-            &options,
-        )
+        let (socket, options) = open_connected(remote, options)?;
+        Self::from_socket(socket, &options)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {

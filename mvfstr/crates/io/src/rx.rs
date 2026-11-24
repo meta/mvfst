@@ -5,8 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The receive half of [`MmsgBackend`](crate::MmsgBackend): `recvmmsg` into buffers the
-//! backend owns, with UDP_GRO, and the metadata of each buffer.
+//! The receive half of [`MmsgBackend`](crate::MmsgBackend) and
+//! [`HostBackend`](crate::HostBackend): `recvmmsg` into buffers the backend owns, with UDP_GRO,
+//! and the metadata of each buffer.
 
 use std::io;
 use std::mem::size_of;

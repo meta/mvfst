@@ -29,8 +29,14 @@ pub struct TimerFd {
 }
 
 impl TimerFd {
-    /// Creates a disarmed timer.
+    /// Creates a disarmed timer. Fails when the thread is not running a tokio runtime.
     pub fn new() -> io::Result<Self> {
+        // Registering with the reactor panics without a runtime, so return an error instead.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(io::Error::other(
+                "TimerFd needs a tokio runtime with I/O enabled on this thread",
+            ));
+        }
         // SAFETY: plain system call with constant flags.
         let fd = unsafe {
             libc::timerfd_create(
@@ -156,6 +162,12 @@ mod tests {
             .enable_time()
             .build()
             .expect("runtime")
+    }
+
+    #[test]
+    fn without_a_tokio_runtime_creating_a_timer_fails() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        assert!(TimerFd::new().is_err());
     }
 
     #[test]
