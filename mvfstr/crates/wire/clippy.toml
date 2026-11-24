@@ -1,0 +1,7 @@
+# Protocol code never reads a clock; callers pass `now`.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "sans-IO purity: take `now` as an input" },
+  { path = "std::time::SystemTime::now", reason = "sans-IO purity: take the Unix time as an input" },
+  { path = "std::time::Instant::elapsed", reason = "sans-IO purity: reads the clock; subtract from `now` instead" },
+  { path = "std::time::SystemTime::elapsed", reason = "sans-IO purity: reads the clock; subtract from the Unix time input instead" },
+]

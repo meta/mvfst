@@ -1,0 +1,1855 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Connection tests over the pair harness of [`crate::testing`].
+
+use std::collections::BTreeSet;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::ops::RangeInclusive;
+use std::time::Duration;
+use std::time::Instant;
+
+use bytes::Bytes;
+use mvfstr_crypto::TAG_LEN;
+use mvfstr_crypto::unprotect_header;
+use mvfstr_tls::Level;
+use mvfstr_wire::ConnectionId;
+use mvfstr_wire::Frame;
+use mvfstr_wire::Frames;
+use mvfstr_wire::Header;
+use mvfstr_wire::HeaderSpec;
+use mvfstr_wire::PacketType;
+use mvfstr_wire::PacketWriter;
+use mvfstr_wire::Side;
+use mvfstr_wire::TransportErrorCode;
+use mvfstr_wire::VarInt;
+use mvfstr_wire::Version;
+use rustls::pki_types::ServerName;
+
+use super::ConnError;
+use super::Connection;
+use crate::AlpnPolicy;
+use crate::AppCode;
+use crate::CloseReason;
+use crate::ConnEvent;
+use crate::ConnKey;
+use crate::ConnOptions;
+use crate::DatagramSize;
+use crate::DropReason;
+use crate::Ecn;
+use crate::Endpoint;
+use crate::Initiator;
+use crate::InlineSealer;
+use crate::Inputs;
+use crate::RecvSummary;
+use crate::Route;
+use crate::RxDatagram;
+use crate::RxMeta;
+use crate::SealError;
+use crate::SealJob;
+use crate::Sealer;
+use crate::ServerConfig;
+use crate::SlotId;
+use crate::Stop;
+use crate::TransportConfig;
+use crate::TxLimits;
+use crate::TxReport;
+use crate::TxSeqRange;
+use crate::recovery::RecoveryConfig;
+use crate::recovery::Space;
+use crate::recovery::test_epoch;
+use crate::testing::LinkConfig;
+use crate::testing::Loss;
+use crate::testing::Pair;
+use crate::testing::PairConfig;
+use crate::testing::TestRng;
+use crate::testing::VecSink;
+use crate::testing::fixtures::Setup;
+use crate::testing::fixtures::unix_now;
+
+/// Every handshake here completes well within this, losses included.
+pub(super) const LIMIT: Duration = Duration::from_secs(10);
+
+pub(super) fn start(config: PairConfig) -> (Instant, Pair) {
+    let epoch = test_epoch();
+    (epoch, Pair::new(epoch, unix_now(), config))
+}
+
+pub(super) fn handshake(config: PairConfig) -> (Instant, Pair) {
+    let (epoch, mut pair) = start(config);
+    assert!(
+        pair.handshake(epoch + LIMIT),
+        "no handshake: client {:?}, server {:?}",
+        pair.client.events,
+        pair.server.events
+    );
+    (epoch, pair)
+}
+
+/// Returns the types of the packets coalesced in a datagram.
+fn packet_types(mut datagram: &[u8]) -> Vec<PacketType> {
+    let mut types = Vec::new();
+    while !datagram.is_empty() {
+        let Ok(Header::Protected(header)) = Header::parse(datagram, 8) else {
+            panic!("an unparsable packet");
+        };
+        types.push(header.ty());
+        datagram = &datagram[header.packet_len()..];
+    }
+    types
+}
+
+/// Splits a datagram into its coalesced packets.
+fn packets(datagram: &[u8]) -> Vec<(PacketType, Vec<u8>)> {
+    packets_to(datagram, 8)
+}
+
+/// Splits a datagram into its coalesced packets, whose short headers carry a Destination
+/// Connection ID of `dcid_len` bytes.
+fn packets_to(mut datagram: &[u8], dcid_len: usize) -> Vec<(PacketType, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Ok(Header::Protected(header)) = Header::parse(datagram, dcid_len) {
+        let (packet, rest) = datagram.split_at(header.packet_len());
+        out.push((header.ty(), packet.to_vec()));
+        datagram = rest;
+    }
+    out
+}
+
+fn closed(reason: CloseReason, initiator: Initiator) -> ConnEvent {
+    ConnEvent::Closed { reason, initiator }
+}
+
+pub(super) fn limits(now: Instant) -> TxLimits {
+    TxLimits {
+        now,
+        max_segments: 16,
+        max_datagram: 1500,
+        max_bytes: u32::MAX,
+    }
+}
+
+pub(super) fn client_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 50_000)
+}
+
+pub(super) fn server_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 4433)
+}
+
+/// Hands `conn` one datagram from `src`.
+pub(super) fn deliver(
+    conn: &mut Connection,
+    now: Instant,
+    src: SocketAddr,
+    mut data: Vec<u8>,
+) -> RecvSummary {
+    let meta = RxMeta {
+        src,
+        dst_ip: None,
+        ecn: Ecn::NotEct,
+        stride: 0,
+        rx_time: now,
+    };
+    conn.recv_batch(
+        now,
+        &mut [RxDatagram {
+            meta: &meta,
+            data: &mut data,
+        }],
+    )
+}
+
+/// A client that has sent its first datagram, and a server connection that has processed it
+/// and not sent anything yet.
+struct Accepted {
+    now: Instant,
+    client: Connection,
+    server: Connection,
+}
+
+fn accepted(setup: &Setup) -> Accepted {
+    let now = test_epoch();
+    let config = setup.pair();
+    let mut rng = TestRng::new(1);
+    let mut cx = Inputs {
+        now,
+        unix_now: unix_now(),
+        rng: &mut rng,
+    };
+    let key = ConnKey {
+        index: 1,
+        generation: 1,
+    };
+    let mut client = Endpoint::new(config.endpoint.clone(), None)
+        .connect(
+            &mut cx,
+            key,
+            server_addr(),
+            ServerName::try_from("localhost").unwrap(),
+            &config.client,
+            ConnOptions::default(),
+        )
+        .unwrap();
+    let mut sink = VecSink::new(1500);
+    client.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    let mut sent = sink.take();
+    assert_eq!(sent.len(), 1, "a ClientHello in one datagram");
+    let datagram = sent.remove(0).data;
+    let meta = RxMeta {
+        src: client_addr(),
+        dst_ip: None,
+        ecn: Ecn::NotEct,
+        stride: 0,
+        rx_time: now,
+    };
+    let mut endpoint = Endpoint::new(config.endpoint, Some(config.server.clone()));
+    let Route::Accept(incoming) = endpoint.route(now, &meta, &datagram) else {
+        panic!("the server does not accept the ClientHello");
+    };
+    let server = endpoint
+        .accept(
+            &mut cx,
+            key,
+            incoming,
+            &config.server,
+            ConnOptions::default(),
+        )
+        .unwrap();
+    Accepted {
+        now,
+        client,
+        server,
+    }
+}
+
+/// A packet built by hand and sealed with a connection's write keys.
+pub(super) struct Forge<'a> {
+    space: Space,
+    header: HeaderSpec<'a>,
+    pn: u64,
+    /// An ACK frame of one range, written first.
+    pub(super) ack: Option<RangeInclusive<u64>>,
+    frames: &'a [Frame<'a>],
+    /// PADDING up to this packet length.
+    len: usize,
+    /// Bits set in the first byte under header protection.
+    first_bits: u8,
+    /// Whether the payload is empty, so the AEAD tag follows the header. Short headers only.
+    empty: bool,
+}
+
+impl<'a> Forge<'a> {
+    /// Returns a packet `conn` could send in `space`, with packet number `pn` and `frames`.
+    pub(super) fn of(conn: &Connection, space: Space, pn: u64, frames: &'a [Frame<'a>]) -> Self {
+        let header = match space {
+            Space::Initial => HeaderSpec::Initial {
+                version: conn.version,
+                dcid: conn.remote_cid(),
+                scid: conn.local_cid,
+                token: &[],
+            },
+            Space::Handshake => HeaderSpec::Handshake {
+                version: conn.version,
+                dcid: conn.remote_cid(),
+                scid: conn.local_cid,
+            },
+            Space::Data => HeaderSpec::OneRtt {
+                dcid: conn.remote_cid(),
+                spin: false,
+                key_phase: false,
+            },
+        };
+        Self {
+            space,
+            header,
+            pn,
+            ack: None,
+            frames,
+            len: 0,
+            first_bits: 0,
+            empty: false,
+        }
+    }
+
+    /// Seals the packet with `conn`'s keys.
+    pub(super) fn seal(&self, conn: &Connection) -> Vec<u8> {
+        let mut buf = vec![0; 1500];
+        let mut w = PacketWriter::new(&mut buf, self.header, self.pn, 4, TAG_LEN).unwrap();
+        if let Some(range) = self.ack.clone() {
+            w.ack(range, std::iter::empty(), VarInt::ZERO, None)
+                .unwrap();
+        }
+        for frame in self.frames {
+            w.frame(frame).unwrap();
+        }
+        w.pad_to(self.len).unwrap();
+        let layout = w.finish();
+        let len = if self.empty {
+            layout.hdr_len + TAG_LEN
+        } else {
+            layout.len
+        };
+        buf[0] |= self.first_bits;
+        let keys = &conn.spaces[self.space.index()].keys.as_ref().unwrap().local;
+        let job = SealJob {
+            slot: SlotId(0),
+            keys,
+            pn: self.pn,
+            hdr_len: u16::try_from(layout.hdr_len).unwrap(),
+            len: u16::try_from(len).unwrap(),
+        };
+        InlineSealer.seal(job, &mut buf).unwrap();
+        buf.truncate(len);
+        buf
+    }
+}
+
+/// Opens the packets of a datagram `conn` sent with its own write keys: each packet's type and
+/// plaintext.
+pub(super) fn open_own(conn: &Connection, datagram: &[u8]) -> Vec<(PacketType, Vec<u8>)> {
+    packets_to(datagram, dcid_len(conn))
+        .into_iter()
+        .map(|(ty, packet)| (ty, open_packet(conn, ty, packet)))
+        .collect()
+}
+
+/// Returns the plaintexts of the 1-RTT packets of a datagram `conn` sent, skipping the packets of
+/// other spaces, whose keys may be discarded by now.
+pub(super) fn open_own_one_rtt(conn: &Connection, datagram: &[u8]) -> Vec<Vec<u8>> {
+    packets_to(datagram, dcid_len(conn))
+        .into_iter()
+        .filter(|(ty, _)| *ty == PacketType::OneRtt)
+        .map(|(ty, packet)| open_packet(conn, ty, packet))
+        .collect()
+}
+
+/// Returns the length of the Destination Connection ID in the short headers `conn` sends: that of
+/// its peer's IDs, which have one length in these tests.
+fn dcid_len(conn: &Connection) -> usize {
+    conn.sources
+        .cids
+        .peer
+        .ids()
+        .first()
+        .map_or(8, |(_, cid, _)| cid.len())
+}
+
+fn open_packet(conn: &Connection, ty: PacketType, mut packet: Vec<u8>) -> Vec<u8> {
+    let space = match ty {
+        PacketType::Initial => Space::Initial,
+        PacketType::Handshake => Space::Handshake,
+        PacketType::OneRtt => Space::Data,
+        PacketType::ZeroRtt => panic!("no 0-RTT packets are built"),
+    };
+    let keys = &conn.spaces[space.index()].keys.as_ref().unwrap().local;
+    let Ok(Header::Protected(header)) = Header::parse(&packet, dcid_len(conn)) else {
+        panic!("an unparsable packet");
+    };
+    let pn_offset = header.pn_offset();
+    let pn_len = unprotect_header(keys.header(), &mut packet, pn_offset).unwrap();
+    let pn = packet[pn_offset..pn_offset + pn_len]
+        .iter()
+        .fold(0, |acc, &byte| acc << 8 | u64::from(byte));
+    let (header, payload) = packet.split_at_mut(pn_offset + pn_len);
+    keys.packet()
+        .decrypt_in_place(pn, header, payload)
+        .unwrap()
+        .to_vec()
+}
+
+/// Returns the code and frame type of the CONNECTION_CLOSE `conn` reports it sent on an error.
+pub(super) fn local_close(conn: &mut Connection) -> Option<(TransportErrorCode, Option<VarInt>)> {
+    std::iter::from_fn(|| conn.poll_event()).find_map(|event| match event {
+        ConnEvent::Closed {
+            reason: CloseReason::Transport {
+                code, frame_type, ..
+            },
+            initiator: Initiator::Local,
+        } => Some((code, frame_type)),
+        _ => None,
+    })
+}
+
+#[test]
+fn the_handshake_completes_for_client_and_server() {
+    let (_, pair) = handshake(Setup::default().pair());
+    for (peer, side) in [(&pair.client, Side::Client), (&pair.server, Side::Server)] {
+        let conn = peer.conn();
+        assert_eq!(conn.side(), side);
+        assert_eq!(conn.version(), Version::V1);
+        assert_eq!(conn.alpn(), Some(&b"h3"[..]));
+        assert_eq!(
+            peer.events[..2],
+            [ConnEvent::Connected, ConnEvent::Confirmed]
+        );
+        // Both handshake spaces are discarded once the handshake is confirmed (RFC 9001).
+        assert!(conn.spaces[Space::Initial.index()].discarded);
+        assert!(conn.spaces[Space::Handshake.index()].discarded);
+        assert_eq!(conn.stats().tx_inconsistent, 0);
+    }
+    // The server's flight coalesces its Initial and Handshake packets, as RFC 9000 allows.
+    let (_, first) = &pair.server.sent[0];
+    assert_eq!(
+        packet_types(&first.data)[..2],
+        [PacketType::Initial, PacketType::Handshake]
+    );
+    // Client datagrams with an Initial, and server datagrams with an ack-eliciting one, are
+    // padded to 1,200 bytes, as RFC 9000 requires.
+    for (_, datagram) in &pair.client.sent {
+        if packet_types(&datagram.data).contains(&PacketType::Initial) {
+            assert_eq!(datagram.data.len(), 1200);
+        }
+    }
+    assert_eq!(first.data.len(), 1200);
+}
+
+#[test]
+fn a_handshake_failure_closes_both_sides_with_the_tls_alert() {
+    let setup = Setup {
+        client_alpn: &[b"hq-interop"],
+        ..Setup::default()
+    };
+    let (epoch, mut pair) = start(setup.pair());
+    pair.run_until(epoch + LIMIT, |pair| {
+        pair.client.has_event(&ConnEvent::Drained) && pair.server.has_event(&ConnEvent::Drained)
+    });
+    // Without a common application protocol, RFC 9001 requires the TLS alert 120.
+    let code = TransportErrorCode::crypto(120);
+    let server_close = pair.server.events.iter().find_map(|event| match event {
+        ConnEvent::Closed {
+            reason: CloseReason::Transport { code, .. },
+            initiator,
+        } => Some((*code, *initiator)),
+        _ => None,
+    });
+    assert_eq!(server_close, Some((code, Initiator::Local)));
+    let client_close = pair.client.events.iter().find_map(|event| match event {
+        ConnEvent::Closed {
+            reason: CloseReason::Transport { code, .. },
+            initiator,
+        } => Some((*code, *initiator)),
+        _ => None,
+    });
+    assert_eq!(client_close, Some((code, Initiator::Peer)));
+    for peer in [&pair.client, &pair.server] {
+        assert!(!peer.has_event(&ConnEvent::Connected));
+        assert_eq!(peer.events.last(), Some(&ConnEvent::Drained));
+    }
+}
+
+#[test]
+fn the_handshake_survives_losing_each_of_its_datagrams_once() {
+    let (_, baseline) = handshake(Setup::default().pair());
+    let counts = [baseline.client.sent.len(), baseline.server.sent.len()];
+    assert!(counts[0] >= 2 && counts[1] >= 2, "{counts:?}");
+    for (to_server, count) in [(true, counts[0]), (false, counts[1])] {
+        for index in 0..count {
+            let mut config = Setup::default().pair();
+            let link = if to_server {
+                &mut config.to_server
+            } else {
+                &mut config.to_client
+            };
+            link.loss = Loss::Drop(vec![index]);
+            let (_, pair) = handshake(config);
+            let lost = if to_server {
+                pair.to_server.lost()
+            } else {
+                pair.to_client.lost()
+            };
+            assert_eq!(lost, 1, "datagram {index} towards the server: {to_server}");
+        }
+    }
+}
+
+#[test]
+fn the_handshake_completes_over_a_1200_byte_mtu() {
+    // A post-quantum ClientHello and a large certificate take several datagrams each way.
+    let mut config = Setup {
+        pq: true,
+        cert_names: 40,
+        ..Setup::default()
+    }
+    .pair();
+    config.to_server.mtu = 1200;
+    config.to_client.mtu = 1200;
+    let (_, pair) = handshake(config);
+    assert_eq!(pair.to_server.lost() + pair.to_client.lost(), 0);
+    for peer in [&pair.client, &pair.server] {
+        let full = peer
+            .sent
+            .iter()
+            .filter(|(_, d)| d.data.len() == 1200)
+            .count();
+        assert!(full >= 2, "{full} full datagrams");
+    }
+}
+
+#[test]
+fn peer_maximum_datagrams_fill_a_1452_byte_mtu() {
+    let transport = TransportConfig::builder()
+        .datagram_size(DatagramSize::PeerMaximum)
+        .build()
+        .unwrap();
+    // A post-quantum key share makes the server's flight larger than one datagram.
+    let setup = Setup {
+        pq: true,
+        ..Setup::default()
+    }
+    .transport(transport);
+    let mut config = setup.pair();
+    config.to_server.mtu = 1452;
+    config.to_client.mtu = 1452;
+    let (_, pair) = handshake(config);
+    assert_eq!(pair.to_server.lost() + pair.to_client.lost(), 0);
+    // The client's Initials go out before the server's limit arrives; the server has the
+    // client's from the ClientHello.
+    assert_eq!(pair.client.sent[0].1.data.len(), 1200);
+    assert_eq!(pair.server.sent[0].1.data.len(), 1452);
+    let largest = [&pair.client, &pair.server]
+        .into_iter()
+        .flat_map(|peer| &peer.sent)
+        .map(|(_, datagram)| datagram.data.len())
+        .max();
+    assert_eq!(largest, Some(1452));
+}
+
+#[test]
+fn the_minimum_policy_keeps_datagrams_at_1200_bytes_whatever_the_peer_allows() {
+    let mut config = Setup {
+        pq: true,
+        ..Setup::default()
+    }
+    .pair();
+    config.to_server.mtu = 1452;
+    config.to_client.mtu = 1452;
+    let (_, pair) = handshake(config);
+    let largest = [&pair.client, &pair.server]
+        .into_iter()
+        .flat_map(|peer| &peer.sent)
+        .map(|(_, datagram)| datagram.data.len())
+        .max();
+    assert_eq!(largest, Some(1200));
+}
+
+#[test]
+fn a_client_hello_in_two_datagrams_completes() {
+    let setup = Setup {
+        pq: true,
+        ..Setup::default()
+    };
+    let (epoch, pair) = handshake(setup.pair());
+    let first_flight: Vec<_> = pair
+        .client
+        .sent
+        .iter()
+        .filter(|(at, _)| *at == epoch)
+        .map(|(_, datagram)| datagram)
+        .collect();
+    assert_eq!(first_flight.len(), 2);
+    for datagram in first_flight {
+        assert_eq!(datagram.data.len(), 1200);
+        assert_eq!(packet_types(&datagram.data), [PacketType::Initial]);
+    }
+}
+
+#[test]
+fn the_handshake_completes_on_mvfst_connections() {
+    let setup = Setup {
+        client_versions: vec![Version::MVFST],
+        server_versions: vec![Version::V1, Version::MVFST],
+        ..Setup::default()
+    };
+    let (_, pair) = handshake(setup.pair());
+    assert_eq!(pair.client.conn().version(), Version::MVFST);
+    assert_eq!(pair.server.conn().version(), Version::MVFST);
+}
+
+#[test]
+fn one_server_takes_mvfst_clients_with_or_without_alpn_and_version_1_clients_with_it() {
+    // rustls refuses a ClientHello without ALPN under the server's main config, which lists h3,
+    // and one with ALPN under its MVFST config, whose protocol list is empty.
+    let no_alpn = Setup {
+        server_alpn: &[],
+        alpn: AlpnPolicy::AllowMissing,
+        ..Setup::default()
+    }
+    .pair()
+    .server
+    .tls()
+    .clone();
+    let with_server = |client: Setup| {
+        let mut config = client.pair();
+        config.server = ServerConfig::builder(Setup::default().pair().server.tls().clone())
+            .versions(vec![Version::V1, Version::MVFST])
+            .mvfst_tls(no_alpn.clone())
+            .build()
+            .expect("a server config");
+        config
+    };
+
+    let mvfst_client = Setup {
+        client_versions: vec![Version::MVFST],
+        client_alpn: &[],
+        alpn: AlpnPolicy::AllowMissing,
+        ..Setup::default()
+    };
+    let (_, pair) = handshake(with_server(mvfst_client));
+    assert_eq!(pair.server.conn().version(), Version::MVFST);
+    assert_eq!(pair.server.conn().alpn(), None);
+
+    let mvfst_client_with_alpn = Setup {
+        client_versions: vec![Version::MVFST],
+        ..Setup::default()
+    };
+    let (_, pair) = handshake(with_server(mvfst_client_with_alpn));
+    assert_eq!(pair.server.conn().version(), Version::MVFST);
+    assert_eq!(pair.server.conn().alpn(), Some(&b"h3"[..]));
+
+    let (_, pair) = handshake(with_server(Setup::default()));
+    assert_eq!(pair.server.conn().version(), Version::V1);
+    assert_eq!(pair.server.conn().alpn(), Some(&b"h3"[..]));
+}
+
+#[test]
+fn the_idle_timeout_closes_both_sides_silently() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let confirmed = pair.now;
+    let idle = closed(CloseReason::Silent, Initiator::IdleTimeout);
+    // The idle timeout does not fire before the 30-second default.
+    assert!(
+        !pair.run_until(confirmed + Duration::from_secs(29), |pair| {
+            pair.client.has_event(&idle) || pair.server.has_event(&idle)
+        })
+    );
+    assert!(pair.run_until(confirmed + Duration::from_secs(31), |pair| {
+        pair.client.has_event(&ConnEvent::Drained) && pair.server.has_event(&ConnEvent::Drained)
+    }));
+    for peer in [&pair.client, &pair.server] {
+        let tail = &peer.events[peer.events.len() - 2..];
+        assert_eq!(tail, [idle.clone(), ConnEvent::Drained]);
+        assert_eq!(peer.conn().next_deadline(), None);
+        // The drained connection's routes are gone.
+        assert_eq!(peer.endpoint.route_count(), 0);
+    }
+}
+
+#[test]
+fn the_smaller_idle_timeout_of_the_two_sides_applies() {
+    let short = TransportConfig::builder()
+        .idle_timeout(Some(Duration::from_secs(5)))
+        .build()
+        .unwrap();
+    let setup = Setup {
+        server_transport: short,
+        ..Setup::default()
+    };
+    let (_, mut pair) = handshake(setup.pair());
+    let confirmed = pair.now;
+    assert!(pair.run_until(confirmed + Duration::from_secs(6), |pair| {
+        pair.client.has_event(&ConnEvent::Drained) && pair.server.has_event(&ConnEvent::Drained)
+    }));
+    assert!(pair.now >= confirmed + Duration::from_secs(4));
+}
+
+#[test]
+fn close_sends_connection_close_and_both_sides_drain() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let srtt = pair.client.conn().stats().smoothed_rtt;
+    let closed_at = pair.now;
+    let reason = CloseReason::Application {
+        code: AppCode(VarInt::from_u32(7)),
+        reason: Bytes::from_static(b"bye"),
+    };
+    pair.client.conn_mut().close(
+        closed_at,
+        AppCode(VarInt::from_u32(7)),
+        Bytes::from_static(b"bye"),
+    );
+    assert!(pair.run_until(closed_at + LIMIT, |pair| {
+        pair.client.has_event(&ConnEvent::Drained)
+    }));
+    // The closing period lasts three PTOs, as RFC 9000 recommends.
+    assert!(pair.now >= closed_at + 3 * (srtt + Duration::from_millis(25)));
+    pair.run(closed_at + LIMIT);
+    let client_tail = &pair.client.events[pair.client.events.len() - 2..];
+    assert_eq!(
+        client_tail,
+        [closed(reason.clone(), Initiator::Local), ConnEvent::Drained]
+    );
+    let server_tail = &pair.server.events[pair.server.events.len() - 2..];
+    assert_eq!(
+        server_tail,
+        [closed(reason, Initiator::Peer), ConnEvent::Drained]
+    );
+    // One CONNECTION_CLOSE from the client; RFC 9000 bars a draining server from sending.
+    assert_eq!(
+        pair.client
+            .sent
+            .iter()
+            .filter(|(at, _)| *at >= closed_at)
+            .count(),
+        1
+    );
+    assert_eq!(
+        pair.server
+            .sent
+            .iter()
+            .filter(|(at, _)| *at >= closed_at)
+            .count(),
+        0
+    );
+    assert_eq!(pair.server.endpoint.route_count(), 0);
+    assert_eq!(pair.client.endpoint.route_count(), 0);
+}
+
+#[test]
+fn a_transport_close_carries_its_code_to_the_peer() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let closed_at = pair.now;
+    pair.server.conn_mut().close_transport(
+        closed_at,
+        TransportErrorCode::NO_ERROR,
+        Bytes::from_static(b"quiesced"),
+    );
+    pair.run(closed_at + LIMIT);
+    let reason = |frame_type| CloseReason::Transport {
+        code: TransportErrorCode::NO_ERROR,
+        frame_type,
+        reason: Bytes::from_static(b"quiesced"),
+    };
+    let server_tail = &pair.server.events[pair.server.events.len().saturating_sub(2)..];
+    assert_eq!(
+        server_tail,
+        [closed(reason(None), Initiator::Local), ConnEvent::Drained]
+    );
+    // The frame carries frame type 0 for "unknown", which the receiver reports as given.
+    let client_tail = &pair.client.events[pair.client.events.len().saturating_sub(2)..];
+    assert_eq!(
+        client_tail,
+        [
+            closed(reason(Some(VarInt::ZERO)), Initiator::Peer),
+            ConnEvent::Drained
+        ]
+    );
+}
+
+#[test]
+fn a_closing_endpoint_answers_packets_with_its_close() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let closed_at = pair.now;
+    pair.client
+        .conn_mut()
+        .close(closed_at, AppCode(VarInt::from_u32(1)), Bytes::new());
+    // The server's PING crosses the client's CONNECTION_CLOSE.
+    pair.server.conn_mut().ping();
+    pair.run(closed_at + LIMIT);
+    assert_eq!(
+        pair.server
+            .sent
+            .iter()
+            .filter(|(at, _)| *at >= closed_at)
+            .count(),
+        1
+    );
+    assert_eq!(
+        pair.client
+            .sent
+            .iter()
+            .filter(|(at, _)| *at >= closed_at)
+            .count(),
+        2
+    );
+    assert!(pair.server.has_event(&ConnEvent::Drained));
+}
+
+#[test]
+fn abort_ends_the_connection_without_sending() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let aborted_at = pair.now;
+    pair.client.conn_mut().abort();
+    pair.step();
+    let tail = &pair.client.events[pair.client.events.len() - 2..];
+    assert_eq!(
+        tail,
+        [
+            closed(CloseReason::Silent, Initiator::Local),
+            ConnEvent::Drained
+        ]
+    );
+    assert_eq!(
+        pair.client
+            .sent
+            .iter()
+            .filter(|(at, _)| *at >= aborted_at)
+            .count(),
+        0
+    );
+    let outcome = pair.client.conn_mut().poll_transmit(
+        &limits(aborted_at),
+        &mut VecSink::new(1500),
+        &mut InlineSealer,
+    );
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Closed));
+}
+
+#[test]
+fn a_server_sends_at_most_three_times_what_it_received_before_validation() {
+    // A certificate of several kilobytes makes the server's flight larger than its credit.
+    let setup = Setup {
+        cert_names: 120,
+        ..Setup::default()
+    };
+    let mut config = setup.pair();
+    // Only the client's first datagram arrives, so the address is never validated.
+    config.to_server.loss = Loss::Drop((1..1000).collect());
+    let (epoch, mut pair) = start(config);
+    pair.run(epoch + LIMIT);
+    let received = pair.server.conn().stats().recv_bytes;
+    let sent: usize = pair.server.sent.iter().map(|(_, d)| d.data.len()).sum();
+    assert_eq!(received, 1200);
+    assert!(sent as u64 <= 3 * received, "sent {sent}");
+    assert!(
+        pair.server
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.stop == Stop::Amplification)
+    );
+    assert!(!pair.server.has_event(&ConnEvent::Connected));
+}
+
+#[test]
+fn a_large_server_flight_resumes_once_the_client_validates_the_address() {
+    let setup = Setup {
+        cert_names: 120,
+        ..Setup::default()
+    };
+    let (_, pair) = handshake(setup.pair());
+    // Bytes sent never pass three times those received until the first Handshake packet from
+    // the client arrives; the link delays datagrams by 10 ms and does not drop any.
+    let delay = Duration::from_millis(10);
+    let validated_at = pair
+        .client
+        .sent
+        .iter()
+        .find(|(_, d)| packet_types(&d.data).contains(&PacketType::Handshake))
+        .map(|(at, _)| *at + delay)
+        .unwrap();
+    let mut sent = 0;
+    for (at, datagram) in pair.server.sent.iter().filter(|(at, _)| *at < validated_at) {
+        sent += datagram.data.len();
+        let received: usize = pair
+            .client
+            .sent
+            .iter()
+            .filter(|(sent_at, _)| *sent_at + delay <= *at)
+            .map(|(_, d)| d.data.len())
+            .sum();
+        assert!(sent <= 3 * received, "sent {sent}, received {received}");
+    }
+    assert!(
+        pair.server
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.stop == Stop::Amplification)
+    );
+}
+
+#[test]
+fn ack_frames_acknowledge_exactly_the_packets_received() {
+    let mut config = Setup::default().pair();
+    // Gaps in both directions once the handshake is over.
+    config.to_server.loss = Loss::Drop(vec![8, 11, 12, 15]);
+    config.to_client.loss = Loss::Drop(vec![9, 13]);
+    let (_, mut pair) = handshake(config);
+    for _ in 0..20 {
+        pair.client.conn_mut().ping();
+        pair.server.conn_mut().ping();
+        let until = pair.now + Duration::from_millis(30);
+        pair.run(until);
+    }
+    let mut gaps = false;
+    for peer in [&pair.client, &pair.server] {
+        let log = &peer.conn().sources.ack[Space::Data.index()].log;
+        assert!(log.frames.len() > 5);
+        for (ranges, received) in &log.frames {
+            let acked: BTreeSet<u64> = ranges.iter().flat_map(|r| r.clone()).collect();
+            let lowest = *acked.first().unwrap();
+            let expected: BTreeSet<u64> = received
+                .iter()
+                .copied()
+                .filter(|&pn| pn >= lowest)
+                .collect();
+            assert_eq!(acked, expected);
+            assert_eq!(acked.last(), received.iter().max());
+            gaps |= ranges.len() > 1;
+        }
+    }
+    assert!(gaps, "no ACK frame had a gap");
+    assert!(pair.to_server.lost() + pair.to_client.lost() == 6);
+}
+
+#[test]
+fn a_refused_slot_leaves_the_connection_unchanged() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let before = (
+        format!("{:?}", conn.explain_transmit(&limits(epoch))),
+        conn.stats(),
+        conn.next_deadline(),
+    );
+    let mut sink = VecSink::new(1500);
+    sink.set_refuse(true);
+    let outcome = conn.poll_transmit(&limits(epoch), &mut sink, &mut InlineSealer);
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Socket));
+    let after = (
+        format!("{:?}", conn.explain_transmit(&limits(epoch))),
+        conn.stats(),
+        conn.next_deadline(),
+    );
+    assert_eq!(before, after);
+    assert_eq!(conn.recovery.space(Space::Initial).next_pn(), 0);
+    // A full batch also ends before a slot is taken.
+    let mut sink = VecSink::new(1500);
+    let outcome = conn.poll_transmit(
+        &TxLimits {
+            max_segments: 0,
+            ..limits(epoch)
+        },
+        &mut sink,
+        &mut InlineSealer,
+    );
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::BatchFull));
+    assert_eq!(sink.slots_lent(), 0);
+    // So does a used-up egress grant.
+    let outcome = conn.poll_transmit(
+        &TxLimits {
+            max_bytes: 100,
+            ..limits(epoch)
+        },
+        &mut sink,
+        &mut InlineSealer,
+    );
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Endpoint));
+    assert_eq!(sink.slots_lent(), 0);
+    // The next attempt sends the ClientHello with packet number 0.
+    let outcome = conn.poll_transmit(&limits(epoch), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.datagrams, 1);
+    assert_eq!(conn.recovery.space(Space::Initial).next_pn(), 1);
+}
+
+#[test]
+fn a_candidate_that_fits_no_packet_is_skipped_and_counted() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let tiny = TxLimits {
+        max_datagram: 20,
+        ..limits(epoch)
+    };
+    let mut sink = VecSink::new(20);
+    let outcome = conn.poll_transmit(&tiny, &mut sink, &mut InlineSealer);
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Inconsistent));
+    assert_eq!(conn.stats().tx_inconsistent, 1);
+    assert_eq!(conn.stats().sent_packets, 0);
+    assert_eq!(conn.recovery.space(Space::Initial).next_pn(), 0);
+    // The skipped ClientHello stays queued, so the handshake still completes.
+    assert!(pair.handshake(epoch + LIMIT));
+}
+
+#[test]
+fn an_idle_connection_reports_idle_and_keys_pending_waits_for_keys() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let mut sink = VecSink::new(1500);
+    let conn = pair.client.conn_mut();
+    let outcome = conn.poll_transmit(&limits(epoch), &mut sink, &mut InlineSealer);
+    assert_eq!((outcome.datagrams, outcome.stop), (1, Stop::Idle));
+    // A PING waits for 1-RTT keys.
+    conn.ping();
+    let outcome = conn.poll_transmit(&limits(epoch), &mut sink, &mut InlineSealer);
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::KeysPending));
+    drop(sink.take());
+    assert!(pair.handshake(epoch + LIMIT));
+    let now = pair.now + Duration::from_secs(1);
+    let outcome = pair.client.conn_mut().poll_transmit(
+        &limits(now),
+        &mut VecSink::new(1500),
+        &mut InlineSealer,
+    );
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Idle));
+}
+
+#[test]
+fn a_server_buffers_1rtt_packets_until_the_handshake_completes() {
+    let mut config = Setup::default().pair();
+    // The client's second datagram carries its Finished and, coalesced after it, a 1-RTT PING;
+    // it is held back and delivered in pieces below.
+    config.to_server.loss = Loss::Drop(vec![1]);
+    let (epoch, mut pair) = start(config);
+    pair.client.conn_mut().ping();
+    assert!(pair.run_until(epoch + LIMIT, |pair| pair.to_server.lost() == 1));
+    let datagram = pair.client.sent[1].1.data.clone();
+    let parts = packets(&datagram);
+    let types: Vec<_> = parts.iter().map(|(ty, _)| *ty).collect();
+    assert!(
+        types.ends_with(&[PacketType::Handshake, PacketType::OneRtt]),
+        "{types:?}"
+    );
+    let (one_rtt, rest): (Vec<_>, Vec<_>) = parts
+        .into_iter()
+        .partition(|(ty, _)| *ty == PacketType::OneRtt);
+    let one_rtt = one_rtt.into_iter().next().unwrap().1;
+    let rest: Vec<u8> = rest.into_iter().flat_map(|(_, bytes)| bytes).collect();
+    let meta = RxMeta {
+        src: pair.client.addr,
+        dst_ip: Some(pair.server.addr.ip()),
+        ecn: Ecn::NotEct,
+        stride: 0,
+        rx_time: pair.now,
+    };
+    let now = pair.now;
+    let server = pair.server.conn_mut();
+    // The server holds 1-RTT keys but, as RFC 9001 requires, does not open 1-RTT packets before
+    // the handshake completes; it buffers a bounded number.
+    for copy in 0..=super::MAX_BUFFERED {
+        let mut data = one_rtt.clone();
+        let summary = server.recv_batch(
+            now,
+            &mut [RxDatagram {
+                meta: &meta,
+                data: &mut data,
+            }],
+        );
+        let expect = if copy < super::MAX_BUFFERED {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        assert_eq!((summary.buffered, summary.dropped), expect);
+        assert_eq!(summary.packets, 0);
+    }
+    let mut data = rest;
+    let summary = server.recv_batch(
+        now,
+        &mut [RxDatagram {
+            meta: &meta,
+            data: &mut data,
+        }],
+    );
+    assert!(server.handshake.complete);
+    // The Handshake packet, then one copy of the PING; the other copies are duplicates, and the
+    // Initial is in a datagram below 1,200 bytes.
+    assert_eq!(summary.packets, 2);
+    assert_eq!(summary.dropped, super::MAX_BUFFERED as u32);
+    assert_eq!(server.sources.ack[Space::Data.index()].log.received, [0]);
+}
+
+#[test]
+fn a_client_drops_a_server_initial_that_carries_a_token() {
+    let Accepted {
+        now,
+        mut client,
+        server,
+    } = accepted(&Setup::default());
+    let close = [Frame::ConnectionClose {
+        error_code: TransportErrorCode::CONNECTION_REFUSED,
+        frame_type: VarInt::ZERO,
+        reason: b"",
+    }];
+    let with_token = Forge {
+        header: HeaderSpec::Initial {
+            version: Version::V1,
+            dcid: server.remote_cid(),
+            scid: server.local_cid,
+            token: b"token",
+        },
+        ..Forge::of(&server, Space::Initial, 0, &close)
+    };
+    // RFC 9000 requires an empty token in a server's Initial, so the client discards the packet.
+    let summary = deliver(&mut client, now, server_addr(), with_token.seal(&server));
+    assert_eq!((summary.packets, summary.dropped), (0, 1));
+    assert_eq!(client.poll_event(), None);
+    // Without the token the same CONNECTION_CLOSE is taken.
+    let packet = Forge::of(&server, Space::Initial, 1, &close).seal(&server);
+    let summary = deliver(&mut client, now, server_addr(), packet);
+    assert_eq!(summary.packets, 1);
+    assert!(matches!(
+        client.poll_event(),
+        Some(ConnEvent::Closed {
+            initiator: Initiator::Peer,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn datagrams_from_another_address_earn_no_amplification_credit() {
+    let setup = Setup {
+        cert_names: 120,
+        ..Setup::default()
+    };
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&setup);
+    let mut sink = VecSink::new(1500);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.stop, Stop::Amplification);
+    // Datagrams routed here by connection ID, but from another address.
+    let stranger = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 9);
+    for _ in 0..3 {
+        deliver(&mut server, now, stranger, vec![0; 1200]);
+    }
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Amplification));
+    // Credit comes only from the address being validated, as RFC 9000 requires.
+    deliver(&mut server, now, client_addr(), vec![0; 1200]);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert!(outcome.datagrams > 0);
+    let sent: usize = sink.take().iter().map(|d| d.data.len()).sum();
+    assert!(sent <= 3 * 2400, "sent {sent}");
+}
+
+#[test]
+fn a_datagram_started_by_an_ack_takes_no_data_past_the_egress_grant() {
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&Setup::default());
+    let mut sink = VecSink::new(1500);
+    let spent = TxLimits {
+        max_bytes: 0,
+        ..limits(now)
+    };
+    let outcome = server.poll_transmit(&spent, &mut sink, &mut InlineSealer);
+    // The grant never refuses the due Initial ACK, but CRYPTO data needs the grant to join it.
+    assert_eq!((outcome.datagrams, outcome.stop), (1, Stop::Endpoint));
+    let datagram = sink.take().remove(0).data;
+    assert_eq!(packet_types(&datagram), [PacketType::Initial]);
+    assert!(datagram.len() < 1200, "an ACK-only Initial is not padded");
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert!(outcome.datagrams > 0);
+    drop(sink.take());
+}
+
+#[test]
+fn a_due_probe_goes_out_with_the_egress_grant_spent() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let mut sink = VecSink::new(1500);
+    conn.poll_transmit(&limits(epoch), &mut sink, &mut InlineSealer);
+    assert_eq!(sink.take().len(), 1);
+    // The ClientHello is lost: the PTO makes probes due and queues its bytes again as lost data.
+    let pto = conn.next_deadline().unwrap();
+    conn.on_deadline(pto);
+    assert!(conn.recovery.probes_due(Space::Initial) > 0);
+    let spent = TxLimits {
+        max_bytes: 0,
+        ..limits(pto)
+    };
+    let outcome = conn.poll_transmit(&spent, &mut sink, &mut InlineSealer);
+    // The grant refuses the lost data's own start but never a probe, which the lost data joins.
+    assert!(outcome.datagrams > 0, "{outcome:?}");
+    let probe = sink.take().remove(0).data;
+    assert_eq!(probe.len(), 1200);
+    let opened = open_own(conn, &probe);
+    assert_eq!(opened.len(), 1);
+    assert!(
+        Frames::new(&opened[0].1)
+            .map(Result::unwrap)
+            .any(|frame| matches!(frame, Frame::Crypto { offset, .. } if offset == VarInt::ZERO)),
+        "the probe carries the ClientHello again"
+    );
+}
+
+#[test]
+fn a_short_credit_goes_to_the_start_packet_before_any_joiner() {
+    let setup = Setup {
+        cert_names: 120,
+        ..Setup::default()
+    };
+    let Accepted {
+        now,
+        client,
+        mut server,
+    } = accepted(&setup);
+    let mut sink = VecSink::new(1500);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.stop, Stop::Amplification);
+    drop(sink.take());
+    // A client PING makes the Initial ACK due while Handshake CRYPTO data is still queued.
+    let ping = Forge {
+        len: 1200,
+        ..Forge::of(&client, Space::Initial, 1, &[Frame::Ping])
+    };
+    deliver(&mut server, now, client_addr(), ping.seal(&client));
+    // Credit for the smallest Initial packet and a few bytes more, not for a Handshake one too.
+    let credit = server.min_packet_len(Space::Initial) as u64 + 11;
+    assert!(
+        credit
+            < (server.min_packet_len(Space::Initial) + server.min_packet_len(Space::Handshake))
+                as u64
+    );
+    server.path.sent = 3 * server.path.received - credit;
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.datagrams, 1);
+    // The datagram holds the packet its start was admitted for.
+    let datagram = sink.take().remove(0).data;
+    assert_eq!(packet_types(&datagram), [PacketType::Initial]);
+}
+
+/// Returns whether a packet's plaintext holds a CONNECTION_CLOSE of either type.
+fn holds_close(plaintext: &[u8]) -> bool {
+    Frames::new(plaintext).map(Result::unwrap).any(|frame| {
+        matches!(
+            frame,
+            Frame::ConnectionClose { .. } | Frame::ApplicationClose { .. }
+        )
+    })
+}
+
+#[test]
+fn a_close_waits_for_credit_that_holds_its_frame() {
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&Setup::default());
+    // A reason far longer than the few bytes the smallest 1-RTT packet has room for.
+    server.close(
+        now,
+        AppCode(VarInt::from_u32(7)),
+        Bytes::from(vec![b'x'; 100]),
+    );
+    // Credit for the Initial and Handshake CLOSEs and for the smallest 1-RTT packet, not for
+    // the 1-RTT CLOSE with its reason.
+    server.path.sent = 3 * server.path.received - 200;
+    let mut sink = VecSink::new(1500);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    let sent = sink.take();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        packet_types(&sent[0].data),
+        [PacketType::Initial, PacketType::Handshake]
+    );
+    assert!(server.path.credit() >= server.min_packet_len(Space::Data) as u64);
+    // The credit stops the attempt with the CLOSE still pending, and tx_inconsistent stays at zero.
+    assert_eq!(outcome.stop, Stop::Amplification);
+    assert_eq!(server.stats().tx_inconsistent, 0);
+    // The client's next datagram brings the credit the CLOSE needs.
+    deliver(&mut server, now, client_addr(), vec![0; 1200]);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.datagrams, 1);
+    let opened = open_own(&server, &sink.take().remove(0).data);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].0, PacketType::OneRtt);
+    assert!(Frames::new(&opened[0].1).map(Result::unwrap).any(
+        |frame| matches!(frame, Frame::ApplicationClose { reason, .. } if reason.len() == 100)
+    ));
+}
+
+#[test]
+fn a_closing_connection_sends_no_packet_without_its_close() {
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&Setup::default());
+    // The ClientHello's ACK is due, and a transport CLOSE keeps its reason in every space.
+    server.close_on_error(
+        now,
+        ConnError::new(
+            TransportErrorCode::PROTOCOL_VIOLATION,
+            "a reason longer than the room an ACK leaves in the smallest Initial packet",
+        ),
+    );
+    // Credit for an Initial packet that holds the ACK but not the CLOSE.
+    let credit = server.min_packet_len(Space::Initial) as u64 + 11;
+    server.path.sent = 3 * server.path.received - credit;
+    let mut sink = VecSink::new(1500);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    // While closing, an ACK goes out only in a packet with the CLOSE (RFC 9000).
+    for datagram in sink.take() {
+        for (ty, plaintext) in open_own(&server, &datagram.data) {
+            assert!(holds_close(&plaintext), "a {ty:?} packet without the CLOSE");
+        }
+    }
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Amplification));
+    assert_eq!(server.stats().tx_inconsistent, 0);
+    deliver(&mut server, now, client_addr(), vec![0; 1200]);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.datagrams, 1);
+    let opened = open_own(&server, &sink.take().remove(0).data);
+    assert_eq!(opened.len(), 3);
+    for (ty, plaintext) in &opened {
+        assert!(holds_close(plaintext), "a {ty:?} packet without the CLOSE");
+    }
+}
+
+#[test]
+fn a_connection_takes_the_longest_initial_rtt_the_builder_accepts() {
+    let longest = TransportConfig::builder()
+        .initial_rtt(RecoveryConfig::MAX_TIMER_SETTING)
+        .build()
+        .unwrap();
+    handshake(Setup::default().transport(longest).pair());
+}
+
+#[test]
+fn handshakes_from_one_setup_send_datagrams_of_the_same_sizes() {
+    // The server's flight fills several datagrams, so its length shows in the last one
+    // instead of in padding.
+    let setup = Setup {
+        cert_names: 120,
+        ..Setup::default()
+    };
+    let sizes = |pair: &Pair| {
+        [&pair.client, &pair.server].map(|peer| {
+            peer.sent
+                .iter()
+                .map(|(_, datagram)| datagram.data.len())
+                .collect::<Vec<_>>()
+        })
+    };
+    let (_, first) = handshake(setup.pair());
+    for _ in 0..3 {
+        let (_, pair) = handshake(setup.pair());
+        assert_eq!(sizes(&pair), sizes(&first));
+    }
+}
+
+#[test]
+fn rtt_samples_run_to_when_the_ack_arrived() {
+    let Accepted {
+        now,
+        mut client,
+        server,
+    } = accepted(&Setup::default());
+    let ack = Forge {
+        ack: Some(0..=0),
+        ..Forge::of(&server, Space::Initial, 0, &[])
+    };
+    let mut data = ack.seal(&server);
+    // The ACK of the ClientHello arrives after 20 ms and waits 80 ms more to be processed.
+    let meta = RxMeta {
+        src: server_addr(),
+        dst_ip: None,
+        ecn: Ecn::NotEct,
+        stride: 0,
+        rx_time: now + Duration::from_millis(20),
+    };
+    let summary = client.recv_batch(
+        now + Duration::from_millis(100),
+        &mut [RxDatagram {
+            meta: &meta,
+            data: &mut data,
+        }],
+    );
+    assert_eq!(summary.packets, 1);
+    // The sample ends when the ACK was received, as RFC 9002 defines it.
+    assert_eq!(client.recovery.rtt().latest(), Duration::from_millis(20));
+}
+
+#[test]
+fn a_server_arms_its_pto_when_its_credit_covers_a_handshake_probe() {
+    let Accepted {
+        now,
+        client,
+        mut server,
+    } = accepted(&Setup::default());
+    let mut sink = VecSink::new(1500);
+    server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    drop(sink.take());
+    // The client acknowledges the server's Initial but does not send a Handshake packet, so the
+    // address stays unvalidated with only Handshake data in flight.
+    let ack = Forge {
+        ack: Some(0..=0),
+        len: 1200,
+        ..Forge::of(&client, Space::Initial, 1, &[])
+    };
+    let summary = deliver(&mut server, now, client_addr(), ack.seal(&client));
+    assert_eq!(summary.packets, 1);
+    assert_eq!(
+        server
+            .recovery
+            .space(Space::Initial)
+            .ack_eliciting_in_flight(),
+        0
+    );
+    assert!(
+        server
+            .recovery
+            .space(Space::Handshake)
+            .ack_eliciting_in_flight()
+            > 0
+    );
+    assert!(!server.path.validated);
+    let idle = now + Duration::from_secs(30);
+    // Too little credit for an Initial, enough for a Handshake probe.
+    server.path.sent = 3 * server.path.received - 900;
+    assert!(server.next_deadline().unwrap() < idle, "no PTO armed");
+    // The PTO stays unarmed when not even a Handshake packet fits, as RFC 9002 requires.
+    server.path.sent = 3 * server.path.received - 30;
+    assert_eq!(server.next_deadline(), Some(idle));
+}
+
+/// Seals a 1-RTT packet with `frames`, as the client of a confirmed pair would but with
+/// `first_bits` and `empty` as in [`Forge`], delivers it to the server, and returns the
+/// server's CONNECTION_CLOSE.
+fn server_close_on_one_rtt(
+    first_bits: u8,
+    empty: bool,
+    frames: &[Frame<'_>],
+) -> Option<(TransportErrorCode, Option<VarInt>)> {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let now = pair.now;
+    let client = pair.client.conn();
+    let pn = client.recovery.space(Space::Data).next_pn() + 10;
+    let packet = Forge {
+        first_bits,
+        empty,
+        ..Forge::of(client, Space::Data, pn, frames)
+    }
+    .seal(client);
+    let server = pair.server.conn_mut();
+    let summary = deliver(server, now, client_addr(), packet);
+    assert_eq!(summary.packets, 1);
+    local_close(server)
+}
+
+#[test]
+fn reserved_bits_set_are_a_protocol_violation() {
+    // The short header's reserved bits are 0x18, and RFC 9000 requires them to be zero.
+    assert_eq!(
+        server_close_on_one_rtt(0x10, false, &[Frame::Ping]),
+        Some((TransportErrorCode::PROTOCOL_VIOLATION, None))
+    );
+}
+
+#[test]
+fn a_packet_without_frames_is_a_protocol_violation() {
+    assert_eq!(
+        server_close_on_one_rtt(0, true, &[]),
+        Some((TransportErrorCode::PROTOCOL_VIOLATION, None))
+    );
+}
+
+#[test]
+fn handshake_done_from_a_client_is_a_protocol_violation() {
+    assert_eq!(
+        server_close_on_one_rtt(0, false, &[Frame::HandshakeDone]),
+        Some((
+            TransportErrorCode::PROTOCOL_VIOLATION,
+            Some(VarInt::from_u32(0x1e))
+        ))
+    );
+}
+
+#[test]
+fn new_token_from_a_client_is_a_protocol_violation() {
+    let new_token = [Frame::NewToken { token: b"token" }];
+    // RFC 9000 lets only a server send NEW_TOKEN.
+    assert_eq!(
+        server_close_on_one_rtt(0, false, &new_token),
+        Some((
+            TransportErrorCode::PROTOCOL_VIOLATION,
+            Some(VarInt::from_u32(0x07))
+        ))
+    );
+    // A client accepts it but does not keep the token: Retry and resumption are not supported.
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let now = pair.now;
+    let server = pair.server.conn();
+    let pn = server.recovery.space(Space::Data).next_pn() + 10;
+    let packet = Forge::of(server, Space::Data, pn, &new_token).seal(server);
+    let client = pair.client.conn_mut();
+    let summary = deliver(client, now, server_addr(), packet);
+    assert_eq!(summary.packets, 1);
+    assert_eq!(local_close(client), None);
+}
+
+#[test]
+fn a_frame_its_packet_type_may_not_carry_is_a_protocol_violation() {
+    let Accepted {
+        now,
+        client,
+        mut server,
+    } = accepted(&Setup::default());
+    let frames = [Frame::MaxData(VarInt::from_u32(1000))];
+    let packet = Forge {
+        len: 1200,
+        ..Forge::of(&client, Space::Initial, 1, &frames)
+    };
+    deliver(&mut server, now, client_addr(), packet.seal(&client));
+    assert_eq!(
+        local_close(&mut server),
+        Some((
+            TransportErrorCode::PROTOCOL_VIOLATION,
+            Some(VarInt::from_u32(0x10))
+        ))
+    );
+}
+
+#[test]
+fn new_crypto_data_at_a_finished_level_is_a_protocol_violation() {
+    let Accepted {
+        now,
+        client,
+        mut server,
+    } = accepted(&Setup::default());
+    // The server has read the ClientHello and now reads Handshake CRYPTO.
+    assert_eq!(server.tls.read_level(), Level::Handshake);
+    let frames = [Frame::Crypto {
+        offset: VarInt::from_u32(5000),
+        data: &[1; 10],
+    }];
+    let packet = Forge {
+        len: 1200,
+        ..Forge::of(&client, Space::Initial, 1, &frames)
+    };
+    deliver(&mut server, now, client_addr(), packet.seal(&client));
+    assert_eq!(
+        local_close(&mut server),
+        Some((TransportErrorCode::PROTOCOL_VIOLATION, None))
+    );
+}
+
+/// Returns a pair whose client sent its Finished in a datagram the server never got, with the
+/// offset and bytes of the CRYPTO frame that carried it.
+fn held_finished() -> (Pair, u64, Vec<u8>) {
+    let mut config = Setup::default().pair();
+    config.to_server.loss = Loss::Drop(vec![1]);
+    let (epoch, mut pair) = start(config);
+    assert!(pair.run_until(epoch + LIMIT, |pair| pair.to_server.lost() == 1));
+    assert!(!pair.server.conn().handshake.complete);
+    let datagram = &pair.client.sent[1].1.data;
+    let (_, packet) = packets(datagram)
+        .into_iter()
+        .find(|(ty, _)| *ty == PacketType::Handshake)
+        .expect("the client's second datagram carries its Finished");
+    let (_, plaintext) = open_own(pair.client.conn(), &packet).remove(0);
+    let (offset, data) = Frames::new(&plaintext)
+        .map(Result::unwrap)
+        .find_map(|frame| match frame {
+            Frame::Crypto { offset, data } => Some((offset.into_inner(), data.to_vec())),
+            _ => None,
+        })
+        .expect("a CRYPTO frame");
+    (pair, offset, data)
+}
+
+/// Seals a Handshake packet with `frames` as the client of `pair` would, with a packet number
+/// `ahead` past its next one, and delivers it to the server.
+fn client_handshake_packet(pair: &mut Pair, ahead: u64, frames: &[Frame<'_>]) -> RecvSummary {
+    let now = pair.now;
+    let addr = pair.client.addr;
+    let client = pair.client.conn();
+    let pn = client.recovery.space(Space::Handshake).next_pn() + ahead;
+    let packet = Forge::of(client, Space::Handshake, pn, frames).seal(client);
+    deliver(pair.server.conn_mut(), now, addr, packet)
+}
+
+#[test]
+fn the_finished_repeated_in_its_own_packet_completes_the_handshake() {
+    let (mut pair, offset, finished) = held_finished();
+    let crypto = Frame::Crypto {
+        offset: VarInt::from_u64(offset).unwrap(),
+        data: &finished,
+    };
+    // RFC 9000 lets CRYPTO data arrive again, here in the packet that completes the handshake,
+    // after the server confirmed it.
+    let summary = client_handshake_packet(&mut pair, 0, &[crypto, crypto]);
+    assert_eq!(summary.packets, 1);
+    let server = pair.server.conn_mut();
+    assert_eq!(local_close(server), None);
+    assert!(server.handshake.confirmed);
+    assert!(server.spaces[Space::Handshake.index()].discarded);
+}
+
+#[test]
+fn handshake_crypto_data_left_past_the_finished_is_a_protocol_violation() {
+    let (mut pair, offset, finished) = held_finished();
+    let end = offset + finished.len() as u64;
+    let beyond = [Frame::Crypto {
+        offset: VarInt::from_u64(end + 10).unwrap(),
+        data: &[1; 5],
+    }];
+    let summary = client_handshake_packet(&mut pair, 0, &beyond);
+    assert_eq!(summary.packets, 1);
+    assert_eq!(local_close(pair.server.conn_mut()), None);
+    let crypto = [Frame::Crypto {
+        offset: VarInt::from_u64(offset).unwrap(),
+        data: &finished,
+    }];
+    client_handshake_packet(&mut pair, 1, &crypto);
+    // TLS moved past the level with bytes still unread at it, a protocol violation under RFC 9001.
+    assert_eq!(
+        local_close(pair.server.conn_mut()),
+        Some((TransportErrorCode::PROTOCOL_VIOLATION, None))
+    );
+}
+
+#[test]
+fn crypto_data_far_past_what_tls_read_is_crypto_buffer_exceeded() {
+    let Accepted {
+        now,
+        mut client,
+        server,
+    } = accepted(&Setup::default());
+    let frames = [Frame::Crypto {
+        offset: VarInt::from_u32(100_000),
+        data: &[1],
+    }];
+    let packet = Forge::of(&server, Space::Initial, 0, &frames).seal(&server);
+    deliver(&mut client, now, server_addr(), packet);
+    assert_eq!(
+        local_close(&mut client),
+        Some((TransportErrorCode::CRYPTO_BUFFER_EXCEEDED, None))
+    );
+}
+
+#[test]
+fn later_packets_of_a_datagram_for_another_connection_id_are_ignored() {
+    let Accepted {
+        now,
+        client,
+        mut server,
+    } = accepted(&Setup::default());
+    let first = Forge::of(&client, Space::Initial, 1, &[Frame::Ping]).seal(&client);
+    let other = ConnectionId::new(&[9; 8]).unwrap();
+    let second = Forge {
+        header: HeaderSpec::Initial {
+            version: Version::V1,
+            dcid: other,
+            scid: client.local_cid,
+            token: &[],
+        },
+        len: 1200 - first.len(),
+        ..Forge::of(&client, Space::Initial, 2, &[Frame::Ping])
+    }
+    .seal(&client);
+    let datagram = [first, second].concat();
+    assert_eq!(datagram.len(), 1200);
+    // RFC 9000 has a receiver ignore a later packet with a different Destination Connection ID.
+    let summary = deliver(&mut server, now, client_addr(), datagram);
+    assert_eq!((summary.packets, summary.dropped), (1, 1));
+}
+
+#[test]
+fn long_header_packets_from_another_source_connection_id_are_ignored() {
+    let Accepted {
+        now,
+        client,
+        mut server,
+    } = accepted(&Setup::default());
+    let stranger = Forge {
+        header: HeaderSpec::Initial {
+            version: Version::V1,
+            dcid: client.remote_cid(),
+            scid: ConnectionId::new(&[9; 8]).unwrap(),
+            token: &[],
+        },
+        len: 1200,
+        ..Forge::of(&client, Space::Initial, 1, &[Frame::Ping])
+    };
+    // The client's first Initial fixed its connection ID (RFC 9000).
+    let summary = deliver(&mut server, now, client_addr(), stranger.seal(&client));
+    assert_eq!((summary.packets, summary.dropped), (0, 1));
+    let own = Forge {
+        len: 1200,
+        ..Forge::of(&client, Space::Initial, 2, &[Frame::Ping])
+    };
+    let summary = deliver(&mut server, now, client_addr(), own.seal(&client));
+    assert_eq!((summary.packets, summary.dropped), (1, 0));
+}
+
+#[test]
+fn an_application_close_before_confirmation_goes_out_in_every_keyed_space() {
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&Setup::default());
+    server.close(
+        now,
+        AppCode(VarInt::from_u32(7)),
+        Bytes::from_static(b"bye"),
+    );
+    let mut sink = VecSink::new(1500);
+    let outcome = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.datagrams, 1);
+    let datagram = sink.take().remove(0).data;
+    let opened = open_own(&server, &datagram);
+    let types: Vec<_> = opened.iter().map(|(ty, _)| *ty).collect();
+    assert_eq!(
+        types,
+        [
+            PacketType::Initial,
+            PacketType::Handshake,
+            PacketType::OneRtt
+        ]
+    );
+    for (ty, plaintext) in &opened {
+        let close = Frames::new(plaintext).map(Result::unwrap).find(|frame| {
+            matches!(
+                frame,
+                Frame::ConnectionClose { .. } | Frame::ApplicationClose { .. }
+            )
+        });
+        // RFC 9000 has an application close in an Initial or Handshake packet sent as a
+        // transport APPLICATION_ERROR, with its reason cleared.
+        let expected = match ty {
+            PacketType::OneRtt => Frame::ApplicationClose {
+                error_code: VarInt::from_u32(7),
+                reason: b"bye",
+            },
+            _ => Frame::ConnectionClose {
+                error_code: TransportErrorCode::APPLICATION_ERROR,
+                frame_type: VarInt::ZERO,
+                reason: b"",
+            },
+        };
+        assert_eq!(close, Some(expected), "{ty:?}");
+    }
+}
+
+#[test]
+fn a_dropped_datagram_is_lost_at_once_and_its_ack_sent_again() {
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&Setup::default());
+    let mut sink = VecSink::new(1500);
+    let first = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    let sent_packets: usize = sink
+        .take()
+        .iter()
+        .map(|d| packet_types(&d.data).len())
+        .sum();
+    let acks = |server: &Connection| server.sources.ack[Space::Initial.index()].log.frames.len();
+    assert_eq!(acks(&server), 1);
+    let idle = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!((idle.datagrams, idle.stop), (0, Stop::Idle));
+    server.on_tx_report(
+        now,
+        TxReport::Dropped {
+            tx: TxSeqRange {
+                start: 0,
+                end: u64::from(first.datagrams),
+            },
+            reason: DropReason::LocalQueue,
+        },
+    );
+    assert_eq!(server.stats().lost_packets, sent_packets as u64);
+    // The CRYPTO data goes out again at once, with the Initial ACK.
+    let again = server.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    assert_eq!(again.datagrams, first.datagrams);
+    assert_eq!(acks(&server), 2);
+    drop(sink.take());
+}
+
+/// A sealer that refuses every packet.
+struct Refusing;
+
+impl Sealer for Refusing {
+    fn seal(&mut self, _job: SealJob<'_>, _pkt: &mut [u8]) -> Result<(), SealError> {
+        Err(SealError::Encrypt)
+    }
+}
+
+#[test]
+fn a_seal_failure_sends_nothing_and_keeps_the_crypto_data() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let mut sink = VecSink::new(1500);
+    let outcome = conn.poll_transmit(&limits(epoch), &mut sink, &mut Refusing);
+    assert_eq!((outcome.datagrams, outcome.stop), (0, Stop::Inconsistent));
+    assert!(sink.take().is_empty());
+    assert_eq!(conn.recovery.space(Space::Initial).next_pn(), 0);
+    assert_eq!(conn.stats().sent_packets, 0);
+    // The ClientHello went back to its buffer: the next attempt sends it.
+    let outcome = conn.poll_transmit(&limits(epoch), &mut sink, &mut InlineSealer);
+    assert_eq!(outcome.datagrams, 1);
+    assert_eq!(conn.recovery.space(Space::Initial).next_pn(), 1);
+    drop(sink.take());
+}
+
+#[test]
+fn a_connection_that_requires_alpn_closes_when_tls_agrees_on_none() {
+    // Both protocol lists are empty, so TLS completes without one; the config builders refuse
+    // AlpnPolicy::Required without protocols, so the server's policy is set by hand.
+    let setup = Setup {
+        client_alpn: &[],
+        server_alpn: &[],
+        alpn: AlpnPolicy::AllowMissing,
+        ..Setup::default()
+    };
+    let (epoch, mut pair) = start(setup.pair());
+    assert!(pair.run_until(epoch + LIMIT, |pair| pair.server.conn.is_some()));
+    pair.server.conn_mut().alpn_policy = AlpnPolicy::Required;
+    pair.run_until(epoch + LIMIT, |pair| {
+        pair.client.has_event(&ConnEvent::Drained) && pair.server.has_event(&ConnEvent::Drained)
+    });
+    // Without a negotiated application protocol, RFC 9001 requires the TLS alert 120.
+    let code = TransportErrorCode::crypto(120);
+    assert!(!pair.server.has_event(&ConnEvent::Connected));
+    assert!(pair.server.events.iter().any(|event| matches!(
+        event,
+        ConnEvent::Closed {
+            reason: CloseReason::Transport { code: c, .. },
+            initiator: Initiator::Local,
+        } if *c == code
+    )));
+    assert!(pair.client.events.iter().any(|event| matches!(
+        event,
+        ConnEvent::Closed {
+            reason: CloseReason::Transport { code: c, .. },
+            initiator: Initiator::Peer,
+        } if *c == code
+    )));
+}
+
+#[test]
+fn a_connection_moves_between_threads_but_is_never_shared() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Connection>();
+    // With a `Sync` connection both impls apply and the call below is ambiguous.
+    trait AmbiguousIfSync<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    <Connection as AmbiguousIfSync<_>>::check();
+}
+
+#[test]
+fn the_handshake_and_its_acks_hold_up_over_a_reordering_link() {
+    let mut config = Setup::default().pair();
+    let jittery = LinkConfig {
+        jitter: Duration::from_millis(15),
+        ..LinkConfig::default()
+    };
+    config.to_server = jittery.clone();
+    config.to_client = jittery;
+    let (_, mut pair) = handshake(config);
+    for _ in 0..20 {
+        pair.client.conn_mut().ping();
+        pair.server.conn_mut().ping();
+        let until = pair.now + Duration::from_millis(5);
+        pair.run(until);
+    }
+    let until = pair.now + Duration::from_millis(100);
+    pair.run(until);
+    assert!(pair.to_server.reordered() + pair.to_client.reordered() > 0);
+    for peer in [&pair.client, &pair.server] {
+        let log = &peer.conn().sources.ack[Space::Data.index()].log;
+        assert!(!log.frames.is_empty());
+        for (ranges, received) in &log.frames {
+            let acked: BTreeSet<u64> = ranges.iter().flat_map(|r| r.clone()).collect();
+            let lowest = *acked.first().unwrap();
+            let expected: BTreeSet<u64> = received
+                .iter()
+                .copied()
+                .filter(|&pn| pn >= lowest)
+                .collect();
+            assert_eq!(acked, expected);
+        }
+    }
+}

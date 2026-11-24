@@ -1,0 +1,484 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Received-packet tracking for one packet number space: the ranges an ACK frame reports,
+//! duplicate detection, ECN counts and the once-per-batch "ACK due" decision (RFC 9000).
+
+use std::collections::VecDeque;
+use std::ops::RangeInclusive;
+use std::time::Duration;
+use std::time::Instant;
+
+use super::Space;
+use crate::receive::Ecn;
+
+/// The ECN counts of one space, reported in ACK_ECN frames (RFC 9000).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EcnCounts {
+    /// Packets received with ECT(0).
+    pub ect0: u64,
+    /// Packets received with ECT(1).
+    pub ect1: u64,
+    /// Packets received with CE.
+    pub ce: u64,
+}
+
+/// Whether an ACK frame is due in a space, evaluated once per receive batch (RFC 9000).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckDue {
+    /// The space has not received a packet since the last ACK frame.
+    None,
+    /// Only packets that are not ack-eliciting arrived: an ACK may join a packet sent for another
+    /// reason but must not start one (RFC 9000).
+    Piggyback,
+    /// Ack-eliciting packets wait; an ACK must start a packet by this time and may join one
+    /// before.
+    At(Instant),
+    /// An ACK must be sent now.
+    Now,
+}
+
+/// The packets received in one space, and what that means for the next ACK frame.
+#[derive(Clone, Debug)]
+pub struct ReceivedPackets {
+    space: Space,
+    /// Disjoint, non-adjacent inclusive ranges in ascending order.
+    ranges: VecDeque<(u64, u64)>,
+    max_ranges: usize,
+    /// The packet number below which packets were in dropped ranges and count as duplicates.
+    floor: u64,
+    /// The packet number below which packets were in an ACK frame the peer acknowledged and are not
+    /// reported.
+    report_floor: u64,
+    ecn: EcnCounts,
+    /// Whether any packet arrived since the last ACK frame was sent.
+    unacked: bool,
+    /// Ack-eliciting packets that arrived since the last ACK frame was sent.
+    unacked_eliciting: u32,
+    /// When the first of those arrived.
+    first_unacked_eliciting: Option<Instant>,
+    /// Whether a packet that arrived since the last ACK frame is to be acknowledged at once.
+    immediate: bool,
+    /// The largest ack-eliciting packet number received.
+    largest_eliciting: Option<u64>,
+    /// The largest packet number received and when it arrived.
+    largest: Option<(u64, Instant)>,
+}
+
+impl ReceivedPackets {
+    /// Creates the tracking for `space`, which keeps at most `max_ranges` ranges (at least 1) and
+    /// drops the oldest first.
+    pub fn new(space: Space, max_ranges: usize) -> Self {
+        let max_ranges = max_ranges.max(1);
+        Self {
+            space,
+            ranges: VecDeque::with_capacity(max_ranges + 1),
+            max_ranges,
+            floor: 0,
+            report_floor: 0,
+            ecn: EcnCounts::default(),
+            unacked: false,
+            unacked_eliciting: 0,
+            first_unacked_eliciting: None,
+            immediate: false,
+            largest_eliciting: None,
+            largest: None,
+        }
+    }
+
+    /// Records a decrypted packet, or returns `false` without recording it if it is a duplicate.
+    pub fn on_packet(&mut self, pn: u64, ack_eliciting: bool, ecn: Ecn, rx_time: Instant) -> bool {
+        if !self.insert(pn) {
+            return false;
+        }
+        match ecn {
+            Ecn::NotEct => {}
+            Ecn::Ect0 => self.ecn.ect0 += 1,
+            Ecn::Ect1 => self.ecn.ect1 += 1,
+            Ecn::Ce => self.ecn.ce += 1,
+        }
+        self.unacked = true;
+        if self.largest.is_none_or(|(largest, _)| pn > largest) {
+            self.largest = Some((pn, rx_time));
+        }
+        if ack_eliciting {
+            self.unacked_eliciting += 1;
+            self.first_unacked_eliciting.get_or_insert(rx_time);
+            // Initial and Handshake packets are never acknowledged late, as RFC 9000 requires; it
+            // recommends the same on reordering, a gap or a CE mark to speed the peer's response.
+            if self.space != Space::Data || ecn == Ecn::Ce || self.reorders_or_gaps(pn) {
+                self.immediate = true;
+            }
+            self.largest_eliciting = self.largest_eliciting.max(Some(pn));
+        }
+        while self.ranges.len() > self.max_ranges
+            && let Some((_, end)) = self.ranges.pop_front()
+        {
+            self.floor = end + 1;
+        }
+        true
+    }
+
+    /// Returns whether `pn` was already received; if so, the packet must not be processed again.
+    pub fn is_duplicate(&self, pn: u64) -> bool {
+        if pn < self.floor {
+            return true;
+        }
+        let i = self.ranges.partition_point(|&(_, end)| end < pn);
+        i < self.ranges.len() && self.ranges[i].0 <= pn
+    }
+
+    /// Returns whether the newly recorded ack-eliciting `pn` is below the largest ack-eliciting
+    /// packet received, or above it with a packet missing in between.
+    fn reorders_or_gaps(&self, pn: u64) -> bool {
+        let Some(largest) = self.largest_eliciting else {
+            return false;
+        };
+        if pn < largest {
+            return true;
+        }
+        // `pn` was just recorded, so a range holds it; every packet down to `largest` has arrived
+        // exactly when that range reaches it.
+        let i = self.ranges.partition_point(|&(_, end)| end < pn);
+        self.ranges.get(i).is_none_or(|&(start, _)| start > largest)
+    }
+
+    /// Adds `pn` to the ranges, or returns `false` if it is already there.
+    fn insert(&mut self, pn: u64) -> bool {
+        if pn < self.floor {
+            return false;
+        }
+        // The common case: the next packet in order extends the newest range.
+        match self.ranges.back_mut() {
+            Some(last) if pn == last.1 + 1 => {
+                last.1 = pn;
+                return true;
+            }
+            Some(last) if pn > last.1 + 1 => {
+                self.ranges.push_back((pn, pn));
+                return true;
+            }
+            None => {
+                self.ranges.push_back((pn, pn));
+                return true;
+            }
+            Some(_) => {}
+        }
+        if self.is_duplicate(pn) {
+            return false;
+        }
+        let i = self.ranges.partition_point(|&(_, end)| end < pn);
+        let joins_prev = i > 0 && self.ranges[i - 1].1 + 1 == pn;
+        let joins_next = i < self.ranges.len() && self.ranges[i].0 == pn + 1;
+        match (joins_prev, joins_next) {
+            (true, true) => {
+                self.ranges[i - 1].1 = self.ranges[i].1;
+                self.ranges.remove(i);
+            }
+            (true, false) => self.ranges[i - 1].1 = pn,
+            (false, true) => self.ranges[i].0 = pn,
+            (false, false) => self.ranges.insert(i, (pn, pn)),
+        }
+        true
+    }
+
+    /// Returns whether an ACK frame is due at `now`, for a policy that acknowledges once
+    /// `threshold` ack-eliciting packets wait and at most `delay` after the first of them arrived.
+    /// The caller evaluates it once per receive batch, after recording every packet in it.
+    pub fn ack_due(&self, now: Instant, threshold: u8, delay: Duration) -> AckDue {
+        if let Some(first) = self.first_unacked_eliciting {
+            let deadline = first + delay;
+            if self.immediate || self.unacked_eliciting >= u32::from(threshold) || now >= deadline {
+                return AckDue::Now;
+            }
+            return AckDue::At(deadline);
+        }
+        if self.unacked {
+            AckDue::Piggyback
+        } else {
+            AckDue::None
+        }
+    }
+
+    /// Resets the ACK-due decision when an ACK frame that covers the packets so far is sealed.
+    pub fn on_ack_sent(&mut self) {
+        self.unacked = false;
+        self.unacked_eliciting = 0;
+        self.first_unacked_eliciting = None;
+        self.immediate = false;
+    }
+
+    /// Returns the largest packet number received and when it arrived.
+    pub fn largest(&self) -> Option<(u64, Instant)> {
+        self.largest
+    }
+
+    /// Returns the ACK Delay to report at `now`: the time since the largest packet arrived
+    /// (RFC 9000).
+    pub fn ack_delay(&self, now: Instant) -> Duration {
+        self.largest
+            .map_or(Duration::ZERO, |(_, at)| now.saturating_duration_since(at))
+    }
+
+    /// Returns the ECN counts of the packets processed so far.
+    pub fn ecn_counts(&self) -> EcnCounts {
+        self.ecn
+    }
+
+    /// Lets later ACK frames leave out packets up to `largest`, as RFC 9000 allows once a packet
+    /// carrying our ACK frame with that Largest Acknowledged is acknowledged. Those packets still
+    /// count as duplicates.
+    pub fn on_ack_frame_acked(&mut self, largest: u64) {
+        self.report_floor = self.report_floor.max(largest + 1);
+    }
+
+    /// Returns the ranges to acknowledge, largest first, as the ACK encoder takes them. The
+    /// iterator is `Clone` because the encoder walks the ranges twice.
+    pub fn ranges(&self) -> impl Iterator<Item = RangeInclusive<u64>> + Clone + '_ {
+        let largest = self.ranges.back().map_or(0, |&(_, end)| end);
+        let floor = self.report_floor.min(largest);
+        self.ranges
+            .iter()
+            .rev()
+            .take_while(move |&&(_, end)| end >= floor)
+            .map(move |&(start, end)| start.max(floor)..=end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ranges(r: &ReceivedPackets) -> Vec<RangeInclusive<u64>> {
+        r.ranges().collect()
+    }
+
+    fn receive(r: &mut ReceivedPackets, t: Instant, pns: &[u64]) {
+        for &pn in pns {
+            assert!(
+                r.on_packet(pn, true, Ecn::NotEct, t),
+                "{pn} reported duplicate"
+            );
+        }
+    }
+
+    #[test]
+    fn packets_are_merged_into_ranges_reported_largest_first() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        receive(&mut r, t0, &[10, 11, 12, 15, 14, 20, 18, 13]);
+        assert_eq!(ranges(&r), vec![20..=20, 18..=18, 10..=15]);
+        receive(&mut r, t0, &[19, 5]);
+        assert_eq!(ranges(&r), vec![18..=20, 10..=15, 5..=5]);
+    }
+
+    #[test]
+    fn duplicates_are_detected_and_not_recorded() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        receive(&mut r, t0, &[1, 2, 3, 7, 8]);
+        for pn in [1, 2, 3, 7, 8] {
+            assert!(r.is_duplicate(pn));
+            assert!(!r.on_packet(pn, true, Ecn::NotEct, t0));
+        }
+        assert!(!r.is_duplicate(5));
+        assert_eq!(ranges(&r), vec![7..=8, 1..=3]);
+    }
+
+    #[test]
+    fn the_oldest_ranges_are_dropped_and_their_packets_count_as_duplicates() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 3);
+        receive(&mut r, t0, &[1, 3, 5, 7]);
+        assert_eq!(ranges(&r), vec![7..=7, 5..=5, 3..=3]);
+        // Packets in or below the dropped range are never accepted again, as RFC 9000 requires.
+        assert!(r.is_duplicate(0));
+        assert!(r.is_duplicate(1));
+        assert!(!r.on_packet(1, true, Ecn::NotEct, t0));
+        assert!(!r.is_duplicate(2));
+        receive(&mut r, t0, &[11]);
+        assert_eq!(ranges(&r), vec![11..=11, 7..=7, 5..=5]);
+        // An out-of-order packet that adds a range in the middle also drops the oldest.
+        receive(&mut r, t0, &[9]);
+        assert_eq!(ranges(&r), vec![11..=11, 9..=9, 7..=7]);
+        assert!(r.is_duplicate(5));
+        assert!(!r.is_duplicate(6));
+        assert!(!r.is_duplicate(8));
+    }
+
+    /// Takes the ranges with the bounds of the ACK encoder (`mvfstr_wire::PacketWriter::ack`) and
+    /// walks the older ones twice, as it does: once to count them, once to collect them.
+    fn encode<I>(largest: RangeInclusive<u64>, older: I) -> (usize, Vec<RangeInclusive<u64>>)
+    where
+        I: IntoIterator<Item = RangeInclusive<u64>>,
+        I::IntoIter: Clone,
+    {
+        let older = older.into_iter();
+        let count = older.clone().count();
+        (count, std::iter::once(largest).chain(older).collect())
+    }
+
+    #[test]
+    fn the_ranges_feed_the_ack_encoder_without_a_copy() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        receive(&mut r, t0, &[1, 2, 5, 6, 9]);
+        let mut it = r.ranges();
+        let largest = it.next().unwrap();
+        assert_eq!(encode(largest, it), (2, vec![9..=9, 5..=6, 1..=2]));
+    }
+
+    #[test]
+    fn ranges_covered_by_an_acknowledged_ack_frame_are_no_longer_reported() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        receive(&mut r, t0, &[1, 2, 3, 4, 5, 8, 9, 10]);
+        r.on_ack_frame_acked(4);
+        assert_eq!(ranges(&r), vec![8..=10, 5..=5]);
+        assert!(r.is_duplicate(2));
+        // The largest received packet is always reported (RFC 9000).
+        r.on_ack_frame_acked(10);
+        assert_eq!(ranges(&r), vec![10..=10]);
+        receive(&mut r, t0, &[11]);
+        assert_eq!(ranges(&r), vec![11..=11]);
+        // An older ACK frame acknowledged late leaves the ranges unchanged.
+        r.on_ack_frame_acked(4);
+        assert_eq!(ranges(&r), vec![11..=11]);
+    }
+
+    #[test]
+    fn ecn_counts_grow_once_per_processed_packet() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        for (pn, ecn) in [(1, Ecn::Ect0), (2, Ecn::Ect0), (3, Ecn::Ect1), (4, Ecn::Ce)] {
+            assert!(r.on_packet(pn, false, ecn, t0));
+        }
+        assert!(r.on_packet(5, false, Ecn::NotEct, t0));
+        // Duplicates are not processed and do not count (RFC 9000).
+        assert!(!r.on_packet(4, false, Ecn::Ce, t0));
+        assert_eq!(
+            r.ecn_counts(),
+            EcnCounts {
+                ect0: 2,
+                ect1: 1,
+                ce: 1
+            }
+        );
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn no_ack_is_due_without_packets_and_none_starts_for_non_eliciting_ones() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert_eq!(r.ack_due(t0, 2, 25 * MS), AckDue::None);
+        for pn in 1..=5 {
+            assert!(r.on_packet(pn, false, Ecn::NotEct, t0));
+        }
+        assert_eq!(r.ack_due(t0 + 100 * MS, 2, 25 * MS), AckDue::Piggyback);
+    }
+
+    #[test]
+    fn ack_eliciting_packets_make_an_ack_due_at_the_threshold_or_after_the_delay() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert!(r.on_packet(1, false, Ecn::NotEct, t0));
+        assert!(r.on_packet(2, true, Ecn::NotEct, t0 + MS));
+        assert!(r.on_packet(3, false, Ecn::NotEct, t0 + 2 * MS));
+        // One ack-eliciting packet: due max_ack_delay after it arrived.
+        assert_eq!(r.ack_due(t0 + 2 * MS, 2, 25 * MS), AckDue::At(t0 + 26 * MS));
+        assert_eq!(r.ack_due(t0 + 26 * MS, 2, 25 * MS), AckDue::Now);
+        // A second one reaches the threshold.
+        assert!(r.on_packet(4, true, Ecn::NotEct, t0 + 3 * MS));
+        assert_eq!(r.ack_due(t0 + 3 * MS, 2, 25 * MS), AckDue::Now);
+        assert_eq!(r.ack_due(t0 + 3 * MS, 3, 25 * MS), AckDue::At(t0 + 26 * MS));
+    }
+
+    #[test]
+    fn ack_eliciting_initial_and_handshake_packets_are_acknowledged_at_once() {
+        let t0 = crate::recovery::test_epoch();
+        for space in [Space::Initial, Space::Handshake] {
+            let mut r = ReceivedPackets::new(space, 32);
+            assert!(r.on_packet(0, false, Ecn::NotEct, t0));
+            assert_eq!(r.ack_due(t0, 2, 25 * MS), AckDue::Piggyback, "{space:?}");
+            assert!(r.on_packet(1, true, Ecn::NotEct, t0));
+            assert_eq!(r.ack_due(t0, 2, 25 * MS), AckDue::Now, "{space:?}");
+        }
+    }
+
+    /// Feeds `(pn, ack_eliciting)` packets to a fresh 1-RTT tracker with a threshold of 10 and
+    /// returns whether an ACK is due at once.
+    fn due_now_after(packets: &[(u64, bool)]) -> bool {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        for &(pn, eliciting) in packets {
+            assert!(r.on_packet(pn, eliciting, Ecn::NotEct, t0));
+        }
+        r.ack_due(t0, 10, 25 * MS) == AckDue::Now
+    }
+
+    #[test]
+    fn reordered_or_gapped_ack_eliciting_packets_are_acknowledged_at_once() {
+        // In order, including through a received non-eliciting packet: an ACK is not due at once.
+        assert!(!due_now_after(&[(1, true), (2, true)]));
+        assert!(!due_now_after(&[(1, true), (2, false), (3, true)]));
+        assert!(!due_now_after(&[(1, false), (2, false), (3, true)]));
+        // Smaller than an ack-eliciting packet already received.
+        assert!(due_now_after(&[(2, true), (1, true)]));
+        // Larger than the largest ack-eliciting packet with packets missing in between.
+        assert!(due_now_after(&[(1, true), (2, true), (4, true)]));
+        assert!(due_now_after(&[(1, true), (3, false), (5, true)]));
+        // A non-eliciting packet never makes an ACK due.
+        assert!(!due_now_after(&[(1, true), (3, false)]));
+    }
+
+    #[test]
+    fn a_ce_marked_ack_eliciting_packet_is_acknowledged_at_once() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        // Not for a non-eliciting packet: that would answer it with an ACK-only packet.
+        assert!(r.on_packet(1, false, Ecn::Ce, t0));
+        assert_eq!(r.ack_due(t0, 10, 25 * MS), AckDue::Piggyback);
+        assert!(r.on_packet(2, true, Ecn::Ce, t0));
+        assert_eq!(r.ack_due(t0, 10, 25 * MS), AckDue::Now);
+    }
+
+    #[test]
+    fn sending_an_ack_resets_the_decision_but_keeps_the_ranges() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert!(r.on_packet(1, true, Ecn::NotEct, t0));
+        assert!(r.on_packet(3, true, Ecn::NotEct, t0));
+        assert_eq!(r.ack_due(t0, 10, 25 * MS), AckDue::Now);
+        r.on_ack_sent();
+        assert_eq!(r.ack_due(t0 + 30 * MS, 10, 25 * MS), AckDue::None);
+        assert_eq!(ranges(&r), vec![3..=3, 1..=1]);
+        assert!(r.on_packet(4, false, Ecn::NotEct, t0 + 40 * MS));
+        assert_eq!(r.ack_due(t0 + 40 * MS, 10, 25 * MS), AckDue::Piggyback);
+        // The delay runs from the first ack-eliciting packet after the ACK.
+        assert!(r.on_packet(5, true, Ecn::NotEct, t0 + 50 * MS));
+        assert_eq!(
+            r.ack_due(t0 + 50 * MS, 10, 25 * MS),
+            AckDue::At(t0 + 75 * MS)
+        );
+    }
+
+    #[test]
+    fn the_ack_delay_runs_from_the_arrival_of_the_largest_packet() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert_eq!(r.largest(), None);
+        assert!(r.on_packet(5, true, Ecn::NotEct, t0 + MS));
+        assert!(r.on_packet(3, true, Ecn::NotEct, t0 + 2 * MS));
+        assert_eq!(r.largest(), Some((5, t0 + MS)));
+        assert_eq!(r.ack_delay(t0 + 10 * MS), 9 * MS);
+        assert!(r.on_packet(6, false, Ecn::NotEct, t0 + 3 * MS));
+        assert_eq!(r.largest(), Some((6, t0 + 3 * MS)));
+        assert_eq!(r.ack_delay(t0 + 10 * MS), 7 * MS);
+    }
+}
