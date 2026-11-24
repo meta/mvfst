@@ -456,7 +456,7 @@ impl Connection {
                     .then(|| setup.cids.reset_token(&setup.local_cid)),
             },
         );
-        let params = encode(&params);
+        let params = params::encode_server_params(&setup.transport, setup.version, params);
         let session = match (tls, without_alpn) {
             (ServerTls::Rustls(tls), Some(without_alpn)) => TlsSession::server_choosing_by_alpn(
                 tls.clone(),

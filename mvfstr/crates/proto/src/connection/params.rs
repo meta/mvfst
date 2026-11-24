@@ -23,6 +23,7 @@ use mvfstr_wire::Version;
 
 use super::ConnError;
 use super::GRANULARITY;
+use crate::config::ParamsLayout;
 use crate::config::TransportConfig;
 
 /// The id of max_datagram_frame_size (RFC 9221), which decoding keeps among the parameters that
@@ -89,10 +90,35 @@ pub(crate) fn local_params(
         ack_delay_exponent: VarInt::from_u32(u32::from(ack.ack_delay_exponent)),
         max_ack_delay: varint(advertised_max_ack_delay(ack.max_ack_delay, horizon)),
         active_connection_id_limit: varint(config.active_connection_id_limit()),
+        disable_active_migration: config.disable_active_migration(),
         initial_source_connection_id: Some(ids.initial_scid),
         stateless_reset_token: ids.reset_token,
+        extra: config.extra_params().to_vec(),
         ..TransportParameters::default()
     }
+}
+
+/// Encodes the parameters a server connection on `version` advertises, in the layout of its
+/// config, which must have been validated.
+pub(crate) fn encode_server_params(
+    config: &TransportConfig,
+    version: Version,
+    mut params: TransportParameters,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    let encoded = match config.params_layout() {
+        ParamsLayout::Rfc => params.encode(&mut out),
+        ParamsLayout::MvfstServer => {
+            if version.unaliased() == Version::MVFST {
+                params.original_destination_connection_id = None;
+                params.initial_source_connection_id = None;
+                params.retry_source_connection_id = None;
+            }
+            params.encode_in_mvfst_server_order(&mut out)
+        }
+    };
+    encoded.expect("should encode the parameters of a validated transport config");
+    out
 }
 
 /// What the peer's parameters must agree with (RFC 9000).
@@ -244,6 +270,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::config::ConfigError;
 
     fn cid(byte: u8) -> ConnectionId {
         ConnectionId::new(&[byte; 8]).unwrap()
@@ -344,6 +371,116 @@ mod tests {
         assert_eq!(params.initial_max_data, VarInt::from_u32(1 << 20));
         assert_eq!(params.max_ack_delay, VarInt::from_u32(25));
         assert_eq!(params.stateless_reset_token, Some(ResetToken([5; 16])));
+    }
+
+    #[test]
+    fn a_config_that_disables_active_migration_advertises_it() {
+        assert!(!server_params().disable_active_migration);
+        let config = TransportConfig::builder()
+            .disable_active_migration(true)
+            .build()
+            .unwrap();
+        let params = local_params(
+            &config,
+            Duration::ZERO,
+            LocalIds {
+                initial_scid: cid(2),
+                original_dcid: Some(cid(1)),
+                reset_token: Some(ResetToken([5; 16])),
+            },
+        );
+        assert!(params.disable_active_migration);
+        assert!(
+            TransportParameters::decode(&encode(&params), &[])
+                .unwrap()
+                .disable_active_migration
+        );
+    }
+
+    #[test]
+    fn a_configs_extra_params_follow_the_rfc_ones_and_must_not_be_rfc_ids_or_repeat() {
+        let legacy_receive_timestamps = (VarInt::from_u32(0xff0a001), Bytes::from_static(&[0]));
+        let quic_experiment = (VarInt::from_u32(0x3a65db), Bytes::from_static(&[7]));
+        let config = TransportConfig::builder()
+            .extra_params(vec![
+                legacy_receive_timestamps.clone(),
+                quic_experiment.clone(),
+            ])
+            .build()
+            .unwrap();
+        let ids = LocalIds {
+            initial_scid: cid(2),
+            original_dcid: Some(cid(1)),
+            reset_token: Some(ResetToken([5; 16])),
+        };
+        let params = local_params(&config, Duration::ZERO, ids);
+        assert_eq!(
+            params.extra,
+            vec![legacy_receive_timestamps.clone(), quic_experiment]
+        );
+        let raw = encode(&params);
+        assert!(raw.ends_with(&[0x8f, 0xf0, 0xa0, 0x01, 1, 0, 0x80, 0x3a, 0x65, 0xdb, 1, 7]));
+        for refused in [
+            vec![(VarInt::from_u32(0x0b), Bytes::from_static(&[1]))],
+            vec![
+                legacy_receive_timestamps.clone(),
+                legacy_receive_timestamps.clone(),
+            ],
+        ] {
+            assert_eq!(
+                TransportConfig::builder().extra_params(refused).build(),
+                Err(ConfigError::OutOfRange {
+                    field: "extra_params"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn mvfsts_server_layout_writes_mvfsts_order_and_no_connection_ids_on_mvfst_versions() {
+        let rfc = TransportConfig::default();
+        let mvfst = TransportConfig::builder()
+            .params_layout(ParamsLayout::MvfstServer)
+            .build()
+            .unwrap();
+        let mut params = server_params();
+        params.retry_source_connection_id = Some(cid(3));
+        let mut in_mvfst_order = Vec::new();
+        params
+            .encode_in_mvfst_server_order(&mut in_mvfst_order)
+            .unwrap();
+        assert_ne!(in_mvfst_order, encode(&params));
+        for version in [Version::V1, Version::QUIC_V1_ALIAS, Version::QUIC_V1_ALIAS2] {
+            assert_eq!(
+                encode_server_params(&mvfst, version, params.clone()),
+                in_mvfst_order,
+                "{version:?}"
+            );
+            assert_eq!(
+                encode_server_params(&rfc, version, params.clone()),
+                encode(&params),
+                "{version:?}"
+            );
+        }
+        let mut bare = params.clone();
+        bare.original_destination_connection_id = None;
+        bare.initial_source_connection_id = None;
+        bare.retry_source_connection_id = None;
+        let mut bare_in_mvfst_order = Vec::new();
+        bare.encode_in_mvfst_server_order(&mut bare_in_mvfst_order)
+            .unwrap();
+        for version in [Version::MVFST, Version::MVFST_ALIAS] {
+            assert_eq!(
+                encode_server_params(&mvfst, version, params.clone()),
+                bare_in_mvfst_order,
+                "{version:?}"
+            );
+            assert_eq!(
+                encode_server_params(&rfc, version, params.clone()),
+                encode(&params),
+                "{version:?}: the RFC layout keeps the ids"
+            );
+        }
     }
 
     #[test]

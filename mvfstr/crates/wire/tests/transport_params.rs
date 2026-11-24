@@ -308,6 +308,102 @@ fn values_outside_the_allowed_range_are_invalid() {
     assert_eq!(params.max_ack_delay, v((1 << 14) - 1));
 }
 
+/// The parameters of a server connection on version 1 with mvfst's defaults: 66,560-byte stream
+/// windows, a 1 MiB connection window, 2,048 streams each way, a 60 s idle timeout, a
+/// 1,500-byte max_udp_payload_size, and migration disabled.
+fn mvfst_server_defaults() -> TransportParameters {
+    TransportParameters {
+        original_destination_connection_id: Some(cid(&[1, 2, 3, 4, 5, 6, 7, 8])),
+        max_idle_timeout: v(60_000),
+        stateless_reset_token: Some(ResetToken(std::array::from_fn(|i| i as u8))),
+        max_udp_payload_size: v(1500),
+        initial_max_data: v(1 << 20),
+        initial_max_stream_data_bidi_local: v(66_560),
+        initial_max_stream_data_bidi_remote: v(66_560),
+        initial_max_stream_data_uni: v(66_560),
+        initial_max_streams_bidi: v(2048),
+        initial_max_streams_uni: v(2048),
+        disable_active_migration: true,
+        initial_source_connection_id: Some(cid(&[0x11, 0x12, 0x13, 0x14, 0x15])),
+        ..TransportParameters::default()
+    }
+}
+
+#[test]
+fn mvfsts_server_order_writes_the_integers_even_at_their_defaults_then_the_token_and_ids() {
+    let mut out = vec![0xee];
+    let mut params = mvfst_server_defaults();
+    params.extra = vec![(v(0xff0a001), Bytes::from_static(&[0]))];
+    params.encode_in_mvfst_server_order(&mut out).unwrap();
+    assert_eq!(out[0], 0xee, "appends");
+    // ack_delay_exponent and active_connection_id_limit are written at their defaults.
+    assert_eq!(
+        out[1..],
+        hex("
+            00 08 0102030405060708
+            05 04 80010400  06 04 80010400  07 04 80010400  04 04 80100000  08 02 4800
+            09 02 4800  01 04 8000ea60  0a 01 03  03 02 45dc  0e 01 02
+            02 10 000102030405060708090a0b0c0d0e0f
+            0c 00
+            0f 05 1112131415
+            8ff0a001 01 00")
+    );
+    assert_eq!(
+        TransportParameters::decode(&out[1..], &[v(0xff0a001)]),
+        Ok(params)
+    );
+}
+
+#[test]
+fn mvfsts_server_order_writes_every_parameter_with_the_retry_source_id_after_the_initial_one() {
+    let mut params = every_parameter();
+    params.extra = vec![(v(0xff0a001), Bytes::from_static(&[0]))];
+    let mut out = Vec::new();
+    params.encode_in_mvfst_server_order(&mut out).unwrap();
+    // mvfst never sends preferred_address; it follows disable_active_migration, as in id order.
+    assert_eq!(
+        out,
+        hex("
+            00 08 0102030405060708
+            05 04 80010400  06 04 80010400  07 08 c0000000ffffffff  04 04 80100000  08 02 4800
+            09 02 4800  01 04 8000ea60  0a 01 0a  0b 02 4064  03 02 45ac  0e 01 05
+            02 10 000102030405060708090a0b0c0d0e0f
+            0c 00
+            0d 2d c0000201 1151 20010db8000000000000000000000001 1152 04 aabbccdd
+                  101112131415161718191a1b1c1d1e1f
+            0f 05 1112131415
+            10 04 21222324
+            8ff0a001 01 00")
+    );
+    assert_eq!(
+        TransportParameters::decode(&out, &[v(0xff0a001)]),
+        Ok(params)
+    );
+}
+
+#[test]
+fn mvfsts_server_order_writes_max_ack_delay_after_the_exponent_only_away_from_25_ms() {
+    let mut params = mvfst_server_defaults();
+    params.original_destination_connection_id = None;
+    params.stateless_reset_token = None;
+    params.disable_active_migration = false;
+    params.initial_source_connection_id = None;
+    let mut at_default = Vec::new();
+    params
+        .encode_in_mvfst_server_order(&mut at_default)
+        .unwrap();
+    params.max_ack_delay = v(31);
+    let mut out = Vec::new();
+    params.encode_in_mvfst_server_order(&mut out).unwrap();
+    assert_eq!(
+        out,
+        hex("
+            05 04 80010400  06 04 80010400  07 04 80010400  04 04 80100000  08 02 4800
+            09 02 4800  01 04 8000ea60  0a 01 03  0b 01 1f  03 02 45dc  0e 01 02")
+    );
+    assert_eq!(at_default.len(), out.len() - 3);
+}
+
 #[test]
 fn encoding_writes_extra_parameters_after_the_known_ones() {
     let params = TransportParameters {

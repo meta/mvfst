@@ -339,6 +339,18 @@ pub enum DatagramSize {
     PeerMaximum,
 }
 
+/// How a server connection lays out the transport parameters it sends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParamsLayout {
+    /// In id order, leaving out the parameters at their defaults.
+    #[default]
+    Rfc,
+    /// As an mvfst server sends them, so that the bytes match: in mvfst's order, every integer
+    /// parameter written even at its default, max_ack_delay only when it is not 25 ms, and on
+    /// MVFST and its alias without the connection ID parameters.
+    MvfstServer,
+}
+
 /// Transport settings of a connection: what it advertises in its transport parameters and how
 /// it sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,7 +379,13 @@ pub struct TransportConfig {
     key_update: KeyUpdatePolicy,
     datagram_size: DatagramSize,
     buffered_packets: usize,
+    disable_active_migration: bool,
+    params_layout: ParamsLayout,
+    extra_params: Vec<(VarInt, Bytes)>,
 }
+
+/// The largest transport parameter id RFC 9000 defines, retry_source_connection_id.
+const LAST_RFC9000_PARAM: u64 = 0x10;
 
 /// mvfst's default stream window, 65 KiB.
 const DEFAULT_STREAM_WINDOW: u64 = 65 * 1024;
@@ -399,6 +417,9 @@ impl Default for TransportConfig {
             key_update: KeyUpdatePolicy::default(),
             datagram_size: DatagramSize::default(),
             buffered_packets: 20,
+            disable_active_migration: false,
+            params_layout: ParamsLayout::default(),
+            extra_params: Vec::new(),
         }
     }
 }
@@ -545,6 +566,21 @@ impl TransportConfig {
     /// Returns how many packets a connection keeps until their keys arrive.
     pub fn buffered_packets(&self) -> usize {
         self.buffered_packets
+    }
+
+    /// Returns whether a connection advertises disable_active_migration.
+    pub fn disable_active_migration(&self) -> bool {
+        self.disable_active_migration
+    }
+
+    /// Returns how a server lays out its transport parameters.
+    pub fn params_layout(&self) -> ParamsLayout {
+        self.params_layout
+    }
+
+    /// Returns the transport parameters advertised as given, after those RFC 9000 defines.
+    pub fn extra_params(&self) -> &[(VarInt, Bytes)] {
+        &self.extra_params
     }
 }
 
@@ -716,6 +752,30 @@ impl TransportConfigBuilder {
         self
     }
 
+    /// Sets whether a connection advertises disable_active_migration, under which its peer must
+    /// not move the connection to a new address of its choosing (RFC 9000). A server still follows
+    /// a client whose address changes, as after a NAT rebinding. Default off.
+    pub fn disable_active_migration(mut self, disable: bool) -> Self {
+        self.config.disable_active_migration = disable;
+        self
+    }
+
+    /// Sets how a server lays out its transport parameters. Clients always use
+    /// [`ParamsLayout::Rfc`]. Default [`ParamsLayout::Rfc`].
+    pub fn params_layout(mut self, layout: ParamsLayout) -> Self {
+        self.config.params_layout = layout;
+        self
+    }
+
+    /// Sets transport parameters to advertise as given, in order, after those RFC 9000 defines,
+    /// each id above RFC 9000's and used at most once. mvfstr does not act on them, so they must
+    /// not advertise a feature it lacks; mvfst's `ack_receive_timestamps_enabled` of 0, which
+    /// turns receive timestamps off, is safe. Default empty.
+    pub fn extra_params(mut self, params: Vec<(VarInt, Bytes)>) -> Self {
+        self.config.extra_params = params;
+        self
+    }
+
     /// Validates the settings.
     pub fn build(self) -> Result<Arc<TransportConfig>, ConfigError> {
         let c = &self.config;
@@ -792,12 +852,17 @@ impl TransportConfigBuilder {
         )?;
         check(c.pacing_min_burst >= 1, "pacing_min_burst")?;
         check(c.pacing_max_burst >= c.pacing_min_burst, "pacing_max_burst")?;
+        // The encoder fails on an id that RFC 9000 defines or that repeats, which decoders reject.
+        let extra_ids_ok = c.extra_params.iter().enumerate().all(|(i, (id, _))| {
+            id.into_inner() > LAST_RFC9000_PARAM && c.extra_params[..i].iter().all(|(e, _)| e != id)
+        });
+        check(extra_ids_ok, "extra_params")?;
         Ok(Arc::new(self.config))
     }
 }
 
 /// The versions mvfstr implements.
-const SUPPORTED_VERSIONS: [Version; 5] = [
+pub const SUPPORTED_VERSIONS: [Version; 5] = [
     Version::V1,
     Version::MVFST,
     Version::QUIC_V1_ALIAS,

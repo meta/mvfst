@@ -633,6 +633,88 @@ fn a_host_alert_closes_the_connection_with_its_crypto_error() {
     );
 }
 
+/// A server's host that keeps the transport parameters of each Start input and never answers.
+struct Capturing(Rc<RefCell<Vec<Vec<u8>>>>);
+
+impl TlsHost for Capturing {
+    fn handle(&mut self, _: TlsConnId, input: TlsInput<'_>) -> TlsPoll {
+        if let TlsInput::Start {
+            transport_params, ..
+        } = input
+        {
+            self.0.borrow_mut().push(transport_params.to_vec());
+        }
+        TlsPoll::Pending
+    }
+
+    fn poll_ready(&mut self) -> Option<(TlsConnId, TlsStep)> {
+        None
+    }
+
+    fn cancel(&mut self, _: TlsConnId) {}
+}
+
+/// Returns the ids of the transport parameters in `raw`, in order.
+fn param_ids(raw: &[u8]) -> Vec<u64> {
+    let mut ids = Vec::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let (id, len) = VarInt::decode(rest).unwrap();
+        let (value_len, len_len) = VarInt::decode(&rest[len..]).unwrap();
+        ids.push(id.into_inner());
+        rest = &rest[len + len_len + usize::try_from(value_len.into_inner()).unwrap()..];
+    }
+    ids
+}
+
+#[test]
+fn a_server_hands_its_host_the_parameters_in_its_configs_layout() {
+    let mvfst = crate::TransportConfig::builder()
+        .params_layout(crate::ParamsLayout::MvfstServer)
+        .disable_active_migration(true)
+        .build()
+        .unwrap();
+    for (version, ids) in [
+        (
+            mvfstr_wire::Version::V1,
+            &[
+                0x00, 0x05, 0x06, 0x07, 0x04, 0x08, 0x09, 0x01, 0x0a, 0x03, 0x0e, 0x02, 0x0c, 0x0f,
+            ][..],
+        ),
+        (
+            mvfstr_wire::Version::MVFST,
+            &[
+                0x05, 0x06, 0x07, 0x04, 0x08, 0x09, 0x01, 0x0a, 0x03, 0x0e, 0x02, 0x0c,
+            ][..],
+        ),
+    ] {
+        let setup = Setup {
+            client_versions: vec![version],
+            server_versions: if version == mvfstr_wire::Version::V1 {
+                vec![version]
+            } else {
+                vec![mvfstr_wire::Version::V1, version]
+            },
+            server_transport: mvfst.clone(),
+            ..Setup::default()
+        };
+        let (_, client_tls) = setup.rustls();
+        let epoch = crate::recovery::test_epoch();
+        let config = setup.pair_with(ServerTls::External, ClientTls::Rustls(client_tls));
+        let mut pair = Pair::new(epoch, unix_now(), config);
+        let starts = Rc::new(RefCell::new(Vec::new()));
+        pair.set_tls_host(
+            Side::Server,
+            Box::new(Capturing(starts.clone())),
+            Duration::ZERO,
+        );
+        pair.run(epoch + RTT);
+        let starts = starts.borrow();
+        assert_eq!(starts.len(), 1, "{version:?}");
+        assert_eq!(param_ids(&starts[0]), ids, "{version:?}");
+    }
+}
+
 #[test]
 fn a_step_for_a_connection_that_waits_for_none_is_refused() {
     let hour = Duration::from_secs(3600);

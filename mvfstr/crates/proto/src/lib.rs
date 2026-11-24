@@ -74,6 +74,8 @@ pub use config::ConnOptions;
 pub use config::DatagramSize;
 pub use config::EndpointConfig;
 pub use config::KeyUpdatePolicy;
+pub use config::ParamsLayout;
+pub use config::SUPPORTED_VERSIONS;
 pub use config::ServerConfig;
 pub use config::ServerTls;
 pub use config::TransportConfig;

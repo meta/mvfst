@@ -205,13 +205,7 @@ impl TransportParameters {
     /// [`decode`](Self::decode) would reject: a value out of range, or an extra parameter whose
     /// id repeats or is one RFC 9000 defines.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TransportParameterError> {
-        self.check_ranges()?;
-        for (i, (id, _)) in self.extra.iter().enumerate() {
-            let repeated = self.extra[..i].iter().any(|(earlier, _)| earlier == id);
-            if *id <= LAST_RFC9000_ID || repeated {
-                return Err(TransportParameterError::Duplicate(*id));
-            }
-        }
+        self.check_encodable()?;
         // An absent parameter takes its default, so a parameter at its default is left out.
         let default = Self::default();
         if let Some(cid) = &self.original_destination_connection_id {
@@ -284,21 +278,7 @@ impl TransportParameters {
             put_param(out, DISABLE_ACTIVE_MIGRATION, &[]);
         }
         if let Some(address) = &self.preferred_address {
-            put_varint(out, PREFERRED_ADDRESS);
-            let cid = &address.connection_id;
-            // Two addresses with ports, the CID length byte, the CID and the token.
-            put_varint(
-                out,
-                varint_from_len(4 + 2 + 16 + 2 + 1 + cid.len() + ResetToken::LEN),
-            );
-            out.extend_from_slice(&address.ipv4.ip().octets());
-            out.extend_from_slice(&address.ipv4.port().to_be_bytes());
-            out.extend_from_slice(&address.ipv6.ip().octets());
-            out.extend_from_slice(&address.ipv6.port().to_be_bytes());
-            // Connection IDs hold at most 20 bytes.
-            out.push(cid.len() as u8);
-            out.extend_from_slice(cid);
-            out.extend_from_slice(&address.stateless_reset_token.0);
+            put_preferred_address(out, address);
         }
         put_int(
             out,
@@ -314,6 +294,91 @@ impl TransportParameters {
         }
         for (id, value) in &self.extra {
             put_param(out, *id, value);
+        }
+        Ok(())
+    }
+
+    /// Appends the encoding of these parameters in the order of an mvfst server, for a server
+    /// that must send the same bytes: original_destination_connection_id; the stream and
+    /// connection windows, the stream limits, max_idle_timeout, ack_delay_exponent,
+    /// max_udp_payload_size and active_connection_id_limit, each written even at its default, with
+    /// max_ack_delay after ack_delay_exponent when it is not the default; stateless_reset_token,
+    /// disable_active_migration, then preferred_address, which mvfst never sends;
+    /// initial_source_connection_id and retry_source_connection_id; then the extra ones. Fails
+    /// as [`encode`](Self::encode) does.
+    pub fn encode_in_mvfst_server_order(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> Result<(), TransportParameterError> {
+        self.check_encodable()?;
+        if let Some(cid) = &self.original_destination_connection_id {
+            put_param(out, ORIGINAL_DESTINATION_CONNECTION_ID, cid);
+        }
+        for (id, value) in [
+            (
+                INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+                self.initial_max_stream_data_bidi_local,
+            ),
+            (
+                INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+                self.initial_max_stream_data_bidi_remote,
+            ),
+            (
+                INITIAL_MAX_STREAM_DATA_UNI,
+                self.initial_max_stream_data_uni,
+            ),
+            (INITIAL_MAX_DATA, self.initial_max_data),
+            (INITIAL_MAX_STREAMS_BIDI, self.initial_max_streams_bidi),
+            (INITIAL_MAX_STREAMS_UNI, self.initial_max_streams_uni),
+            (MAX_IDLE_TIMEOUT, self.max_idle_timeout),
+            (ACK_DELAY_EXPONENT, self.ack_delay_exponent),
+        ] {
+            put_int_always(out, id, value);
+        }
+        // mvfst never sends max_ack_delay, so its peers assume the default; a server with another
+        // value must still send it.
+        put_int(
+            out,
+            MAX_ACK_DELAY,
+            self.max_ack_delay,
+            Self::default().max_ack_delay,
+        );
+        put_int_always(out, MAX_UDP_PAYLOAD_SIZE, self.max_udp_payload_size);
+        put_int_always(
+            out,
+            ACTIVE_CONNECTION_ID_LIMIT,
+            self.active_connection_id_limit,
+        );
+        if let Some(token) = &self.stateless_reset_token {
+            put_param(out, STATELESS_RESET_TOKEN, &token.0);
+        }
+        if self.disable_active_migration {
+            put_param(out, DISABLE_ACTIVE_MIGRATION, &[]);
+        }
+        if let Some(address) = &self.preferred_address {
+            put_preferred_address(out, address);
+        }
+        if let Some(cid) = &self.initial_source_connection_id {
+            put_param(out, INITIAL_SOURCE_CONNECTION_ID, cid);
+        }
+        if let Some(cid) = &self.retry_source_connection_id {
+            put_param(out, RETRY_SOURCE_CONNECTION_ID, cid);
+        }
+        for (id, value) in &self.extra {
+            put_param(out, *id, value);
+        }
+        Ok(())
+    }
+
+    /// Fails on anything [`decode`](Self::decode) would reject: a value out of range, or an extra
+    /// parameter whose id repeats or is one RFC 9000 defines.
+    fn check_encodable(&self) -> Result<(), TransportParameterError> {
+        self.check_ranges()?;
+        for (i, (id, _)) in self.extra.iter().enumerate() {
+            let repeated = self.extra[..i].iter().any(|(earlier, _)| earlier == id);
+            if *id <= LAST_RFC9000_ID || repeated {
+                return Err(TransportParameterError::Duplicate(*id));
+            }
         }
         Ok(())
     }
@@ -337,6 +402,28 @@ fn put_int(out: &mut Vec<u8>, id: VarInt, value: VarInt, default: VarInt) {
     if value == default {
         return;
     }
+    put_int_always(out, id, value);
+}
+
+fn put_preferred_address(out: &mut Vec<u8>, address: &PreferredAddress) {
+    put_varint(out, PREFERRED_ADDRESS);
+    let cid = &address.connection_id;
+    // Two addresses with ports, the CID length byte, the CID and the token.
+    put_varint(
+        out,
+        varint_from_len(4 + 2 + 16 + 2 + 1 + cid.len() + ResetToken::LEN),
+    );
+    out.extend_from_slice(&address.ipv4.ip().octets());
+    out.extend_from_slice(&address.ipv4.port().to_be_bytes());
+    out.extend_from_slice(&address.ipv6.ip().octets());
+    out.extend_from_slice(&address.ipv6.port().to_be_bytes());
+    // Connection IDs hold at most 20 bytes.
+    out.push(cid.len() as u8);
+    out.extend_from_slice(cid);
+    out.extend_from_slice(&address.stateless_reset_token.0);
+}
+
+fn put_int_always(out: &mut Vec<u8>, id: VarInt, value: VarInt) {
     put_varint(out, id);
     put_varint(out, varint_from_len(value.encoded_size()));
     put_varint(out, value);
