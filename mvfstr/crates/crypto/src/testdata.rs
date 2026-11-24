@@ -94,6 +94,26 @@ pub(crate) const A4_RETRY: &str = concat!(
     "0f2496ba",
 );
 
+/// A self-signed Ed25519 certificate for "localhost", valid from 2000 to 9999, as DER.
+pub(crate) const TEST_CERT: &str = concat!(
+    "3082011d3081d0a003020102020101300506032b657030143112301006035504",
+    "030c096c6f63616c686f73743020170d3030303130313030303030305a180f39",
+    "393939313233313233353935395a30143112301006035504030c096c6f63616c",
+    "686f7374302a300506032b6570032100e9db2a70243d8b9f0b2b8b8d9843bbdb",
+    "78eecd5dd9382d88082a2c11941c21b3a345304330140603551d11040d300b82",
+    "096c6f63616c686f7374300c0603551d130101ff04023000301d0603551d0e04",
+    "160414744c8580061eee8cc243e505a332a2ffac7a2040300506032b65700341",
+    "00dad9d6eb4a0cc7f33f74d16da15bd272ea2058ab6a485127ad4b6244df5cd7",
+    "078d178e13d8e24b4dc241189341a0d7af21c834bbcfd389da326c4bf87710ce",
+    "06",
+);
+
+/// The PKCS #8 private key of [`TEST_CERT`], as DER.
+pub(crate) const TEST_KEY: &str = concat!(
+    "302e020100300506032b6570042204205980a26cd54d1602b1fdd7fe390030e4",
+    "c596b6fdf5ce83c1188b0791e5be36aa",
+);
+
 /// Decodes hex, ignoring whitespace.
 pub(crate) fn unhex(s: &str) -> Vec<u8> {
     let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();

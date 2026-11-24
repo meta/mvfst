@@ -5,20 +5,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! HKDF-Extract and HKDF-Expand-Label over SHA-256 (RFC 5869, RFC 8446).
+//! HKDF-Extract, HKDF-Expand and HKDF-Expand-Label (RFC 5869, RFC 8446).
 //!
 //! QUIC derives its Initial secrets, and the key, IV and header-protection key of any traffic
-//! secret, with these functions (RFC 9001). Every secret mvfstr derives itself uses SHA-256;
-//! rustls derives the Handshake and 1-RTT secrets with the negotiated suite's hash.
+//! secret, with these functions (RFC 9001). The Initial secrets use SHA-256, and a traffic secret
+//! uses the hash of its cipher suite, SHA-256 or SHA-384.
 
 use std::fmt;
 
 use crate::backend::digest;
 use crate::backend::hkdf;
 use crate::backend::hmac;
+use crate::secrets::SecretHash;
 
 /// The SHA-256 output length, which is the length of an Initial secret.
 pub const SHA256_LEN: usize = 32;
+
+/// The SHA-384 output length, which is the length of a traffic secret of a SHA-384 cipher suite.
+pub(crate) const SHA384_LEN: usize = 48;
 
 /// The longest secret taken as an HKDF pseudorandom key, the longest digest output. aws-lc-rs's
 /// `Prk::new_less_safe` panics on a longer one and ring's takes any length; refusing a longer
@@ -35,21 +39,21 @@ pub fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; SHA256_LEN] {
     prk
 }
 
-/// Why HKDF-Expand-Label refused its inputs.
+/// Why HKDF-Expand or HKDF-Expand-Label refused its inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpandLabelError {
     /// The label (with its "tls13 " prefix) or the context is longer than 255 bytes, or the
     /// output is longer than 255 hash lengths.
     TooLong,
-    /// The secret is longer than 64 bytes, the longest digest output.
+    /// The secret or pseudorandom key is longer than 64 bytes, the longest digest output.
     SecretTooLong,
 }
 
 impl fmt::Display for ExpandLabelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooLong => f.write_str("HKDF-Expand-Label input or output too long"),
-            Self::SecretTooLong => f.write_str("HKDF-Expand-Label secret longer than 64 bytes"),
+            Self::TooLong => f.write_str("HKDF-Expand input or output too long"),
+            Self::SecretTooLong => f.write_str("HKDF-Expand secret longer than 64 bytes"),
         }
     }
 }
@@ -65,10 +69,18 @@ pub fn hkdf_expand_label(
     context: &[u8],
     out: &mut [u8],
 ) -> Result<(), ExpandLabelError> {
+    expand_label(SecretHash::Sha256, secret, label, context, out)
+}
+
+/// Fills `out` with HKDF-Expand-Label over `hash`, as [`hkdf_expand_label`] does over SHA-256.
+pub(crate) fn expand_label(
+    hash: SecretHash,
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) -> Result<(), ExpandLabelError> {
     const PREFIX: &[u8] = b"tls13 ";
-    if secret.len() > MAX_SECRET_LEN {
-        return Err(ExpandLabelError::SecretTooLong);
-    }
     let full_label_len =
         u8::try_from(PREFIX.len() + label.len()).map_err(|_| ExpandLabelError::TooLong)?;
     let context_len = u8::try_from(context.len()).map_err(|_| ExpandLabelError::TooLong)?;
@@ -83,8 +95,36 @@ pub fn hkdf_expand_label(
         &[context_len],
         context,
     ];
-    let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, secret);
-    prk.expand(&info, OutLen(out.len()))
+    let hash = match hash {
+        SecretHash::Sha256 => hkdf::HKDF_SHA256,
+        SecretHash::Sha384 => hkdf::HKDF_SHA384,
+    };
+    expand(hash, secret, &info, out)
+}
+
+/// Fills `out` with HKDF-Expand over SHA-256 (RFC 5869) of the pseudorandom key `prk`, with the
+/// concatenation of the `info` parts as the info string. Fails with [`ExpandLabelError`] when
+/// `prk` is longer than 64 bytes or `out` longer than 255 hash lengths.
+pub fn hkdf_expand_sha256(
+    prk: &[u8],
+    info: &[&[u8]],
+    out: &mut [u8],
+) -> Result<(), ExpandLabelError> {
+    expand(hkdf::HKDF_SHA256, prk, info, out)
+}
+
+/// Fills `out` with HKDF-Expand of `prk` over `hash`, with the concatenation of the `info` parts.
+fn expand(
+    hash: hkdf::Algorithm,
+    prk: &[u8],
+    info: &[&[u8]],
+    out: &mut [u8],
+) -> Result<(), ExpandLabelError> {
+    if prk.len() > MAX_SECRET_LEN {
+        return Err(ExpandLabelError::SecretTooLong);
+    }
+    hkdf::Prk::new_less_safe(hash, prk)
+        .expand(info, OutLen(out.len()))
         .and_then(|okm| okm.fill(out))
         .map_err(|_| ExpandLabelError::TooLong)
 }
@@ -102,6 +142,7 @@ impl hkdf::KeyType for OutLen {
 mod tests {
     use super::*;
     use crate::testdata::RFC9001_DCID;
+    use crate::testdata::hex;
     use crate::testdata::unhex;
 
     #[test]
@@ -171,6 +212,71 @@ mod tests {
             Err(ExpandLabelError::TooLong)
         );
         assert_eq!(out, [0; 16], "a refused expansion writes nothing");
+    }
+
+    /// RFC 5869 Appendix A test cases 1-3, the SHA-256 ones, from their pseudorandom keys. Each
+    /// info string is also split into parts, which expand as their concatenation.
+    #[test]
+    fn expand_matches_rfc5869_sha256_cases_with_info_in_parts() {
+        let info_2: Vec<u8> = (0xb0..=0xff).collect();
+        let cases = [
+            (
+                "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+                unhex("f0f1f2f3f4f5f6f7f8f9"),
+                concat!(
+                    "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf",
+                    "34007208d5b887185865",
+                ),
+            ),
+            (
+                "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244",
+                info_2,
+                concat!(
+                    "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c",
+                    "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71",
+                    "cc30c58179ec3e87c14c01d5c1f3434f1d87",
+                ),
+            ),
+            (
+                "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04",
+                Vec::new(),
+                concat!(
+                    "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d",
+                    "9d201395faa4b61a96c8",
+                ),
+            ),
+        ];
+        for (prk, info, okm) in cases {
+            let (prk, okm) = (unhex(prk), unhex(okm));
+            let (head, tail) = info.split_at(info.len() / 3);
+            for parts in [&[&info[..]][..], &[head, &[], tail]] {
+                let mut out = vec![0; okm.len()];
+                hkdf_expand_sha256(&prk, parts, &mut out).unwrap();
+                assert_eq!(hex(&out), hex(&okm), "{} info parts", parts.len());
+            }
+        }
+    }
+
+    #[test]
+    fn expand_refuses_a_long_output_or_key_and_writes_nothing() {
+        let mut huge = vec![0; 255 * SHA256_LEN + 1];
+        assert_eq!(
+            hkdf_expand_sha256(&[7; SHA256_LEN], &[b"info"], &mut huge),
+            Err(ExpandLabelError::TooLong)
+        );
+        assert!(
+            huge.iter().all(|b| *b == 0),
+            "a refused expansion writes nothing"
+        );
+
+        let mut out = [0; 16];
+        assert_eq!(hkdf_expand_sha256(&[7; 64], &[b"info"], &mut out), Ok(()));
+        let mut refused = [0; 16];
+        assert_eq!(
+            hkdf_expand_sha256(&[7; 65], &[b"info"], &mut refused),
+            Err(ExpandLabelError::SecretTooLong)
+        );
+        assert_eq!(refused, [0; 16], "a refused expansion writes nothing");
     }
 
     #[test]

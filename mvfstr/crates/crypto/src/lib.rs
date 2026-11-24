@@ -14,7 +14,8 @@
 //! [`QuicAlgorithm`] is the `rustls::quic::Algorithm` through which rustls's TLS 1.3 key schedule
 //! builds every Handshake, 1-RTT and key-update key as an mvfstr key; [`with_quic_suites`]
 //! rewrites a caller's `CryptoProvider` to suites that carry it. [`KeySet`] holds the keys of one
-//! level and [`KeyUpdater`] derives later 1-RTT key phases. The [`seal`] module holds the
+//! level and [`KeyUpdater`] derives later 1-RTT key phases; both are built either from rustls or
+//! from the raw [`TrafficSecret`]s of another TLS stack. The [`seal`] module holds the
 //! [`Sealer`] seam, through which the connection seals a packet it built in a backend slot;
 //! [`InlineSealer`] seals it at once.
 //!
@@ -36,6 +37,7 @@ mod keys;
 mod packet;
 mod retry;
 pub mod seal;
+mod secrets;
 pub mod suite;
 #[cfg(test)]
 mod testdata;
@@ -56,6 +58,7 @@ pub use header::unprotect_header;
 pub use hkdf::ExpandLabelError;
 pub use hkdf::SHA256_LEN;
 pub use hkdf::hkdf_expand_label;
+pub use hkdf::hkdf_expand_sha256;
 pub use hkdf::hkdf_extract_sha256;
 pub use initial::INITIAL_SALT_MVFST;
 pub use initial::INITIAL_SALT_V1;
@@ -81,6 +84,9 @@ pub use seal::SealOutcome;
 pub use seal::Sealer;
 pub use seal::SlotAccess;
 pub use seal::SlotId;
+pub use secrets::SecretHash;
+pub use secrets::SecretLengthError;
+pub use secrets::TrafficSecret;
 pub use suite::cipher_suite;
 pub use suite::derive_suite;
 pub use suite::quic_algorithm;
