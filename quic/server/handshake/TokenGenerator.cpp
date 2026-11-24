@@ -37,7 +37,7 @@ Optional<BufPtr> TokenGenerator::encryptToken(
   if (!maybeEncryptedToken) {
     MVLOG_ERROR << "Failed to encypt addr validation token with IP "
                 << token.clientIp.str();
-    return Optional<BufPtr>();
+    return {};
   }
 
   // Convert folly::Optional to quic::Optional (tiny::optional)
