@@ -103,6 +103,8 @@ use crate::turn::Limits;
 use crate::turn::POLL_CHARGE;
 use crate::turn::RX_BATCHES;
 use crate::turn::TURN_STAGING;
+use crate::turn::TxRecord;
+use crate::turn::WakeRecord;
 
 /// How long a test waits for something that should happen in milliseconds.
 const WAIT: Duration = Duration::from_secs(20);
@@ -6957,4 +6959,606 @@ fn a_turn_counts_each_poll_by_the_bytes_it_staged() {
         "a turn staged more than {most} bytes: {per_turn:?}"
     );
     harness.shutdown();
+}
+
+/// Returns what the transmit phases of the driver for sessions of type `S` on gated sockets on
+/// `worker` did, and what `read` returns, both read in one pause of that driver.
+fn tx_record<S: QuicSession, T: Send + 'static>(
+    worker: &ManagedWorker,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> (TxRecord, T) {
+    let (tx, rx) = mpsc::channel();
+    worker
+        .handle()
+        .submit(move |_| {
+            let record = with_backend_handle::<S, Gated, _>(|handle| handle.tx_record());
+            let _ = tx.send((record, read()));
+        })
+        .expect("the worker takes commands");
+    rx.recv_timeout(WAIT).expect("the worker answers")
+}
+
+/// How long the server's worker is held after each of its next [`BULK_STALLS`] attempts in
+/// [`stalled_bulk`].
+const BULK_STALL: Duration = Duration::from_millis(3);
+
+/// The attempts after which [`stalled_bulk`] holds the server's worker.
+const BULK_STALLS: usize = 6;
+
+/// Has a [`Bulk`] server send seven datagrams, within the initial window, over gated sockets with
+/// at most two datagrams per attempt, so its connection makes several attempts in one transmit
+/// phase, while the server's worker is held [`BULK_STALL`] after each of its next [`BULK_STALLS`]
+/// attempts. Returns the server valve's events from the client's request on, and the server
+/// driver's record, read together.
+fn stalled_bulk() -> (Vec<Event>, TxRecord) {
+    const LEN: usize = 8_000;
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: MmsgOptions::default(),
+        valves: Arc::clone(&valves),
+    });
+    harness.limits.max_segments = 2;
+    let pair = BulkPair::new(&harness, 1, LEN);
+    valves.server.clear();
+    valves.server.stall(BULK_STALL, BULK_STALLS);
+    pair.go();
+    await_reports(&pair.rx, vec![Report::Received(uni(3), LEN)]);
+    let (record, events) = tx_record::<Bulk, _>(&harness.server, move || valves.server.events());
+    // The driver debug-asserts that a connection's attempts and reports do not go back in time.
+    let stats = harness.server_stats::<Bulk>();
+    assert_eq!(stats.contained_panics, 0, "{stats:?}");
+    harness.shutdown();
+    (events, record)
+}
+
+#[test]
+fn an_unpaced_connection_keeps_the_phases_reading_and_its_one_flush() {
+    let (events, record) = stalled_bulk();
+    assert!(
+        most_attempts_per_flush(&events) >= 2,
+        "each attempt had its own flush: {events:?}"
+    );
+    let mut readings = HashMap::new();
+    for attempt in &record.attempts {
+        let reading = *readings.entry(attempt.phase).or_insert(attempt.at);
+        assert_eq!(
+            reading, attempt.at,
+            "attempts of one phase ran at different readings: {:?}",
+            record.attempts
+        );
+    }
+    assert_eq!(record.phase_clock_reads, 0, "{record:?}");
+    assert!(
+        record.wakes.iter().all(|wake| wake.phase.is_none()),
+        "a pacing wake was taken inside a transmit phase: {record:?}"
+    );
+}
+
+/// How long the server's worker is held after each of its stalled attempts in [`stalled_paced`]:
+/// less than the 1.6 ms between a paced connection's runs there.
+const PACED_STALL: Duration = Duration::from_millis(1);
+
+/// A transmit attempt on a gated server socket, with what the driver recorded of it.
+#[derive(Debug)]
+struct Joined {
+    key: ConnKey,
+    phase: u64,
+    /// The reading it ran at.
+    at: Instant,
+    /// When the gated socket recorded its start.
+    started: Instant,
+    /// The runs it built.
+    runs: usize,
+}
+
+/// What a server did in [`stalled_paced`] from its clients' requests on.
+struct Paced {
+    events: Vec<Event>,
+    attempts: Vec<Joined>,
+    /// The place in the driver's record of the first of `attempts`.
+    first: usize,
+    wakes: Vec<WakeRecord>,
+    stats: crate::EndpointStats,
+}
+
+impl Paced {
+    /// Returns the driver's attempt at place `place` in its record, if it is in `attempts`.
+    fn joined(&self, place: usize) -> Option<&Joined> {
+        self.attempts.get(place.checked_sub(self.first)?)
+    }
+}
+
+/// What [`stalled_paced`] varies.
+struct PacedSetup {
+    /// The bytes each server sends.
+    len: usize,
+    /// The clients' transport settings.
+    client: Arc<TransportConfig>,
+    /// The attempts after which the server's worker is held.
+    stalls: usize,
+}
+
+impl Default for PacedSetup {
+    /// Returns a setup in which each server sends eight datagrams, within the window, to a
+    /// sluggish client, and the first 40 attempts are stalled.
+    fn default() -> Self {
+        Self {
+            len: 9_000,
+            client: sluggish_and_paced(),
+            stalls: 40,
+        }
+    }
+}
+
+/// Has three paced [`Bulk`] servers on one endpoint send `setup.len` bytes each to their own
+/// client through a relay that delays each datagram 10 ms, while the server's worker is held
+/// [`PACED_STALL`] after each of its next `setup.stalls` attempts. At a window per round trip
+/// and a minimum burst of 1, each connection releases a datagram every 1.6 ms.
+fn stalled_paced(setup: PacedSetup) -> Paced {
+    const CLIENTS: usize = 3;
+    let PacedSetup {
+        len,
+        client,
+        stalls,
+    } = setup;
+    let valves = Arc::new(Valves::default());
+    let harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: MmsgOptions::default(),
+        valves: Arc::clone(&valves),
+    });
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| Ok(Bulk::new("server", len, None, server_reports.clone())));
+        app.transport = Some(sluggish_and_paced());
+        app
+    });
+    let go = Arc::new(AtomicBool::new(false));
+    let links: Vec<Relay> = (0..CLIENTS)
+        .map(|_| Relay::delayed(addr, Duration::from_millis(10)))
+        .collect();
+    let conns: Vec<ConnHandle> = links
+        .iter()
+        .map(|link| {
+            let (go, tx) = (Arc::clone(&go), tx.clone());
+            let options = ConnOptions {
+                transport: Some(Arc::clone(&client)),
+            };
+            harness.connect_with(link.addr, options, move || {
+                Bulk::new("client", 1, Some(go), tx)
+            })
+        })
+        .collect();
+    let confirmed = || Report::Event("client", ConnEvent::Confirmed);
+    await_reports(&rx, (0..CLIENTS).map(|_| confirmed()).collect());
+    valves.server.clear();
+    valves.server.stall(PACED_STALL, stalls);
+    let asked = Instant::now();
+    go.store(true, Ordering::SeqCst);
+    for conn in &conns {
+        conn.wake().expect("the connection is live");
+    }
+    let received = || Report::Received(uni(3), len);
+    await_reports_within(&rx, (0..CLIENTS).map(|_| received()).collect(), STALL);
+    let (record, (events, started, runs)) = tx_record::<Bulk, _>(&harness.server, move || {
+        let valve = &valves.server;
+        (valve.events(), valve.started(), valve.runs())
+    });
+    let stats = harness.server_stats::<Bulk>();
+    harness.shutdown();
+    let first = record
+        .attempts
+        .len()
+        .checked_sub(started.len())
+        .expect("the driver recorded every attempt the socket saw");
+    let attempts = record.attempts[first..]
+        .iter()
+        .zip(&started)
+        .enumerate()
+        .map(|(n, (attempt, start))| {
+            assert_eq!(
+                attempt.key, start.conn,
+                "the driver and the socket disagree"
+            );
+            Joined {
+                key: attempt.key,
+                phase: attempt.phase,
+                at: attempt.at,
+                started: start.at,
+                runs: runs.iter().filter(|run| run.attempt == n).count(),
+            }
+        })
+        .collect();
+    let wakes = record
+        .wakes
+        .into_iter()
+        .filter(|wake| wake.taken >= asked)
+        .collect();
+    Paced {
+        events,
+        attempts,
+        first,
+        wakes,
+        stats,
+    }
+}
+
+/// Returns whether every attempt in `events` that built a run is followed by a flush before
+/// the next attempt.
+fn each_run_flushed_before_the_next_attempt(events: &[Event]) -> bool {
+    events
+        .split(|&event| event == Event::Attempt)
+        .skip(1)
+        .all(|after| !after.contains(&Event::Run) || after.contains(&Event::Flush))
+}
+
+#[test]
+fn a_paced_attempt_builds_at_a_fresh_reading_and_is_flushed_before_the_next_attempt() {
+    let paced = stalled_paced(PacedSetup::default());
+    let events = &paced.events;
+    assert!(
+        each_run_flushed_before_the_next_attempt(events),
+        "a paced attempt's runs waited past the next attempt: {events:?}"
+    );
+    // Each stall is 1 ms, so a reading from before one lies at least that far before the
+    // attempt starts.
+    let stale: Vec<&Joined> = paced
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.started.saturating_duration_since(attempt.at) > Duration::from_micros(500)
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "attempts ran at readings more than 0.5 ms before they began: {stale:?}"
+    );
+    let served: Vec<usize> = paced.wakes.iter().filter_map(|wake| wake.next).collect();
+    let ordinary_after_another = paced
+        .attempts
+        .iter()
+        .enumerate()
+        .skip(1)
+        .any(|(n, attempt)| {
+            attempt.runs > 0
+                && attempt.phase == paced.attempts[n - 1].phase
+                && !served.contains(&(paced.first + n))
+        });
+    assert!(
+        ordinary_after_another,
+        "no phase had an attempt that built a run after another attempt without a wake taken in \
+         the phase: {:?}",
+        paced.attempts
+    );
+}
+
+#[test]
+fn a_paced_attempt_requeued_on_a_full_batch_is_flushed_on_its_own_socket_before_the_next_attempt() {
+    // Eight datagrams from the client, within the window, over a link with a round trip of 20 ms.
+    // After idle the pacer releases its credit and one run, a datagram each, at once; with one
+    // datagram per attempt, the second goes out in an attempt requeued behind the first.
+    const LEN: usize = 9_000;
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: MmsgOptions::default(),
+        valves: Arc::clone(&valves),
+    });
+    harness.limits.max_segments = 1;
+    let mut relay = None;
+    let pair = BulkPair::through(&harness, LEN, 1, sluggish_and_paced(), |server| {
+        let link = Relay::delayed(server, Duration::from_millis(10));
+        let addr = link.addr;
+        relay = Some(link);
+        addr
+    });
+    let _link = relay.expect("the client connects through the relay");
+    let requeues = harness.client_stats::<Bulk>().requeues;
+    valves.client.clear();
+    pair.go();
+    await_reports_within(&pair.rx, vec![Report::Received(uni(2), LEN)], STALL);
+    // A command runs between the driver's polls, so the client's last attempt has ended.
+    let client = harness.client_stats::<Bulk>();
+    assert!(
+        client.requeues > requeues,
+        "no attempt was requeued: {client:?}"
+    );
+    let events = valves.client.events();
+    assert!(
+        each_run_flushed_before_the_next_attempt(&events),
+        "a paced attempt's runs waited past the next attempt: {events:?}"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn a_pacing_wake_that_comes_due_during_a_transmit_phase_is_served_before_the_next_attempt() {
+    let paced = stalled_paced(PacedSetup::default());
+    // A wake that comes due during a stall waits at least for the stall's end. The margin
+    // allows for a loaded host.
+    let late: Vec<&WakeRecord> = paced
+        .wakes
+        .iter()
+        .filter(|wake| {
+            wake.phase.is_none()
+                && wake.taken.saturating_duration_since(wake.due) > Duration::from_millis(1)
+        })
+        .collect();
+    assert!(
+        late.is_empty(),
+        "wakes taken at the intake more than 1 ms late: {late:?}"
+    );
+    let served: Vec<(&WakeRecord, usize)> = paced
+        .wakes
+        .iter()
+        .filter(|wake| wake.phase.is_some())
+        .filter_map(|wake| Some((wake, wake.next?)))
+        .collect();
+    assert!(
+        !served.is_empty(),
+        "no wake was served inside a transmit phase: {:?}",
+        paced.wakes
+    );
+    for &(wake, next) in &served {
+        let attempt = paced
+            .joined(next)
+            .unwrap_or_else(|| panic!("the attempt after {wake:?} is not the socket's"));
+        assert!(
+            attempt.key.index == wake.index && attempt.at == wake.taken,
+            "the attempt after {wake:?} is not its connection's at its reading: {attempt:?}"
+        );
+        // However late its wake, a served attempt builds at most the pacer's credit and one run.
+        assert!(
+            (1..=2).contains(&attempt.runs),
+            "a served attempt built {} runs: {attempt:?}",
+            attempt.runs
+        );
+    }
+    let lumped = paced
+        .events
+        .split(|&event| event == Event::Flush)
+        .any(|between| {
+            between
+                .split(|&event| event == Event::Attempt)
+                .skip(1)
+                .filter(|after| after.contains(&Event::Run))
+                .count()
+                > 1
+        });
+    assert!(
+        !lumped,
+        "the runs of two attempts left in one flush: {:?}",
+        paced.events
+    );
+    let mut serves = HashMap::new();
+    for (wake, _) in &served {
+        *serves.entry((wake.phase, wake.index)).or_insert(0) += 1;
+    }
+    assert!(
+        serves.values().any(|&count| count >= 2),
+        "no connection was served twice in one transmit phase: {serves:?}"
+    );
+    assert!(paced.stats.phase_pacing_wakes > 0, "{:?}", paced.stats);
+}
+
+/// Returns the places in the driver's record of the attempts that the in-phase serves among
+/// `wakes` gave.
+fn served_attempts(wakes: &[WakeRecord]) -> Vec<usize> {
+    wakes
+        .iter()
+        .filter(|wake| wake.phase.is_some())
+        .filter_map(|wake| wake.next)
+        .collect()
+}
+
+#[test]
+fn a_connection_served_while_it_waits_in_the_phase_queue_makes_one_attempt_for_both() {
+    // Clients that acknowledge each packet at once: over a transfer of several round trips,
+    // with every attempt stalled, their acknowledgments dirty the server's connections while
+    // their pacing wakes are armed and come due. That happens in most runs, not all.
+    let client = TransportConfig::builder()
+        .ack_policy(AckPolicy {
+            eliciting_threshold: 1,
+            ..AckPolicy::default()
+        })
+        .pacing(true)
+        .pacing_min_burst(1)
+        .build()
+        .expect("a transport config");
+    let mut checked = 0;
+    for _ in 0..5 {
+        let paced = stalled_paced(PacedSetup {
+            len: 60_000,
+            client: Arc::clone(&client),
+            stalls: usize::MAX,
+            ..PacedSetup::default()
+        });
+        let served = served_attempts(&paced.wakes);
+        for wake in paced.wakes.iter().filter(|wake| wake.queued) {
+            let (Some(phase), Some(next)) = (wake.phase, wake.next) else {
+                panic!("a wake taken from the queue gave no attempt: {wake:?}");
+            };
+            // With room for every paced run in one attempt, attempts are not requeued, so any
+            // later attempt of the connection in the phase is another serve.
+            let again: Vec<&Joined> = paced
+                .attempts
+                .iter()
+                .enumerate()
+                .filter(|&(n, attempt)| {
+                    paced.first + n > next
+                        && attempt.phase == phase
+                        && attempt.key.index == wake.index
+                        && !served.contains(&(paced.first + n))
+                })
+                .map(|(_, attempt)| attempt)
+                .collect();
+            assert!(
+                again.is_empty(),
+                "the connection of {wake:?} attempted again from the queue: {again:?}"
+            );
+            checked += 1;
+        }
+        if checked > 0 {
+            return;
+        }
+    }
+    panic!("in five runs no wake was served while its connection waited in the queue");
+}
+
+/// Has a [`Bulk`] client connection for each of `transports` send 9,000 bytes, within the
+/// window, to one server through its own relay that delays each datagram 10 ms, with the client's
+/// worker held 5 ms after each of its attempts: more than the 1.6 ms between a paced connection's
+/// runs. The connections are told to send in one turn of the client's driver, so their first
+/// attempts share a transmit phase; with `drop_run`, the first data run is dropped. Returns the
+/// client driver's record and counters, read together.
+fn stalled_clients(
+    limits: Limits,
+    transports: &[Arc<TransportConfig>],
+    drop_run: bool,
+) -> (TxRecord, crate::EndpointStats) {
+    const LEN: usize = 9_000;
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: MmsgOptions::default(),
+        valves: Arc::clone(&valves),
+    });
+    harness.limits = limits;
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| Ok(Bulk::new("server", 1, None, server_reports.clone())));
+        app.transport = Some(sluggish());
+        app
+    });
+    let go = Arc::new(AtomicBool::new(false));
+    let links: Vec<Relay> = transports
+        .iter()
+        .map(|_| Relay::delayed(addr, Duration::from_millis(10)))
+        .collect();
+    let conns: Vec<ConnHandle> = links
+        .iter()
+        .zip(transports)
+        .map(|(link, transport)| {
+            let (go, tx) = (Arc::clone(&go), tx.clone());
+            let options = ConnOptions {
+                transport: Some(Arc::clone(transport)),
+            };
+            harness.connect_with(link.addr, options, move || {
+                Bulk::new("client", LEN, Some(go), tx)
+            })
+        })
+        .collect();
+    let each = |report: fn() -> Report| transports.iter().map(|_| report()).collect();
+    await_reports(&rx, each(|| Report::Event("client", ConnEvent::Confirmed)));
+    if drop_run {
+        valves.client.drop_next_run_of(DROP_AT);
+    }
+    valves.client.stall(Duration::from_millis(5), usize::MAX);
+    let blocked = Harness::block(&harness.client);
+    go.store(true, Ordering::SeqCst);
+    for conn in &conns {
+        conn.wake().expect("the connection is live");
+    }
+    drop(blocked);
+    await_reports_within(&rx, each(|| Report::Received(uni(2), LEN)), STALL);
+    let (record, stats) = tx_record::<Bulk, _>(&harness.client, || {
+        with_backend_handle::<Bulk, Gated, _>(|handle| handle.stats())
+    });
+    harness.shutdown();
+    (record, stats)
+}
+
+#[test]
+fn a_pacing_wake_taken_while_its_connection_waits_for_the_next_phase_gives_no_attempt_in_this_one()
+{
+    // The first attempt's first run is dropped, which dirties its connection for the next phase,
+    // and that connection's pacing wake comes due in the stall after the attempt, while the other
+    // connection waits in the phase's queue.
+    let paced = sluggish_and_paced();
+    let (record, stats) = stalled_clients(Limits::default(), &[Arc::clone(&paced), paced], true);
+    let mut followed = false;
+    for wake in record.wakes.iter().filter(|wake| wake.next.is_none()) {
+        let Some(phase) = wake.phase else {
+            continue;
+        };
+        // Paced attempts run at a fresh reading or at their check's, so those after the take
+        // run at its reading or later.
+        let after: Vec<_> = record
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.phase == phase && attempt.at >= wake.taken)
+            .collect();
+        assert!(
+            after.iter().all(|attempt| attempt.key.index != wake.index),
+            "the connection of {wake:?} attempted again in its phase: {after:?}"
+        );
+        assert!(
+            record
+                .attempts
+                .iter()
+                .any(|attempt| attempt.phase == phase + 1 && attempt.key.index == wake.index),
+            "the connection of {wake:?} did not attempt in the next phase: {:?}",
+            record.attempts
+        );
+        // The take was the check before the next pop.
+        if let Some(next) = after.first() {
+            assert_eq!(
+                next.at, wake.taken,
+                "the attempt after {wake:?} ran at a reading of its own: {after:?}"
+            );
+            followed = true;
+        }
+    }
+    assert!(
+        followed,
+        "no wake was taken while its connection waited for the next phase and another waited \
+         in the queue: {:?}",
+        record.wakes
+    );
+    let taken = record.wakes.iter().filter(|wake| wake.phase.is_some());
+    assert_eq!(
+        stats.phase_pacing_wakes,
+        taken.count() as u64,
+        "not every take in a transmit phase counted: {:?}",
+        record.wakes
+    );
+}
+
+#[test]
+fn the_serves_and_full_batch_requeues_of_a_transmit_phase_share_its_requeue_cap() {
+    // The unpaced connection fills batches of two datagrams, and the paced one's wakes come due
+    // in the stalls; with a cap of one, a phase serves or requeues once, not once each.
+    let limits = Limits {
+        max_segments: 2,
+        requeues: 1,
+        ..Limits::default()
+    };
+    let (record, _) = stalled_clients(limits, &[sluggish(), sluggish_and_paced()], false);
+    let served = served_attempts(&record.wakes);
+    // Per phase, the serves that gave an attempt and the other attempts of a connection that
+    // already attempted in it: requeues.
+    let mut spent: HashMap<u64, u64> = HashMap::new();
+    let mut seen = Vec::new();
+    for (n, attempt) in record.attempts.iter().enumerate() {
+        if served.contains(&n) || seen.contains(&(attempt.phase, attempt.key)) {
+            *spent.entry(attempt.phase).or_default() += 1;
+        }
+        seen.push((attempt.phase, attempt.key));
+    }
+    assert!(
+        spent.values().all(|&count| count <= limits.requeues),
+        "a phase served and requeued more than its cap: {spent:?}"
+    );
+    let contested = spent.keys().any(|&phase| {
+        let mut attempts = record
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.phase == phase);
+        attempts
+            .next()
+            .is_some_and(|first| attempts.any(|attempt| attempt.key != first.key))
+    });
+    assert!(
+        contested,
+        "no phase reached its cap with both connections attempting in it: {spent:?}"
+    );
 }

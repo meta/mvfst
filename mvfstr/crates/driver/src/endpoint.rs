@@ -40,6 +40,8 @@ use crate::turn::Core;
 use crate::turn::EndpointStats;
 use crate::turn::Limits;
 use crate::turn::Server;
+#[cfg(test)]
+use crate::turn::TxRecord;
 
 /// The task that runs one endpoint on a Roxygen worker: it owns the worker's UDP sockets through
 /// backends of type `B`, the sans-IO endpoint and the slab of connections and sessions, and runs
@@ -280,6 +282,14 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
         self.core
             .upgrade()
             .map_or_else(Vec::new, |core| core.issued_cids())
+    }
+
+    /// Returns what the driver's transmit phases have done so far.
+    #[cfg(test)]
+    pub(crate) fn tx_record(&self) -> TxRecord {
+        self.core
+            .upgrade()
+            .map_or_else(TxRecord::default, |core| core.tx_record())
     }
 
     /// Makes the driver's next turn panic outside every connection's guard.

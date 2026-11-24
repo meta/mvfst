@@ -12,6 +12,7 @@ use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -36,6 +37,8 @@ use crate::config::SetupError;
 use crate::flags::Flags;
 use crate::report::Measurement;
 use crate::report::stats_line;
+use crate::server::Closed;
+use crate::server::Driver;
 use crate::server::ServerApp;
 use crate::server::Settings;
 
@@ -49,7 +52,7 @@ const DRAIN_WAIT: Duration = Duration::from_secs(1);
 pub(crate) struct RunningServer {
     _worker: ManagedWorker,
     addr: SocketAddr,
-    closed: mpsc::Receiver<ConnStats>,
+    closed: mpsc::Receiver<Closed>,
 }
 
 impl RunningServer {
@@ -58,9 +61,9 @@ impl RunningServer {
         self.addr
     }
 
-    /// Returns the channel that carries the counters of each connection that closes, under
-    /// `--stats`. The channel ends when the server's worker stops.
-    pub(crate) fn closed_connections(&self) -> &mpsc::Receiver<ConnStats> {
+    /// Returns the channel that carries each connection that closes, under `--stats`. The
+    /// channel ends when the server's worker stops.
+    pub(crate) fn closed_connections(&self) -> &mpsc::Receiver<Closed> {
         &self.closed
     }
 }
@@ -75,30 +78,37 @@ impl fmt::Debug for RunningServer {
 
 /// Starts a server configured by `flags`.
 pub(crate) fn start_server(flags: &Flags) -> Result<RunningServer, RunError> {
+    start_server_with(flags, backend_options(flags))
+}
+
+/// Starts a server configured by `flags`, with the socket settings `options`.
+fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServer, RunError> {
     let addr = resolve(flags)?;
     let endpoint = config::endpoint_config()?;
     let server = config::server_config(flags)?;
     let (closed_tx, closed) = mpsc::channel();
     let settings = Settings::new(flags, closed_tx);
-    let options = backend_options(flags);
     let segments = max_segments(flags);
     let worker = ManagedWorker::new(WORKER_COMMANDS)?;
     let (started_tx, started) = mpsc::channel();
     worker
         .handle()
         .submit(move |worker| {
-            let started =
-                EndpointDriver::<_, MmsgBackend>::builder(endpoint, ServerApp::new(settings))
-                    .bind_server(addr, server)
-                    .backend_options(options)
-                    .max_segments(segments)
-                    .spawn(worker)
-                    .map_err(|error| error.to_string())
-                    .and_then(|driver| {
-                        driver
-                            .local_addr()
-                            .ok_or_else(|| "the server driver has no socket".to_owned())
-                    });
+            let driver = Driver::default();
+            let app = ServerApp::new(settings, Rc::clone(&driver));
+            let started = EndpointDriver::<_, MmsgBackend>::builder(endpoint, app)
+                .bind_server(addr, server)
+                .backend_options(options)
+                .max_segments(segments)
+                .spawn(worker)
+                .map_err(|error| error.to_string())
+                .and_then(|handle| {
+                    let started = handle
+                        .local_addr()
+                        .ok_or_else(|| "the server driver has no socket".to_owned());
+                    let _ = driver.set(handle);
+                    started
+                });
             let _ = started_tx.send(started);
         })
         .map_err(|_| RunError::WorkerGone)?;
@@ -440,7 +450,7 @@ mod tests {
             ..loopback(Mode::Client, 0)
         };
         client_output(&server, client.clone());
-        let stats = server
+        let Closed { stats, .. } = server
             .closed_connections()
             .recv_timeout(Duration::from_secs(10))
             .expect("the closed connection's counters");
@@ -454,6 +464,33 @@ mod tests {
         client_output(&quiet, client);
         let report = quiet.closed_connections().try_recv();
         assert_eq!(report, Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn a_closed_connection_comes_with_the_server_sockets_stops() {
+        // With room for one datagram built and not yet sent, every transmit attempt that has
+        // more to send stops on the socket after its first datagram.
+        let flags = Flags {
+            stats: true,
+            ..loopback(Mode::Server, 0)
+        };
+        let options = MmsgOptions {
+            max_unsent: 1500,
+            ..backend_options(&flags)
+        };
+        let server = start_server_with(&flags, options).unwrap();
+        client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let closed = server
+            .closed_connections()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the closed connection");
+        assert!(closed.socket_stops > 0, "{closed:?}");
     }
 
     #[test]

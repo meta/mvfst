@@ -200,6 +200,7 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     steered_in: Cell<u64>,
     sent_packets: Cell<u64>,
     sent_datagrams: Cell<u64>,
+    phase_pacing_wakes: Cell<u64>,
     /// The counters as the driver ends, for its handles to read afterwards.
     last: Rc<Cell<EndpointStats>>,
     /// Set by [`EndpointHandle::abort`](crate::EndpointHandle::abort): the next turn ends the
@@ -218,6 +219,8 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     /// them.
     #[cfg(test)]
     issued: RefCell<Vec<mvfstr_proto::ConnectionId>>,
+    #[cfg(test)]
+    record: RefCell<TxRecord>,
 }
 
 /// The server socket and what accepting needs.
@@ -299,6 +302,12 @@ struct Entry<S, B> {
     served_deadline: Option<Instant>,
     /// The connection's entry in the pacing timers.
     pacing: Option<Instant>,
+    /// Whether the connection's transport config turns pacing on.
+    paces: bool,
+    /// The reading the connection's last transmit attempt ran at, to assert that its attempts and
+    /// reports do not go back in time.
+    #[cfg(debug_assertions)]
+    attempted_at: Option<Instant>,
     /// The waker handed to each stream's producer.
     stream_wakers: HashMap<StreamId, Waker>,
     /// The turn of `pull_work`.
@@ -378,6 +387,8 @@ pub struct EndpointStats {
     pub sent_packets: u64,
     /// UDP datagrams the connections sent, each segment of a GSO send counted.
     pub sent_datagrams: u64,
+    /// Pacing wakes taken inside transmit phases, between attempts.
+    pub phase_pacing_wakes: u64,
 }
 
 /// A graceful shutdown in progress. A step's time is `None` once the step is taken, or when it lies
@@ -395,6 +406,19 @@ enum Due {
     Deadline,
     Pacing,
     Wake,
+}
+
+/// What a check between the attempts of a transmit phase took.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// The check, if one ran, did not find a due pacing wake.
+    Nothing,
+    /// A wake whose connection makes the next attempt, out of the phase's queue if it waited
+    /// there.
+    Serve(ConnKey),
+    /// A wake whose connection waits in [`Sched::dirty`] for the next phase, dirtied again after
+    /// its attempt in this one, or whose slot is empty.
+    Deferred,
 }
 
 /// What the task does after a turn.
@@ -476,6 +500,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             steered_in: Cell::new(0),
             sent_packets: Cell::new(0),
             sent_datagrams: Cell::new(0),
+            phase_pacing_wakes: Cell::new(0),
             last: Rc::default(),
             aborted: Cell::new(false),
             pull_ids: RefCell::new(Vec::new()),
@@ -485,6 +510,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             fail_turn: Cell::new(false),
             #[cfg(test)]
             issued: RefCell::default(),
+            #[cfg(test)]
+            record: RefCell::default(),
         }
     }
 
@@ -514,6 +541,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.issued.borrow().clone()
     }
 
+    /// Returns what the transmit phases have done so far.
+    #[cfg(test)]
+    pub(crate) fn tx_record(&self) -> TxRecord {
+        self.record.borrow().clone()
+    }
+
     /// Returns the endpoint's counters.
     pub(crate) fn stats(&self) -> EndpointStats {
         EndpointStats {
@@ -527,6 +560,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             steered_in: self.steered_in.get(),
             sent_packets: self.sent_packets.get(),
             sent_datagrams: self.sent_datagrams.get(),
+            phase_pacing_wakes: self.phase_pacing_wakes.get(),
         }
     }
 
@@ -550,9 +584,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         options: ConnOptions,
         session: A::Session,
     ) -> Result<ConnHandle, DriverConnectError> {
+        let paces = options
+            .transport
+            .as_ref()
+            .unwrap_or_else(|| config.transport())
+            .pacing();
         match self.create_client(remote, server_name, &config, options) {
             Ok((key, conn, socket)) => {
-                let wake = self.insert(key, conn, session, Some(Box::new(socket)));
+                let wake = self.insert(key, conn, session, Some(Box::new(socket)), paces);
                 // The call may come from outside the driver's own poll.
                 self.shared.wake_task();
                 Ok(ConnHandle::new(wake))
@@ -683,8 +722,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
 
     /// Returns the host's time. A turn reads it once for its quiesce steps, intake and first
     /// application phase, then again for each later application or transmit phase and after each
-    /// batch is received, so packet times and RTT samples do not lag by earlier work.
+    /// batch is received, so packet times and RTT samples do not lag by earlier work. A transmit
+    /// phase also reads it for each attempt of a paced connection, and before each pop from its
+    /// queue while a pacing wake is armed, until the phase's requeue cap is spent.
     fn clock(&self) -> Instant {
+        #[cfg(test)]
+        self.record.borrow_mut().clock_read();
         self.worker.host().now()
     }
 
@@ -915,9 +958,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
 
     /// Serves the connection whose pacing release came due first.
     fn serve_pacing(&self, now: Instant) {
+        #[cfg(test)]
+        let due = self.sched.borrow().timers.next(Kind::Pacing);
         let Some(index) = self.sched.borrow_mut().timers.pop_due(Kind::Pacing, now) else {
             return;
         };
+        #[cfg(test)]
+        if let Some(due) = due {
+            self.record.borrow_mut().wake(index, due, now, false, false);
+        }
         let Some(key) = self.slab.borrow().key_at(index) else {
             return;
         };
@@ -1125,7 +1174,22 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
 
     /// Makes one transmit attempt for each dirty connection, re-queueing full batches at the
     /// tail, then flushes the sockets used and takes their reports.
+    ///
+    /// Attempts run at `now`, read as the phase starts. A connection's own socket is flushed after
+    /// its last attempt of the phase, and the server socket, which the other connections share, at
+    /// the end of the phase. A paced connection's attempt runs instead at a reading taken just
+    /// before it, and its socket is also flushed right after it if the attempt built a run, so its
+    /// runs do not wait in the pool behind a stale reading; these flushes of the server socket stop
+    /// once one meets EAGAIN. While a pacing wake is armed, the phase checks before each pop from
+    /// its queue, including any pop that finds it empty, whether a wake has come due; the earliest
+    /// due wake's connection makes the next attempt at the check's reading unless it waits for the
+    /// next phase, so a wake is late by about an attempt rather than a turn. A pop that finds the
+    /// queue empty ends the phase unless the check before it took a wake that does not give an
+    /// attempt. Serves that give an attempt count against `limits.requeues` with full-batch
+    /// requeues, and the checks stop once that cap is spent.
     fn transmit_phase(&self, now: Instant, cx: &mut Context<'_>) {
+        #[cfg(test)]
+        self.record.borrow_mut().begin_phase();
         let mut queue = {
             let mut sched = self.sched.borrow_mut();
             let sched = &mut *sched;
@@ -1133,15 +1197,64 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             queue.extend(sched.dirty.drain(..));
             queue
         };
+        let mut latest = now;
         let mut flush_server = false;
+        // Per-attempt flushes of the server socket stop once one meets an EAGAIN; the end of the
+        // phase still flushes it and waits for it to be writable.
+        let mut server_flushes = true;
         let mut requeues = 0;
-        while let Some(key) = queue.pop_front() {
+        // Serves that gave an attempt plus full-batch requeues, at most `limits.requeues`.
+        let mut spent = 0;
+        loop {
+            let mut reading = None;
+            let mut take = Take::Nothing;
+            if spent < self.limits.requeues
+                && self.sched.borrow().timers.next(Kind::Pacing).is_some()
+            {
+                let at = self.clock();
+                latest = at;
+                reading = Some(at);
+                take = self.take_pacing_wake(at, &mut queue);
+            }
+            let next = match take {
+                Take::Serve(key) => {
+                    spent += 1;
+                    Some(key)
+                }
+                Take::Deferred | Take::Nothing => queue.pop_front(),
+            };
+            let Some(key) = next else {
+                if take == Take::Deferred {
+                    continue;
+                }
+                break;
+            };
             self.with_entry(key, "transmit", |entry| {
                 entry.dirty = false;
+                // Only paced connections arm pacing wakes, so a served attempt runs at its
+                // check's reading.
+                let at = match reading {
+                    _ if !entry.paces => now,
+                    Some(at) => at,
+                    None => {
+                        latest = self.clock();
+                        latest
+                    }
+                };
+                #[cfg(debug_assertions)]
+                {
+                    debug_assert!(
+                        entry.attempted_at.is_none_or(|last| last <= at),
+                        "a connection's attempt times went back"
+                    );
+                    entry.attempted_at = Some(at);
+                }
+                #[cfg(test)]
+                self.record.borrow_mut().attempt(key, at);
                 let sent_before = entry.conn.stats().sent_packets;
                 let outcome = match entry.socket.as_deref_mut() {
                     Some(socket) => {
-                        attempt(&mut entry.conn, socket, key, now, self.limits.max_segments)
+                        attempt(&mut entry.conn, socket, key, at, self.limits.max_segments)
                     }
                     None => {
                         let Some(server) = &self.server else {
@@ -1152,7 +1265,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                             &mut entry.conn,
                             &mut *server.socket.borrow_mut(),
                             key,
-                            now,
+                            at,
                             self.limits.max_segments,
                         )
                     }
@@ -1162,10 +1275,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 self.sent_packets.set(self.sent_packets.get() + sent);
                 self.sent_datagrams
                     .set(self.sent_datagrams.get() + u64::from(outcome.datagrams));
-                let requeued = outcome.stop == Stop::BatchFull && requeues < self.limits.requeues;
+                let requeued = outcome.stop == Stop::BatchFull && spent < self.limits.requeues;
                 match outcome.stop {
                     Stop::BatchFull if requeued => {
                         requeues += 1;
+                        spent += 1;
                         entry.dirty = true;
                         queue.push_back(key);
                     }
@@ -1179,8 +1293,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     }
                     _ => {}
                 }
-                if entry.socket.is_some() && !requeued {
-                    self.flush_own(key, entry, now, outcome.stop == Stop::Socket);
+                let flush = entry.paces && outcome.datagrams > 0;
+                if entry.socket.is_some() && (!requeued || flush) {
+                    self.flush_own(key, entry, at, outcome.stop == Stop::Socket);
+                } else if entry.socket.is_none()
+                    && flush
+                    && server_flushes
+                    && let Some(server) = &self.server
+                {
+                    server_flushes = !server.socket.borrow_mut().flush(at).blocked;
                 }
                 self.set_pacing(key, entry, outcome.pacing_at);
                 if outcome.datagrams > 0 {
@@ -1192,8 +1313,41 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.sched.borrow_mut().tx_queue = queue;
         self.requeues.set(self.requeues.get() + requeues);
         if flush_server {
-            self.flush_server(now, cx);
+            self.flush_server(latest, cx);
         }
+        #[cfg(test)]
+        self.record.borrow_mut().end_phase();
+    }
+
+    /// Takes the pacing wake due earliest at `at` inside a transmit phase.
+    fn take_pacing_wake(&self, at: Instant, queue: &mut VecDeque<ConnKey>) -> Take {
+        #[cfg(test)]
+        let due = self.sched.borrow().timers.next(Kind::Pacing);
+        let Some(index) = self.sched.borrow_mut().timers.pop_due(Kind::Pacing, at) else {
+            return Take::Nothing;
+        };
+        self.phase_pacing_wakes
+            .set(self.phase_pacing_wakes.get() + 1);
+        let key = self.slab.borrow().key_at(index);
+        #[cfg(test)]
+        let queued = key.is_some_and(|key| queue.contains(&key));
+        let next = key.and_then(|key| {
+            self.with_entry(key, "pacing", |entry| {
+                entry.pacing = None;
+                if entry.dirty {
+                    let place = queue.iter().position(|&queued| queued == key)?;
+                    queue.remove(place);
+                }
+                Some(key)
+            })?
+        });
+        #[cfg(test)]
+        if let Some(due) = due {
+            self.record
+                .borrow_mut()
+                .wake(index, due, at, queued, next.is_some());
+        }
+        next.map_or(Take::Deferred, Take::Serve)
     }
 
     /// Flushes the server socket, applies its reports, and gives the connections it refused
@@ -1209,6 +1363,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         drop(socket);
         for (key, report) in reports.drain(..) {
             self.with_entry(key, "tx report", |entry| {
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    entry.attempted_at.is_none_or(|last| last <= now),
+                    "a connection's reports came before its last attempt"
+                );
                 entry.conn.on_tx_report(now, report);
                 if matches!(report, TxReport::Dropped { .. }) {
                     self.mark_dirty(key, entry);
@@ -1255,6 +1414,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         now: Instant,
         refused: bool,
     ) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            entry.attempted_at.is_none_or(|last| last <= now),
+            "a connection's reports came before its last attempt"
+        );
         let Entry {
             conn,
             socket: Some(socket),
@@ -1539,14 +1703,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 return None;
             }
         };
+        let transport = options
+            .transport
+            .as_ref()
+            .unwrap_or_else(|| server.config.transport());
         if let Some(steering) = &self.steering {
-            steering.accepted(
-                options
-                    .transport
-                    .as_ref()
-                    .unwrap_or_else(|| server.config.transport()),
-            );
+            steering.accepted(transport);
         }
+        let paces = transport.pacing();
         let key = self.slab.borrow_mut().reserve();
         let mut rng = SecureRng(server.config.tls().crypto_provider().secure_random);
         let mut inputs = Inputs {
@@ -1564,7 +1728,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }));
         match created {
             Ok(Ok(conn)) => {
-                self.insert(key, conn, session, None);
+                self.insert(key, conn, session, None, paces);
                 return None;
             }
             Ok(Err(_)) => {}
@@ -1675,13 +1839,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Stores a new connection, due a transmit attempt and a first `poll_session`.
+    /// Stores a new connection, due a transmit attempt and a first `poll_session`. `paces` is
+    /// whether its transport config turns pacing on.
     fn insert(
         &self,
         key: ConnKey,
         conn: Connection,
         session: A::Session,
         socket: Option<Box<B>>,
+        paces: bool,
     ) -> Arc<ConnWake> {
         let wake = ConnWake::new(Arc::clone(&self.shared), key);
         let mut sched = self.sched.borrow_mut();
@@ -1709,6 +1875,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             session_deadline: None,
             served_deadline: None,
             pacing: None,
+            paces,
+            #[cfg(debug_assertions)]
+            attempted_at: None,
             stream_wakers: HashMap::new(),
             pull_turn: 0,
             pull_work: 0,
@@ -1864,6 +2033,82 @@ fn attempt<B: Backend>(
     };
     let mut sink = backend.sink(key);
     conn.poll_transmit(&limits, &mut sink, &mut InlineSealer)
+}
+
+/// What the transmit phases of a driver did, for tests.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TxRecord {
+    /// Transmit phases begun.
+    pub(crate) phases: u64,
+    /// The transmit phase running, if any.
+    phase: Option<u64>,
+    /// Clock reads inside transmit phases.
+    pub(crate) phase_clock_reads: u64,
+    /// Every transmit attempt, in order.
+    pub(crate) attempts: Vec<AttemptRecord>,
+    /// Every pacing wake taken, in order.
+    pub(crate) wakes: Vec<WakeRecord>,
+}
+
+/// A transmit attempt: its connection, its transmit phase, and the clock reading it ran at.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttemptRecord {
+    pub(crate) key: ConnKey,
+    pub(crate) phase: u64,
+    pub(crate) at: Instant,
+}
+
+/// A pacing wake taken: its connection's slot, when it was due and when it was taken, the
+/// transmit phase that took it (`None` for the intake), whether its connection waited in that
+/// phase's queue, and, if its connection made the next attempt, that attempt's place in
+/// [`TxRecord::attempts`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WakeRecord {
+    pub(crate) index: u32,
+    pub(crate) due: Instant,
+    pub(crate) taken: Instant,
+    pub(crate) phase: Option<u64>,
+    pub(crate) queued: bool,
+    pub(crate) next: Option<usize>,
+}
+
+#[cfg(test)]
+impl TxRecord {
+    fn begin_phase(&mut self) {
+        self.phases += 1;
+        self.phase = Some(self.phases);
+    }
+
+    fn end_phase(&mut self) {
+        self.phase = None;
+    }
+
+    fn clock_read(&mut self) {
+        if self.phase.is_some() {
+            self.phase_clock_reads += 1;
+        }
+    }
+
+    fn attempt(&mut self, key: ConnKey, at: Instant) {
+        let phase = self.phase.expect("attempts run inside transmit phases");
+        self.attempts.push(AttemptRecord { key, phase, at });
+    }
+
+    /// Records a wake of slot `index` due at `due` and taken at `taken`; `queued` if its
+    /// connection waited in the phase's queue, and `attempts` if it makes the next attempt.
+    fn wake(&mut self, index: u32, due: Instant, taken: Instant, queued: bool, attempts: bool) {
+        self.wakes.push(WakeRecord {
+            index,
+            due,
+            taken,
+            phase: self.phase,
+            queued,
+            next: attempts.then_some(self.attempts.len()),
+        });
+    }
 }
 
 /// Empties `v` and hands back its allocation for elements of another lifetime, so scratch

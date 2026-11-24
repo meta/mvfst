@@ -7,8 +7,8 @@
 
 //! A backend for the driver's tests: [`MmsgBackend`] behind a [`Valve`] that the test thread
 //! controls. A valve can hold its sockets' flushes behind a simulated EAGAIN, which loopback never
-//! returns, drop a run as the backend drops one that must not leave, and fail a receive. It records
-//! what the sockets did.
+//! returns, drop a run as the backend drops one that must not leave, fail a receive, and hold the
+//! worker after an attempt. It records what the sockets did.
 
 use std::io;
 use std::mem;
@@ -19,6 +19,7 @@ use std::sync::MutexGuard;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
 use std::time::Instant;
 
 use mvfstr_io::Backend;
@@ -50,6 +51,22 @@ pub(crate) enum Event {
     Flush,
     /// Datagrams arrived.
     Received,
+    /// A run ended; [`Valve::runs`] has its attempt.
+    Run,
+}
+
+/// A run a gated socket was handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    /// The number of its transmit attempt since the record last started afresh, from 0.
+    pub(crate) attempt: usize,
+}
+
+/// A transmit attempt on a gated socket: its connection and when it began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Started {
+    pub(crate) conn: ConnKey,
+    pub(crate) at: Instant,
 }
 
 #[derive(Default)]
@@ -67,6 +84,22 @@ struct State {
     events: Vec<Event>,
     /// Datagrams handed to the sockets so far, each segment of a run counted.
     datagrams: usize,
+    /// Transmit attempts since the record last started afresh.
+    attempts: usize,
+    runs: Vec<Run>,
+    /// The transmit attempts since the record last started afresh, in order.
+    started: Vec<Started>,
+    /// How long the worker is held after each attempt, and for how many attempts more.
+    stall: Option<(Duration, usize)>,
+}
+
+impl State {
+    fn restart(&mut self) {
+        self.events.clear();
+        self.attempts = 0;
+        self.runs.clear();
+        self.started.clear();
+    }
 }
 
 /// The test's control of one kind of socket: the server socket, or every client socket.
@@ -103,7 +136,7 @@ impl Valve {
         let waker = {
             let mut state = self.state();
             state.blocked = false;
-            state.events.clear();
+            state.restart();
             state.writable.take()
         };
         if let Some(waker) = waker {
@@ -117,7 +150,7 @@ impl Valve {
     pub(crate) fn drop_next_run_of(&self, len: u16) {
         let mut state = self.state();
         state.drop_run_of = Some(len);
-        state.events.clear();
+        state.restart();
     }
 
     /// Makes the next receive on the sockets fail with an error that the backend passes on.
@@ -127,7 +160,12 @@ impl Valve {
 
     /// Clears the record of what the sockets did.
     pub(crate) fn clear(&self) {
-        self.state().events.clear();
+        self.state().restart();
+    }
+
+    /// Returns the runs the sockets were handed since the record last started afresh.
+    pub(crate) fn runs(&self) -> Vec<Run> {
+        self.state().runs.clone()
     }
 
     /// Returns what the sockets did since the record was last cleared.
@@ -138,6 +176,17 @@ impl Valve {
     /// Returns the datagrams handed to the sockets so far, each segment of a run counted.
     pub(crate) fn datagrams(&self) -> usize {
         self.state().datagrams
+    }
+
+    /// Holds the worker for `hold` after each of the next `attempts` transmit attempts, as a
+    /// preemption in the middle of a transmit phase would.
+    pub(crate) fn stall(&self, hold: Duration, attempts: usize) {
+        self.state().stall = Some((hold, attempts));
+    }
+
+    /// Returns the transmit attempts since the record last started afresh, in order.
+    pub(crate) fn started(&self) -> Vec<Started> {
+        self.state().started.clone()
     }
 }
 
@@ -179,6 +228,8 @@ pub(crate) struct GatedSink<'a> {
     inner: MmsgSink<'a>,
     valve: &'a Valve,
     blocked: bool,
+    /// The attempt's number.
+    attempt: usize,
 }
 
 impl SegmentSink for GatedSink<'_> {
@@ -204,6 +255,10 @@ impl SegmentSink for GatedSink<'_> {
     fn end_run(&mut self, meta: TxMeta) {
         let dropped = {
             let mut state = self.valve.state();
+            state.runs.push(Run {
+                attempt: self.attempt,
+            });
+            state.events.push(Event::Run);
             let dropped = state
                 .drop_run_of
                 .is_some_and(|len| meta.segment_size >= len);
@@ -220,6 +275,21 @@ impl SegmentSink for GatedSink<'_> {
     }
 }
 
+impl Drop for GatedSink<'_> {
+    fn drop(&mut self) {
+        let hold = match &mut self.valve.state().stall {
+            Some((hold, left)) if *left > 0 => {
+                *left -= 1;
+                Some(*hold)
+            }
+            _ => None,
+        };
+        if let Some(hold) = hold {
+            std::thread::sleep(hold);
+        }
+    }
+}
+
 impl TxBackend for Gated {
     type Sink<'a> = GatedSink<'a>;
 
@@ -233,15 +303,19 @@ impl TxBackend for Gated {
         } else {
             &self.valves.client
         };
-        let blocked = {
+        let started = Instant::now();
+        let (blocked, attempt) = {
             let mut state = valve.state();
             state.events.push(Event::Attempt);
-            state.blocked
+            state.attempts += 1;
+            state.started.push(Started { conn, at: started });
+            (state.blocked, state.attempts - 1)
         };
         GatedSink {
             inner: self.inner.sink(conn),
             valve,
             blocked,
+            attempt,
         }
     }
 

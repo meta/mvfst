@@ -26,7 +26,7 @@ use std::process::ExitCode;
 
 use crate::flags::Flags;
 use crate::flags::Mode;
-use crate::report::stats_line;
+use crate::report::closed_line;
 use crate::run::RunError;
 
 fn main() -> ExitCode {
@@ -61,8 +61,15 @@ fn main() -> ExitCode {
 fn serve(flags: &Flags) -> Result<(), RunError> {
     let server = run::start_server(flags)?;
     eprintln!("tperf server started at: {}", server.addr());
-    for stats in server.closed_connections() {
-        println!("{}", stats_line(&stats));
+    for closed in server.closed_connections() {
+        println!(
+            "{}",
+            closed_line(
+                &closed.stats,
+                closed.socket_stops,
+                closed.phase_pacing_wakes
+            )
+        );
     }
     Err(RunError::WorkerGone)
 }

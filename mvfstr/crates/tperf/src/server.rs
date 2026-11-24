@@ -9,7 +9,9 @@
 //! writes to each forever, or `--bytes_per_stream` bytes and then a FIN and a replacement
 //! stream, as mvfst's tperf server does.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::task::Context;
 use std::task::Poll;
@@ -17,10 +19,12 @@ use std::task::Poll;
 use mvfstr_driver::Conn;
 use mvfstr_driver::ConnHandle;
 use mvfstr_driver::ConnInfo;
+use mvfstr_driver::EndpointHandle;
 use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
 use mvfstr_driver::Refusal;
 use mvfstr_driver::SendSink;
+use mvfstr_io::MmsgBackend;
 use mvfstr_proto::Bytes;
 use mvfstr_proto::ConnEvent;
 use mvfstr_proto::ConnOptions;
@@ -41,6 +45,17 @@ const ORDER: SendOrder = SendOrder {
     order: 0,
 };
 
+/// A connection that closed, as the server reports it under `--stats`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Closed {
+    /// The connection's counters.
+    pub(crate) stats: ConnStats,
+    /// The transmit attempts the server socket has refused so far, over every connection.
+    pub(crate) socket_stops: u64,
+    /// The pacing wakes the server's transmit phases have taken so far, over every connection.
+    pub(crate) phase_pacing_wakes: u64,
+}
+
 /// The settings every connection of a server shares.
 #[derive(Clone, Debug)]
 pub(crate) struct Settings {
@@ -49,13 +64,13 @@ pub(crate) struct Settings {
     /// One block of `--block_size` zeros, which every push shares rather than copies.
     block: Bytes,
     stats: bool,
-    /// Where a closed connection's counters go under `--stats`.
-    closed: mpsc::Sender<ConnStats>,
+    /// Where closed connections go under `--stats`.
+    closed: mpsc::Sender<Closed>,
 }
 
 impl Settings {
     /// Creates the settings from `flags`, with closed connections reported to `closed`.
-    pub(crate) fn new(flags: &Flags, closed: mpsc::Sender<ConnStats>) -> Self {
+    pub(crate) fn new(flags: &Flags, closed: mpsc::Sender<Closed>) -> Self {
         Self {
             num_streams: flags.num_streams,
             bytes_per_stream: flags.bytes_per_stream,
@@ -66,16 +81,20 @@ impl Settings {
     }
 }
 
+/// The server's driver, set once it runs, which keeps the counters of the server socket.
+pub(crate) type Driver = Rc<OnceCell<EndpointHandle<ServerApp, MmsgBackend>>>;
+
 /// The server application: it takes every connection.
 #[derive(Debug)]
 pub(crate) struct ServerApp {
     settings: Settings,
+    driver: Driver,
 }
 
 impl ServerApp {
-    /// Creates an application whose connections run with `settings`.
-    pub(crate) fn new(settings: Settings) -> Self {
-        Self { settings }
+    /// Creates an application whose connections run with `settings` on `driver`.
+    pub(crate) fn new(settings: Settings, driver: Driver) -> Self {
+        Self { settings, driver }
     }
 }
 
@@ -89,6 +108,7 @@ impl QuicApplication for ServerApp {
     ) -> Result<ServerSession, Refusal> {
         Ok(ServerSession {
             settings: self.settings.clone(),
+            driver: Rc::clone(&self.driver),
             producers: HashMap::new(),
             to_open: 0,
             handle: None,
@@ -100,6 +120,7 @@ impl QuicApplication for ServerApp {
 #[derive(Debug)]
 pub(crate) struct ServerSession {
     settings: Settings,
+    driver: Driver,
     producers: HashMap<StreamId, Producer>,
     /// Streams not opened yet, for want of stream credit or of a `Conn` to open them on.
     to_open: u32,
@@ -132,7 +153,12 @@ impl QuicSession for ServerSession {
             }
             ConnEvent::StreamsAvailable { dir: Dir::Uni } => self.open_streams(conn),
             ConnEvent::Closed { .. } if self.settings.stats => {
-                let _ = self.settings.closed.send(conn.stats());
+                let endpoint = self.driver.get().map(|driver| driver.stats());
+                let _ = self.settings.closed.send(Closed {
+                    stats: conn.stats(),
+                    socket_stops: endpoint.as_ref().map_or(0, |stats| stats.socket_stops),
+                    phase_pacing_wakes: endpoint.map_or(0, |stats| stats.phase_pacing_wakes),
+                });
             }
             _ => {}
         }

@@ -103,6 +103,15 @@ pub(crate) fn stats_line(stats: &ConnStats) -> String {
     )
 }
 
+/// Returns the server's `--stats` line for a closed connection: its counters, and the
+/// endpoint's cumulative socket stops and pacing wakes taken inside transmit phases.
+pub(crate) fn closed_line(stats: &ConnStats, socket_stops: u64, phase_pacing_wakes: u64) -> String {
+    format!(
+        "{} socket_stops={socket_stops} phase_pacing_wakes={phase_pacing_wakes}",
+        stats_line(stats)
+    )
+}
+
 /// Formats `value` as a C++ `std::ostream` prints a `double` by default: `%g` with six
 /// significant digits, which is how mvfst's tperf prints its throughput.
 pub(crate) fn format_g(value: f64) -> String {
@@ -280,6 +289,46 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             stats_line(&stats),
             "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
              srtt_us=150"
+        );
+    }
+
+    #[test]
+    fn the_servers_closed_connection_line_adds_the_endpoints_socket_stops() {
+        let stats = ConnStats {
+            sent_packets: 81_000,
+            sent_bytes: 117_000_000,
+            lost_packets: 12,
+            recv_packets: 1_900,
+            recv_bytes: 95_000,
+            cwnd: 1_452_000,
+            bytes_in_flight: 63_888,
+            smoothed_rtt: Duration::from_micros(150),
+            tx_inconsistent: 0,
+        };
+        assert_eq!(
+            closed_line(&stats, 7, 0),
+            "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
+             srtt_us=150 socket_stops=7 phase_pacing_wakes=0"
+        );
+    }
+
+    #[test]
+    fn the_servers_closed_connection_line_adds_the_endpoints_phase_pacing_wakes() {
+        let stats = ConnStats {
+            sent_packets: 81_000,
+            sent_bytes: 117_000_000,
+            lost_packets: 12,
+            recv_packets: 1_900,
+            recv_bytes: 95_000,
+            cwnd: 1_452_000,
+            bytes_in_flight: 63_888,
+            smoothed_rtt: Duration::from_micros(150),
+            tx_inconsistent: 0,
+        };
+        assert_eq!(
+            closed_line(&stats, 7, 4_211),
+            "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
+             srtt_us=150 socket_stops=7 phase_pacing_wakes=4211"
         );
     }
 }
