@@ -237,7 +237,7 @@ void QuicServer::bindWorkersToSocket(const quic::SocketAddress& address) {
     // noexcept, so capture failures and rethrow below; bindImpl rolls back.
     workerEvb->runImmediatelyOrRunInEventBaseThreadAndWait(
         [this, workerEvb, processId = processId_, idx = i, &failure] {
-          std::lock_guard<std::mutex> guard(startMutex_);
+          std::scoped_lock guard(startMutex_);
           if (failure) {
             return;
           }
