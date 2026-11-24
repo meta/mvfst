@@ -256,6 +256,19 @@ pub(crate) fn up_and_idle() -> (Cc, Instant) {
     (sim.cc, sim.now)
 }
 
+/// Runs [`up_and_idle`], then sets a bandwidth estimate of `bw` bytes per second and a window of
+/// `cwnd` bytes: UP paces at 1.25 * `bw`, and a restart from idle at `bw`.
+pub(crate) fn up_and_idle_at(bw: u64, cwnd: u64) -> (Cc, Instant) {
+    let (mut cc, idle) = up_and_idle();
+    let Cc::Bbr3(bbr) = &mut cc else {
+        unreachable!("up_and_idle gives a BBR3 controller")
+    };
+    bbr.bw = bw;
+    bbr.pacing_rate = gain(bw, PROBE_BW_UP_PACING_GAIN);
+    bbr.window.cwnd = cwnd;
+    (cc, idle)
+}
+
 #[test]
 fn starts_in_startup_with_the_initial_window_paced_at_2_77_times_it_per_srtt_or_1ms() {
     let sim = Sim::new();

@@ -102,6 +102,7 @@ use crate::cid::ConnRng;
 use crate::cid::LocalCids;
 use crate::cid::MAX_LOCAL_CIDS;
 use crate::cid::PeerCids;
+use crate::pacer::Bursts;
 use crate::pacer::Pacer;
 use crate::recovery::LossRecovery;
 use crate::recovery::RecoveryConfig;
@@ -744,8 +745,12 @@ impl Connection {
         }
     }
 
-    /// Paces at the congestion controller's rate for the current window and RTT.
+    /// Paces at the congestion controller's rate for the current window and RTT. An unpaced
+    /// connection's pacer only stamps releases, which do not depend on the rate.
     fn refresh_pacing_rate(&mut self) {
+        if !self.config.pacing() {
+            return;
+        }
         let rate = self.cc.pacing_rate(self.recovery.rtt().smoothed());
         self.pacer.set_rate(rate);
     }
@@ -1024,9 +1029,9 @@ impl Connection {
 }
 
 /// Returns the state a path starts with: `config`'s congestion controller for datagrams of
-/// `max_datagram_size` bytes, and a pacer at its rate for `recovery`'s smoothed RTT. A controller
-/// that takes rate samples starts from `recovery`'s counts, and BBR3 draws its seed from `rng`;
-/// NewReno and CUBIC leave `rng` untouched.
+/// `max_datagram_size` bytes, and a pacer with `config`'s bursts at its rate for `recovery`'s
+/// smoothed RTT. A controller that takes rate samples starts from `recovery`'s counts, and BBR3
+/// draws its seed from `rng`; NewReno and CUBIC leave `rng` untouched.
 fn congestion_state(
     config: &TransportConfig,
     max_datagram_size: u16,
@@ -1049,16 +1054,17 @@ fn congestion_state(
         seed: u64::from_le_bytes(seed),
         srtt: rtt.first_sample_time().map(|_| rtt.smoothed()),
         total_sent: recovery.total_sent(),
-        pacing_granularity: GRANULARITY,
+        pacing_granularity: config.pacing_granularity(),
         horizon: Duration::ZERO,
     };
     let cc = Cc::start(kind, &windows, max_datagram_size, &start)
         .expect("should accept a validated config's windows and datagrams of at least 1,200 bytes");
-    let pacer = Pacer::new(
-        max_datagram_size,
-        GRANULARITY,
-        cc.pacing_rate(rtt.smoothed()),
-    );
+    let bursts = Bursts {
+        granularity: config.pacing_granularity(),
+        min: config.pacing_min_burst(),
+        max: config.pacing_max_burst(),
+    };
+    let pacer = Pacer::new(max_datagram_size, bursts, cc.pacing_rate(rtt.smoothed()));
     (cc, pacer)
 }
 

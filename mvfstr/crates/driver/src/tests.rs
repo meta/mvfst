@@ -5600,6 +5600,7 @@ fn sluggish_and_paced() -> Arc<TransportConfig> {
             ..AckPolicy::default()
         })
         .pacing(true)
+        .pacing_min_burst(1)
         .build()
         .expect("a transport config")
 }
@@ -5607,9 +5608,9 @@ fn sluggish_and_paced() -> Arc<TransportConfig> {
 #[test]
 fn a_paced_sender_resumes_at_each_release_without_other_input() {
     // Eight datagrams each way, within the window, over a link with a round trip of 20 ms. At a
-    // window per round trip the pacer lets two or three datagrams go at once and holds each of
-    // the others about 1.6 ms, and the sluggish peers do not acknowledge them within the test,
-    // so only the pacing wake moves a sender on.
+    // window per round trip and a minimum burst of 1, the pacer releases runs of one datagram
+    // 1.6 ms apart, two of them at once after idle, and the sluggish peers do not acknowledge
+    // them within the test, so only the pacing wake moves a sender on.
     const LEN: usize = 9_000;
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {

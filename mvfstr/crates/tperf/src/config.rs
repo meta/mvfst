@@ -28,6 +28,8 @@ use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::time_provider::DefaultTimeProvider;
 
 use crate::flags::Flags;
+use crate::flags::MIN_BURST;
+use crate::flags::PACING_TICK_US;
 use crate::flags::QuicVersion;
 
 /// The application protocol the mvfst tperf server selects.
@@ -68,15 +70,24 @@ pub(crate) fn client_transport(flags: &Flags) -> Result<Arc<TransportConfig>, Co
 
 /// Returns the server's transport settings: `--congestion`, `--pacing` and `--max_cwnd_mss`, and
 /// with `--override_packet_size` datagrams at the peer's max_udp_payload_size, capped by
-/// `--max_receive_packet_size` as mvfst caps it at its own. Flow-control windows are mvfst's
-/// defaults.
+/// `--max_receive_packet_size` as mvfst caps it at its own. `--pacing` also sets mvfst tperf's
+/// 200 µs tick and minimum burst of 5, or the pacing flags' values, and `--writes_per_loop` as
+/// the maximum burst. Flow-control windows are mvfst's defaults.
 pub(crate) fn server_transport(flags: &Flags) -> Result<Arc<TransportConfig>, ConfigError> {
     let datagram_size = if flags.override_packet_size {
         DatagramSize::PeerMaximum
     } else {
         DatagramSize::Minimum
     };
-    TransportConfig::builder()
+    let mut builder = TransportConfig::builder();
+    if flags.pacing {
+        let tick = flags.pacing_granularity_us.unwrap_or(PACING_TICK_US);
+        builder = builder
+            .pacing_granularity(Duration::from_micros(u64::from(tick)))
+            .pacing_min_burst(flags.pacing_min_burst.unwrap_or(MIN_BURST))
+            .pacing_max_burst(flags.writes_per_loop);
+    }
+    builder
         .max_streams_bidi(MAX_STREAMS)
         .max_streams_uni(MAX_STREAMS)
         .idle_timeout(Some(IDLE_TIMEOUT))
@@ -302,6 +313,37 @@ mod tests {
         assert!(config.pacing());
         assert_eq!(config.max_udp_payload_size(), 1300);
         assert_eq!(config.max_data(), 1 << 20);
+    }
+
+    #[test]
+    fn pacing_sets_mvfst_tperfs_tick_and_minimum_burst_and_the_batch_as_maximum_burst() {
+        let bursts = |flags: &Flags| {
+            let config = server_transport(flags).unwrap();
+            (
+                config.pacing_granularity(),
+                config.pacing_min_burst(),
+                config.pacing_max_burst(),
+            )
+        };
+        let us = Duration::from_micros;
+        let paced = Flags {
+            pacing: true,
+            ..Flags::default()
+        };
+        assert_eq!(bursts(&paced), (us(200), 5, 44));
+        let tuned = Flags {
+            pacing_granularity_us: Some(100),
+            pacing_min_burst: Some(8),
+            writes_per_loop: 16,
+            ..paced
+        };
+        assert_eq!(bursts(&tuned), (us(100), 8, 16));
+        // Unpaced, the library's defaults stay.
+        let unpaced = Flags {
+            writes_per_loop: 4,
+            ..Flags::default()
+        };
+        assert_eq!(bursts(&unpaced), (us(1000), 5, 44));
     }
 
     #[test]

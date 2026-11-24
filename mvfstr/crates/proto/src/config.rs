@@ -281,6 +281,9 @@ pub struct TransportConfig {
     ack_policy: AckPolicy,
     congestion_control: CongestionControl,
     pacing: bool,
+    pacing_granularity: Duration,
+    pacing_min_burst: u16,
+    pacing_max_burst: u16,
     initial_window: u32,
     min_window: u32,
     max_window: u32,
@@ -309,6 +312,9 @@ impl Default for TransportConfig {
             ack_policy: AckPolicy::default(),
             congestion_control: CongestionControl::default(),
             pacing: false,
+            pacing_granularity: Duration::from_millis(1),
+            pacing_min_burst: 5,
+            pacing_max_burst: 44,
             initial_window: 10,
             min_window: 2,
             max_window: 2000,
@@ -402,6 +408,22 @@ impl TransportConfig {
     /// sample.
     pub fn pacing(&self) -> bool {
         self.pacing
+    }
+
+    /// Returns the pacer's tick: runs are sized to leave about one tick apart, within the minimum
+    /// and maximum burst.
+    pub fn pacing_granularity(&self) -> Duration {
+        self.pacing_granularity
+    }
+
+    /// Returns the fewest datagrams a paced run is sized for.
+    pub fn pacing_min_burst(&self) -> u16 {
+        self.pacing_min_burst
+    }
+
+    /// Returns the most datagrams in a paced run.
+    pub fn pacing_max_burst(&self) -> u16 {
+        self.pacing_max_burst
     }
 
     /// Returns the initial congestion window in datagrams.
@@ -531,6 +553,27 @@ impl TransportConfigBuilder {
         self
     }
 
+    /// Sets the pacer's tick, a non-zero whole number of microseconds. A paced run holds the
+    /// datagrams of about one tick at the pacing rate, within the minimum and maximum burst.
+    /// Default 1 ms, mvfst's library default; mvfst tperf's `--pacing` uses 200 µs.
+    pub fn pacing_granularity(mut self, granularity: Duration) -> Self {
+        self.config.pacing_granularity = granularity;
+        self
+    }
+
+    /// Sets the fewest datagrams a paced run is sized for, at least 1. Default 5, as in mvfst.
+    pub fn pacing_min_burst(mut self, datagrams: u16) -> Self {
+        self.config.pacing_min_burst = datagrams;
+        self
+    }
+
+    /// Sets the most datagrams in a paced run, at least the minimum burst. Default 44, one GSO
+    /// send of mvfst tperf's `--writes_per_loop`.
+    pub fn pacing_max_burst(mut self, datagrams: u16) -> Self {
+        self.config.pacing_max_burst = datagrams;
+        self
+    }
+
     /// Sets the initial congestion window in datagrams, limited to max(this * 1,472, 2 datagrams)
     /// bytes as RFC 9002 recommends, and kept within the minimum and maximum windows. Default 10,
     /// as in mvfst.
@@ -643,6 +686,14 @@ impl TransportConfigBuilder {
         // The congestion controller refuses anything else, and a connection needs it to start.
         check(c.min_window >= 2, "min_window")?;
         check(c.max_window >= c.min_window, "max_window")?;
+        // The pacer sizes runs in whole microseconds, as mvfst's pacer does.
+        check(
+            !c.pacing_granularity.is_zero()
+                && c.pacing_granularity.subsec_nanos().is_multiple_of(1000),
+            "pacing_granularity",
+        )?;
+        check(c.pacing_min_burst >= 1, "pacing_min_burst")?;
+        check(c.pacing_max_burst >= c.pacing_min_burst, "pacing_max_burst")?;
         Ok(Arc::new(self.config))
     }
 }
@@ -979,6 +1030,10 @@ mod tests {
         assert_eq!(config.ack_policy().ack_delay_exponent, 3);
         assert_eq!(config.congestion_control(), CongestionControl::Cubic);
         assert!(!config.pacing());
+        // mvfst's library defaults, and 44 datagrams, one GSO send.
+        assert_eq!(config.pacing_granularity(), Duration::from_millis(1));
+        assert_eq!(config.pacing_min_burst(), 5);
+        assert_eq!(config.pacing_max_burst(), 44);
         assert_eq!(config.initial_window(), 10);
         assert_eq!(config.min_window(), 2);
         assert_eq!(config.max_window(), 2000);
@@ -1009,6 +1064,9 @@ mod tests {
             .ack_policy(ack)
             .congestion_control(CongestionControl::NewReno)
             .pacing(true)
+            .pacing_granularity(Duration::from_micros(200))
+            .pacing_min_burst(2)
+            .pacing_max_burst(64)
             .initial_window(32)
             .min_window(4)
             .max_window(860_000)
@@ -1031,6 +1089,9 @@ mod tests {
         assert_eq!(config.ack_policy(), ack);
         assert_eq!(config.congestion_control(), CongestionControl::NewReno);
         assert!(config.pacing());
+        assert_eq!(config.pacing_granularity(), Duration::from_micros(200));
+        assert_eq!(config.pacing_min_burst(), 2);
+        assert_eq!(config.pacing_max_burst(), 64);
         assert_eq!(config.initial_window(), 32);
         assert_eq!(config.min_window(), 4);
         assert_eq!(config.max_window(), 860_000);
@@ -1173,6 +1234,49 @@ mod tests {
                 Err(out_of_range(field)),
                 "{builder:?}"
             );
+        }
+    }
+
+    #[test]
+    fn pacing_settings_outside_their_range_are_refused() {
+        let cases = [
+            (
+                TransportConfig::builder().pacing_granularity(Duration::ZERO),
+                "pacing_granularity",
+            ),
+            (
+                TransportConfig::builder().pacing_granularity(Duration::from_nanos(200_500)),
+                "pacing_granularity",
+            ),
+            (
+                TransportConfig::builder().pacing_min_burst(0),
+                "pacing_min_burst",
+            ),
+            (
+                TransportConfig::builder()
+                    .pacing_min_burst(5)
+                    .pacing_max_burst(4),
+                "pacing_max_burst",
+            ),
+        ];
+        for (builder, field) in cases {
+            assert_eq!(
+                builder.clone().build(),
+                Err(out_of_range(field)),
+                "{builder:?}"
+            );
+        }
+        let edges = [
+            TransportConfig::builder().pacing_granularity(Duration::from_micros(1)),
+            TransportConfig::builder()
+                .pacing_min_burst(1)
+                .pacing_max_burst(1),
+            TransportConfig::builder()
+                .pacing_min_burst(u16::MAX)
+                .pacing_max_burst(u16::MAX),
+        ];
+        for builder in edges {
+            assert!(builder.clone().build().is_ok(), "{builder:?}");
         }
     }
 

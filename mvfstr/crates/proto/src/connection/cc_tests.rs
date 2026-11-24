@@ -42,19 +42,26 @@ use crate::CreditDue;
 use crate::DatagramSize;
 use crate::DropReason;
 use crate::InlineSealer;
+use crate::Release;
 use crate::SendOrder;
 use crate::Stop;
 use crate::TransportConfig;
+use crate::TxLimits;
 use crate::TxOutcome;
 use crate::TxReport;
 use crate::TxSeqRange;
 use crate::cc::bbr3::State;
 use crate::cc::bbr3::tests::up_and_idle;
+use crate::cc::bbr3::tests::up_and_idle_at;
+use crate::config::TransportConfigBuilder;
+use crate::pacer::Bursts;
+use crate::pacer::Pacer;
 use crate::recovery::Space;
 use crate::testing::Loss;
 use crate::testing::Pair;
 use crate::testing::PairConfig;
 use crate::testing::Peer;
+use crate::testing::SentDatagram;
 use crate::testing::VecSink;
 use crate::testing::fixtures::Setup;
 
@@ -862,16 +869,134 @@ fn attempt(pair: &mut Pair, now: Instant) -> TxOutcome {
     conn.poll_transmit(&limits(now), &mut VecSink::new(1500), &mut InlineSealer)
 }
 
-#[test]
-fn a_paced_sender_stops_until_its_next_release_and_sends_nothing_before_it() {
-    let (_, mut pair) = handshake(setup(config(|c| c.pacing(true))).pair());
+/// Returns a pair whose paced client has `f`'s settings and a window of 100 datagrams, one RTT
+/// after the handshake, with `len` bytes queued on as many streams as their staging cap needs.
+fn backlogged(
+    f: impl FnOnce(TransportConfigBuilder) -> TransportConfigBuilder,
+    len: usize,
+) -> Pair {
+    let client = config(|c| f(c.pacing(true).initial_window(100)));
+    let (_, mut pair) = handshake(setup(client).pair());
     pair.run(pair.now + RTT);
     let conn = pair.client.conn_mut();
-    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
-    let mut data = Bytes::from(pattern(10_000));
-    conn.stream(id).unwrap().send(&mut data).unwrap();
+    let mut data = Bytes::from(pattern(len));
+    while !data.is_empty() {
+        let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
+        conn.stream(id).unwrap().send(&mut data).unwrap();
+    }
+    pair
+}
+
+/// Runs one attempt by the client at `now` with room for 44 datagrams, as in tperf, and returns
+/// its outcome and the datagrams of each run.
+fn attempt_runs(pair: &mut Pair, now: Instant) -> (TxOutcome, Vec<Vec<SentDatagram>>) {
+    let conn = pair.client.conn_mut();
+    let mut sink = VecSink::new(1500);
+    let limits = TxLimits {
+        max_segments: 44,
+        ..limits(now)
+    };
+    let outcome = conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+    let mut runs: Vec<Vec<SentDatagram>> = Vec::new();
+    for datagram in sink.take() {
+        match runs.last_mut() {
+            Some(run) if run[0].meta.tx == datagram.meta.tx => run.push(datagram),
+            _ => runs.push(vec![datagram]),
+        }
+    }
+    (outcome, runs)
+}
+
+fn sizes(runs: &[Vec<SentDatagram>]) -> Vec<usize> {
+    runs.iter().map(Vec::len).collect()
+}
+
+#[test]
+fn a_backlogged_paced_sender_builds_one_full_run_per_wake_with_one_release() {
+    let mut pair = backlogged(|c| c, 100_000);
+    let pacer = &pair.client.conn().pacer;
+    let (burst, t) = (usize::from(pacer.burst()), pacer.run_time());
+    assert!(burst >= 5, "{pacer:?}");
+    // After idle, the credit's run and one more leave together.
     let mut now = pair.now;
-    let first = attempt(&mut pair, now);
+    let (first, runs) = attempt_runs(&mut pair, now);
+    assert_eq!(sizes(&runs), [burst, burst], "{first:?}");
+    assert_eq!(first.stop, Stop::Pacing(now + t));
+    // Then one run of N datagrams per wake, T apart, each run with one release.
+    for _ in 0..5 {
+        now += t;
+        let (outcome, runs) = attempt_runs(&mut pair, now);
+        assert_eq!(sizes(&runs), [burst], "at {now:?}: {outcome:?}");
+        assert_eq!(runs[0][0].meta.release, Release::Asap);
+        assert_eq!(outcome.stop, Stop::Pacing(now + t), "{outcome:?}");
+    }
+}
+
+/// Returns how many datagrams the client sends in attempts at `now` until one stops for anything
+/// but a full batch, as the driver requeues it, and the last outcome.
+fn wake(pair: &mut Pair, now: Instant) -> (u16, TxOutcome) {
+    let mut sent = 0;
+    loop {
+        let (outcome, _) = attempt_runs(pair, now);
+        sent += outcome.datagrams;
+        if outcome.stop != Stop::BatchFull {
+            return (sent, outcome);
+        }
+    }
+}
+
+#[test]
+fn no_wake_releases_more_paced_datagrams_than_the_maximum_burst() {
+    let n = backlogged(|c| c, 0).client.conn().pacer.burst();
+    // Full runs leave one per wake with a credit of 3 datagrams, and two after a late wake
+    // with the credit of a full run.
+    for max in [n + 3, 2 * n, 44] {
+        let mut pair = backlogged(|c| c.pacing_max_burst(max), 150_000);
+        let t = pair.client.conn().pacer.run_time();
+        let (mut now, mut most) = (pair.now, 0);
+        // Wakes on time, and late by T / 2, T, 3T / 2 and 10T.
+        for late in [0, 1, 2, 3, 20, 0] {
+            let (sent, outcome) = wake(&mut pair, now);
+            assert!(
+                sent <= max,
+                "{sent} datagrams with a maximum of {max}: {outcome:?}"
+            );
+            most = most.max(sent);
+            let Stop::Pacing(release) = outcome.stop else {
+                panic!("not paced: {outcome:?}");
+            };
+            now = release + late * t / 2;
+        }
+        assert_eq!(most, if max < 2 * n { n } else { 2 * n }, "maximum {max}");
+    }
+}
+
+#[test]
+fn an_unpaced_sender_fills_each_attempt_with_one_run_up_to_the_window() {
+    let mut pair = backlogged(|c| c.pacing(false), 150_000);
+    let now = pair.now;
+    let mut seen = Vec::new();
+    loop {
+        let (outcome, runs) = attempt_runs(&mut pair, now);
+        assert!(
+            runs.iter()
+                .flatten()
+                .all(|d| d.meta.release == Release::Asap)
+        );
+        seen.push((sizes(&runs), outcome.stop));
+        if outcome.stop != Stop::BatchFull {
+            break;
+        }
+    }
+    let full = || (vec![44], Stop::BatchFull);
+    assert_eq!(seen, [full(), full(), (vec![12], Stop::Cwnd)]);
+}
+
+#[test]
+fn a_paced_sender_stops_until_its_next_release_and_sends_nothing_before_it() {
+    let mut pair = backlogged(|c| c, 100_000);
+    let mut now = pair.now;
+    let (first, _) = attempt_runs(&mut pair, now);
     let Stop::Pacing(release) = first.stop else {
         panic!("not paced: {first:?}");
     };
@@ -879,65 +1004,74 @@ fn a_paced_sender_stops_until_its_next_release_and_sends_nothing_before_it() {
     assert_eq!(first.pacing_at, Some(release));
     let mut sent = u32::from(first.datagrams);
     let mut next = release;
-    while sent < 9 {
+    while sent < 36 {
         for early in [now, next - Duration::from_nanos(1)] {
-            let outcome = attempt(&mut pair, early);
+            let (outcome, _) = attempt_runs(&mut pair, early);
             assert_eq!(outcome.datagrams, 0, "at {early:?}: {outcome:?}");
             assert_eq!(outcome.stop, Stop::Pacing(next));
         }
         now = next;
-        let outcome = attempt(&mut pair, now);
+        let (outcome, _) = attempt_runs(&mut pair, now);
         assert!(outcome.datagrams > 0, "at its release: {outcome:?}");
         sent += u32::from(outcome.datagrams);
-        if let Stop::Pacing(release) = outcome.stop {
-            assert!(release > now);
-            next = release;
-        }
+        let Stop::Pacing(release) = outcome.stop else {
+            panic!("not paced: {outcome:?}");
+        };
+        assert!(release > now);
+        next = release;
     }
 }
 
 #[test]
 fn paced_datagrams_are_spaced_at_the_controllers_pacing_rate() {
-    let (_, mut pair) = handshake(setup(config(|c| c.pacing(true))).pair());
-    pair.run(pair.now + RTT);
-    let conn = pair.client.conn_mut();
+    let mut pair = backlogged(|c| c, 100_000);
+    let conn = pair.client.conn();
     let rate = conn.cc.pacing_rate(conn.recovery.rtt().smoothed()).get();
-    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
-    let mut data = Bytes::from(pattern(10_000));
-    conn.stream(id).unwrap().send(&mut data).unwrap();
     let now = pair.now;
-    let Stop::Pacing(release) = attempt(&mut pair, now).stop else {
+    let Stop::Pacing(release) = attempt_runs(&mut pair, now).0.stop else {
         panic!("not paced");
     };
-    let one = attempt(&mut pair, release);
-    assert_eq!(one.datagrams, 1, "{one:?}");
+    let (one, runs) = attempt_runs(&mut pair, release);
+    let burst = pair.client.conn().pacer.burst();
+    assert_eq!((one.datagrams, runs.len()), (burst, 1), "{one:?}");
     let Stop::Pacing(next) = one.stop else {
         panic!("not paced: {one:?}");
     };
-    // The pacer's clock advances by the datagram's size over the rate, rounded up.
-    let nanos = (u64::from(one.bytes) * 1_000_000_000).div_ceil(rate);
-    assert_eq!(next - release, Duration::from_nanos(nanos));
+    // The pacer's clock advances by the run's bytes at its rate, N datagrams per T, which is
+    // the controller's rate up to mvfst's rounding of T to whole microseconds.
+    let paced = u128::from(one.bytes) * 1_000_000_000 / (next - release).as_nanos();
+    let rate = u128::from(rate);
+    assert!(
+        paced.abs_diff(rate) * 100 <= rate,
+        "{paced} B/s paced at {rate} B/s"
+    );
 }
 
 #[test]
 fn a_paced_flight_leaves_spread_out_in_virtual_time() {
-    let (_, mut pair) = handshake(setup(config(|c| c.pacing(true))).pair());
-    pair.run(pair.now + RTT);
+    let mut pair = backlogged(|c| c, 100_000);
     let (start, from) = (pair.now, pair.client.sent.len());
-    let conn = pair.client.conn_mut();
-    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
-    let mut data = Bytes::from(pattern(10_000));
-    conn.stream(id).unwrap().send(&mut data).unwrap();
+    let pacer = &pair.client.conn().pacer;
+    let (burst, t) = (usize::from(pacer.burst()), pacer.run_time());
     pair.run(pair.now + RTT);
-    let times: Vec<Instant> = pair.client.sent[from..from + 9]
+    let times: Vec<Instant> = pair.client.sent[from..from + 5 * burst]
         .iter()
         .map(|(sent, _)| *sent)
         .collect();
-    // Two datagrams of burst credit and the one crossing it leave at once, then one every
-    // 1.6 ms, all before the first ACK could arrive 20 ms later.
-    assert!(times.iter().take(3).all(|&t| t == start), "{times:?}");
-    assert!(times[2..].windows(2).all(|w| w[0] < w[1]), "{times:?}");
-    assert!(times[8] < start + Duration::from_millis(20), "{times:?}");
+    // Two runs leave at once, then one every T, all before the first ACK could arrive 20 ms
+    // later.
+    assert!(
+        times[..2 * burst].iter().all(|&at| at == start),
+        "{times:?}"
+    );
+    for (k, run) in times[2 * burst..].chunks(burst).enumerate() {
+        let at = start + (k as u32 + 1) * t;
+        assert!(run.iter().all(|&sent| sent == at), "{times:?}");
+    }
+    assert!(
+        times[5 * burst - 1] < start + Duration::from_millis(20),
+        "{times:?}"
+    );
 }
 
 /// Hands the client hand-built 1-RTT packets from the server, one per frame list, at `now`.
@@ -953,41 +1087,35 @@ fn from_server(pair: &mut Pair, now: Instant, packets: &[&[Frame<'_>]]) {
 
 #[test]
 fn an_ack_only_datagram_takes_no_pacing_tokens() {
-    let (_, mut pair) = handshake(setup(config(|c| c.pacing(true))).pair());
-    pair.run(pair.now + RTT);
+    let mut pair = backlogged(|c| c, 100_000);
     let now = pair.now;
-    let conn = pair.client.conn_mut();
-    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
-    let mut data = Bytes::from(pattern(10_000));
-    conn.stream(id).unwrap().send(&mut data).unwrap();
-    let Stop::Pacing(release) = attempt(&mut pair, now).stop else {
+    let Stop::Pacing(release) = attempt_runs(&mut pair, now).0.stop else {
         panic!("not paced");
     };
     // Two ack-eliciting packets make an ACK due at once.
     from_server(&mut pair, now, &[&[Frame::Ping], &[Frame::Ping]]);
-    let ack = attempt(&mut pair, now);
-    assert_eq!(ack.datagrams, 1, "{ack:?}");
+    let (ack, runs) = attempt_runs(&mut pair, now);
+    assert_eq!((ack.datagrams, runs.len()), (1, 1), "{ack:?}");
     assert_eq!(ack.stop, Stop::Pacing(release));
 }
 
 #[test]
 fn probe_datagrams_take_no_pacing_tokens() {
-    let (_, mut pair) = handshake(setup(config(|c| c.pacing(true))).pair());
-    pair.run(pair.now + RTT);
+    let mut pair = backlogged(|c| c, 100_000);
+    let pacer = &pair.client.conn().pacer;
+    let (burst, t) = (usize::from(pacer.burst()), pacer.run_time());
     let now = pair.now;
-    let conn = pair.client.conn_mut();
-    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
-    let mut data = Bytes::from(pattern(10_000));
-    conn.stream(id).unwrap().send(&mut data).unwrap();
-    assert_eq!(attempt(&mut pair, now).datagrams, 3);
+    assert_eq!(sizes(&attempt_runs(&mut pair, now).1), [burst, burst]);
     // The discarded datagrams are not acknowledged, so the PTO comes long after the pacer's clock.
     let conn = pair.client.conn_mut();
     let pto = conn.next_deadline().unwrap();
     conn.on_deadline(pto);
     assert_eq!(conn.recovery.probes_due(Space::Data), 2);
-    let outcome = attempt(&mut pair, pto);
-    // The two probes, then the burst credit's two datagrams and the one crossing it.
-    assert_eq!(outcome.datagrams, 5, "{outcome:?}");
+    let (outcome, runs) = attempt_runs(&mut pair, pto);
+    // The two full-size probes in an unpaced run, then the data after them in runs of its
+    // own, the credit's and one more, debited once each.
+    assert_eq!(sizes(&runs), [2, burst, burst], "{outcome:?}");
+    assert_eq!(outcome.stop, Stop::Pacing(pto + t));
 }
 
 #[cfg(feature = "aws-lc-rs")]
@@ -1041,18 +1169,26 @@ fn initial_and_handshake_packets_are_not_paced_before_the_one_rtt_keys() {
 
 #[test]
 fn the_pacing_burst_follows_the_datagram_size_the_peer_allows() {
-    let client = config(|c| c.pacing(true).datagram_size(DatagramSize::PeerMaximum));
-    let (_, mut pair) = handshake(setup(client).pair());
-    pair.run(pair.now + RTT);
+    let mut pair = backlogged(|c| c.datagram_size(DatagramSize::PeerMaximum), 100_000);
     let now = pair.now;
-    let conn = pair.client.conn_mut();
+    let conn = pair.client.conn();
     assert_eq!(conn.mtu, 1452);
-    let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
-    let mut data = Bytes::from(pattern(10_000));
-    conn.stream(id).unwrap().send(&mut data).unwrap();
-    // Two 1,452-byte datagrams of burst credit and the one crossing it.
-    let burst = attempt(&mut pair, now);
-    assert_eq!((burst.datagrams, burst.bytes), (3, 3 * 1452), "{burst:?}");
+    // N and T are those of 1,452-byte datagrams at the controller's rate.
+    let rate = conn.cc.pacing_rate(conn.recovery.rtt().smoothed());
+    let bursts = Bursts {
+        granularity: Duration::from_millis(1),
+        min: 5,
+        max: 44,
+    };
+    let expected = Pacer::new(1452, bursts, rate);
+    let (burst, t) = (conn.pacer.burst(), conn.pacer.run_time());
+    assert_eq!((burst, t), (expected.burst(), expected.run_time()));
+    assert_ne!(burst, Pacer::new(1200, bursts, rate).burst());
+    // Two runs of N 1,452-byte datagrams.
+    let (first, runs) = attempt_runs(&mut pair, now);
+    let n = u32::from(burst);
+    assert_eq!((first.bytes, runs.len()), (2 * n * 1452, 2), "{first:?}");
+    assert_eq!(first.stop, Stop::Pacing(now + t));
 }
 
 #[test]
@@ -1120,20 +1256,56 @@ fn bbr3_restarting_probe_bw_from_idle_paces_the_attempt_at_the_restart_rate() {
     let mut data = Bytes::from(pattern(100_000));
     conn.stream(id).unwrap().send(&mut data).unwrap();
     // The first datagram restarts UP from idle at 1 MB/s, and the pacer takes that rate before
-    // it stamps the datagram, without an ACK or timeout in between.
+    // it debits the run, without an ACK or timeout in between.
     let mut pacer = conn.pacer.clone();
     pacer.set_rate(NonZeroU64::new(1_000_000).unwrap());
     let now = pair.now;
     let mut sink = VecSink::new(1500);
     let outcome = conn.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    let mut runs: Vec<(TxSeqRange, u64)> = Vec::new();
     for datagram in sink.take() {
-        pacer.on_paced(now, datagram.data.len() as u64);
+        match runs.last_mut() {
+            Some((tx, bytes)) if *tx == datagram.meta.tx => *bytes += datagram.data.len() as u64,
+            _ => runs.push((datagram.meta.tx, datagram.data.len() as u64)),
+        }
+    }
+    for (_, bytes) in runs {
+        pacer.on_paced(now, bytes);
     }
     assert_eq!(
         outcome.stop,
         Stop::Pacing(pacer.next_release(now)),
         "{outcome:?}"
     );
+}
+
+#[test]
+fn bbr3_restarting_probe_bw_from_idle_sizes_the_attempts_runs_at_the_restart_rate() {
+    let bbr3 = config(|c| {
+        c.congestion_control(CongestionControl::Bbr3)
+            .pacing(true)
+            .pacing_granularity(Duration::from_micros(200))
+    });
+    let (_, mut pair) = handshake(setup(bbr3).pair());
+    let (cc, idle) = up_and_idle_at(125_000_000, 100 * 1200);
+    pair.run(idle.max(pair.now + RTT));
+    let conn = pair.client.conn_mut();
+    assert_eq!(conn.recovery.bytes_in_flight(), 0);
+    conn.cc = cc;
+    conn.refresh_pacing_rate();
+    // UP at 1.25 Gbit/s gives runs of N = 27 1,200-byte datagrams per 200 µs tick.
+    assert_eq!(conn.pacer.burst(), 27);
+    let mut data = Bytes::from(pattern(100_000));
+    while !data.is_empty() {
+        let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
+        conn.stream(id).unwrap().send(&mut data).unwrap();
+    }
+    // The first datagram restarts UP from idle at 1 Gbit/s, N = 21 and T = 201 µs, which sizes
+    // the run it opens as well as the next.
+    let now = pair.now;
+    let (outcome, runs) = attempt_runs(&mut pair, now);
+    assert_eq!(sizes(&runs), [21, 21], "{outcome:?}");
+    assert_eq!(outcome.stop, Stop::Pacing(now + Duration::from_micros(201)));
 }
 
 #[test]

@@ -1298,6 +1298,12 @@ impl Bbr3 {
         self.rng
     }
 
+    /// Returns the pacing granularity and horizon, which feed the send quantum and offload budget.
+    #[cfg(test)]
+    pub(crate) fn pacing_inputs(&self) -> (Duration, Duration) {
+        (self.granularity, self.horizon)
+    }
+
     #[cfg(test)]
     pub(crate) fn state(&self) -> State {
         self.state

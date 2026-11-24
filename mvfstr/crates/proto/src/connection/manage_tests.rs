@@ -1540,6 +1540,30 @@ fn a_bbr3_controller_rebuilt_on_a_move_to_a_new_ip_is_seeded_and_ready_to_pace_a
 }
 
 #[test]
+fn bbr3_takes_the_pacing_granularity_at_creation_and_after_a_move() {
+    let tick = Duration::from_micros(200);
+    let setup = Setup::default().transport(
+        TransportConfig::builder()
+            .congestion_control(CongestionControl::Bbr3)
+            .pacing(true)
+            .pacing_granularity(tick)
+            .build()
+            .unwrap(),
+    );
+    let mut created = None;
+    let (_, _, pair) = migrate_after_congestion_in(&setup, stranger(), |server| {
+        created = Some(server.cc.bbr3().pacing_inputs());
+    });
+    let zero = Duration::ZERO;
+    assert_eq!(created, Some((tick, zero)));
+    assert_eq!(
+        pair.server.conn().cc.bbr3().pacing_inputs(),
+        (tick, zero),
+        "the rebuilt controller"
+    );
+}
+
+#[test]
 fn a_validated_move_to_a_new_ip_restarts_the_configured_window_and_the_pacer() {
     let setup = Setup {
         server_transport: TransportConfig::builder()

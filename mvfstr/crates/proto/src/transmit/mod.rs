@@ -193,7 +193,8 @@ pub enum Stop {
     ConnFlowControl,
     /// The candidate's space does not have a write key yet. Wake on ingress that installs keys.
     KeysPending,
-    /// [`TxLimits::max_segments`] datagrams were built. Re-queue at the tail of the phase.
+    /// [`TxLimits::max_segments`] datagrams were built, or the rest of the batch could not hold a
+    /// full paced run, which waits for the next attempt. Re-queue at the tail of the phase.
     BatchFull,
     /// The egress grant ([`TxLimits::max_bytes`]) is used up. Wake on the next grant.
     Endpoint,

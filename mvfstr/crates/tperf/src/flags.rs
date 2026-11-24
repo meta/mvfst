@@ -56,7 +56,17 @@ pub(crate) struct Flags {
     pub(crate) compat_mvfst: bool,
     pub(crate) quic_version: QuicVersion,
     pub(crate) stats: bool,
+    /// With `--pacing`, the pacing tick in µs instead of mvfst tperf's 200.
+    pub(crate) pacing_granularity_us: Option<u32>,
+    /// With `--pacing`, the minimum burst instead of mvfst's 5.
+    pub(crate) pacing_min_burst: Option<u16>,
 }
+
+/// The pacing tick mvfst tperf's `--pacing` sets, in µs.
+pub(crate) const PACING_TICK_US: u32 = 200;
+
+/// mvfst's default minimum pacing burst.
+pub(crate) const MIN_BURST: u16 = 5;
 
 impl Default for Flags {
     /// The defaults of mvfst's tperf.
@@ -82,6 +92,8 @@ impl Default for Flags {
             compat_mvfst: true,
             quic_version: QuicVersion::V1,
             stats: false,
+            pacing_granularity_us: None,
+            pacing_min_burst: None,
         }
     }
 }
@@ -129,6 +141,22 @@ impl Flags {
         }
         if flags.congestion == CongestionControl::Bbr3 && !flags.pacing {
             return Err(FlagError::Bbr3NeedsPacing);
+        }
+        if !flags.pacing {
+            if flags.pacing_granularity_us.is_some() {
+                return Err(FlagError::NeedsPacing("pacing_granularity_us"));
+            }
+            if flags.pacing_min_burst.is_some() {
+                return Err(FlagError::NeedsPacing("pacing_min_burst"));
+            }
+        }
+        // --writes_per_loop, which caps mvfst tperf's GSO sends, is the maximum burst when pacing.
+        let min_burst = flags.pacing_min_burst.unwrap_or(MIN_BURST);
+        if flags.pacing && flags.writes_per_loop < min_burst {
+            return Err(FlagError::BatchBelowMinimumBurst {
+                writes_per_loop: flags.writes_per_loop,
+                min_burst,
+            });
         }
         Ok(flags)
     }
@@ -182,6 +210,10 @@ impl Flags {
                 }
             }
             "stats" => self.stats = bool_value()?,
+            "pacing_granularity_us" => {
+                self.pacing_granularity_us = Some(positive(value).ok_or_else(bad)?)
+            }
+            "pacing_min_burst" => self.pacing_min_burst = Some(positive(value).ok_or_else(bad)?),
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -206,7 +238,7 @@ const BOOL_FLAGS: [&str; 8] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 15] = [
+const VALUE_FLAGS: [&str; 17] = [
     "mode",
     "host",
     "port",
@@ -220,6 +252,8 @@ const VALUE_FLAGS: [&str; 15] = [
     "bytes_per_stream",
     "max_receive_packet_size",
     "quic_version",
+    "pacing_granularity_us",
+    "pacing_min_burst",
     "minloglevel",
     "v",
 ];
@@ -251,6 +285,15 @@ pub(crate) enum FlagError {
     Bbr3NeedsPacing,
     /// BBR3 was chosen for the client, which never paces.
     Bbr3ServerSide,
+    /// A pacing flag was set without `--pacing`.
+    NeedsPacing(&'static str),
+    /// With `--pacing`, `--writes_per_loop`, the maximum burst, is below the minimum burst.
+    BatchBelowMinimumBurst {
+        /// `--writes_per_loop`.
+        writes_per_loop: u16,
+        /// The minimum burst.
+        min_burst: u16,
+    },
     /// The value does not parse or is out of the flag's range.
     BadValue {
         /// The flag's name.
@@ -273,6 +316,15 @@ impl fmt::Display for FlagError {
             Self::Bbr3ServerSide => write!(
                 f,
                 "--congestion=bbr3 is server-side: the client never paces, so it takes newreno or cubic"
+            ),
+            Self::NeedsPacing(flag) => write!(f, "--{flag} needs --pacing"),
+            Self::BatchBelowMinimumBurst {
+                writes_per_loop,
+                min_burst,
+            } => write!(
+                f,
+                "with --pacing, --writes_per_loop={writes_per_loop} caps each pacing burst below \
+                 the minimum burst of {min_burst}"
             ),
             Self::BadValue { flag, value } => {
                 write!(f, "illegal value '{value}' specified for flag '{flag}'")
@@ -313,6 +365,8 @@ mod tests {
             compat_mvfst: true,
             quic_version: QuicVersion::V1,
             stats: false,
+            pacing_granularity_us: None,
+            pacing_min_burst: None,
         };
         assert_eq!(flags, expected);
     }
@@ -367,6 +421,8 @@ mod tests {
                 compat_mvfst: false,
                 quic_version: QuicVersion::Mvfst,
                 stats: true,
+                pacing_granularity_us: None,
+                pacing_min_burst: None,
             }
         );
         let server = parse(&[
@@ -446,6 +502,9 @@ mod tests {
             "--duration=-1",
             "--congestion=bbr",
             "--pacing=maybe",
+            "--pacing_granularity_us=0",
+            "--pacing_min_burst=0",
+            "--pacing_min_burst=65536",
         ] {
             let (flag, value) = arg[2..].split_once('=').unwrap();
             assert_eq!(
@@ -510,6 +569,56 @@ mod tests {
             "checked once every flag is read"
         );
         assert!(parse(&["--mode=client", "--num_streams=1", "--bytes_per_stream=0"]).is_ok());
+    }
+
+    #[test]
+    fn the_pacing_flags_override_the_tick_and_the_minimum_burst() {
+        let flags = parse(&[
+            "--pacing",
+            "--pacing_granularity_us=100",
+            "--pacing_min_burst",
+            "8",
+        ])
+        .unwrap();
+        assert_eq!(
+            (flags.pacing_granularity_us, flags.pacing_min_burst),
+            (Some(100), Some(8))
+        );
+    }
+
+    #[test]
+    fn the_pacing_flags_are_refused_without_pacing() {
+        for (arg, flag) in [
+            ("--pacing_granularity_us=100", "pacing_granularity_us"),
+            ("--pacing_min_burst=8", "pacing_min_burst"),
+        ] {
+            assert_eq!(parse(&[arg]), Err(FlagError::NeedsPacing(flag)), "{arg}");
+            assert_eq!(
+                parse(&[arg, "--nopacing"]),
+                Err(FlagError::NeedsPacing(flag))
+            );
+        }
+    }
+
+    #[test]
+    fn pacing_refuses_a_batch_below_the_minimum_burst() {
+        // --writes_per_loop is the maximum burst, which may not be below the minimum.
+        assert_eq!(
+            parse(&["--pacing", "--writes_per_loop=4"]),
+            Err(FlagError::BatchBelowMinimumBurst {
+                writes_per_loop: 4,
+                min_burst: 5,
+            })
+        );
+        assert_eq!(
+            parse(&["--pacing_min_burst=8", "--writes_per_loop=7", "--pacing"]),
+            Err(FlagError::BatchBelowMinimumBurst {
+                writes_per_loop: 7,
+                min_burst: 8,
+            })
+        );
+        assert!(parse(&["--writes_per_loop=4"]).is_ok(), "unpaced");
+        assert!(parse(&["--pacing", "--pacing_min_burst=4", "--writes_per_loop=4"]).is_ok());
     }
 
     #[test]

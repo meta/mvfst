@@ -80,6 +80,8 @@ struct StartCand {
 struct Scan {
     start: Option<StartCand>,
     blocked: Blocked,
+    /// Whether a candidate of a paced class may start, when the scan looked for one.
+    paced: bool,
 }
 
 /// One packet built into the datagram.
@@ -95,7 +97,7 @@ struct Built {
     probe: bool,
 }
 
-/// The open GSO run.
+/// The open GSO run: one release, and one pacer debit when it ends.
 #[derive(Clone, Copy, Debug)]
 struct Run {
     path: PathId,
@@ -103,6 +105,34 @@ struct Run {
     segments: u16,
     segment_size: u16,
     class: TxClass,
+    /// When its datagrams leave.
+    release: Instant,
+    /// Whether it took its release from the pacer's clock, so that it holds at most a burst
+    /// and the pacing gate stays open while it does.
+    paced: bool,
+    /// The datagrams the attempt had room for when it opened.
+    room: u16,
+    /// The bytes of its paced datagrams.
+    paced_bytes: u64,
+}
+
+impl Run {
+    /// Adds a datagram of `len` bytes, which takes pacing tokens if `paced`.
+    fn add(&mut self, len: u16, paced: bool) {
+        if self.segments == 0 {
+            self.segment_size = len;
+        }
+        self.segments += 1;
+        // An unpaced datagram does not take tokens, in a paced run too.
+        if paced {
+            self.paced_bytes += u64::from(len);
+        }
+    }
+
+    /// Returns whether it is a paced run of `burst` datagrams, or of all the attempt had room for.
+    fn is_full(&self, burst: u16) -> bool {
+        self.paced && self.segments >= burst.min(self.room)
+    }
 }
 
 /// The sources skipped for the rest of an attempt because their start did not fit.
@@ -119,12 +149,13 @@ impl Skipped {
     }
 }
 
-/// What limits the joiners of a datagram besides the admission table: the sources skipped in
-/// this attempt, and whether the egress grant has room for the datagram.
+/// What limits the candidates of a datagram besides the admission table: the sources skipped in
+/// this attempt, whether the egress grant has room for the datagram, and the pacing gate.
 #[derive(Clone, Copy, Debug)]
 struct JoinLimits {
     skipped: Skipped,
     grant: bool,
+    pacing: Option<Instant>,
 }
 
 /// What building one datagram did.
@@ -134,8 +165,8 @@ enum Outcome {
     Empty,
     /// The sealer failed; the CRYPTO bytes written went back to their buffers as lost.
     Unsealed,
-    /// The datagram was sealed and committed.
-    Sent { len: u16 },
+    /// The datagram was sealed and committed; `paced` if it carries a paced packet but not a probe.
+    Sent { len: u16, paced: bool },
 }
 
 impl Connection {
@@ -159,14 +190,30 @@ impl Connection {
         let mut skipped = Skipped::default();
         let mut run: Option<Run> = None;
         let seg_max = self.mtu.min(lim.max_datagram);
+        let pacing = self.pacing_active();
         loop {
-            let grant = u64::from(out.bytes) + u64::from(seg_max) <= u64::from(lim.max_bytes);
+            // A paced run holds the pacer's current burst: a send can change the rate (BBR3's
+            // restart from idle) after the run opened.
+            if run.is_some_and(|open| open.is_full(self.pacer.burst())) {
+                self.end_run(sink, &mut run);
+            }
+            let in_paced_run = run.is_some_and(|open| open.paced);
+            let joins = JoinLimits {
+                skipped,
+                grant: u64::from(out.bytes) + u64::from(seg_max) <= u64::from(lim.max_bytes),
+                pacing: if in_paced_run {
+                    None
+                } else {
+                    self.pacing_gate(lim.now)
+                },
+            };
+            let predict = pacing && !in_paced_run;
             let alt = self
                 .alt
                 .is_some()
-                .then(|| self.scan(lim.now, ALT_PATH, &skipped, grant, None))
+                .then(|| self.scan(lim.now, ALT_PATH, joins, predict, None))
                 .filter(|alt| alt.start.is_some());
-            let scan = alt.unwrap_or_else(|| self.scan(lim.now, PathId(0), &skipped, grant, None));
+            let scan = alt.unwrap_or_else(|| self.scan(lim.now, PathId(0), joins, predict, None));
             let Some(start) = scan.start else {
                 (out.stop, out.pacing_at) = self.classify(&scan.blocked);
                 break;
@@ -180,16 +227,50 @@ impl Connection {
             } else {
                 TxClass::Data
             };
-            // A run goes to one address.
-            if run.is_some_and(|open| open.path != start.path) {
+            // A run goes to one address. A paced run's scan skipped the pacing gate, so the next
+            // run's start is looked for again.
+            if let Some(open) = run
+                && open.path != start.path
+            {
                 self.end_run(sink, &mut run);
+                if open.paced {
+                    continue;
+                }
+            }
+            // A paced datagram never joins an unpaced run.
+            let paced = predict && scan.paced && !self.probing();
+            if paced {
+                self.end_run(sink, &mut run);
+            }
+            if run.is_none() {
+                let room = lim.max_segments - out.datagrams;
+                let release = if paced {
+                    // Only an empty attempt opens a paced run without room for a full burst.
+                    if room < self.pacer.burst() && out.datagrams > 0 {
+                        out.stop = Stop::BatchFull;
+                        break;
+                    }
+                    self.pacer.next_release(lim.now)
+                } else {
+                    self.pacer.unpaced_release(lim.now)
+                };
+                run = Some(Run {
+                    path: start.path,
+                    first_tx: self.tx_seq,
+                    segments: 0,
+                    segment_size: 0,
+                    class,
+                    release,
+                    paced,
+                    room,
+                    paced_bytes: 0,
+                });
             }
             // The slot comes before any packet number is taken.
             let Some((slot, buf)) = sink.next_segment(seg_max, class) else {
                 out.stop = Stop::Socket;
                 break;
             };
-            let joins = JoinLimits { skipped, grant };
             match self.build(lim.now, start, joins, slot, buf, sealer) {
                 Outcome::Empty => {
                     sink.end_segment(0);
@@ -205,20 +286,10 @@ impl Connection {
                     out.stop = Stop::Inconsistent;
                     break;
                 }
-                Outcome::Sent { len } => {
+                Outcome::Sent { len, paced } => {
                     sink.end_segment(len);
-                    let tx = self.tx_seq - 1;
-                    match &mut run {
-                        Some(open) => open.segments += 1,
-                        None => {
-                            run = Some(Run {
-                                path: start.path,
-                                first_tx: tx,
-                                segments: 1,
-                                segment_size: len,
-                                class,
-                            })
-                        }
+                    if let Some(open) = &mut run {
+                        open.add(len, paced && pacing);
                     }
                     out.datagrams += 1;
                     out.bytes += u32::from(len);
@@ -255,14 +326,12 @@ impl Connection {
     /// remaining candidates may not start.
     pub(super) fn explain(&self, lim: &TxLimits) -> TxExplain {
         let mut detail = String::new();
-        let grant = u64::from(self.mtu.min(lim.max_datagram)) <= u64::from(lim.max_bytes);
-        let scan = self.scan(
-            lim.now,
-            PathId(0),
-            &Skipped::default(),
-            grant,
-            Some(&mut detail),
-        );
+        let joins = JoinLimits {
+            skipped: Skipped::default(),
+            grant: u64::from(self.mtu.min(lim.max_datagram)) <= u64::from(lim.max_bytes),
+            pacing: self.pacing_gate(lim.now),
+        };
+        let scan = self.scan(lim.now, PathId(0), joins, false, Some(&mut detail));
         let (stop, pacing_at) = self.classify(&scan.blocked);
         if let Some(start) = scan.start {
             let _ = writeln!(
@@ -278,19 +347,21 @@ impl Connection {
         }
     }
 
-    /// Finds the first candidate that may start a datagram on `path`, scanning every space and the
-    /// sources in order, with `grant` true when the egress grant has room for one more datagram. It
-    /// records what blocked each candidate before that one, or every candidate with `detail`.
+    /// Finds the first candidate that may start a datagram on `path` within `joins`, scanning every
+    /// space and the sources in order, and records what blocked each candidate it scanned; with
+    /// `detail` it scans them all. With `find_paced`, it scans on until a candidate of a paced
+    /// class may start, and reports whether one may.
     fn scan(
         &self,
         now: Instant,
         path: PathId,
-        skipped: &Skipped,
-        grant: bool,
+        joins: JoinLimits,
+        find_paced: bool,
         mut detail: Option<&mut String>,
     ) -> Scan {
         let mut blocked = Blocked::default();
         let mut start = None;
+        let mut paced = false;
         let mut scratch = Vec::new();
         for space in Space::ALL {
             // A discarded space is skipped, as its keys are gone, and so is a space whose packets
@@ -300,39 +371,44 @@ impl Connection {
             }
             let cx = self.send_cx(now, space, path, &mut scratch);
             for id in SourceId::ORDER {
-                if skipped.contains(id) || !self.source_active(id, path, &cx.packet) {
+                if joins.skipped.contains(id) || !self.source_active(id, path, &cx.packet) {
                     continue;
                 }
                 let Some(cand) = self.sources.candidate(id, &cx) else {
                     continue;
                 };
-                let gate = self.start_gate(now, space, path, cand, grant);
+                let gate = self.start_gate(space, path, cand, joins);
                 let verdict = may_start(cand.class, &gate);
                 if let Some(detail) = detail.as_deref_mut() {
                     let _ = writeln!(detail, "{space:?} {id:?} {cand:?}: {verdict:?}");
                 }
                 match verdict {
                     Start::Yes => {
-                        let candidate = StartCand {
+                        paced |= cand.class.is_paced();
+                        start.get_or_insert(StartCand {
                             path,
                             source: id,
                             space,
                             cand,
-                        };
-                        if detail.is_none() {
+                        });
+                        if detail.is_none() && (paced || !find_paced) {
                             return Scan {
-                                start: Some(candidate),
+                                start,
                                 blocked,
+                                paced,
                             };
                         }
-                        start.get_or_insert(candidate);
                     }
                     Start::Never => {}
                     Start::Blocked(block) => blocked.note(block),
                 }
             }
         }
-        Scan { start, blocked }
+        Scan {
+            start,
+            blocked,
+            paced,
+        }
     }
 
     /// Returns an attempt's stop when it cannot start a datagram, and the earliest pacing release.
@@ -413,14 +489,7 @@ impl Connection {
 
     /// Returns the gate `cand` in `space` must pass to start a datagram on `path`: the datagram is
     /// charged 1,200 bytes if `cand` forces that size, else the packet `cand` needs.
-    fn start_gate(
-        &self,
-        now: Instant,
-        space: Space,
-        path: PathId,
-        cand: Candidate,
-        grant: bool,
-    ) -> Gate {
+    fn start_gate(&self, space: Space, path: PathId, cand: Candidate, joins: JoinLimits) -> Gate {
         let datagram_size = if full_size(self.side, space, cand.class) {
             u64::from(MIN_DATAGRAM)
         } else {
@@ -428,14 +497,13 @@ impl Connection {
         };
         Gate {
             datagram_size,
-            ..self.join_gate(now, space, self.credit_of(path), grant)
+            ..self.join_gate(space, self.credit_of(path), joins)
         }
     }
 
-    /// Returns the gate a joiner in `space` must pass in a datagram that may hold `room` bytes,
-    /// with `grant` true when the egress grant has room for it; the caller sets the size the
-    /// joiner would force.
-    fn join_gate(&self, now: Instant, space: Space, room: u64, grant: bool) -> Gate {
+    /// Returns the gate a joiner in `space` must pass in a datagram that may hold `room` bytes
+    /// within `joins`; the caller sets the size the joiner would force.
+    fn join_gate(&self, space: Space, room: u64, joins: JoinLimits) -> Gate {
         Gate {
             keys: self.has_keys(space),
             credit: room,
@@ -443,9 +511,9 @@ impl Connection {
             probes_due: self.recovery.probes_due(space),
             bytes_in_flight: self.recovery.bytes_in_flight(),
             cwnd: self.cc.cwnd(),
-            pacing: self.pacing_release(now),
+            pacing: joins.pacing,
             conn_credit: self.sources.streams.conn_send.available(),
-            grant,
+            grant: joins.grant,
         }
     }
 
@@ -461,12 +529,19 @@ impl Connection {
     }
 
     /// Returns the pacer's next release, if it holds paced candidates back at `now`.
-    fn pacing_release(&self, now: Instant) -> Option<Instant> {
+    fn pacing_gate(&self, now: Instant) -> Option<Instant> {
         if !self.pacing_active() {
             return None;
         }
         let release = self.pacer.next_release(now);
         (release > now).then_some(release)
+    }
+
+    /// Returns whether probes are due in any space, which the next datagram would carry.
+    fn probing(&self) -> bool {
+        Space::ALL
+            .into_iter()
+            .any(|space| self.recovery.probes_due(space) > 0)
     }
 
     /// Returns the room a packet in `space` needs for `payload` bytes of frames, at the largest
@@ -512,7 +587,7 @@ impl Connection {
                 continue;
             }
             let cx = self.send_cx(now, space, start.path, &mut scratch);
-            let gate = self.join_gate(now, space, room, joins.grant);
+            let gate = self.join_gate(space, room, joins);
             let probe = cx.probes_due > 0;
             let smallest = SourceId::ORDER
                 .into_iter()
@@ -569,7 +644,7 @@ impl Connection {
             let Some(header) = self.header_spec(space, start.path) else {
                 continue;
             };
-            let gate = self.join_gate(now, space, room as u64, joins.grant);
+            let gate = self.join_gate(space, room as u64, joins);
             let side = self.side;
             let admit = move |class: Class| {
                 let forces = full_size(side, space, class);
@@ -741,17 +816,10 @@ impl Connection {
         if self.cc.take_pacer_refresh() {
             self.refresh_pacing_rate();
         }
-        if self.pacing_active() {
-            // ACK-only and probe datagrams do not take pacing tokens.
-            let mut packets = built.iter().flatten();
-            let paced = packets.clone().any(|packet| packet.packet.paced)
-                && !packets.any(|packet| packet.probe);
-            if paced {
-                self.pacer.on_paced(now, len as u64);
-            } else {
-                self.pacer.on_unpaced(now);
-            }
-        }
+        // ACK-only and probe datagrams do not take pacing tokens.
+        let mut packets = built.iter().flatten();
+        let paced = packets.clone().any(|packet| packet.packet.paced)
+            && !packets.any(|packet| packet.probe);
         self.stats.sent_bytes += len as u64;
         self.charge_path(now, path, len, challenge);
         // The first ack-eliciting packet sent after a received one restarts the idle timer
@@ -768,14 +836,20 @@ impl Connection {
         Outcome::Sent {
             // The datagram fits its slot, whose length is a u16.
             len: u16::try_from(len).unwrap_or(u16::MAX),
+            paced,
         }
     }
 
-    /// Closes the open run, if any, with its metadata.
-    fn end_run<S: SegmentSink>(&self, sink: &mut S, run: &mut Option<Run>) {
+    /// Closes the open run, if any, with its metadata, and debits the pacer once with its paced
+    /// bytes.
+    fn end_run<S: SegmentSink>(&mut self, sink: &mut S, run: &mut Option<Run>) {
         let Some(run) = run.take() else {
             return;
         };
+        if run.segments == 0 {
+            return;
+        }
+        self.pacer.on_run(run.release, run.paced_bytes);
         sink.end_run(TxMeta {
             path: run.path,
             dst: self.remote_of(run.path),
@@ -879,4 +953,44 @@ impl Connection {
 fn full_size(side: Side, space: Space, class: Class) -> bool {
     let ack_eliciting = !matches!(class, Class::Piggyback | Class::AckOnly | Class::Response);
     space == Space::Initial && (side == Side::Client || ack_eliciting)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unpaced_datagram_in_a_paced_run_takes_no_tokens_and_counts_toward_its_burst() {
+        let release = crate::recovery::test_epoch();
+        let mut run = Run {
+            path: PathId(0),
+            first_tx: 0,
+            segments: 0,
+            segment_size: 0,
+            class: TxClass::Urgent,
+            release,
+            paced: true,
+            room: 44,
+            paced_bytes: 0,
+        };
+        // An ACK-only datagram, then paced ones, in a burst of 5.
+        run.add(1200, false);
+        for _ in 0..3 {
+            run.add(1200, true);
+        }
+        assert!(!run.is_full(5));
+        run.add(1200, true);
+        assert!(run.is_full(5));
+        assert_eq!((run.segments, run.paced_bytes), (5, 4 * 1200));
+        assert_eq!((run.segment_size, run.release), (1200, release));
+        // It holds at most the datagrams the attempt had room for.
+        let narrow = Run { room: 3, ..run };
+        assert!(narrow.is_full(44));
+        // An unpaced run is not limited to a burst.
+        let unpaced = Run {
+            paced: false,
+            ..run
+        };
+        assert!(!unpaced.is_full(5));
+    }
 }
