@@ -316,6 +316,10 @@ impl Sources {
 
     /// Writes source `id`'s candidates into the packet while `admit` accepts their class and
     /// they fit.
+    // The attempt calls this for each active source of every packet it builds. `#[inline]` here
+    // and on `fill_from` puts a copy of both into the attempt's codegen unit, so LLVM can inline
+    // them however rustc partitions the crate that instantiates the attempt.
+    #[inline]
     pub(crate) fn fill(
         &mut self,
         id: SourceId,
@@ -533,6 +537,8 @@ fn candidate_of<S: FrameSource>(source: &S, cx: &SendCx<'_>) -> Option<Candidate
 }
 
 /// Joins `source`'s candidates to the packet while `admit` accepts their class and they fit.
+// Inlined with `Sources::fill`; see there.
+#[inline]
 fn fill_from<S: FrameSource>(
     source: &mut S,
     w: &mut PacketWriter<'_>,
