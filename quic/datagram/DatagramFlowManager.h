@@ -35,6 +35,7 @@ class DatagramFlowManager {
   struct QueuedDatagram {
     // User-provided, not `= default`: writeBuffer_ instantiates F14FastMap over
     // these nested types before gcc has evaluated their member initializers.
+    // NOLINTNEXTLINE(modernize-use-equals-default)
     QueuedDatagram() {}
 
     BufQueue buf;
@@ -55,6 +56,7 @@ class DatagramFlowManager {
     // popped. Set by closeFlow(), and at creation for ephemeral flows.
     bool draining{false};
 
+    // NOLINTNEXTLINE(modernize-use-equals-default)
     DatagramFlowQueue() {} // Not `= default`; see QueuedDatagram above.
 
     ~DatagramFlowQueue() = default;
