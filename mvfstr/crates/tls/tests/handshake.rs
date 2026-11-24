@@ -142,7 +142,7 @@ impl Peer {
                     self.one_rtt = Some(keys);
                     self.update = Some(update);
                 }
-                None => {}
+                Some(KeyChange::ZeroRtt(_)) | None => {}
             }
         }
         progressed
@@ -394,7 +394,7 @@ fn a_resuming_client_reports_only_the_parameters_of_the_current_connection() {
     assert_eq!(client.tls.peer_transport_params(), None);
     run(&mut client, &mut server).unwrap();
     assert_eq!(
-        client.tls.rustls().handshake_kind(),
+        client.tls.rustls().unwrap().handshake_kind(),
         Some(rustls::HandshakeKind::Resumed)
     );
     assert_eq!(
@@ -477,7 +477,12 @@ fn keys_of_every_level_interoperate_in_both_directions() {
         seal_and_open(&client_keys.local, &server_keys.remote, &header, 7);
         seal_and_open(&server_keys.local, &client_keys.remote, &header, 9);
     }
-    let suite = client.tls.rustls().negotiated_cipher_suite().unwrap();
+    let suite = client
+        .tls
+        .rustls()
+        .unwrap()
+        .negotiated_cipher_suite()
+        .unwrap();
     assert!(mvfstr_crypto::quic_algorithm(suite.tls13().unwrap()).is_some());
 }
 
@@ -579,7 +584,12 @@ fn key_updates_follow_the_rfc9001_quic_ku_derivation() {
     let server = TlsSession::server(server_config(&[b"h3"]), Version::V1, Vec::new());
     let (mut client, mut server) = (Peer::new(client.unwrap()), Peer::new(server.unwrap()));
     run(&mut client, &mut server).unwrap();
-    let suite = client.tls.rustls().negotiated_cipher_suite().unwrap();
+    let suite = client
+        .tls
+        .rustls()
+        .unwrap()
+        .negotiated_cipher_suite()
+        .unwrap();
     assert_eq!(suite.suite(), chacha20);
 
     let ku = |secret: &[u8; SHA256_LEN]| {

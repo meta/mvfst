@@ -883,7 +883,7 @@ impl Connection {
                     self.spaces[Space::Data.index()].keys = Some(keys);
                     self.replay_due = true;
                 }
-                None => {}
+                Some(KeyChange::ZeroRtt(_)) | None => {}
             }
         }
         if self.handshake.peer_params.is_none()

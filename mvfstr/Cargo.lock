@@ -332,6 +332,7 @@ dependencies = [
 name = "mvfstr_tls"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "mvfstr_crypto",
  "mvfstr_wire",
  "rcgen",

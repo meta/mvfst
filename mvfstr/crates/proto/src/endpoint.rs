@@ -913,9 +913,14 @@ fn version_negotiation(
 fn rustls_error(error: TlsError) -> rustls::Error {
     match error {
         TlsError::Config(error) | TlsError::Alert { error, .. } | TlsError::Failed(error) => error,
-        TlsError::UnsupportedVersion(_) | TlsError::WrongLevel { .. } => {
-            rustls::Error::General(error.to_string())
-        }
+        TlsError::UnsupportedVersion(_)
+        | TlsError::WrongLevel { .. }
+        | TlsError::LeftUnread { .. }
+        | TlsError::BufferExceeded { .. }
+        | TlsError::PostHandshakeAuth
+        | TlsError::HostAlert(_)
+        | TlsError::NotPending
+        | TlsError::InvalidStep => rustls::Error::General(error.to_string()),
     }
 }
 

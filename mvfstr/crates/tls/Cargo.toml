@@ -20,6 +20,7 @@ categories = ["network-programming"]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
+bytes = "1.12.1"
 mvfstr_crypto = { version = "0.1.0", path = "../crypto", default-features = false }
 mvfstr_wire = { version = "0.1.0", path = "../wire" }
 rustls = { version = "0.23.46", features = ["std"], default-features = false }

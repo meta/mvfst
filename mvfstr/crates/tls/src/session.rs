@@ -12,15 +12,23 @@ use std::sync::Arc;
 
 use mvfstr_crypto::KeySet;
 use mvfstr_crypto::KeyUpdater;
+use mvfstr_crypto::PacketKeys;
 use mvfstr_wire::Side;
 use mvfstr_wire::TransportErrorCode;
 use mvfstr_wire::Version;
 use rustls::AlertDescription;
 use rustls::ClientConfig;
+use rustls::HandshakeType;
 use rustls::PeerMisbehaved;
 use rustls::ServerConfig;
 use rustls::pki_types::ServerName;
 use rustls::quic;
+
+use crate::external::AppTokenVerdict;
+use crate::external::ExternalSession;
+use crate::external::HandshakeSummary;
+use crate::external::TlsInput;
+use crate::external::TlsStep;
 
 /// An encryption level that carries CRYPTO frames. 0-RTT packets do not carry them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,6 +56,9 @@ pub enum KeyChange {
         /// The updater that derives the keys of key phases 1, 2 and on.
         update: KeyUpdater,
     },
+    /// The 0-RTT keys, which only an External session reports: a client's write keys, or the read
+    /// keys of a server that accepted early data. They leave the CRYPTO level unchanged.
+    ZeroRtt(PacketKeys),
 }
 
 /// One piece of TLS output, from [`TlsSession::write_crypto`].
@@ -86,6 +97,31 @@ pub enum TlsError {
         /// The level TLS reads.
         expected: Level,
     },
+    /// CRYPTO bytes that the TLS host of an External session did not read before it delivered the
+    /// keys of a later level. RFC 9001 makes this a PROTOCOL_VIOLATION.
+    LeftUnread {
+        /// The level of the bytes.
+        level: Level,
+    },
+    /// More CRYPTO bytes at a level than an External session holds for its TLS host before the
+    /// host consumes them. The connection closes with CRYPTO_BUFFER_EXCEEDED, as RFC 9000 allows.
+    BufferExceeded {
+        /// The level of the bytes.
+        level: Level,
+    },
+    /// A CertificateRequest after the handshake, which RFC 9001 forbids a server to send and makes
+    /// a PROTOCOL_VIOLATION.
+    PostHandshakeAuth,
+    /// The TLS host of an External session failed the handshake with this fatal alert, and the
+    /// connection closes with CRYPTO_ERROR 0x0100 + alert.
+    HostAlert(u8),
+    /// A [`TlsStep`] was delivered to a session that was not waiting for one: a session on rustls,
+    /// or one whose host does not hold an input. The session did not change.
+    NotPending,
+    /// The TLS host of an External session delivered a step the session cannot apply: secrets
+    /// without a suite or with a hash other than the suite's, or CRYPTO bytes or secrets for a
+    /// level its keys do not reach in order.
+    InvalidStep,
 }
 
 impl TlsError {
@@ -93,10 +129,16 @@ impl TlsError {
     pub fn transport_error_code(&self) -> TransportErrorCode {
         match self {
             Self::Alert { alert, .. } => TransportErrorCode::crypto(u8::from(*alert)),
-            Self::WrongLevel { .. } => TransportErrorCode::PROTOCOL_VIOLATION,
-            Self::UnsupportedVersion(_) | Self::Config(_) | Self::Failed(_) => {
-                TransportErrorCode::INTERNAL_ERROR
+            Self::HostAlert(alert) => TransportErrorCode::crypto(*alert),
+            Self::WrongLevel { .. } | Self::LeftUnread { .. } | Self::PostHandshakeAuth => {
+                TransportErrorCode::PROTOCOL_VIOLATION
             }
+            Self::BufferExceeded { .. } => TransportErrorCode::CRYPTO_BUFFER_EXCEEDED,
+            Self::UnsupportedVersion(_)
+            | Self::Config(_)
+            | Self::Failed(_)
+            | Self::NotPending
+            | Self::InvalidStep => TransportErrorCode::INTERNAL_ERROR,
         }
     }
 }
@@ -111,6 +153,20 @@ impl fmt::Display for TlsError {
             Self::WrongLevel { level, expected } => {
                 write!(f, "CRYPTO data at {level:?} while TLS reads {expected:?}")
             }
+            Self::LeftUnread { level } => {
+                write!(f, "CRYPTO data at {level:?} left unread when TLS moved on")
+            }
+            Self::BufferExceeded { level } => {
+                write!(f, "more CRYPTO data at {level:?} than is held for TLS")
+            }
+            Self::PostHandshakeAuth => f.write_str("a CertificateRequest after the handshake"),
+            Self::HostAlert(alert) => write!(f, "the TLS host raised alert {alert}"),
+            Self::NotPending => {
+                f.write_str("a TLS step was delivered while the session waits for none")
+            }
+            Self::InvalidStep => {
+                f.write_str("the TLS host delivered a step the session cannot apply")
+            }
         }
     }
 }
@@ -119,14 +175,102 @@ impl std::error::Error for TlsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Config(error) | Self::Alert { error, .. } | Self::Failed(error) => Some(error),
-            Self::UnsupportedVersion(_) | Self::WrongLevel { .. } => None,
+            Self::UnsupportedVersion(_)
+            | Self::WrongLevel { .. }
+            | Self::LeftUnread { .. }
+            | Self::BufferExceeded { .. }
+            | Self::PostHandshakeAuth
+            | Self::HostAlert(_)
+            | Self::NotPending
+            | Self::InvalidStep => None,
+        }
+    }
+}
+
+/// Returns whether a ClientHello body carries the transport parameters extension of `version`.
+/// RFC 9001 requires a server to refuse a ClientHello without it, with missing_extension, and
+/// rustls does not check this: it accepts either codepoint for any version. A malformed body is
+/// left to TLS.
+pub(crate) fn has_transport_parameters(version: Version, body: &[u8]) -> bool {
+    extension_in(body, transport_parameters_extension(version)) != Some(false)
+}
+
+/// Returns the error that refuses a peer's CRYPTO bytes with `alert`.
+pub(crate) fn refusal(alert: AlertDescription, why: PeerMisbehaved) -> TlsError {
+    TlsError::Alert {
+        alert,
+        error: why.into(),
+    }
+}
+
+/// Frames the 1-RTT CRYPTO bytes of a session, which carry the messages TLS 1.3 sends after the
+/// handshake, and refuses the messages QUIC forbids there.
+///
+/// It reads every 1-RTT byte before TLS does, so it tracks where each message starts even after
+/// [`TlsSession::finish`] has freed TLS in the middle of one, and the rules still hold then.
+#[derive(Debug, Default)]
+pub(crate) struct PostHandshake {
+    /// The bytes of the current message's header still to come after its type.
+    header_left: u8,
+    /// The current message's length while its header arrives, then the bytes of its body still
+    /// to come.
+    body_left: usize,
+}
+
+impl PostHandshake {
+    /// Reads the next 1-RTT CRYPTO bytes of an endpoint on `side`. After the handshake QUIC
+    /// carries only the server's NewSessionTickets: RFC 9001 makes a CertificateRequest a
+    /// PROTOCOL_VIOLATION and a KeyUpdate an unexpected_message, and any other message is
+    /// unexpected there too.
+    pub(crate) fn read(&mut self, side: Side, data: &[u8]) -> Result<(), TlsError> {
+        let mut data = data;
+        loop {
+            if self.header_left == 0 {
+                let skip = data.len().min(self.body_left);
+                self.body_left -= skip;
+                data = &data[skip..];
+            }
+            let Some((&byte, rest)) = data.split_first() else {
+                return Ok(());
+            };
+            data = rest;
+            if self.header_left > 0 {
+                self.body_left = self.body_left << 8 | usize::from(byte);
+                self.header_left -= 1;
+                continue;
+            }
+            let kind = HandshakeType::from(byte);
+            match (side, kind) {
+                (Side::Client, HandshakeType::NewSessionTicket) => {}
+                (Side::Client, HandshakeType::CertificateRequest) => {
+                    return Err(TlsError::PostHandshakeAuth);
+                }
+                (_, HandshakeType::KeyUpdate) => {
+                    let why = PeerMisbehaved::KeyUpdateReceivedInQuicConnection;
+                    return Err(refusal(AlertDescription::UnexpectedMessage, why));
+                }
+                _ => {
+                    let expect_types = match side {
+                        Side::Client => vec![HandshakeType::NewSessionTicket],
+                        Side::Server => Vec::new(),
+                    };
+                    return Err(TlsError::Alert {
+                        alert: AlertDescription::UnexpectedMessage,
+                        error: rustls::Error::InappropriateHandshakeMessage {
+                            expect_types,
+                            got_type: kind,
+                        },
+                    });
+                }
+            }
+            self.header_left = 3;
         }
     }
 }
 
 /// Returns the rustls QUIC version for a QUIC version: `V1` for v1, `V1Draft` (transport
 /// parameters in extension 0xffa5) for MVFST, and that of the aliased version for an alias.
-fn rustls_version(version: Version) -> Result<quic::Version, TlsError> {
+pub(crate) fn rustls_version(version: Version) -> Result<quic::Version, TlsError> {
     match version.unaliased() {
         Version::V1 => Ok(quic::Version::V1),
         Version::MVFST => Ok(quic::Version::V1Draft),
@@ -144,14 +288,26 @@ fn transport_parameters_extension(version: Version) -> u16 {
     }
 }
 
-/// The TLS 1.3 handshake of one QUIC connection, over rustls's QUIC state machine.
+/// The TLS 1.3 handshake of one QUIC connection.
 ///
 /// The connection feeds received CRYPTO bytes in with [`read_crypto`](Self::read_crypto), at
 /// [`read_level`](Self::read_level), and drains CRYPTO bytes to send and new keys with
 /// [`write_crypto`](Self::write_crypto) after every input. Initial keys do not come from TLS;
 /// see [`mvfstr_crypto::initial_keys`].
-pub struct TlsSession {
-    conn: quic::Connection,
+///
+/// Both arms are boxed: a connection holds its session inline, and the rustls state machine is
+/// over a kilobyte.
+pub enum TlsSession {
+    /// rustls runs the handshake inside the session.
+    Rustls(Box<RustlsSession>),
+    /// A TLS stack outside the session runs the handshake.
+    External(Box<ExternalSession>),
+}
+
+/// The state of a [`TlsSession`] whose handshake runs on rustls's QUIC state machine.
+pub struct RustlsSession {
+    state: RustlsState,
+    side: Side,
     version: Version,
     write_level: Level,
     /// The alert for a failure that rustls reported without one.
@@ -163,6 +319,17 @@ pub struct TlsSession {
     /// Whether a server has given rustls its Initial bytes and not yet drained the answer, a
     /// ServerHello or HelloRetryRequest. Initial bytes that arrive before that answer are refused.
     hello_unanswered: bool,
+    post_handshake: PostHandshake,
+}
+
+/// The rustls connection, which [`TlsSession::finish`] replaces with what it negotiated.
+enum RustlsState {
+    Running(Box<quic::Connection>),
+    Finished {
+        peer_transport_params: Option<Box<[u8]>>,
+        alpn: Option<Box<[u8]>>,
+        early_data_accepted: bool,
+    },
 }
 
 /// What a server that chooses its config by the ClientHello's ALPN extension holds until the
@@ -173,7 +340,7 @@ struct AlpnChoice {
 }
 
 impl TlsSession {
-    /// Starts a client handshake. The ClientHello is ready to drain at once.
+    /// Starts a client handshake on rustls. The ClientHello is ready to drain at once.
     pub fn client(
         config: Arc<ClientConfig>,
         version: Version,
@@ -183,23 +350,24 @@ impl TlsSession {
         let quic_version = rustls_version(version)?;
         let conn = quic::ClientConnection::new(config, quic_version, server_name, transport_params)
             .map_err(TlsError::Config)?;
-        Ok(TlsSession::new(conn.into(), version))
+        Ok(TlsSession::Rustls(RustlsSession::new(conn.into(), version)))
     }
 
-    /// Starts a server handshake, which waits for the ClientHello.
+    /// Starts a server handshake on rustls, which waits for the ClientHello.
     pub fn server(
         config: Arc<ServerConfig>,
         version: Version,
         transport_params: Vec<u8>,
     ) -> Result<TlsSession, TlsError> {
-        let quic_version = rustls_version(version)?;
-        let conn = quic::ServerConnection::new(config, quic_version, transport_params)
-            .map_err(TlsError::Config)?;
-        Ok(TlsSession::new(conn.into(), version))
+        Ok(TlsSession::Rustls(RustlsSession::server(
+            config,
+            version,
+            transport_params,
+        )?))
     }
 
-    /// Starts a server handshake that takes `config` for a ClientHello that offers ALPN and
-    /// `without_alpn` for one that does not.
+    /// Starts a server handshake on rustls that takes `config` for a ClientHello that offers ALPN
+    /// and `without_alpn` for one that does not.
     ///
     /// rustls, following RFC 9001, refuses a QUIC ClientHello without ALPN when its config lists
     /// protocols, and one that offers protocols when the list is empty, so a server that takes both
@@ -211,37 +379,113 @@ impl TlsSession {
         version: Version,
         transport_params: Vec<u8>,
     ) -> Result<TlsSession, TlsError> {
-        let mut session = Self::server(config, version, transport_params.clone())?;
+        let mut session = RustlsSession::server(config, version, transport_params.clone())?;
         session.alpn_choice = Some(Box::new(AlpnChoice {
             without_alpn,
             transport_params,
         }));
-        Ok(session)
+        Ok(TlsSession::Rustls(session))
     }
 
-    fn new(conn: quic::Connection, version: Version) -> TlsSession {
-        TlsSession {
-            conn,
+    /// Starts a server handshake run by a [`TlsHost`](crate::TlsHost), which waits for the
+    /// ClientHello. `transport_params` go to the host with the first [`TlsInput`].
+    pub fn external_server(
+        version: Version,
+        transport_params: Vec<u8>,
+    ) -> Result<TlsSession, TlsError> {
+        rustls_version(version)?;
+        Ok(TlsSession::External(ExternalSession::new(
+            Side::Server,
             version,
-            write_level: Level::Initial,
-            alert: None,
-            alpn_choice: None,
-            partial_hello: Vec::new(),
-            hello_unanswered: false,
+            transport_params,
+            None,
+        )))
+    }
+
+    /// Starts a client handshake run by a [`TlsHost`](crate::TlsHost). The first [`TlsInput`]
+    /// carries `server_name` and `transport_params` for the host's ClientHello.
+    pub fn external_client(
+        version: Version,
+        server_name: &str,
+        transport_params: Vec<u8>,
+    ) -> Result<TlsSession, TlsError> {
+        rustls_version(version)?;
+        Ok(TlsSession::External(ExternalSession::new(
+            Side::Client,
+            version,
+            transport_params,
+            Some(server_name),
+        )))
+    }
+
+    /// Returns the next input for the [`TlsHost`](crate::TlsHost) of an External session, after
+    /// which the session waits for the input's [`TlsStep`], which [`deliver`](Self::deliver) takes.
+    /// Returns `None` while the host still has the previous input, when the session does not have
+    /// another ready, and on rustls.
+    pub fn tls_input(&mut self) -> Option<TlsInput<'_>> {
+        match self {
+            Self::Rustls(_) => None,
+            Self::External(session) => session.tls_input(),
+        }
+    }
+
+    /// Applies the host's step for the input the session last handed out. Drain the step's CRYPTO
+    /// bytes and keys with [`write_crypto`](Self::write_crypto) afterwards. A session that is not
+    /// waiting for a step refuses it with [`TlsError::NotPending`].
+    pub fn deliver(&mut self, step: TlsStep) -> Result<(), TlsError> {
+        match self {
+            Self::Rustls(_) => Err(TlsError::NotPending),
+            Self::External(session) => session.deliver(step),
+        }
+    }
+
+    /// Returns whether the host of an External session has an input whose step has not been
+    /// delivered.
+    pub fn is_pending(&self) -> bool {
+        match self {
+            TlsSession::Rustls(_) => false,
+            TlsSession::External(session) => session.is_pending(),
+        }
+    }
+
+    /// Queues a [`TlsInput::WriteTicket`] for the host of an External server, for a session ticket
+    /// that carries `app_token`; the ticket goes out as 1-RTT CRYPTO bytes. The request is ignored
+    /// before the handshake is complete, after [`finish`](Self::finish), while an earlier request
+    /// is outstanding, for a client, and on rustls, which sends its tickets by itself.
+    pub fn request_ticket(&mut self, app_token: Vec<u8>) {
+        match self {
+            Self::Rustls(_) => {}
+            Self::External(session) => session.request_ticket(app_token),
+        }
+    }
+
+    /// Frees the handshake state once the handshake is confirmed (RFC 9001), keeping what it
+    /// negotiated, and queues the `Finish` input for an External session's host. It leaves the
+    /// session unchanged before the handshake is complete. Drain
+    /// [`write_crypto`](Self::write_crypto) first: a rustls server's queued session tickets go with
+    /// its connection. A client drops the session tickets it reads afterwards, and other messages
+    /// are still refused.
+    pub fn finish(&mut self) {
+        match self {
+            Self::Rustls(session) => session.finish(),
+            Self::External(session) => session.finish(),
         }
     }
 
     /// Returns this endpoint's role.
     pub fn side(&self) -> Side {
-        match self.conn {
-            quic::Connection::Client(_) => Side::Client,
-            quic::Connection::Server(_) => Side::Server,
+        match self {
+            Self::Rustls(session) => session.side(),
+            Self::External(session) => session.side(),
         }
     }
 
     /// Returns the QUIC version the session was created for.
     pub fn version(&self) -> Version {
-        self.version
+        match self {
+            Self::Rustls(session) => session.version,
+            Self::External(session) => session.version(),
+        }
     }
 
     /// Returns the level whose CRYPTO bytes TLS reads next.
@@ -250,15 +494,18 @@ impl TlsSession {
     /// server keeps reading Handshake bytes after it has 1-RTT keys, until the client's Finished
     /// completes the handshake.
     pub fn read_level(&self) -> Level {
-        match self.write_level {
-            Level::OneRtt if self.conn.is_handshaking() => Level::Handshake,
-            level => level,
+        match self {
+            Self::Rustls(session) => session.read_level(),
+            Self::External(session) => session.read_level(),
         }
     }
 
     /// Returns the level of the CRYPTO bytes TLS writes next.
     pub fn write_level(&self) -> Level {
-        self.write_level
+        match self {
+            Self::Rustls(session) => session.write_level,
+            Self::External(session) => session.write_level(),
+        }
     }
 
     /// Feeds TLS the next in-order CRYPTO bytes received at `level`, which must be the
@@ -270,8 +517,161 @@ impl TlsSession {
     /// [choosing its config by ALPN](Self::server_choosing_by_alpn) then picks the config.
     /// Bytes that follow a ClientHello before its answer is drained with
     /// [`write_crypto`](Self::write_crypto) are refused with unexpected_message, as rustls
-    /// refuses them when they come with the ClientHello.
+    /// refuses them when they come with the ClientHello. At 1-RTT only a client reads messages,
+    /// and only NewSessionTicket; the others are refused, after [`finish`](Self::finish) too, as
+    /// RFC 9001 and TLS 1.3 require. Apart from a server's ClientHello, which it keeps whole, an
+    /// External session holds at most 64 KiB, in at most 1,024 reads, that its host has not
+    /// consumed, and refuses more with [`TlsError::BufferExceeded`].
     pub fn read_crypto(&mut self, level: Level, data: &[u8]) -> Result<(), TlsError> {
+        match self {
+            Self::Rustls(session) => session.read_crypto(level, data),
+            Self::External(session) => session.read_crypto(level, data),
+        }
+    }
+
+    /// Appends the CRYPTO bytes TLS has ready for one level to `buf`, and reports any keys TLS
+    /// installed after them. Returns `None` once TLS has written everything it has ready; call it
+    /// until then after every [`read_crypto`](Self::read_crypto).
+    pub fn write_crypto(&mut self, buf: &mut Vec<u8>) -> Option<CryptoOutput> {
+        match self {
+            Self::Rustls(session) => session.write_crypto(buf),
+            Self::External(session) => session.write_crypto(buf),
+        }
+    }
+
+    /// Returns the transport parameters the peer sent. On rustls, a server has them once it has
+    /// read the ClientHello, and a client once it has read the server's handshake flight and
+    /// drained the 1-RTT keys from [`write_crypto`](Self::write_crypto). An External session has
+    /// them once a delivered [`TlsStep`] carries them.
+    pub fn peer_transport_params(&self) -> Option<&[u8]> {
+        match self {
+            Self::Rustls(session) => session.peer_transport_params(),
+            Self::External(session) => session.peer_transport_params(),
+        }
+    }
+
+    /// Returns the negotiated application protocol, or `None` if the handshake has not
+    /// negotiated one.
+    pub fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            Self::Rustls(session) => session.alpn(),
+            Self::External(session) => session.alpn(),
+        }
+    }
+
+    /// Returns whether the handshake is complete (RFC 9001): this endpoint has sent its Finished,
+    /// that is, drained it with [`write_crypto`](Self::write_crypto), and verified the peer's.
+    pub fn is_handshake_complete(&self) -> bool {
+        match self {
+            Self::Rustls(session) => session.is_handshake_complete(),
+            Self::External(session) => session.is_handshake_complete(),
+        }
+    }
+
+    /// Returns whether early data is accepted: by this server, or by the server a client sent it
+    /// to. On rustls only a client reports it.
+    pub fn is_early_data_accepted(&self) -> bool {
+        match self {
+            Self::Rustls(session) => session.is_early_data_accepted(),
+            Self::External(session) => session.is_early_data_accepted(),
+        }
+    }
+
+    /// Returns what the host of an External session reported the handshake negotiated.
+    pub fn handshake_summary(&self) -> Option<&HandshakeSummary> {
+        match self {
+            Self::Rustls(_) => None,
+            Self::External(session) => session.handshake_summary(),
+        }
+    }
+
+    /// Returns the verdict of an External server's host on the app token of a resumed ticket.
+    pub fn app_token_verdict(&self) -> Option<AppTokenVerdict> {
+        match self {
+            Self::Rustls(_) => None,
+            Self::External(session) => session.app_token_verdict(),
+        }
+    }
+
+    /// Returns the CRYPTO_ERROR for the fatal alert TLS failed with, if any.
+    pub fn alert(&self) -> Option<TransportErrorCode> {
+        match self {
+            Self::Rustls(session) => session.alert(),
+            Self::External(session) => session.alert(),
+        }
+    }
+
+    /// Returns the rustls connection of a session on rustls until [`finish`](Self::finish) frees
+    /// it, for what this wrapper does not expose (negotiated suite and key exchange group, peer
+    /// certificates, exporters).
+    pub fn rustls(&self) -> Option<&quic::Connection> {
+        match self {
+            Self::Rustls(session) => session.conn(),
+            Self::External(_) => None,
+        }
+    }
+}
+
+impl RustlsSession {
+    fn new(conn: quic::Connection, version: Version) -> Box<RustlsSession> {
+        let side = match conn {
+            quic::Connection::Client(_) => Side::Client,
+            quic::Connection::Server(_) => Side::Server,
+        };
+        Box::new(RustlsSession {
+            state: RustlsState::Running(Box::new(conn)),
+            side,
+            version,
+            write_level: Level::Initial,
+            alert: None,
+            alpn_choice: None,
+            partial_hello: Vec::new(),
+            hello_unanswered: false,
+            post_handshake: PostHandshake::default(),
+        })
+    }
+
+    fn server(
+        config: Arc<ServerConfig>,
+        version: Version,
+        transport_params: Vec<u8>,
+    ) -> Result<Box<RustlsSession>, TlsError> {
+        let quic_version = rustls_version(version)?;
+        let conn = quic::ServerConnection::new(config, quic_version, transport_params)
+            .map_err(TlsError::Config)?;
+        Ok(RustlsSession::new(conn.into(), version))
+    }
+
+    fn side(&self) -> Side {
+        self.side
+    }
+
+    fn conn(&self) -> Option<&quic::Connection> {
+        match &self.state {
+            RustlsState::Running(conn) => Some(conn),
+            RustlsState::Finished { .. } => None,
+        }
+    }
+
+    fn conn_mut(&mut self) -> Option<&mut quic::Connection> {
+        match &mut self.state {
+            RustlsState::Running(conn) => Some(conn),
+            RustlsState::Finished { .. } => None,
+        }
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.conn().is_some_and(|conn| conn.is_handshaking())
+    }
+
+    fn read_level(&self) -> Level {
+        match self.write_level {
+            Level::OneRtt if self.is_handshaking() => Level::Handshake,
+            level => level,
+        }
+    }
+
+    fn read_crypto(&mut self, level: Level, data: &[u8]) -> Result<(), TlsError> {
         let expected = self.read_level();
         if level != expected {
             return Err(TlsError::WrongLevel { level, expected });
@@ -279,7 +679,18 @@ impl TlsSession {
         if level == Level::Initial && self.side() == Side::Server {
             return self.read_client_hello(data);
         }
-        self.conn.read_hs(data).map_err(|error| self.failure(error))
+        if level == Level::OneRtt
+            && let Err(error) = self.post_handshake.read(self.side, data)
+        {
+            self.alert = alert_of(&error).or(self.alert);
+            return Err(error);
+        }
+        // A finished session drops the tickets it reads.
+        let Some(conn) = self.conn_mut() else {
+            return Ok(());
+        };
+        let read = conn.read_hs(data);
+        read.map_err(|error| self.failure(error))
     }
 
     /// Reads a server's Initial bytes: a ClientHello, which may be the second one that follows a
@@ -291,8 +702,7 @@ impl TlsSession {
         if self.hello_unanswered && !data.is_empty() {
             let alert = AlertDescription::UnexpectedMessage;
             self.alert = Some(alert);
-            let error = PeerMisbehaved::KeyEpochWithPendingFragment.into();
-            return Err(TlsError::Alert { alert, error });
+            return Err(refusal(alert, PeerMisbehaved::KeyEpochWithPendingFragment));
         }
         let mut hello = std::mem::take(&mut self.partial_hello);
         hello.extend_from_slice(data);
@@ -305,20 +715,23 @@ impl TlsSession {
             ClientHello::Refused => {}
         }
         self.hello_unanswered = true;
-        self.conn
-            .read_hs(&hello)
-            .map_err(|error| self.failure(error))
+        let Some(conn) = self.conn_mut() else {
+            return Ok(());
+        };
+        let read = conn.read_hs(&hello);
+        read.map_err(|error| self.failure(error))
     }
 
     /// Checks a whole ClientHello's transport parameters extension, and picks the config of a
     /// server choosing by ALPN.
     fn check_client_hello(&mut self, body: &[u8]) -> Result<(), TlsError> {
-        let extension = transport_parameters_extension(self.version);
-        if extension_in(body, extension) == Some(false) {
+        if !has_transport_parameters(self.version, body) {
             let alert = AlertDescription::MissingExtension;
             self.alert = Some(alert);
-            let error = PeerMisbehaved::MissingQuicTransportParameters.into();
-            return Err(TlsError::Alert { alert, error });
+            return Err(refusal(
+                alert,
+                PeerMisbehaved::MissingQuicTransportParameters,
+            ));
         }
         let Some(choice) = self.alpn_choice.take() else {
             return Ok(());
@@ -327,20 +740,20 @@ impl TlsSession {
         // refuses it.
         if extension_in(body, ALPN) == Some(false) {
             let quic_version = rustls_version(self.version)?;
-            self.conn = quic::ServerConnection::new(
+            let conn = quic::ServerConnection::new(
                 choice.without_alpn,
                 quic_version,
                 choice.transport_params,
             )
-            .map_err(TlsError::Config)?
-            .into();
+            .map_err(TlsError::Config)?;
+            self.state = RustlsState::Running(Box::new(conn.into()));
         }
         Ok(())
     }
 
     /// Classifies a rustls failure by the alert TLS raised for it.
     fn failure(&mut self, error: rustls::Error) -> TlsError {
-        if let Some(alert) = self.conn.alert() {
+        if let Some(alert) = self.conn().and_then(quic::Connection::alert) {
             return TlsError::Alert { alert, error };
         }
         // rustls refuses a handshake message longer than it can buffer without raising an alert;
@@ -353,14 +766,11 @@ impl TlsSession {
         TlsError::Failed(error)
     }
 
-    /// Appends the CRYPTO bytes TLS has ready for one level to `buf`, and reports any keys TLS
-    /// installed after them. Returns `None` once TLS has written everything it has ready; call it
-    /// until then after every [`read_crypto`](Self::read_crypto).
-    pub fn write_crypto(&mut self, buf: &mut Vec<u8>) -> Option<CryptoOutput> {
+    fn write_crypto(&mut self, buf: &mut Vec<u8>) -> Option<CryptoOutput> {
         let start = buf.len();
         let level = self.write_level;
         // rustls returns the bytes of one level per call, ending where it installs new keys.
-        let change = self.conn.write_hs(buf);
+        let change = self.conn_mut()?.write_hs(buf);
         let len = buf.len() - start;
         let keys = change.map(|change| match change {
             quic::KeyChange::Handshake { keys } => {
@@ -381,55 +791,92 @@ impl TlsSession {
         Some(CryptoOutput { level, len, keys })
     }
 
-    /// Returns the transport parameters the peer sent. A server has them once it has read the
-    /// ClientHello; a client once it has read the server's handshake flight and drained the
-    /// 1-RTT keys from [`write_crypto`](Self::write_crypto).
-    pub fn peer_transport_params(&self) -> Option<&[u8]> {
+    fn peer_transport_params(&self) -> Option<&[u8]> {
         // A resuming rustls client holds the parameters stored with the session, which only 0-RTT
         // may use (RFC 9000), until the server's EncryptedExtensions replaces them. That message
         // comes before the server's Finished, and so before the 1-RTT keys.
         if self.side() == Side::Client && self.write_level != Level::OneRtt {
             return None;
         }
-        self.conn.quic_transport_parameters()
+        match &self.state {
+            RustlsState::Running(conn) => conn.quic_transport_parameters(),
+            RustlsState::Finished {
+                peer_transport_params,
+                ..
+            } => peer_transport_params.as_deref(),
+        }
     }
 
-    /// Returns the negotiated application protocol, or `None` if the handshake has not
-    /// negotiated one.
-    pub fn alpn(&self) -> Option<&[u8]> {
-        self.conn.alpn_protocol()
+    fn alpn(&self) -> Option<&[u8]> {
+        match &self.state {
+            RustlsState::Running(conn) => conn.alpn_protocol(),
+            RustlsState::Finished { alpn, .. } => alpn.as_deref(),
+        }
     }
 
-    /// Returns whether the handshake is complete (RFC 9001): this endpoint has sent its Finished,
-    /// that is, drained it with [`write_crypto`](Self::write_crypto), and verified the peer's.
-    pub fn is_handshake_complete(&self) -> bool {
+    fn is_early_data_accepted(&self) -> bool {
+        match &self.state {
+            RustlsState::Running(conn) => match &**conn {
+                quic::Connection::Client(conn) => conn.is_early_data_accepted(),
+                quic::Connection::Server(_) => false,
+            },
+            RustlsState::Finished {
+                early_data_accepted,
+                ..
+            } => *early_data_accepted,
+        }
+    }
+
+    fn is_handshake_complete(&self) -> bool {
         // rustls stops handshaking once it has queued its Finished; the 1-RTT key change comes
         // with those bytes, so it marks them drained.
-        self.write_level == Level::OneRtt && !self.conn.is_handshaking()
+        self.write_level == Level::OneRtt && !self.is_handshaking()
     }
 
-    /// Returns the CRYPTO_ERROR for the fatal alert TLS failed with, if any.
-    pub fn alert(&self) -> Option<TransportErrorCode> {
-        self.conn
-            .alert()
+    fn alert(&self) -> Option<TransportErrorCode> {
+        self.conn()
+            .and_then(quic::Connection::alert)
             .or(self.alert)
             .map(|alert| TransportErrorCode::crypto(u8::from(alert)))
     }
 
-    /// Returns the rustls connection, for what this wrapper does not expose (negotiated suite and
-    /// key exchange group, peer certificates, exporters).
-    pub fn rustls(&self) -> &quic::Connection {
-        &self.conn
+    /// Drops the rustls connection of a complete handshake, keeping what it negotiated.
+    fn finish(&mut self) {
+        if !self.is_handshake_complete() {
+            return;
+        }
+        self.state = RustlsState::Finished {
+            peer_transport_params: self.peer_transport_params().map(Box::from),
+            alpn: self.alpn().map(Box::from),
+            early_data_accepted: self.is_early_data_accepted(),
+        };
     }
 }
 
 impl fmt::Debug for TlsSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TlsSession")
+        match self {
+            Self::Rustls(session) => session.fmt(f),
+            Self::External(session) => session.fmt(f),
+        }
+    }
+}
+
+impl fmt::Debug for RustlsSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RustlsSession")
             .field("side", &self.side())
             .field("version", &self.version)
             .field("write_level", &self.write_level)
             .finish_non_exhaustive()
+    }
+}
+
+/// Returns the alert of a refusal that closes the connection with one.
+pub(crate) fn alert_of(error: &TlsError) -> Option<AlertDescription> {
+    match error {
+        TlsError::Alert { alert, .. } => Some(*alert),
+        _ => None,
     }
 }
 
@@ -442,7 +889,7 @@ const ALPN: u16 = 16;
 
 /// What the bytes at the start of a server's Initial CRYPTO data hold (RFC 8446).
 #[derive(Debug, PartialEq, Eq)]
-enum ClientHello<'a> {
+pub(crate) enum ClientHello<'a> {
     /// The start of a ClientHello.
     Partial,
     /// A whole ClientHello, with this body.
@@ -452,7 +899,7 @@ enum ClientHello<'a> {
 }
 
 /// Parses the ClientHello at the start of `bytes`, Initial CRYPTO bytes not yet given to rustls.
-fn parse_client_hello(bytes: &[u8]) -> ClientHello<'_> {
+pub(crate) fn parse_client_hello(bytes: &[u8]) -> ClientHello<'_> {
     const CLIENT_HELLO: u8 = 1;
     let Some((&[kind, len @ ..], rest)) = bytes.split_first_chunk::<4>() else {
         return ClientHello::Partial;
@@ -522,6 +969,11 @@ mod tests {
         body.extend(extensions);
         let len = u32::try_from(body.len()).unwrap().to_be_bytes();
         [&[1], &len[1..], &body].concat()
+    }
+
+    #[test]
+    fn a_session_is_two_words_with_both_arms_boxed() {
+        assert_eq!(size_of::<TlsSession>(), 2 * size_of::<usize>());
     }
 
     #[test]
