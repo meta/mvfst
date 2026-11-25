@@ -140,15 +140,16 @@ impl std::error::Error for HeaderProtectionError {}
 /// Applies header protection to the packet in `packet`, whose packet number starts at
 /// `pn_offset` and whose payload is already sealed.
 ///
-/// The packet number length comes from the unprotected first byte. Fails with
-/// [`HeaderProtectionError`], leaving the packet unchanged, when `pn_offset` is 0, when the packet
-/// is too short for the sample, or when the key returns an error.
+/// The packet number length comes from the unprotected first byte, and the sample is
+/// [`SAMPLE_LEN`] bytes whatever length the key reports. Fails with [`HeaderProtectionError`],
+/// leaving the packet unchanged, when `pn_offset` is 0, when the packet is too short for the
+/// sample, or when the key returns an error.
 pub fn protect_header(
     key: &dyn HeaderProtectionKey,
     packet: &mut [u8],
     pn_offset: usize,
 ) -> Result<(), HeaderProtectionError> {
-    let (first, packet_number, sample) = split_for_header_protection(key, packet, pn_offset)?;
+    let (first, packet_number, sample) = split_for_header_protection(packet, pn_offset)?;
     key.encrypt_in_place(sample, first, packet_number)
         .map_err(|_| HeaderProtectionError::Key)
 }
@@ -157,35 +158,35 @@ pub fn protect_header(
 /// `pn_offset`, and returns the packet number length.
 ///
 /// The packet number length is read from the first byte once it is unmasked, so the caller
-/// does not pass it. Fails with [`HeaderProtectionError`], leaving the packet unchanged, when
-/// `pn_offset` is 0, when the packet is too short for the sample, or when the key returns an error.
+/// does not pass it. The sample is [`SAMPLE_LEN`] bytes, as in [`protect_header`]. Fails with
+/// [`HeaderProtectionError`], leaving the packet unchanged, when `pn_offset` is 0, when the packet
+/// is too short for the sample, or when the key returns an error.
 pub fn unprotect_header(
     key: &dyn HeaderProtectionKey,
     packet: &mut [u8],
     pn_offset: usize,
 ) -> Result<usize, HeaderProtectionError> {
-    let (first, packet_number, sample) = split_for_header_protection(key, packet, pn_offset)?;
+    let (first, packet_number, sample) = split_for_header_protection(packet, pn_offset)?;
     key.decrypt_in_place(sample, first, packet_number)
         .map_err(|_| HeaderProtectionError::Key)?;
     Ok(usize::from(*first & 0x03) + 1)
 }
 
 /// Splits a packet into its first byte, the four bytes from the packet number offset, and the
-/// sample that starts after them.
-fn split_for_header_protection<'a>(
-    key: &dyn HeaderProtectionKey,
-    packet: &'a mut [u8],
+/// [`SAMPLE_LEN`]-byte sample that starts after them.
+fn split_for_header_protection(
+    packet: &mut [u8],
     pn_offset: usize,
-) -> Result<(&'a mut u8, &'a mut [u8], &'a [u8]), HeaderProtectionError> {
+) -> Result<(&mut u8, &mut [u8], &[u8]), HeaderProtectionError> {
     let sample_end = pn_offset
-        .checked_add(MAX_PN_LEN + key.sample_len())
+        .checked_add(MAX_PN_LEN + SAMPLE_LEN)
         .ok_or(HeaderProtectionError::TooShort)?;
     if pn_offset == 0 || packet.len() < sample_end {
         return Err(HeaderProtectionError::TooShort);
     }
     let (first, rest) = packet.split_at_mut(1);
     let (packet_number, rest) = rest[pn_offset - 1..].split_at_mut(MAX_PN_LEN);
-    Ok((&mut first[0], packet_number, &rest[..key.sample_len()]))
+    Ok((&mut first[0], packet_number, &rest[..SAMPLE_LEN]))
 }
 
 impl fmt::Debug for AeadHeaderKey {

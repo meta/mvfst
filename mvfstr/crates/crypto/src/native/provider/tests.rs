@@ -324,7 +324,7 @@ impl QuicPeer {
             }
             match change {
                 Some(quic::KeyChange::OneRtt { keys, next }) => {
-                    let keys = KeySet::from_rustls(keys);
+                    let keys = KeySet::from_rustls(keys).unwrap();
                     let updater = KeyUpdater::new(next, &keys);
                     self.one_rtt = Some((keys, updater));
                 }

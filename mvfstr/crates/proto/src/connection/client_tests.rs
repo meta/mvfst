@@ -9,14 +9,18 @@
 //! negotiated parameters, stream limits, keepalive, PTO limit, Retry and 0-RTT.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
+use mvfstr_crypto::AES_128_GCM;
 use mvfstr_crypto::PacketKeys;
 use mvfstr_crypto::TAG_LEN;
 use mvfstr_crypto::retry_integrity_tag;
 use mvfstr_crypto::unprotect_header;
+use mvfstr_tls::AcceptAnyServerCert;
+use mvfstr_tls::ManualTimeProvider;
 use mvfstr_wire::ConnectionId;
 use mvfstr_wire::Dir;
 use mvfstr_wire::Frame;
@@ -31,6 +35,12 @@ use mvfstr_wire::TransportErrorCode;
 use mvfstr_wire::Version;
 use mvfstr_wire::decode_packet_number;
 use mvfstr_wire::encode_retry;
+use rustls::CipherSuiteCommon;
+use rustls::SupportedCipherSuite;
+use rustls::Tls13CipherSuite;
+use rustls::crypto::cipher::AeadKey;
+use rustls::crypto::cipher::Iv;
+use rustls::quic;
 
 use super::Connection;
 use super::stream_tests::App;
@@ -44,6 +54,7 @@ use super::tests::limits;
 use super::tests::open_own_one_rtt;
 use super::tests::server_addr;
 use super::tests::start;
+use crate::ClientTls;
 use crate::CloseReason;
 use crate::ConnEvent;
 use crate::Initiator;
@@ -52,6 +63,7 @@ use crate::KeepAlive;
 use crate::OpenError;
 use crate::PathId;
 use crate::ServerConfig;
+use crate::ServerTls;
 use crate::StreamReady;
 use crate::TransportConfig;
 use crate::config::TransportConfigBuilder;
@@ -61,6 +73,7 @@ use crate::testing::Pair;
 use crate::testing::PairConfig;
 use crate::testing::VecSink;
 use crate::testing::fixtures::Setup;
+use crate::testing::fixtures::unix_now;
 
 fn transport(
     build: impl FnOnce(TransportConfigBuilder) -> TransportConfigBuilder,
@@ -443,6 +456,122 @@ fn a_tls_failure_keeps_the_rustls_error_and_closes_with_its_alert() {
     assert_eq!(heard, code);
     assert!(pair.server.conn().local_tls_error().is_none());
     assert_eq!(client.tls_info(), None);
+}
+
+/// A packet key that reports a 12-byte AEAD tag and otherwise seals and opens as the key it wraps.
+struct TwelveByteTag(Box<dyn quic::PacketKey>);
+
+impl quic::PacketKey for TwelveByteTag {
+    fn encrypt_in_place(
+        &self,
+        packet_number: u64,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<quic::Tag, rustls::Error> {
+        self.0.encrypt_in_place(packet_number, header, payload)
+    }
+
+    fn decrypt_in_place<'a>(
+        &self,
+        packet_number: u64,
+        header: &[u8],
+        payload: &'a mut [u8],
+    ) -> Result<&'a [u8], rustls::Error> {
+        self.0.decrypt_in_place(packet_number, header, payload)
+    }
+
+    fn tag_len(&self) -> usize {
+        12
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        self.0.confidentiality_limit()
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        self.0.integrity_limit()
+    }
+}
+
+/// mvfstr's AES-128-GCM, except that its packet keys report a 12-byte tag.
+struct TwelveByteTags;
+
+impl quic::Algorithm for TwelveByteTags {
+    fn packet_key(&self, key: AeadKey, iv: Iv) -> Box<dyn quic::PacketKey> {
+        Box::new(TwelveByteTag(AES_128_GCM.packet_key(key, iv)))
+    }
+
+    fn header_protection_key(&self, key: AeadKey) -> Box<dyn quic::HeaderProtectionKey> {
+        AES_128_GCM.header_protection_key(key)
+    }
+
+    fn aead_key_len(&self) -> usize {
+        AES_128_GCM.aead_key_len()
+    }
+}
+
+/// Returns a client rustls config, built without mvfstr_tls's suite rewrite, that offers only
+/// TLS_AES_128_GCM_SHA256 with [`TwelveByteTags`] as its QUIC algorithm.
+fn twelve_byte_tag_client() -> Arc<rustls::ClientConfig> {
+    static SUITE: LazyLock<Tls13CipherSuite> = LazyLock::new(|| {
+        let base = &mvfstr_crypto::cipher_suite::TLS13_AES_128_GCM_SHA256;
+        Tls13CipherSuite {
+            common: CipherSuiteCommon {
+                suite: base.common.suite,
+                hash_provider: base.common.hash_provider,
+                confidentiality_limit: base.common.confidentiality_limit,
+            },
+            hkdf_provider: base.hkdf_provider,
+            aead_alg: base.aead_alg,
+            quic: Some(&TwelveByteTags),
+        }
+    });
+    let mut provider = mvfstr_crypto::default_provider();
+    provider.cipher_suites = vec![SupportedCipherSuite::Tls13(&SUITE)];
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::X25519);
+    let verifier = Arc::new(AcceptAnyServerCert::new(&provider));
+    let time = Arc::new(ManualTimeProvider::new(unix_now()));
+    let mut config = rustls::ClientConfig::builder_with_details(Arc::new(provider), time)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("the provider has a TLS 1.3 suite and a group")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    Arc::new(config)
+}
+
+#[test]
+fn a_client_refuses_tls_keys_with_a_12_byte_tag_when_tls_installs_them() {
+    let setup = Setup::default();
+    let (server, _) = setup.rustls();
+    let config = setup.pair_with(
+        ServerTls::Rustls(server),
+        ClientTls::Rustls(twelve_byte_tag_client()),
+    );
+    let (epoch, mut pair) = start(config);
+    pair.run_until(epoch + LIMIT, |pair| {
+        pair.client.has_event(&ConnEvent::Drained) && pair.server.has_event(&ConnEvent::Drained)
+    });
+    // mvfstr seals with 16-byte tags only. The client refuses the Handshake keys as TLS
+    // installs them and closes with INTERNAL_ERROR, which the server receives, before the
+    // handshake completes.
+    let code = TransportErrorCode::INTERNAL_ERROR;
+    let Some((CloseReason::Transport { code: sent, .. }, Initiator::Internal)) =
+        closed(&pair.client.events)
+    else {
+        panic!("no internal close: {:?}", pair.client.events);
+    };
+    assert_eq!(sent, code);
+    let Some((CloseReason::Transport { code: heard, .. }, Initiator::Peer)) =
+        closed(&pair.server.events)
+    else {
+        panic!("no peer close: {:?}", pair.server.events);
+    };
+    assert_eq!(heard, code);
+    assert!(!pair.client.has_event(&ConnEvent::Connected));
 }
 
 #[test]

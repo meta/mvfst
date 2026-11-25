@@ -657,7 +657,7 @@ pub(crate) mod fixtures {
         pub(crate) fn write(&mut self, to: &mut Peer) -> Result<bool, TlsError> {
             let mut progressed = self.run_host()?;
             let mut buf = Vec::new();
-            while let Some(out) = self.tls.write_crypto(&mut buf) {
+            while let Some(out) = self.tls.write_crypto(&mut buf)? {
                 progressed = true;
                 let bytes = buf.split_off(buf.len() - out.len);
                 if !bytes.is_empty() {

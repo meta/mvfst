@@ -1299,7 +1299,8 @@ impl Connection {
     }
 
     /// For a client resuming a session that allows early data, installs the 0-RTT write keys and
-    /// the remembered parameters as 0-RTT uses them (RFC 9000 and RFC 9001).
+    /// the remembered parameters as 0-RTT uses them (RFC 9000 and RFC 9001). The client does not
+    /// send 0-RTT when either cannot be used.
     fn start_early_data(&mut self) {
         if self.state != State::Open {
             return;
@@ -1307,7 +1308,10 @@ impl Connection {
         let Some(tls) = self.tls.rustls() else {
             return;
         };
-        let Some(keys) = tls.zero_rtt_keys() else {
+        let Some(keys) = tls
+            .zero_rtt_keys()
+            .and_then(|keys| PacketKeys::from_rustls(keys).ok())
+        else {
             return;
         };
         let Some(remembered) = tls
@@ -1326,7 +1330,7 @@ impl Connection {
             return;
         }
         self.early = Some(Box::new(EarlyState {
-            keys: Some(Arc::new(PacketKeys::from_rustls(keys))),
+            keys: Some(Arc::new(keys)),
             params: Some(view),
         }));
         self.push_event(ConnEvent::EarlyDataWritable);

@@ -17,6 +17,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::header::SAMPLE_LEN;
 use crate::header::protect_header;
 // Also exported from this module, beside the `SealJob` that holds it.
 pub use crate::keys::PacketKeys;
@@ -31,7 +32,7 @@ pub struct SlotId(pub u32);
 ///
 /// The packet occupies `pkt[..len]` of its slot: the header in `pkt[..hdr_len]`, ending with the
 /// packet number, whose length is in the low two bits of the unprotected first byte; then the
-/// plaintext payload; then room for the AEAD tag in the last `keys.packet().tag_len()` bytes.
+/// plaintext payload; then room for the AEAD tag in the last [`TAG_LEN`] bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct SealJob<'a> {
     /// The backend slot holding the packet.
@@ -106,27 +107,19 @@ pub struct InlineSealer;
 impl Sealer for InlineSealer {
     fn seal(&mut self, job: SealJob<'_>, pkt: &mut [u8]) -> Result<(), SealError> {
         let keys = &**job.keys;
-        let (len, hdr_len, tag_len) = (
-            usize::from(job.len),
-            usize::from(job.hdr_len),
-            keys.tag_len(),
-        );
-        if tag_len != TAG_LEN {
-            // rustls tags are 16 bytes; a key that reports another tag length cannot seal a packet.
-            return Err(SealError::Encrypt);
-        }
+        let (len, hdr_len) = (usize::from(job.len), usize::from(job.hdr_len));
         if len == 0 || len > pkt.len() {
             return Err(SealError::BadLayout);
         }
         let pn_len = usize::from(pkt[0] & 0x03) + 1;
         let pn_offset = hdr_len.checked_sub(pn_len).ok_or(SealError::BadLayout)?;
-        let sample_end = pn_offset + 4 + keys.header().sample_len();
-        if pn_offset == 0 || hdr_len + tag_len > len || sample_end > len {
+        let sample_end = pn_offset + 4 + SAMPLE_LEN;
+        if pn_offset == 0 || hdr_len + TAG_LEN > len || sample_end > len {
             return Err(SealError::BadLayout);
         }
         let packet = &mut pkt[..len];
         let (header, rest) = packet.split_at_mut(hdr_len);
-        let (payload, tag_room) = rest.split_at_mut(len - hdr_len - tag_len);
+        let (payload, tag_room) = rest.split_at_mut(len - hdr_len - TAG_LEN);
         let tag = keys
             .packet()
             .encrypt_in_place(job.pn, header, payload)
@@ -138,11 +131,15 @@ impl Sealer for InlineSealer {
 
 #[cfg(test)]
 mod tests {
+    use rustls::quic::HeaderProtectionKey;
     use rustls::quic::PacketKey;
 
     use super::*;
     use crate::algorithm::AES_128_GCM;
     use crate::header::AeadHeaderKey;
+    use crate::header::unprotect_header;
+    use crate::keys::KeyMaterial;
+    use crate::packet::AeadPacketKey;
     use crate::testdata::A2_CRYPTO;
     use crate::testdata::A2_HEADER;
     use crate::testdata::A2_PACKET;
@@ -253,19 +250,18 @@ mod tests {
         assert_ne!(slot, fits);
     }
 
-    /// A packet key that reports an 8-byte tag, which rustls's 16-byte `Tag` cannot carry.
-    struct ShortTagKey(PacketKeys);
+    /// A key whose length methods panic, and which otherwise seals, opens and masks as the key it
+    /// wraps.
+    struct NoLengthCalls<K>(K);
 
-    impl PacketKey for ShortTagKey {
+    impl PacketKey for NoLengthCalls<AeadPacketKey> {
         fn encrypt_in_place(
             &self,
             packet_number: u64,
             header: &[u8],
             payload: &mut [u8],
         ) -> Result<rustls::quic::Tag, rustls::Error> {
-            self.0
-                .packet()
-                .encrypt_in_place(packet_number, header, payload)
+            self.0.encrypt_in_place(packet_number, header, payload)
         }
 
         fn decrypt_in_place<'a>(
@@ -274,13 +270,11 @@ mod tests {
             header: &[u8],
             payload: &'a mut [u8],
         ) -> Result<&'a [u8], rustls::Error> {
-            self.0
-                .packet()
-                .decrypt_in_place(packet_number, header, payload)
+            self.0.decrypt_in_place(packet_number, header, payload)
         }
 
         fn tag_len(&self) -> usize {
-            8
+            panic!("tag_len called per packet")
         }
 
         fn confidentiality_limit(&self) -> u64 {
@@ -292,22 +286,58 @@ mod tests {
         }
     }
 
+    impl HeaderProtectionKey for NoLengthCalls<AeadHeaderKey> {
+        fn encrypt_in_place(
+            &self,
+            sample: &[u8],
+            first: &mut u8,
+            packet_number: &mut [u8],
+        ) -> Result<(), rustls::Error> {
+            self.0.encrypt_in_place(sample, first, packet_number)
+        }
+
+        fn decrypt_in_place(
+            &self,
+            sample: &[u8],
+            first: &mut u8,
+            packet_number: &mut [u8],
+        ) -> Result<(), rustls::Error> {
+            self.0.decrypt_in_place(sample, first, packet_number)
+        }
+
+        fn sample_len(&self) -> usize {
+            panic!("sample_len called per packet")
+        }
+    }
+
     #[test]
-    fn keys_whose_tag_length_differs_from_rustls_tags_are_refused() {
-        let inner = PacketKeys::from_secret(&AES_128_GCM, &[9; 32]);
-        let header = Box::new(AeadHeaderKey::new(&AES_128_GCM, &[1; 16]).unwrap());
-        let keys = Arc::new(PacketKeys::new(Box::new(ShortTagKey(inner)), header));
-        let mut slot = short_packet(12);
-        let before = slot.clone();
+    fn sealing_and_opening_do_not_call_the_length_methods_of_the_keys() {
+        // The server Initial of RFC 9001 Appendix A.3, packet number 1 in two bytes.
+        let secret = "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b";
+        let material = KeyMaterial::derive(&AES_128_GCM, &unhex(secret).try_into().unwrap());
+        let packet = AeadPacketKey::new(&AES_128_GCM, material.key(), *material.iv()).unwrap();
+        let header = AeadHeaderKey::new(&AES_128_GCM, material.hp()).unwrap();
+        let keys = Arc::new(PacketKeys::new(
+            Box::new(NoLengthCalls(packet)),
+            Box::new(NoLengthCalls(header)),
+        ));
+        let header = unhex(A3_HEADER);
+        let mut slot = [header.clone(), unhex(A3_PAYLOAD), vec![0; TAG_LEN]].concat();
         let job = SealJob {
             slot: SlotId(0),
             keys: &keys,
-            pn: 0x2a,
-            hdr_len: 10,
-            len: (slot.len() - 8) as u16,
+            pn: 1,
+            hdr_len: header.len() as u16,
+            len: slot.len() as u16,
         };
-        assert_eq!(InlineSealer.seal(job, &mut slot), Err(SealError::Encrypt));
-        assert_eq!(slot, before);
+        InlineSealer.seal(job, &mut slot).unwrap();
+        assert_eq!(slot, unhex(A3_PACKET));
+
+        let pn_offset = header.len() - 2;
+        assert_eq!(unprotect_header(keys.header(), &mut slot, pn_offset), Ok(2));
+        let (header, payload) = slot.split_at_mut(header.len());
+        let plain = keys.packet().decrypt_in_place(1, header, payload).unwrap();
+        assert_eq!(plain, unhex(A3_PAYLOAD));
     }
 
     #[test]

@@ -1016,7 +1016,14 @@ impl Connection {
     pub(super) fn drain_tls(&mut self) -> Result<(), ConnError> {
         loop {
             self.tls_out.clear();
-            let Some(output) = self.tls.write_crypto(&mut self.tls_out) else {
+            let output = self.tls.write_crypto(&mut self.tls_out).map_err(|error| {
+                if matches!(error, TlsError::UnsupportedKeys(_)) {
+                    ConnError::new(error.transport_error_code(), "unusable TLS keys")
+                } else {
+                    tls_failure(&error)
+                }
+            })?;
+            let Some(output) = output else {
                 break;
             };
             let space = level_space(output.level);
@@ -1046,16 +1053,18 @@ impl Connection {
             }
         }
         // A server that accepted early data reads 0-RTT (RFC 9001); otherwise rustls does not
-        // return 0-RTT keys.
+        // return 0-RTT keys. 0-RTT packets stay unread if the keys are refused.
         if self.side == Side::Server
             && !self.handshake.complete
             && self.early.is_none()
-            && let Some(keys) = self.tls.rustls().and_then(|tls| tls.zero_rtt_keys())
+            && let Some(keys) = self
+                .tls
+                .rustls()
+                .and_then(|tls| tls.zero_rtt_keys())
+                .and_then(|keys| mvfstr_crypto::PacketKeys::from_rustls(keys).ok())
         {
             self.early = Some(Box::new(super::EarlyState {
-                keys: Some(std::sync::Arc::new(mvfstr_crypto::PacketKeys::from_rustls(
-                    keys,
-                ))),
+                keys: Some(std::sync::Arc::new(keys)),
                 params: None,
             }));
         }

@@ -128,7 +128,7 @@ impl Peer {
     fn write(&mut self, to: &mut Peer) -> bool {
         let mut progressed = false;
         let mut buf = Vec::new();
-        while let Some(out) = self.tls.write_crypto(&mut buf) {
+        while let Some(out) = self.tls.write_crypto(&mut buf).unwrap() {
             progressed = true;
             if out.len > 0 {
                 let start = buf.len() - out.len;
@@ -340,14 +340,14 @@ fn a_client_refuses_encrypted_extensions_with_the_transport_parameters_of_anothe
         )
         .unwrap();
         let mut hello = Vec::new();
-        while client.write_crypto(&mut hello).is_some() {}
+        while client.write_crypto(&mut hello).unwrap().is_some() {}
         server.read_hs(&hello).unwrap();
         let (mut server_hello, mut encrypted_extensions) = (Vec::new(), Vec::new());
         assert!(server.write_hs(&mut server_hello).is_some());
         assert!(server.write_hs(&mut encrypted_extensions).is_some());
 
         client.read_crypto(Level::Initial, &server_hello).unwrap();
-        while client.write_crypto(&mut Vec::new()).is_some() {}
+        while client.write_crypto(&mut Vec::new()).unwrap().is_some() {}
         let error = client
             .read_crypto(Level::Handshake, &encrypted_extensions)
             .unwrap_err();
@@ -705,7 +705,7 @@ fn the_server_chooses_once_the_whole_client_hello_has_arrived() {
     let (last, head) = hello.split_last().unwrap();
     for byte in head {
         server.tls.read_crypto(Level::Initial, &[*byte]).unwrap();
-        assert!(server.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(matches!(server.tls.write_crypto(&mut Vec::new()), Ok(None)));
     }
     server.tls.read_crypto(Level::Initial, &[*last]).unwrap();
     run(&mut client, &mut server).unwrap();
@@ -850,7 +850,7 @@ fn crypto_bytes_at_a_level_tls_is_not_reading_are_refused_unconsumed() {
         assert_eq!((refused, expected), (level, Level::Initial));
         assert_eq!(error.transport_error_code().into_inner(), 0x0a);
     }
-    assert!(server.tls.write_crypto(&mut Vec::new()).is_none());
+    assert!(matches!(server.tls.write_crypto(&mut Vec::new()), Ok(None)));
     assert_eq!(server.tls.read_level(), Level::Initial);
     run(&mut client, &mut server).unwrap();
     assert!(client.tls.is_handshake_complete() && server.tls.is_handshake_complete());

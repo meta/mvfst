@@ -90,6 +90,7 @@ pub use keys::KeyMaterial;
 pub use keys::KeySet;
 pub use keys::KeyUpdater;
 pub use keys::PacketKeys;
+pub use keys::UnsupportedKeyError;
 pub use packet::AeadPacketKey;
 pub use packet::NONCE_LEN;
 pub use packet::TAG_LEN;

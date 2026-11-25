@@ -928,7 +928,8 @@ fn rustls_error(error: TlsError) -> rustls::Error {
         | TlsError::PostHandshakeAuth
         | TlsError::HostAlert(_)
         | TlsError::NotPending
-        | TlsError::InvalidStep => rustls::Error::General(error.to_string()),
+        | TlsError::InvalidStep
+        | TlsError::UnsupportedKeys(_) => rustls::Error::General(error.to_string()),
     }
 }
 

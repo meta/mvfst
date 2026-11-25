@@ -16,10 +16,12 @@ use rustls::quic::PacketKey;
 use crate::algorithm::MAX_KEY_LEN;
 use crate::algorithm::QuicAlgorithm;
 use crate::header::AeadHeaderKey;
+use crate::header::SAMPLE_LEN;
 use crate::hkdf::SHA256_LEN;
 use crate::hkdf::expand_label;
 use crate::packet::AeadPacketKey;
 use crate::packet::NONCE_LEN;
+use crate::packet::TAG_LEN;
 use crate::secrets::SecretHash;
 use crate::secrets::TrafficSecret;
 
@@ -88,10 +90,25 @@ impl fmt::Debug for KeyMaterial {
     }
 }
 
+/// Keys from rustls whose AEAD tag or header-protection sample is not 16 bytes. Every QUIC v1
+/// cipher suite uses 16 bytes for both, and mvfstr seals and protects headers with those lengths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedKeyError;
+
+impl fmt::Display for UnsupportedKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("keys without a 16-byte AEAD tag and header-protection sample")
+    }
+}
+
+impl std::error::Error for UnsupportedKeyError {}
+
 /// The keys that protect packets in one direction at one encryption level: the AEAD packet key
 /// and the header-protection key.
 ///
 /// The header-protection key is shared, because a key update replaces only the packet key.
+/// Sealing and header protection use the 16-byte tag and sample of every QUIC v1 cipher suite, not
+/// the lengths the keys report; [`from_rustls`](Self::from_rustls) refuses keys that report others.
 pub struct PacketKeys {
     packet: Box<dyn PacketKey>,
     header: Arc<dyn HeaderProtectionKey>,
@@ -127,12 +144,31 @@ impl PacketKeys {
         // `KeyMaterial` holds keys of exactly `alg`'s length.
         let header =
             AeadHeaderKey::new(alg, material.hp()).expect("derived key has the algorithm's length");
-        PacketKeys::new(Box::new(aead_packet_key(alg, material)), Box::new(header))
+        let keys = PacketKeys::new(Box::new(aead_packet_key(alg, material)), Box::new(header));
+        debug_assert!(
+            keys.has_quic_lengths(),
+            "derived keys use 16-byte tags and samples"
+        );
+        keys
     }
 
-    /// Takes over the keys rustls built for one direction of one encryption level.
-    pub fn from_rustls(keys: rustls::quic::DirectionalKeys) -> PacketKeys {
-        PacketKeys::new(keys.packet, keys.header)
+    /// Takes over the keys rustls built for one direction of one encryption level. Fails with
+    /// [`UnsupportedKeyError`] when the AEAD tag or the header-protection sample of the keys is
+    /// not 16 bytes.
+    pub fn from_rustls(
+        keys: rustls::quic::DirectionalKeys,
+    ) -> Result<PacketKeys, UnsupportedKeyError> {
+        let keys = PacketKeys::new(keys.packet, keys.header);
+        if !keys.has_quic_lengths() {
+            return Err(UnsupportedKeyError);
+        }
+        Ok(keys)
+    }
+
+    /// Returns whether the keys report the 16-byte tag and sample that sealing and header
+    /// protection use.
+    fn has_quic_lengths(&self) -> bool {
+        self.packet.tag_len() == TAG_LEN && self.header.sample_len() == SAMPLE_LEN
     }
 
     /// Returns the AEAD packet key.
@@ -189,12 +225,13 @@ pub struct KeySet {
 }
 
 impl KeySet {
-    /// Takes over the keys rustls built for one encryption level.
-    pub fn from_rustls(keys: rustls::quic::Keys) -> KeySet {
-        KeySet {
-            local: Arc::new(PacketKeys::from_rustls(keys.local)),
-            remote: PacketKeys::from_rustls(keys.remote),
-        }
+    /// Takes over the keys rustls built for one encryption level. Fails as
+    /// [`PacketKeys::from_rustls`] does for either direction.
+    pub fn from_rustls(keys: rustls::quic::Keys) -> Result<KeySet, UnsupportedKeyError> {
+        Ok(KeySet {
+            local: Arc::new(PacketKeys::from_rustls(keys.local)?),
+            remote: PacketKeys::from_rustls(keys.remote)?,
+        })
     }
 
     /// Derives the keys of one encryption level from its raw traffic secrets: `local` protects the
@@ -282,13 +319,18 @@ impl KeyUpdater {
                 (key(local), key(remote))
             }
         };
-        KeySet {
+        let next = KeySet {
             local: Arc::new(PacketKeys::with_shared_header(
                 local,
                 self.local_header.clone(),
             )),
             remote: PacketKeys::with_shared_header(remote, self.remote_header.clone()),
-        }
+        };
+        debug_assert!(
+            next.local.has_quic_lengths() && next.remote.has_quic_lengths(),
+            "a key update keeps the 16-byte tag and sample of the first 1-RTT keys"
+        );
+        next
     }
 }
 
@@ -318,6 +360,7 @@ mod tests {
     use crate::algorithm::CHACHA20_POLY1305;
     use crate::backend::cipher_suite as rustls_suite;
     use crate::backend::default_provider;
+    use crate::header::SAMPLE_LEN;
     use crate::header::protect_header;
     use crate::header::unprotect_header;
     use crate::packet::TAG_LEN;
@@ -348,7 +391,7 @@ mod tests {
             &RFC9001_DCID,
             rustls::Side::Server,
         );
-        let set = KeySet::from_rustls(keys);
+        let set = KeySet::from_rustls(keys).unwrap();
         let header = unhex(A3_HEADER);
         let mut slot = [header.clone(), unhex(A3_PAYLOAD), vec![0; TAG_LEN]].concat();
         let job = SealJob {
@@ -370,6 +413,138 @@ mod tests {
                 .decrypt_in_place(2, header, payload)
                 .is_ok()
         );
+    }
+
+    /// A packet key that reports `tag_len` as its tag length and otherwise seals and opens as
+    /// `inner` does.
+    struct TagLenDouble {
+        inner: Box<dyn PacketKey>,
+        tag_len: usize,
+    }
+
+    impl PacketKey for TagLenDouble {
+        fn encrypt_in_place(
+            &self,
+            packet_number: u64,
+            header: &[u8],
+            payload: &mut [u8],
+        ) -> Result<quic::Tag, rustls::Error> {
+            self.inner.encrypt_in_place(packet_number, header, payload)
+        }
+
+        fn decrypt_in_place<'a>(
+            &self,
+            packet_number: u64,
+            header: &[u8],
+            payload: &'a mut [u8],
+        ) -> Result<&'a [u8], rustls::Error> {
+            self.inner.decrypt_in_place(packet_number, header, payload)
+        }
+
+        fn tag_len(&self) -> usize {
+            self.tag_len
+        }
+
+        fn confidentiality_limit(&self) -> u64 {
+            self.inner.confidentiality_limit()
+        }
+
+        fn integrity_limit(&self) -> u64 {
+            self.inner.integrity_limit()
+        }
+    }
+
+    /// A header-protection key that reports `sample_len` as its sample length and otherwise masks
+    /// as `inner` does.
+    struct SampleLenDouble {
+        inner: Box<dyn HeaderProtectionKey>,
+        sample_len: usize,
+    }
+
+    impl HeaderProtectionKey for SampleLenDouble {
+        fn encrypt_in_place(
+            &self,
+            sample: &[u8],
+            first: &mut u8,
+            packet_number: &mut [u8],
+        ) -> Result<(), rustls::Error> {
+            self.inner.encrypt_in_place(sample, first, packet_number)
+        }
+
+        fn decrypt_in_place(
+            &self,
+            sample: &[u8],
+            first: &mut u8,
+            packet_number: &mut [u8],
+        ) -> Result<(), rustls::Error> {
+            self.inner.decrypt_in_place(sample, first, packet_number)
+        }
+
+        fn sample_len(&self) -> usize {
+            self.sample_len
+        }
+    }
+
+    /// Returns whether rustls's server Initial keys of RFC 9001 Appendix A install after `alter`
+    /// changed one direction: as packet keys, and as a key set with the change in its local or in
+    /// its remote direction.
+    fn installs(alter: impl Fn(quic::DirectionalKeys) -> quic::DirectionalKeys) -> [bool; 3] {
+        let initial = || {
+            quic::Keys::initial(
+                quic::Version::V1,
+                rustls_suite::TLS13_AES_128_GCM_SHA256.tls13().unwrap(),
+                &AES_128_GCM,
+                &RFC9001_DCID,
+                rustls::Side::Server,
+            )
+        };
+        let alone = PacketKeys::from_rustls(alter(initial().local));
+        let (keys, other) = (initial(), initial());
+        let local = KeySet::from_rustls(quic::Keys {
+            local: alter(keys.local),
+            remote: keys.remote,
+        });
+        let remote = KeySet::from_rustls(quic::Keys {
+            local: other.local,
+            remote: alter(other.remote),
+        });
+        [alone.is_ok(), local.is_ok(), remote.is_ok()]
+    }
+
+    #[test]
+    fn rustls_keys_with_a_12_byte_tag_are_refused_at_install() {
+        let tag_len = |tag_len| {
+            move |keys: quic::DirectionalKeys| quic::DirectionalKeys {
+                packet: Box::new(TagLenDouble {
+                    inner: keys.packet,
+                    tag_len,
+                }),
+                header: keys.header,
+            }
+        };
+        assert_eq!(installs(tag_len(TAG_LEN)), [true; 3], "16-byte tags");
+        assert_eq!(installs(tag_len(12)), [false; 3], "12-byte tags");
+    }
+
+    #[test]
+    fn rustls_keys_with_a_sample_other_than_16_bytes_are_refused_at_install() {
+        let sample_len = |sample_len| {
+            move |keys: quic::DirectionalKeys| quic::DirectionalKeys {
+                packet: keys.packet,
+                header: Box::new(SampleLenDouble {
+                    inner: keys.header,
+                    sample_len,
+                }),
+            }
+        };
+        assert_eq!(
+            installs(sample_len(SAMPLE_LEN)),
+            [true; 3],
+            "16-byte samples"
+        );
+        for len in [12, 20] {
+            assert_eq!(installs(sample_len(len)), [false; 3], "{len}-byte samples");
+        }
     }
 
     #[test]
@@ -640,7 +815,7 @@ mod tests {
         ];
         for (suite, alg) in suites {
             let handshake = rustls_handshake(suite);
-            let theirs = KeySet::from_rustls(handshake.keys);
+            let theirs = KeySet::from_rustls(handshake.keys).unwrap();
             let ours = KeySet::from_secrets(alg, &handshake.local, &handshake.remote);
             assert_eq!(sealed(&ours.local), sealed(&theirs.local), "{alg:?}");
             assert_eq!(sealed(&ours.remote), sealed(&theirs.remote), "{alg:?}");

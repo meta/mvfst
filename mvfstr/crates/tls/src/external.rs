@@ -1199,7 +1199,7 @@ mod tests {
             "the ClientHello waits until the host answers Start"
         );
         assert!(server.tls.is_pending());
-        assert!(server.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(matches!(server.tls.write_crypto(&mut Vec::new()), Ok(None)));
         // Each later step is delivered when the host completes it.
         run(&mut client, &mut server).unwrap();
         assert!(!server.tls.is_pending());
@@ -1361,7 +1361,7 @@ mod tests {
             client.tls.deliver(stray()),
             Err(TlsError::NotPending)
         ));
-        assert!(client.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(matches!(client.tls.write_crypto(&mut Vec::new()), Ok(None)));
         let mut server = Peer::rustls_server(config(), Version::V1);
         assert!(matches!(
             server.tls.deliver(stray()),
@@ -1416,11 +1416,11 @@ mod tests {
             );
             assert_eq!(negotiated(peer), kept);
             assert_eq!(peer.tls.alert(), None);
-            assert!(peer.tls.write_crypto(&mut Vec::new()).is_none());
+            assert!(matches!(peer.tls.write_crypto(&mut Vec::new()), Ok(None)));
         }
         // A ticket that arrives after confirmation is dropped.
         client.tls.read_crypto(Level::OneRtt, &tickets).unwrap();
-        assert!(client.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(matches!(client.tls.write_crypto(&mut Vec::new()), Ok(None)));
 
         let mut client = Peer::external_client(Version::V1, &[b"h3"]);
         let mut server = Peer::external_server(config(), Version::V1);
@@ -1439,12 +1439,12 @@ mod tests {
             );
             assert_eq!(negotiated(peer), kept);
             assert!(peer.tls.tls_input().is_none() && !peer.tls.is_pending());
-            assert!(peer.tls.write_crypto(&mut Vec::new()).is_none());
+            assert!(matches!(peer.tls.write_crypto(&mut Vec::new()), Ok(None)));
             assert_eq!(buffered(peer), 0, "the session freed its buffers");
         }
         client.tls.read_crypto(Level::OneRtt, &tickets).unwrap();
         assert!(client.tls.tls_input().is_none() && !client.tls.is_pending());
-        assert!(client.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(matches!(client.tls.write_crypto(&mut Vec::new()), Ok(None)));
         assert_eq!(buffered(&client), 0);
 
         // Finishing while the host works on a ticket frees the buffers once its steps are in.
@@ -1459,7 +1459,10 @@ mod tests {
         client.run_host().unwrap();
         client.run_host().unwrap();
         assert_eq!(client.handed.last(), Some(&Handed::Finish));
-        assert!(!client.tls.is_pending() && client.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(
+            !client.tls.is_pending()
+                && matches!(client.tls.write_crypto(&mut Vec::new()), Ok(None))
+        );
         assert_eq!(buffered(&client), 0, "after a pending input");
     }
 
@@ -1590,7 +1593,7 @@ mod tests {
         step.crypto[Level::OneRtt as usize] = b"ticket".to_vec();
         server.tls.deliver(step).unwrap();
         let mut buf = Vec::new();
-        let out = server.tls.write_crypto(&mut buf).unwrap();
+        let out = server.tls.write_crypto(&mut buf).unwrap().unwrap();
         assert_eq!(
             (out.level, out.len, buf.as_slice()),
             (Level::OneRtt, 6, &b"ticket"[..])
@@ -1642,7 +1645,7 @@ mod tests {
                 error.transport_error_code(),
                 TransportErrorCode::INTERNAL_ERROR
             );
-            assert!(tls.write_crypto(&mut Vec::new()).is_none());
+            assert!(matches!(tls.write_crypto(&mut Vec::new()), Ok(None)));
         }
     }
 
@@ -1742,7 +1745,7 @@ mod tests {
         client.tls.read_crypto(Level::Initial, b"extra").unwrap();
         let (_, step) = client.host.as_mut().unwrap().poll_ready().unwrap();
         assert_eq!(client.tls.deliver(step).map_err(code), violation, "client");
-        assert!(client.tls.write_crypto(&mut Vec::new()).is_none());
+        assert!(matches!(client.tls.write_crypto(&mut Vec::new()), Ok(None)));
 
         // Handshake bytes arrive while a server's host works on the client's Finished.
         let mut client = Peer::rustls_client(Version::V1, &[b"h3"]);
