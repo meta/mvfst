@@ -34,15 +34,27 @@ struct Entry {
     valid: bool,
 }
 
+/// The receive buffers, with one `recvmmsg` header per buffer, built once by `new`. Every pointer
+/// in the headers and iovecs comes from the base pointer (`as_mut_ptr`) of a Vec that is never
+/// resized, not from a reference, so moving `Rx` or borrowing the Vecs later leaves it valid. A
+/// `Box` would not do for `buf`: each move retags it as unique and invalidates older pointers.
 pub(crate) struct Rx {
-    buf: Box<[u8]>,
+    buf: Vec<u8>,
     size: usize,
     entries: Vec<Entry>,
+    /// How many headers the last call filled.
     received: usize,
     names: Vec<libc::sockaddr_storage>,
     control: Vec<CmsgSpace>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the kernel reads it through the headers")
+    )]
     iovs: Vec<libc::iovec>,
     hdrs: Vec<libc::mmsghdr>,
+    /// The `recvmmsg` calls made, for tests that count them.
+    #[cfg(test)]
+    pub(crate) calls: usize,
 }
 
 impl Rx {
@@ -59,49 +71,82 @@ impl Rx {
             len: 0,
             valid: false,
         };
+        let mut buf = vec![0; batch * size];
+        let mut names = vec![sys::empty_sockaddr(); batch];
+        let mut control = vec![CmsgSpace::default(); batch];
+        let buf_base = buf.as_mut_ptr();
+        let mut iovs: Vec<libc::iovec> = (0..batch)
+            .map(|i| libc::iovec {
+                // SAFETY: `i < batch`, so the offset is inside `buf`, which holds `batch * size`
+                // bytes.
+                iov_base: unsafe { buf_base.add(i * size) }.cast(),
+                iov_len: size,
+            })
+            .collect();
+        let (names_base, control_base, iovs_base) =
+            (names.as_mut_ptr(), control.as_mut_ptr(), iovs.as_mut_ptr());
+        let hdrs = (0..batch)
+            .map(|i| {
+                let mut hdr = sys::empty_mmsghdr();
+                // SAFETY: `i < batch`, the length of `names`, `control` and `iovs`, so each offset
+                // is inside its Vec, and `&raw mut` takes the control bytes without a reference.
+                unsafe {
+                    hdr.msg_hdr.msg_name = names_base.add(i).cast();
+                    hdr.msg_hdr.msg_iov = iovs_base.add(i);
+                    hdr.msg_hdr.msg_control = (&raw mut (*control_base.add(i)).0).cast();
+                }
+                hdr.msg_hdr.msg_iovlen = 1;
+                whole_lengths(&mut hdr.msg_hdr);
+                hdr
+            })
+            .collect();
         Self {
-            buf: vec![0; batch * size].into_boxed_slice(),
+            buf,
             size,
             entries: vec![placeholder; batch],
             received: 0,
-            names: vec![sys::empty_sockaddr(); batch],
-            control: vec![CmsgSpace::default(); batch],
-            iovs: Vec::with_capacity(batch),
-            hdrs: Vec::with_capacity(batch),
+            names,
+            control,
+            iovs,
+            hdrs,
+            #[cfg(test)]
+            calls: 0,
         }
     }
 
     /// Receives one batch. Returns how many buffers hold datagrams, possibly 0.
     pub(crate) fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
-        self.received = 0;
-        self.iovs.clear();
-        self.hdrs.clear();
-        for buf in self.buf.chunks_exact_mut(self.size) {
-            self.iovs.push(libc::iovec {
-                iov_base: buf.as_mut_ptr().cast(),
-                iov_len: buf.len(),
-            });
-        }
-        for (i, (name, control)) in self.names.iter_mut().zip(&mut self.control).enumerate() {
-            let mut hdr = sys::empty_mmsghdr();
-            hdr.msg_hdr.msg_name = (&raw mut *name).cast();
-            hdr.msg_hdr.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
-            hdr.msg_hdr.msg_iov = &raw mut self.iovs[i];
-            hdr.msg_hdr.msg_iovlen = 1;
-            hdr.msg_hdr.msg_control = control.0.as_mut_ptr().cast();
-            hdr.msg_hdr.msg_controllen = control.0.len() as _;
-            self.hdrs.push(hdr);
-        }
+        self.rearm();
         let n = loop {
+            #[cfg(test)]
+            {
+                self.calls += 1;
+            }
             // SAFETY: every header points at its own name buffer, control buffer and one iovec
-            // over its own receive buffer, all owned by `self` and untouched until the call
-            // returns.
+            // over its own receive buffer, with their whole lengths. All of them are owned by
+            // `self`, and the pointers are valid as the type's doc says. Nothing else touches
+            // them until the call returns.
             match unsafe { sys::recvmmsg(fd, &mut self.hdrs) } {
                 Ok(n) => break n,
                 Err(e) if absorbed(&e) => {}
                 Err(e) => return Err(e),
             }
         };
+        Ok(self.parse(n))
+    }
+
+    /// Gives the headers the last call filled their whole name and control space again. The
+    /// headers after them were not shortened.
+    fn rearm(&mut self) {
+        for hdr in &mut self.hdrs[..self.received] {
+            whole_lengths(&mut hdr.msg_hdr);
+        }
+        self.received = 0;
+    }
+
+    /// Reads the metadata of the `n` headers a call filled. Returns how many buffers hold
+    /// datagrams.
+    fn parse(&mut self, n: usize) -> usize {
         let rx_time = Instant::now();
         let mut valid = 0;
         for i in 0..n {
@@ -135,7 +180,15 @@ impl Rx {
             valid += 1;
         }
         self.received = n;
-        Ok(valid)
+        valid
+    }
+
+    /// Returns whether the last call filled fewer headers than there are: the socket ran out of
+    /// datagrams, or an ICMP error arrived during the call, which `recvmmsg` keeps for the next
+    /// call. That error woke the socket's pollers after the readiness that led to the call, so on
+    /// every host they still report the datagrams left behind.
+    pub(crate) fn drained(&self) -> bool {
+        self.received < self.hdrs.len()
     }
 
     /// Returns the buffers of the last batch that hold datagrams.
@@ -147,6 +200,13 @@ impl Rx {
             .filter(|(_, entry)| entry.valid)
             .map(|(buf, entry)| (&entry.meta, &mut buf[..entry.len]))
     }
+}
+
+/// Gives a header the whole name and control space of its buffers. The kernel shortens both
+/// lengths to what it wrote in every header it fills.
+fn whole_lengths(hdr: &mut libc::msghdr) {
+    hdr.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
+    hdr.msg_controllen = cmsg::SPACE as _;
 }
 
 /// Returns whether a receive error is one the backend retries past: EINTR, or an ICMP error a
@@ -227,10 +287,290 @@ fn ecn(tos: u8) -> Ecn {
 
 #[cfg(test)]
 mod tests {
+    use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
+    use std::ptr;
+
+    use socket2::Domain;
+    use socket2::Protocol;
+    use socket2::SockAddr;
+    use socket2::Type;
 
     use super::*;
     use crate::SocketOptions;
+    use crate::cmsg::Encoder;
+    use crate::socket;
+
+    /// Binds a plain UDP socket to `local` whose sends carry `tos` (DSCP and ECN).
+    fn sender(local: SocketAddr, tos: u32) -> UdpSocket {
+        let socket =
+            socket2::Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))
+                .unwrap();
+        if local.is_ipv4() {
+            socket.set_tos_v4(tos).unwrap();
+        } else {
+            socket.set_tclass_v6(tos).unwrap();
+        }
+        socket.bind(&local.into()).unwrap();
+        socket.into()
+    }
+
+    /// Sends `payload` from `from` to `to` as one GSO send of `segment`-byte datagrams.
+    fn gso_send(from: &UdpSocket, to: SocketAddr, payload: &[u8], segment: u16) {
+        let addr = SockAddr::from(to);
+        let mut control = CmsgSpace::default();
+        let mut encoder = Encoder::new(&mut control.0);
+        assert!(encoder.push(libc::SOL_UDP, libc::UDP_SEGMENT, &segment.to_ne_bytes()));
+        let control_len = encoder.len();
+        let mut iov = libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        };
+        let mut msg = sys::empty_mmsghdr().msg_hdr;
+        msg.msg_name = addr.as_ptr().cast_mut().cast();
+        msg.msg_namelen = addr.len();
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.0.as_mut_ptr().cast();
+        msg.msg_controllen = control_len as _;
+        // SAFETY: the header points at `addr`, `iov` (over `payload`) and `control`, all live
+        // until `sendmsg` returns.
+        let sent = unsafe { libc::sendmsg(from.as_raw_fd(), &raw const msg, 0) };
+        assert_eq!(
+            sent,
+            payload.len() as isize,
+            "{}",
+            io::Error::last_os_error()
+        );
+    }
+
+    /// Returns `len` bytes that differ from those of other `seed`s.
+    fn bytes(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+    }
+
+    /// What a test compares of one received buffer: its metadata without the receive time, and
+    /// its bytes.
+    type Got = (SocketAddr, Option<IpAddr>, Ecn, u16, Vec<u8>);
+
+    /// Waits until `fd` is readable, then receives one batch through `rx` and copies it out.
+    fn batch(rx: &mut Rx, fd: RawFd) -> Vec<Got> {
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd`; the timeout only guards against a hang.
+        assert_eq!(unsafe { libc::poll(&raw mut ready, 1, 20_000) }, 1);
+        let valid = rx.recv(fd).unwrap();
+        let got: Vec<Got> = rx
+            .buffers()
+            .map(|(meta, data)| (meta.src, meta.dst_ip, meta.ecn, meta.stride, data.to_vec()))
+            .collect();
+        assert_eq!(got.len(), valid);
+        got
+    }
+
+    #[test]
+    fn headers_built_once_by_new_give_every_batch_its_own_metadata() {
+        let loop4 = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let loop6 = IpAddr::from(Ipv6Addr::LOCALHOST);
+        let s4 = sender(SocketAddr::new(loop4, 0), 0b10);
+        let s6 = sender(SocketAddr::new(loop6, 0), 0b01);
+        let (from4, from6) = (s4.local_addr().unwrap(), s6.local_addr().unwrap());
+        // Without control messages, then with them: a plain socket, a prepared dual-stack socket
+        // with GRO, and prepared IPv4 sockets without and with GRO.
+        let plain = UdpSocket::bind((loop4, 0)).unwrap();
+        plain.set_nonblocking(true).unwrap();
+        let any6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        let dual = socket::open(any6, None, &SocketOptions::default()).unwrap();
+        let no_gro = SocketOptions {
+            gro: false,
+            ..SocketOptions::default()
+        };
+        let v4_no_gro = socket::open(SocketAddr::new(loop4, 0), None, &no_gro).unwrap();
+        let v4 = socket::open(SocketAddr::new(loop4, 0), None, &SocketOptions::default()).unwrap();
+        let port =
+            |socket: &socket2::Socket| socket.local_addr().unwrap().as_socket().unwrap().port();
+        let to_plain = plain.local_addr().unwrap();
+        let (dual4, dual6) = (
+            SocketAddr::new(loop4, port(&dual)),
+            SocketAddr::new(loop6, port(&dual)),
+        );
+        let to_v4_no_gro = SocketAddr::new(loop4, port(&v4_no_gro));
+        let to_v4 = SocketAddr::new(loop4, port(&v4));
+
+        // One receiver with two slots serves every socket in turn. Each kernel call shortens
+        // the name and control lengths of the slots it fills to what it wrote, so a slot reused
+        // without restoring them cuts the next address short or loses its control messages.
+        let mut rx = Rx::new(2, 2048);
+
+        // Both slots: an IPv4 name and no control data.
+        s4.send_to(&bytes(1, 10), to_plain).unwrap();
+        s4.send_to(&bytes(2, 20), to_plain).unwrap();
+        assert_eq!(
+            batch(&mut rx, plain.as_raw_fd()),
+            vec![
+                (from4, None, Ecn::NotEct, 10, bytes(1, 10)),
+                (from4, None, Ecn::NotEct, 20, bytes(2, 20)),
+            ],
+            "a socket without control messages"
+        );
+
+        // Slot 0 needs the whole IPv6 name and control space again.
+        s4.send_to(&bytes(3, 30), dual4).unwrap();
+        assert_eq!(
+            batch(&mut rx, dual.as_raw_fd()),
+            vec![(from4, Some(loop4), Ecn::Ect0, 30, bytes(3, 30))],
+            "an IPv4-mapped source after IPv4 names and no control data"
+        );
+
+        // Slot 0 takes a datagram longer than its buffer; slot 1, last used for an IPv4 name
+        // without control data, an IPv4-mapped source.
+        s6.send_to(&bytes(4, 3000), dual6).unwrap();
+        s4.send_to(&bytes(5, 40), dual4).unwrap();
+        assert_eq!(
+            batch(&mut rx, dual.as_raw_fd()),
+            vec![(from4, Some(loop4), Ecn::Ect0, 40, bytes(5, 40))],
+            "the cut-short datagram is discarded, and the one after it is whole"
+        );
+
+        // The discarded datagram's slot holds a GRO run, which carries one more control message.
+        gso_send(&s6, dual6, &bytes(6, 600), 200);
+        assert_eq!(
+            batch(&mut rx, dual.as_raw_fd()),
+            vec![(from6, Some(loop6), Ecn::Ect1, 200, bytes(6, 600))],
+            "a GRO run in the slot of a discarded datagram"
+        );
+
+        // Slot 1, last filled with a single datagram, holds a GRO run.
+        s6.send_to(&bytes(7, 50), dual6).unwrap();
+        gso_send(&s4, dual4, &bytes(8, 700), 300);
+        assert_eq!(
+            batch(&mut rx, dual.as_raw_fd()),
+            vec![
+                (from6, Some(loop6), Ecn::Ect1, 50, bytes(7, 50)),
+                (from4, Some(loop4), Ecn::Ect0, 300, bytes(8, 700)),
+            ],
+            "a GRO run in a slot that the batch before did not use"
+        );
+
+        // A socket without GRO receives a GSO send as single datagrams, in both slots.
+        let run = bytes(9, 200);
+        gso_send(&s4, to_v4_no_gro, &run, 100);
+        assert_eq!(
+            batch(&mut rx, v4_no_gro.as_raw_fd()),
+            vec![
+                (from4, Some(loop4), Ecn::Ect0, 100, run[..100].to_vec()),
+                (from4, Some(loop4), Ecn::Ect0, 100, run[100..].to_vec()),
+            ],
+            "IPv4 names and control data without GRO"
+        );
+        gso_send(&s4, to_v4, &bytes(10, 600), 200);
+        assert_eq!(
+            batch(&mut rx, v4.as_raw_fd()),
+            vec![(from4, Some(loop4), Ecn::Ect0, 200, bytes(10, 600))],
+            "a GRO run after single datagrams"
+        );
+
+        // The headers are built by `new`, not by each call: every header points at its own name,
+        // control space and iovec with their whole lengths, and every iovec at its own buffer.
+        let fresh = Rx::new(2, 2048);
+        assert_eq!(fresh.hdrs.len(), 2, "new builds every header");
+        for (i, hdr) in fresh.hdrs.iter().enumerate() {
+            let msg = &hdr.msg_hdr;
+            assert_eq!(msg.msg_name, (&raw const fresh.names[i]).cast_mut().cast());
+            assert_eq!(msg.msg_namelen, size_of::<libc::sockaddr_storage>() as _);
+            assert_eq!(msg.msg_iov, (&raw const fresh.iovs[i]).cast_mut());
+            assert_eq!(msg.msg_iovlen, 1);
+            assert_eq!(
+                msg.msg_control,
+                fresh.control[i].0.as_ptr().cast_mut().cast()
+            );
+            assert_eq!(msg.msg_controllen, cmsg::SPACE as _);
+            let buf = fresh.buf[i * 2048..].as_ptr();
+            assert_eq!(fresh.iovs[i].iov_base, buf.cast_mut().cast());
+            assert_eq!(fresh.iovs[i].iov_len, 2048);
+        }
+    }
+
+    /// Moves `rx` through a function, as `ready` and the backends' constructors do.
+    fn moved(rx: Rx) -> Rx {
+        rx
+    }
+
+    /// Writes one datagram into header `i` as `recvmmsg` does, through the pointers the header
+    /// holds: the source address into its name, the traffic class into its control space and
+    /// `data` into its buffer, then the lengths and flags the kernel writes back.
+    fn kernel_fill(rx: &mut Rx, i: usize, src: SocketAddr, tos: u8, data: &[u8]) {
+        let name = SockAddr::from(src);
+        let mut control = CmsgSpace::default();
+        let mut encoder = Encoder::new(&mut control.0);
+        let pushed = if src.is_ipv4() {
+            encoder.push(libc::IPPROTO_IP, libc::IP_TOS, &[tos])
+        } else {
+            let tclass = i32::from(tos).to_ne_bytes();
+            encoder.push(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &tclass)
+        };
+        assert!(pushed);
+        let control_len = encoder.len();
+        let hdr = &mut rx.hdrs[i];
+        let msg = &mut hdr.msg_hdr;
+        assert_eq!(msg.msg_namelen, size_of::<libc::sockaddr_storage>() as _);
+        assert_eq!(msg.msg_controllen, cmsg::SPACE as _);
+        // SAFETY: `msg_iov` points at the header's one iovec.
+        let iov = unsafe { *msg.msg_iov };
+        assert!(data.len() <= iov.iov_len);
+        // SAFETY: the header's name, control space and buffer hold the whole lengths asserted
+        // above, which bound the name, the control data and `data`, and none of them overlaps
+        // the locals copied from.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                name.as_ptr().cast::<u8>(),
+                msg.msg_name.cast(),
+                name.len() as usize,
+            );
+            ptr::copy_nonoverlapping(control.0.as_ptr(), msg.msg_control.cast(), control_len);
+            ptr::copy_nonoverlapping(data.as_ptr(), iov.iov_base.cast(), data.len());
+        }
+        msg.msg_namelen = name.len();
+        msg.msg_controllen = control_len as _;
+        msg.msg_flags = 0;
+        hdr.msg_len = data.len() as u32;
+    }
+
+    #[test]
+    fn the_headers_reach_their_storage_after_rx_moves_and_its_buffers_are_written() {
+        // Without a socket, so that it also runs under Miri, which checks that the pointers the
+        // headers hold may still write their storage after `Rx` has moved and the driver has
+        // written the buffers in place through `buffers()`.
+        let v4 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 4433));
+        let v6 = SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443));
+        let mut rx = moved(Rx::new(2, 64));
+        for round in 0..3 {
+            rx.rearm();
+            kernel_fill(&mut rx, 0, v4, 0b10, &bytes(round, 10));
+            kernel_fill(&mut rx, 1, v6, 0b01, &bytes(round, 20));
+            assert_eq!(rx.parse(2), 2);
+            let got: Vec<_> = rx
+                .buffers()
+                .map(|(meta, data)| {
+                    let got = (meta.src, meta.ecn, meta.stride, data.to_vec());
+                    data.fill(0xff);
+                    got
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (v4, Ecn::Ect0, 10, bytes(round, 10)),
+                    (v6, Ecn::Ect1, 20, bytes(round, 20)),
+                ],
+                "round {round}"
+            );
+            rx = moved(rx);
+        }
+    }
 
     #[test]
     fn a_datagram_whose_control_data_was_cut_short_is_discarded() {

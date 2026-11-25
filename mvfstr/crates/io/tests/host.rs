@@ -410,12 +410,19 @@ fn eagain_clears_read_readiness_until_the_host_sets_it_again() {
     readiness.set(Interest::Read);
     assert_eq!(wakes(&woken), 1);
     assert!(matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(1))));
-    assert!(backend.poll_recv(&mut cx).is_pending(), "EAGAIN");
-    assert!(!readiness.is_set(Interest::Read), "EAGAIN cleared it");
+    assert!(backend.poll_recv(&mut cx).is_pending(), "the short batch");
+    assert!(
+        !readiness.is_set(Interest::Read),
+        "the short batch cleared it"
+    );
 
     // A report while the socket is empty costs one empty read, then waits again.
     readiness.set(Interest::Read);
-    assert_eq!(wakes(&woken), 2, "EAGAIN registered the task again");
+    assert_eq!(
+        wakes(&woken),
+        2,
+        "the pending poll registered the task again"
+    );
     assert!(backend.poll_recv(&mut cx).is_pending());
     assert!(!readiness.is_set(Interest::Read));
 
@@ -576,7 +583,7 @@ fn a_socket_stays_registered_across_receive_cycles() {
         sender.send_to(&cycle.to_be_bytes(), to).unwrap();
         let got = recv_batch(&host, &mut backend);
         assert_eq!(got[0].1, cycle.to_be_bytes());
-        assert!(backend.poll_recv(&mut cx).is_pending(), "read to EAGAIN");
+        assert!(backend.poll_recv(&mut cx).is_pending(), "read to the end");
     }
     assert_eq!(
         host.epoll_ctls(),

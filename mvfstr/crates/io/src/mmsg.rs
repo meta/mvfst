@@ -211,7 +211,7 @@ impl TxBackend for MmsgBackend {
             if tx.blocked() {
                 Err(io::ErrorKind::WouldBlock.into())
             } else {
-                Ok(())
+                Ok(((), false))
             }
         }));
         Poll::Ready(())
@@ -228,12 +228,14 @@ impl TxBackend for MmsgBackend {
 
 impl RxBackend for MmsgBackend {
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        // When every datagram of a batch was discarded, read on, since only EAGAIN from the kernel
-        // means that the socket is empty. Each batch spends budget, so a flood of datagrams that
+        // A batch that fills every buffer reads on, also when every datagram in it was discarded;
+        // a shorter one ends the reads. Each batch spends budget, so a flood of datagrams that
         // are all discarded still yields.
+        let rx = &mut self.rx;
         loop {
             let n = ready!(poll_io(&self.io, cx, Interest::READABLE, |fd| {
-                self.rx.recv(fd.as_raw_fd())
+                let n = rx.recv(fd.as_raw_fd())?;
+                Ok((n, rx.drained()))
             }))?;
             if n > 0 {
                 return Poll::Ready(Ok(n));
@@ -249,13 +251,15 @@ impl RxBackend for MmsgBackend {
 /// Runs `op` when the socket is ready for `interest`, with the coop pattern of Roxygen's TCP reads:
 /// readiness is polled outside tokio's coop budget so it is not charged twice, a task already out
 /// of budget yields first, and each successful call spends one unit, so a socket that stays ready
-/// cannot starve the worker's other tasks. `op` returns `WouldBlock` when the socket was not ready
-/// after all, which clears the readiness and waits for the next edge.
+/// cannot starve the worker's other tasks. `op` returns its result and whether it left the socket
+/// not ready, as a receive that emptied it does, or `WouldBlock` when the socket was not ready
+/// after all. Both clear the readiness, so the next call waits for the next edge without trying
+/// the socket; tokio clears only the readiness this call observed, so an edge during `op` is kept.
 fn poll_io<R>(
     io: &AsyncFd<Socket>,
     cx: &mut Context<'_>,
     interest: Interest,
-    mut op: impl FnMut(BorrowedFd<'_>) -> io::Result<R>,
+    mut op: impl FnMut(BorrowedFd<'_>) -> io::Result<(R, bool)>,
 ) -> Poll<io::Result<R>> {
     loop {
         if !coop::has_budget_remaining() {
@@ -272,6 +276,12 @@ fn poll_io<R>(
             .poll(cx)
         )?;
         if let Ok(result) = guard.try_io(|io| op(io.get_ref().as_fd())) {
+            let result = result.map(|(value, drained)| {
+                if drained {
+                    guard.clear_ready();
+                }
+                value
+            });
             if result.is_ok()
                 && let Poll::Ready(spent) = coop::poll_proceed(cx)
             {
@@ -344,5 +354,185 @@ impl Backend for MmsgBackend {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         MmsgBackend::local_addr(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::UdpSocket;
+    use std::ops::Range;
+
+    use tokio::runtime::Runtime;
+
+    use super::*;
+
+    /// Fails a test that would otherwise hang; passing runs never reach it.
+    const HANG_GUARD: Duration = Duration::from_secs(20);
+
+    fn runtime() -> Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    /// Binds a backend to an IPv4 loopback port, with `rx_batch` receive buffers.
+    fn bind(rx_batch: u16) -> MmsgBackend {
+        let options = MmsgOptions {
+            rx_batch,
+            ..MmsgOptions::default()
+        };
+        MmsgBackend::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &options).unwrap()
+    }
+
+    /// Sends one datagram per id in `ids` to `backend`, each of its own length, and returns them.
+    fn send(sender: &UdpSocket, backend: &MmsgBackend, ids: Range<u8>) -> Vec<Vec<u8>> {
+        let to = backend.local_addr().unwrap();
+        ids.map(|id| {
+            let datagram = vec![id; 10 + usize::from(id)];
+            sender.send_to(&datagram, to).unwrap();
+            datagram
+        })
+        .collect()
+    }
+
+    /// Sends `count` empty datagrams to `backend`.
+    fn send_empty(sender: &UdpSocket, backend: &MmsgBackend, count: usize) {
+        let to = backend.local_addr().unwrap();
+        for _ in 0..count {
+            sender.send_to(&[], to).unwrap();
+        }
+    }
+
+    /// Runs one task that polls `backend` until it has a batch, calling `on_pending` after each
+    /// pending poll. Returns the batch's datagrams and how many times the task was polled.
+    fn recv(
+        rt: &Runtime,
+        backend: &mut MmsgBackend,
+        mut on_pending: impl FnMut(&MmsgBackend),
+    ) -> (Vec<Vec<u8>>, usize) {
+        let mut polls = 0;
+        let task = poll_fn(|cx| {
+            polls += 1;
+            let poll = backend.poll_recv(cx);
+            if poll.is_pending() {
+                on_pending(backend);
+            }
+            poll
+        });
+        let n = rt
+            .block_on(tokio::time::timeout(HANG_GUARD, task))
+            .expect("hang guard")
+            .unwrap();
+        let got: Vec<Vec<u8>> = backend.buffers().map(|(_, data)| data.to_vec()).collect();
+        assert_eq!(got.len(), n);
+        (got, polls)
+    }
+
+    /// Polls `backend` once in a task of its own, and returns whether the poll was pending.
+    fn pending(rt: &Runtime, backend: &mut MmsgBackend) -> bool {
+        rt.block_on(poll_fn(|cx| {
+            Poll::Ready(backend.poll_recv(cx).is_pending())
+        }))
+    }
+
+    #[test]
+    fn a_short_batch_clears_readiness_so_the_next_poll_is_pending_without_a_receive() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..3);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent);
+        assert!(pending(&rt, &mut backend));
+        assert_eq!(
+            backend.rx.calls, 1,
+            "3 datagrams in 32 buffers emptied the socket, so the poll after them reads nothing"
+        );
+    }
+
+    #[test]
+    fn datagrams_that_arrive_after_a_short_batch_wake_the_task_and_are_delivered() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..3);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent);
+
+        // Datagrams that arrive before the next poll wait for the reactor to report the socket.
+        let late = send(&sender, &backend, 3..5);
+        let (got, polls) = recv(&rt, &mut backend, |_| {});
+        assert_eq!(got, late);
+        assert_eq!(
+            polls, 2,
+            "the poll after the short batch is pending until the task is woken"
+        );
+
+        // So do datagrams that arrive after a pending poll, which registered the task.
+        let mut later = Vec::new();
+        let (got, polls) = recv(&rt, &mut backend, |backend| {
+            if later.is_empty() {
+                later = send(&sender, backend, 5..7);
+            }
+        });
+        assert_eq!(got, later);
+        assert_eq!(polls, 2);
+        assert_eq!(
+            backend.rx.calls, 3,
+            "one receive per batch, and none that found the socket empty"
+        );
+    }
+
+    #[test]
+    fn a_full_batch_reads_on_without_a_wake_and_the_short_batch_after_it_ends_the_reads() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(4);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..6);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent[..4]);
+        let (got, polls) = recv(&rt, &mut backend, |_| {});
+        assert_eq!(got, sent[4..]);
+        assert_eq!(
+            polls, 1,
+            "a full batch leaves the socket readable, so the poll reads on"
+        );
+        assert!(pending(&rt, &mut backend));
+        assert_eq!(backend.rx.calls, 2, "the batch of 2 was short");
+    }
+
+    #[test]
+    fn a_full_batch_of_only_discarded_datagrams_reads_on_and_a_short_one_ends_the_reads() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(4);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        send_empty(&sender, &backend, 4);
+        let sent = send(&sender, &backend, 7..8);
+        assert_eq!(
+            recv(&rt, &mut backend, |_| {}).0,
+            sent,
+            "4 empty datagrams fill the batch, so the same poll reads on"
+        );
+        assert_eq!(backend.rx.calls, 2);
+        assert!(pending(&rt, &mut backend));
+        assert_eq!(backend.rx.calls, 2, "the batch of 1 was short");
+
+        // A short batch whose every datagram is discarded also ends the reads: the poll that
+        // takes it is pending without another receive. A datagram sent after that ends the task.
+        send_empty(&sender, &backend, 2);
+        let mut last = Vec::new();
+        let (got, _) = recv(&rt, &mut backend, |backend| {
+            if last.is_empty() && backend.rx.calls > 2 {
+                last = send(&sender, backend, 8..9);
+            }
+        });
+        assert_eq!(got, last);
+        assert_eq!(
+            backend.rx.calls, 4,
+            "one receive for the empty datagrams, one for the last"
+        );
     }
 }

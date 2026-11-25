@@ -12,10 +12,12 @@
 //! folly EventBase, instead of tokio. Each socket is registered with the host once, for reads, and
 //! stays registered; the host [sets](Readiness::set) its [`Readiness`] whenever its loop reports
 //! the socket ready, which wakes the task waiting for it, and the backend
-//! [clears](Readiness::clear) it when the socket returns EAGAIN. The backend reads until EAGAIN or
-//! until its caller's batch budget runs out; with a level-triggered host, a socket left readable
-//! is reported again on the loop's next iteration. Write interest is requested only after a send
-//! returned EAGAIN. [`ManualHost`] is such a host on an epoll instance that its owner runs by hand.
+//! [clears](Readiness::clear) it when the socket returns EAGAIN or after a receive that fills fewer
+//! buffers than the backend has, which ends at the socket's last datagram or at an ICMP error. The
+//! backend reads until then or until its caller's batch budget runs out; with a level-triggered
+//! host, a socket left readable is reported again on the loop's next iteration. Write interest is
+//! requested only after a send returned EAGAIN. [`ManualHost`] is such a host on an epoll instance
+//! that its owner runs by hand.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -68,8 +70,9 @@ pub enum Interest {
 /// the backend that reads and writes it.
 ///
 /// The host sets it when its event loop reports the socket ready, which wakes the task the backend
-/// registered for that interest. The backend clears it when the socket returns EAGAIN, then
-/// registers its task to be woken by the next set.
+/// registered for that interest. The backend clears it after the socket returns EAGAIN, or after a
+/// receive that fills fewer buffers than the backend has, then registers its task to be woken by
+/// the next set.
 #[derive(Clone, Default)]
 pub struct Readiness(Rc<State>);
 
@@ -92,7 +95,8 @@ impl Readiness {
         }
     }
 
-    /// Marks the socket not ready for `interest`, after it returned EAGAIN. Called by the backend.
+    /// Marks the socket not ready for `interest`, after it returned EAGAIN or a receive filled
+    /// fewer buffers than the backend has. Called by the backend.
     pub fn clear(&self, interest: Interest) {
         self.0.slots(interest).0.set(false);
     }
@@ -261,15 +265,21 @@ impl<H: IoHost> TxBackend for HostBackend<H> {
 
 impl<H: IoHost> RxBackend for HostBackend<H> {
     /// Makes one `recvmmsg` call while the host has the socket readable. A batch whose every
-    /// datagram was discarded is `Ready(Ok(0))`: only EAGAIN means the socket is empty, and the
-    /// caller reads on while its budget lasts.
+    /// datagram was discarded is `Ready(Ok(0))`. A batch that fills every buffer leaves the
+    /// readiness set, so the caller reads on while its budget lasts. A shorter one, which ends at
+    /// the socket's last datagram or at an ICMP error, clears it, and so does EAGAIN.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         if self.readiness.is_set(Interest::Read) {
             match self.rx.recv(self.socket.as_raw_fd()) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.readiness.clear(Interest::Read);
                 }
-                result => return Poll::Ready(result),
+                result => {
+                    if result.is_ok() && self.rx.drained() {
+                        self.readiness.clear(Interest::Read);
+                    }
+                    return Poll::Ready(result);
+                }
             }
         }
         self.readiness.wake_when_set(Interest::Read, cx.waker());
@@ -704,5 +714,178 @@ mod tests {
         let again = host.poll(Some(Duration::ZERO)).unwrap();
         assert!(again <= 1, "{again}");
         assert_eq!(host.poll(Some(Duration::ZERO)).unwrap(), 0, "consumed");
+    }
+
+    /// Binds a backend on `host` to an IPv4 loopback port, with `rx_batch` receive buffers.
+    fn bind(host: &ManualHost, rx_batch: u16) -> HostBackend<ManualHost> {
+        let options = HostOptions {
+            host: Some(host.clone()),
+            mmsg: MmsgOptions {
+                rx_batch,
+                ..MmsgOptions::default()
+            },
+        };
+        HostBackend::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &options).unwrap()
+    }
+
+    /// Sends one datagram per id in `ids` to `backend`, each of its own length, and returns them.
+    fn send(
+        sender: &UdpSocket,
+        backend: &HostBackend<ManualHost>,
+        ids: std::ops::Range<u8>,
+    ) -> Vec<Vec<u8>> {
+        let to = backend.local_addr().unwrap();
+        ids.map(|id| {
+            let datagram = vec![id; 10 + usize::from(id)];
+            sender.send_to(&datagram, to).unwrap();
+            datagram
+        })
+        .collect()
+    }
+
+    /// Sends `count` empty datagrams to `backend`.
+    fn send_empty(sender: &UdpSocket, backend: &HostBackend<ManualHost>, count: usize) {
+        let to = backend.local_addr().unwrap();
+        for _ in 0..count {
+            sender.send_to(&[], to).unwrap();
+        }
+    }
+
+    fn datagrams(backend: &mut HostBackend<ManualHost>) -> Vec<Vec<u8>> {
+        backend.buffers().map(|(_, data)| data.to_vec()).collect()
+    }
+
+    /// Polls `backend` until it has a batch, running `host` while it waits, and returns the
+    /// batch's datagrams.
+    fn recv(host: &ManualHost, backend: &mut HostBackend<ManualHost>) -> Vec<Vec<u8>> {
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..8 {
+            if let Poll::Ready(n) = backend.poll_recv(&mut cx) {
+                let got = datagrams(backend);
+                assert_eq!(got.len(), n.unwrap());
+                return got;
+            }
+            host.poll(Some(HANG_GUARD)).unwrap();
+        }
+        panic!("no batch within 8 host polls");
+    }
+
+    #[test]
+    fn a_short_batch_clears_read_readiness_and_the_next_poll_waits_without_a_receive() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..3);
+        assert_eq!(recv(&host, &mut backend), sent);
+        assert!(
+            !backend.readiness.is_set(Interest::Read),
+            "3 datagrams in 32 buffers emptied the socket"
+        );
+
+        let (woken, waker) = counter();
+        assert!(
+            backend
+                .poll_recv(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(
+            backend.rx.calls, 1,
+            "the poll after a short batch reads nothing"
+        );
+        backend.readiness.set(Interest::Read);
+        assert_eq!(wakes(&woken), 1, "the pending poll registered the task");
+    }
+
+    #[test]
+    fn datagrams_that_arrive_after_a_short_batch_wake_the_task_and_are_delivered() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..3);
+        assert_eq!(recv(&host, &mut backend), sent);
+        let (woken, waker) = counter();
+        let mut cx = Context::from_waker(&waker);
+
+        // Datagrams that arrive before the next poll wait for the host to report the socket.
+        let late = send(&sender, &backend, 3..5);
+        assert!(
+            backend.poll_recv(&mut cx).is_pending(),
+            "the short batch emptied the socket"
+        );
+        assert_eq!(host.poll(Some(HANG_GUARD)).unwrap(), 1);
+        assert_eq!(wakes(&woken), 1);
+        assert!(matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(2))));
+        assert_eq!(datagrams(&mut backend), late);
+
+        // So do datagrams that arrive after a pending poll.
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        let later = send(&sender, &backend, 5..7);
+        assert_eq!(host.poll(Some(HANG_GUARD)).unwrap(), 1);
+        assert_eq!(wakes(&woken), 2);
+        assert!(matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(2))));
+        assert_eq!(datagrams(&mut backend), later);
+        assert_eq!(
+            backend.rx.calls, 3,
+            "one receive per batch, and none that found the socket empty"
+        );
+    }
+
+    #[test]
+    fn a_full_batch_reads_on_without_a_wake_and_the_short_batch_after_it_clears_readiness() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 4);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..6);
+        assert_eq!(recv(&host, &mut backend), sent[..4]);
+        assert!(
+            backend.readiness.is_set(Interest::Read),
+            "a full batch leaves the socket readable"
+        );
+
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(2))),
+            "read on without a wake"
+        );
+        assert_eq!(datagrams(&mut backend), sent[4..]);
+        assert!(
+            !backend.readiness.is_set(Interest::Read),
+            "the batch of 2 was short"
+        );
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        assert_eq!(backend.rx.calls, 2);
+    }
+
+    #[test]
+    fn a_full_batch_of_only_discarded_datagrams_reads_on_and_a_short_one_clears_readiness() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 4);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        send_empty(&sender, &backend, 4);
+        let sent = send(&sender, &backend, 7..8);
+        assert!(recv(&host, &mut backend).is_empty());
+        assert!(
+            backend.readiness.is_set(Interest::Read),
+            "4 empty datagrams fill the batch, so the socket may hold more"
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(1))),
+            "read on without a wake"
+        );
+        assert_eq!(datagrams(&mut backend), sent);
+        assert!(
+            !backend.readiness.is_set(Interest::Read),
+            "the batch of 1 was short"
+        );
+
+        send_empty(&sender, &backend, 2);
+        assert!(recv(&host, &mut backend).is_empty());
+        assert!(
+            !backend.readiness.is_set(Interest::Read),
+            "a short batch clears readiness also when every datagram in it was discarded"
+        );
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        assert_eq!(backend.rx.calls, 3);
     }
 }

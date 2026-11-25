@@ -142,6 +142,9 @@ pub trait TxBackend {
 pub trait RxBackend {
     /// Receives a batch. `Ready(Ok(n))` makes `n` buffers available through
     /// [`buffers`](Self::buffers) until the next call; `Pending` registers `cx` for readability.
+    /// A batch that fills fewer buffers than the backend has ends at the socket's last datagram or
+    /// at an ICMP error, and the backend may then stop reading: the next call is `Pending` without
+    /// a system call, until the socket is readable again.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>>;
 
     /// Returns the buffers of the last batch with their metadata. A buffer holds one datagram or a
