@@ -30,7 +30,10 @@ use mvfstr_wire::decode_packet_number;
 use mvfstr_wire::encode_retry;
 
 use super::Connection;
+use super::stream_tests::App;
 use super::stream_tests::ORDER;
+use super::stream_tests::RTT;
+use super::stream_tests::run_apps;
 use super::tests::LIMIT;
 use super::tests::deliver;
 use super::tests::handshake;
@@ -78,6 +81,19 @@ fn read_all(conn: &mut Connection, id: StreamId) -> (usize, bool) {
 
 fn drain_acked(conn: &mut Connection) -> Vec<(StreamId, u64)> {
     std::iter::from_fn(|| conn.poll_stream_acked()).collect()
+}
+
+/// A transport config that queues the growths of the send halves' acknowledged prefixes.
+fn ack_progress() -> Arc<TransportConfig> {
+    transport(|c| c.stream_ack_progress(true))
+}
+
+/// Returns `setup` with a client that queues ack progress.
+fn with_ack_progress(setup: Setup) -> Setup {
+    Setup {
+        client_transport: ack_progress(),
+        ..setup
+    }
 }
 
 /// Returns the frames of the 1-RTT packets of a datagram `conn` sent.
@@ -213,7 +229,7 @@ fn closed(pair_peer_events: &[ConnEvent]) -> Option<(CloseReason, Initiator)> {
 
 #[test]
 fn ack_progress_reports_each_streams_acknowledged_prefix_in_order() {
-    let (_, mut pair) = handshake(Setup::default().pair());
+    let (_, mut pair) = handshake(with_ack_progress(Setup::default()).pair());
     let client = pair.client.conn_mut();
     let a = client.open_stream(Dir::Bi, ORDER).unwrap();
     let b = client.open_stream(Dir::Bi, ORDER).unwrap();
@@ -237,7 +253,7 @@ fn ack_progress_reports_each_streams_acknowledged_prefix_in_order() {
 
 #[test]
 fn ack_progress_grows_step_by_step_and_outlives_the_stream() {
-    let (_, mut pair) = handshake(Setup::default().pair());
+    let (_, mut pair) = handshake(with_ack_progress(Setup::default()).pair());
     let client = pair.client.conn_mut();
     let id = client.open_stream(Dir::Bi, ORDER).unwrap();
     send_all(client, id, 40_000);
@@ -279,7 +295,7 @@ fn ack_progress_grows_step_by_step_and_outlives_the_stream() {
 
 #[test]
 fn ack_progress_skips_holes_until_lost_bytes_are_acknowledged() {
-    let (_, mut pair) = handshake(Setup::default().pair());
+    let (_, mut pair) = handshake(with_ack_progress(Setup::default()).pair());
     pair.to_server.set_loss(Loss::Seeded {
         seed: 11,
         per_mille: 150,
@@ -312,13 +328,67 @@ fn ack_progress_skips_holes_until_lost_bytes_are_acknowledged() {
 
 #[test]
 fn a_server_queues_no_ack_progress() {
-    let (_, mut pair) = handshake(Setup::default().pair());
+    // Even with the setting on.
+    let (_, mut pair) = handshake(Setup::default().transport(ack_progress()).pair());
     let server = pair.server.conn_mut();
     let id = server.open_stream(Dir::Uni, ORDER).unwrap();
     send_all(server, id, 5_000);
     let quiet = pair.now + Duration::from_secs(1);
     pair.run(quiet);
     assert_eq!(pair.server.conn_mut().poll_stream_acked(), None);
+}
+
+/// Runs 200 request streams over `setup`'s pair, 100 at a time, each a request and its FIN
+/// answered by a response and its FIN, until every stream is closed and reaped on both sides;
+/// the test does not poll ack progress. Returns the pair and the streams.
+fn requests_without_polling(setup: Setup) -> (Pair, Vec<StreamId>) {
+    let (_, mut pair) = handshake(setup.pair());
+    let (mut client, mut server) = (App::default(), App::default());
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let conn = pair.client.conn_mut();
+        let batch: Vec<StreamId> = (0..100)
+            .map(|_| conn.open_stream(Dir::Bi, ORDER).unwrap())
+            .collect();
+        for &id in &batch {
+            client.write(id, &b"request"[..], true);
+        }
+        let until = pair.now + RTT;
+        run_apps(&mut pair, until, &mut client, &mut server);
+        for &id in &batch {
+            server.write(id, &b"response"[..], true);
+        }
+        // Long enough for the server to reap the streams and raise the stream limit.
+        let until = pair.now + 3 * RTT;
+        run_apps(&mut pair, until, &mut client, &mut server);
+        ids.extend(batch);
+    }
+    for &id in &ids {
+        assert_eq!(client.data[&id], b"response", "{id:?}");
+        assert_eq!(client.edges_of(id).last(), Some(&StreamReady::Closed));
+        assert_eq!(server.edges_of(id).last(), Some(&StreamReady::Closed));
+        assert!(pair.client.conn_mut().stream(id).is_err(), "{id:?}");
+    }
+    (pair, ids)
+}
+
+#[test]
+fn default_client_keeps_no_ack_progress() {
+    let (mut pair, _) = requests_without_polling(Setup::default());
+    let client = pair.client.conn_mut();
+    assert_eq!(client.sources.streams.acked_len(), 0);
+    assert_eq!(client.poll_stream_acked(), None);
+
+    // With the setting on, the same run keeps one entry per stream after the streams are reaped.
+    let (mut pair, ids) = requests_without_polling(with_ack_progress(Setup::default()));
+    let client = pair.client.conn_mut();
+    assert_eq!(client.sources.streams.acked_len(), 200);
+    let mut acked = drain_acked(client);
+    acked.sort();
+    // The 7 bytes of each request; the FIN is not counted.
+    let expected: Vec<(StreamId, u64)> = ids.iter().map(|&id| (id, 7)).collect();
+    assert_eq!(acked, expected);
+    assert_eq!(client.sources.streams.acked_len(), 0);
 }
 
 #[test]
@@ -841,7 +911,7 @@ fn early_events_in_order(events: &[ConnEvent], accepted: bool) -> bool {
 
 #[test]
 fn accepted_0rtt_carries_a_request_before_the_handshake_completes() {
-    let config = resumable(&early_setup());
+    let config = resumable(&with_ack_progress(early_setup()));
     let (epoch, mut pair) = start(config);
     let client = pair.client.conn_mut();
     assert_eq!(client.poll_event(), Some(ConnEvent::EarlyDataWritable));
@@ -879,7 +949,7 @@ fn accepted_0rtt_carries_a_request_before_the_handshake_completes() {
 
 #[test]
 fn rejected_0rtt_discards_the_early_streams_and_numbering_starts_over() {
-    let config = resumable(&early_setup());
+    let config = resumable(&with_ack_progress(early_setup()));
     let rejecting = with_server(&config, Arc::new(TransportConfig::default()), false);
     let (epoch, mut pair) = start(rejecting);
     let client = pair.client.conn_mut();
@@ -917,6 +987,7 @@ fn rejected_0rtt_discards_the_early_streams_and_numbering_starts_over() {
     let quiet = pair.now + Duration::from_millis(200);
     pair.run(quiet);
     assert_eq!(read_all(pair.client.conn_mut(), again), (400, true));
+    assert_eq!(drain_acked(pair.client.conn_mut()), [(again, 300)]);
 }
 
 #[test]

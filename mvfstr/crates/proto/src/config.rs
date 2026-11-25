@@ -400,6 +400,7 @@ pub struct TransportConfig {
     max_datagram_frame_size: u64,
     datagram_send_queue: usize,
     datagram_recv_queue: usize,
+    stream_ack_progress: bool,
 }
 
 /// The largest transport parameter id RFC 9000 defines, retry_source_connection_id.
@@ -446,6 +447,7 @@ impl Default for TransportConfig {
             max_datagram_frame_size: 0,
             datagram_send_queue: 1024,
             datagram_recv_queue: 1024,
+            stream_ack_progress: false,
         }
     }
 }
@@ -633,6 +635,12 @@ impl TransportConfig {
     /// Returns how many received datagrams wait for the application before the oldest is dropped.
     pub fn datagram_recv_queue(&self) -> usize {
         self.datagram_recv_queue
+    }
+
+    /// Returns whether a client connection queues the growths of its send halves' acknowledged
+    /// prefixes for [`Connection::poll_stream_acked`](crate::Connection::poll_stream_acked).
+    pub fn stream_ack_progress(&self) -> bool {
+        self.stream_ack_progress
     }
 }
 
@@ -861,6 +869,15 @@ impl TransportConfigBuilder {
     /// drops the oldest. Default 1024.
     pub fn datagram_recv_queue(mut self, datagrams: usize) -> Self {
         self.config.datagram_recv_queue = datagrams;
+        self
+    }
+
+    /// Makes a client connection queue the growths of its send halves' acknowledged prefixes for
+    /// [`Connection::poll_stream_acked`](crate::Connection::poll_stream_acked), one entry per
+    /// stream until it is polled, also after the stream is reaped. A server does not queue them.
+    /// Default false: the connection does not queue them.
+    pub fn stream_ack_progress(mut self, enabled: bool) -> Self {
+        self.config.stream_ack_progress = enabled;
         self
     }
 
@@ -1724,6 +1741,16 @@ mod tests {
                 "{builder:?}"
             );
         }
+    }
+
+    #[test]
+    fn stream_ack_progress_is_off_by_default_and_can_be_turned_on() {
+        assert!(!TransportConfig::default().stream_ack_progress());
+        let config = TransportConfig::builder()
+            .stream_ack_progress(true)
+            .build()
+            .unwrap();
+        assert!(config.stream_ack_progress());
     }
 
     #[test]

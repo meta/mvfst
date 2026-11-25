@@ -357,7 +357,8 @@ pub(crate) struct StreamState {
     ranked: Vec<Ranked>,
     /// The final sizes of the latest reaped streams that had a receive half, oldest first.
     reaped_sizes: VecDeque<(StreamId, u64)>,
-    /// Growths of the acknowledged prefixes of send halves not yet polled; only a client has them.
+    /// Growths of the acknowledged prefixes of send halves not yet polled; only a client with
+    /// `stream_ack_progress` on has them.
     acked: Option<AckedProgress>,
 }
 
@@ -443,7 +444,8 @@ impl StreamState {
             empty: BufQueue::new(0),
             ranked: Vec::new(),
             reaped_sizes: VecDeque::new(),
-            acked: (side == Side::Client).then(AckedProgress::default),
+            acked: (side == Side::Client && config.stream_ack_progress())
+                .then(AckedProgress::default),
         }
     }
 
@@ -451,6 +453,12 @@ impl StreamState {
     /// [`Connection::poll_stream_acked`](crate::Connection::poll_stream_acked)).
     pub(crate) fn poll_acked(&mut self) -> Option<(StreamId, u64)> {
         self.acked.as_mut()?.pop()
+    }
+
+    /// Returns how many streams have a growth queued for [`poll_acked`](Self::poll_acked).
+    #[cfg(test)]
+    pub(crate) fn acked_len(&self) -> usize {
+        self.acked.as_ref().map_or(0, |acked| acked.order.len())
     }
 
     /// Hashes what a later transmit attempt reads of the streams, for the empty-attempt digest:

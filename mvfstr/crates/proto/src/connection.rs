@@ -917,7 +917,9 @@ impl Connection {
     /// and the bytes from offset 0 the peer has acknowledged without a gap, the FIN not counted.
     /// Growths of one stream not yet polled coalesce into one entry with the latest value. A
     /// stream's last value is queued no later than its [`StreamReady::Closed`] edge and stays
-    /// queued after the stream is reaped. Only a client connection queues growths.
+    /// queued after the stream is reaped. Only a client connection whose transport config turns
+    /// on [`stream_ack_progress`](crate::config::TransportConfigBuilder::stream_ack_progress)
+    /// queues growths; otherwise this returns `None`.
     pub fn poll_stream_acked(&mut self) -> Option<(StreamId, u64)> {
         self.sources.streams.poll_acked()
     }
