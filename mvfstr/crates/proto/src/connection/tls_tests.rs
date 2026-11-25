@@ -1006,3 +1006,31 @@ fn a_hosts_step_moves_the_connection_clock_to_its_time() {
     assert_eq!(server.tls_deliver(later, step), Ok(()));
     assert_eq!(server.now, later);
 }
+
+#[test]
+fn a_server_reuses_the_crypto_page_of_the_client_hello_for_the_finished() {
+    // Each host step reaches the server 50 ms after the host makes it, so once the server has read
+    // the client's Finished it waits for the last step with its Handshake space still in place.
+    let latency = Duration::from_millis(50);
+    let (epoch, mut pair) = external(&Setup::default(), &[Side::Server], latency);
+    let finished_read = |pair: &Pair| {
+        pair.server.conn.as_ref().is_some_and(|server| {
+            server.spaces[Space::Handshake.index()]
+                .crypto_recv
+                .read_offset()
+                > 0
+        })
+    };
+    assert!(pair.run_until(epoch + LIMIT, finished_read));
+    let server = pair.server.conn();
+    assert!(
+        !server.handshake.confirmed && !server.spaces[Space::Handshake.index()].discarded,
+        "the server waits for its host's answer to the Finished"
+    );
+    assert_eq!(
+        server.crypto_pool.pages_allocated(),
+        1,
+        "the server's ClientHello and the client's Finished share one CRYPTO page"
+    );
+    assert!(pair.handshake(epoch + LIMIT));
+}

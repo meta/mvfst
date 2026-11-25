@@ -998,8 +998,9 @@ impl Connection {
         loop {
             let level = self.tls.read_level();
             let space = level_space(level).index();
-            while let Some(front) = self.spaces[space].crypto_recv.readable().front().cloned() {
-                if let Err(e) = self.tls.read_crypto(level, &front) {
+            while let Some(front) = self.spaces[space].crypto_recv.readable().front() {
+                let len = front.len();
+                if let Err(e) = self.tls.read_crypto(level, front) {
                     let error = ConnError {
                         code: e.transport_error_code(),
                         frame_type: Some(frame_type(FrameKind::Crypto)),
@@ -1012,7 +1013,7 @@ impl Connection {
                 }
                 self.spaces[space]
                     .crypto_recv
-                    .consume(front.len(), &mut self.crypto_pool)
+                    .consume(len, &mut self.crypto_pool)
                     .expect("should consume bytes that are readable");
             }
             self.drain_tls()?;

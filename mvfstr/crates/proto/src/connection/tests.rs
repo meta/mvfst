@@ -77,6 +77,7 @@ use crate::recovery::test_epoch;
 use crate::sources::AckSource;
 use crate::sources::CryptoSource;
 use crate::streams::guard::List;
+use crate::streams::recv_buf::RecvBuffer;
 use crate::testing::LinkConfig;
 use crate::testing::Loss;
 use crate::testing::Pair;
@@ -2717,5 +2718,58 @@ fn the_size_print_gives_the_connection_and_the_parts_it_holds() {
     assert!(
         conn_event > 0 && endpoint_event > 0,
         "events of {conn_event} and {endpoint_event} bytes"
+    );
+}
+
+/// Returns a pair from the default setup, whose server sends session tickets, once both sides
+/// are confirmed and have gone quiet.
+fn confirmed_and_quiet() -> Pair {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let quiet = pair.now + Duration::from_millis(200);
+    pair.run(quiet);
+    pair
+}
+
+#[test]
+fn a_confirmed_connection_neither_keeps_nor_pools_a_crypto_page() {
+    let mut pair = confirmed_and_quiet();
+    for side in [Side::Server, Side::Client] {
+        let conn = match side {
+            Side::Server => pair.server.conn_mut(),
+            Side::Client => pair.client.conn_mut(),
+        };
+        assert_eq!(
+            conn.crypto_pool.memory(),
+            0,
+            "the {side:?} does not keep a free CRYPTO page once confirmed"
+        );
+        // A CRYPTO buffer that releases its page after confirmation, as a client's buffer of
+        // session tickets does.
+        let mut buf = RecvBuffer::new();
+        buf.insert(0, &[0; 100], false, &mut conn.crypto_pool)
+            .expect("the buffer takes in-order bytes");
+        buf.consume(100, &mut conn.crypto_pool)
+            .expect("the bytes are readable");
+        assert_eq!(buf.held_pages(), 0, "the buffer releases its page");
+        assert_eq!(
+            conn.crypto_pool.memory(),
+            0,
+            "the {side:?} frees a CRYPTO page released after confirmation"
+        );
+    }
+}
+
+#[test]
+fn a_client_releases_the_crypto_page_of_its_tickets() {
+    let pair = confirmed_and_quiet();
+    let tickets = &pair.client.conn().spaces[Space::Data.index()].crypto_recv;
+    assert!(
+        tickets.read_offset() > 0,
+        "the client read the server's session tickets"
+    );
+    assert_eq!(
+        tickets.held_pages(),
+        0,
+        "the client releases the page of the tickets that it read"
     );
 }

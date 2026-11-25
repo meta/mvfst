@@ -369,6 +369,12 @@ impl RecvBuffer {
         self.readable.chain_length() + self.pending_bytes
     }
 
+    /// Returns the number of pages that the buffer has not released.
+    #[cfg(test)]
+    pub(crate) fn held_pages(&self) -> usize {
+        self.pages.len()
+    }
+
     /// Returns the offset after the last readable byte.
     fn readable_end(&self) -> u64 {
         self.read_offset + self.readable.chain_length() as u64

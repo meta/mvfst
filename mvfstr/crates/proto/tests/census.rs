@@ -117,13 +117,13 @@ const IDLE_CLIENT: usize = 9_300;
 /// The most heap that a server holds after one request and response.
 const REQUEST_SERVER: usize = 26_827;
 /// The most heap that a client holds after one request and response.
-const REQUEST_CLIENT: usize = 46_436;
+const REQUEST_CLIENT: usize = 30_012;
 /// The most heap that a server holds after an HTTP/3-shaped flight.
 const H3_SERVER: usize = 79_875;
 /// The most heap that a client holds after an HTTP/3-shaped flight.
-const H3_CLIENT: usize = 83_060;
+const H3_CLIENT: usize = 66_636;
 /// The most heap that an idle client holds after its session tickets arrive.
-const TICKETS_CLIENT: usize = 25_884;
+const TICKETS_CLIENT: usize = 9_460;
 
 /// Returns what ring adds to the heap of a connection on `side` when it is the only crypto
 /// backend: ring keeps its keys in Rust allocations, where aws-lc-rs keeps them in C.
