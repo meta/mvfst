@@ -2967,6 +2967,162 @@ fn the_previous_keys_open_only_packets_below_every_one_under_the_current_keys() 
 }
 
 #[test]
+fn in_order_one_rtt_packets_do_not_search_the_ranges_or_compute_a_key_discard_time() {
+    let mut pair = settled(&Setup::default());
+    let now = pair.now;
+    let (client, server) = (
+        pair.client.conn.as_mut().unwrap(),
+        pair.server.conn.as_mut().unwrap(),
+    );
+    assert!(!server.key_phases.as_ref().unwrap().has_previous());
+    let phase = client.key_phases.as_ref().unwrap().phase;
+    let received = server.sources.ack[Space::Data.index()].received();
+    let first = received
+        .largest()
+        .expect("a 1-RTT packet from the client")
+        .0
+        + 1;
+    let (searches, discard_times) = (received.searches(), server.key_discard_times);
+    for pn in first..first + 100 {
+        let summary = deliver(server, now, client_addr(), one_rtt(client, pn, phase));
+        assert_eq!(summary.packets, 1, "{pn}");
+    }
+    let received = server.sources.ack[Space::Data.index()].received();
+    assert_eq!(received.largest().map(|(pn, _)| pn), Some(first + 99));
+    assert_eq!(
+        (
+            received.searches() - searches,
+            server.key_discard_times - discard_times
+        ),
+        (0, 0),
+        "range searches and key discard times computed without previous keys"
+    );
+}
+
+#[test]
+fn after_a_peer_key_update_the_previous_keys_go_three_ptos_after_its_first_packet() {
+    let mut pair = settled(&Setup::default());
+    let now = pair.now;
+    let (client, server) = (
+        pair.client.conn.as_mut().unwrap(),
+        pair.server.conn.as_mut().unwrap(),
+    );
+    let next = client.recovery.space(Space::Data).next_pn();
+    client.initiate_key_update();
+    let discard_at = now + 3 * server.pto_interval();
+    let discard_times = server.key_discard_times;
+    assert_eq!(
+        deliver(server, now, client_addr(), one_rtt(client, next, true)).packets,
+        1
+    );
+    assert_eq!(generation(server), 1);
+    // Later packets under the new keys leave the discard time as it was.
+    let later = now + Duration::from_millis(10);
+    for pn in next + 1..=next + 10 {
+        let summary = deliver(server, later, client_addr(), one_rtt(client, pn, true));
+        assert_eq!(summary.packets, 1, "{pn}");
+    }
+    assert_eq!(
+        server.key_phases.as_ref().unwrap().discard_at(),
+        Some(discard_at)
+    );
+    assert_eq!(
+        server.key_discard_times - discard_times,
+        1,
+        "discard times computed"
+    );
+}
+
+#[test]
+fn after_a_local_key_update_the_previous_keys_go_three_ptos_after_the_first_new_packet() {
+    let mut pair = settled(&Setup::default());
+    let now = pair.now;
+    let (client, server) = (
+        pair.client.conn.as_mut().unwrap(),
+        pair.server.conn.as_mut().unwrap(),
+    );
+    let next = server.recovery.space(Space::Data).next_pn();
+    let delayed = one_rtt(server, next, false);
+    client.initiate_key_update();
+    let pn = client.recovery.space(Space::Data).next_pn();
+    deliver(server, now, client_addr(), one_rtt(client, pn, true));
+    assert_eq!(generation(server), 1, "the server follows");
+    assert_eq!(client.key_phases.as_ref().unwrap().discard_at(), None);
+    let discard_times = client.key_discard_times;
+    let first = now + Duration::from_millis(5);
+    let discard_at = first + 3 * client.pto_interval();
+    assert_eq!(
+        deliver(
+            client,
+            first,
+            server_addr(),
+            one_rtt(server, next + 1, true)
+        )
+        .packets,
+        1
+    );
+    let later = first + Duration::from_millis(5);
+    for pn in next + 2..=next + 11 {
+        let summary = deliver(client, later, server_addr(), one_rtt(server, pn, true));
+        assert_eq!(summary.packets, 1, "{pn}");
+    }
+    assert_eq!(
+        deliver(client, later, server_addr(), delayed).packets,
+        1,
+        "a delayed packet under the old keys"
+    );
+    assert_eq!(
+        client.key_phases.as_ref().unwrap().discard_at(),
+        Some(discard_at)
+    );
+    assert_eq!(
+        client.key_discard_times - discard_times,
+        1,
+        "discard times computed"
+    );
+}
+
+#[test]
+fn a_connection_without_key_updates_computes_no_key_discard_time() {
+    let pair = settled(&Setup::default());
+    for conn in [&pair.client.conn, &pair.server.conn] {
+        let conn = conn.as_ref().unwrap();
+        let received = conn.sources.ack[Space::Data.index()].received();
+        assert!(received.largest().is_some(), "1-RTT packets arrived");
+        assert_eq!(
+            (generation(conn), conn.key_discard_times),
+            (0, 0),
+            "key generation and discard times computed"
+        );
+    }
+}
+
+#[test]
+fn a_delayed_packet_before_the_first_under_new_keys_computes_no_key_discard_time() {
+    let mut pair = settled(&Setup::default());
+    let now = pair.now;
+    let (client, server) = (
+        pair.client.conn.as_mut().unwrap(),
+        pair.server.conn.as_mut().unwrap(),
+    );
+    let next = server.recovery.space(Space::Data).next_pn();
+    let delayed = one_rtt(server, next, false);
+    client.initiate_key_update();
+    let discard_times = client.key_discard_times;
+    assert_eq!(
+        deliver(client, now, server_addr(), delayed).packets,
+        1,
+        "a delayed packet under the old keys"
+    );
+    assert_eq!(client.key_phases.as_ref().unwrap().discard_at(), None);
+    assert_eq!(
+        client.key_discard_times - discard_times,
+        0,
+        "discard times computed"
+    );
+}
+
+#[test]
 fn packets_failing_authentication_past_the_integrity_limit_close_the_connection() {
     let mut pair = settled(&Setup::default());
     let now = pair.now;

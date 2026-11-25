@@ -594,7 +594,19 @@ impl Connection {
     /// previous keys are kept for three PTOs after the first packet under the current ones
     /// (RFC 9001).
     fn on_one_rtt_opened(&mut self, now: Instant, read: ReadKey, pn: u64) -> Result<(), ConnError> {
-        let discard_at = now + 3 * self.pto_interval();
+        let discard_at = if self
+            .key_phases
+            .as_ref()
+            .is_some_and(|phases| phases.sets_discard_time(read))
+        {
+            #[cfg(test)]
+            {
+                self.key_discard_times += 1;
+            }
+            Some(now + 3 * self.pto_interval())
+        } else {
+            None
+        };
         let (Some(phases), Some(keys)) = (
             &mut self.key_phases,
             &mut self.spaces[Space::Data.index()].keys,
@@ -612,7 +624,7 @@ impl Connection {
                         "a newer key phase below the largest packet number",
                     ));
                 }
-                phases.advance(keys, Some(discard_at));
+                phases.advance(keys, discard_at);
                 phases.on_received(pn, discard_at);
             }
         }

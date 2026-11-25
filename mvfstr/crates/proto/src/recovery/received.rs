@@ -8,6 +8,8 @@
 //! Received-packet tracking for one packet number space: the ranges an ACK frame reports,
 //! duplicate detection, ECN counts and the once-per-batch "ACK due" decision (RFC 9000).
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::time::Duration;
@@ -67,6 +69,9 @@ pub struct ReceivedPackets {
     largest_eliciting: Option<u64>,
     /// The largest packet number received and when it arrived.
     largest: Option<(u64, Instant)>,
+    /// Searches of the ranges, for tests of their cost.
+    #[cfg(test)]
+    searches: Cell<u64>,
 }
 
 impl ReceivedPackets {
@@ -87,6 +92,8 @@ impl ReceivedPackets {
             immediate: false,
             largest_eliciting: None,
             largest: None,
+            #[cfg(test)]
+            searches: Cell::new(0),
         }
     }
 
@@ -128,7 +135,11 @@ impl ReceivedPackets {
         if pn < self.floor {
             return true;
         }
-        let i = self.ranges.partition_point(|&(_, end)| end < pn);
+        // The common case: a packet above every one received.
+        if self.ranges.back().is_none_or(|&(_, end)| pn > end) {
+            return false;
+        }
+        let i = self.search(pn);
         i < self.ranges.len() && self.ranges[i].0 <= pn
     }
 
@@ -141,10 +152,22 @@ impl ReceivedPackets {
         if pn < largest {
             return true;
         }
-        // `pn` was just recorded, so a range holds it; every packet down to `largest` has arrived
-        // exactly when that range reaches it.
-        let i = self.ranges.partition_point(|&(_, end)| end < pn);
-        self.ranges.get(i).is_none_or(|&(start, _)| start > largest)
+        // `pn` was just recorded, so a range holds it (the newest one when packets arrive in
+        // order); every packet down to `largest` has arrived exactly when that range reaches it.
+        let start = match self.ranges.back() {
+            Some(&(start, end)) if (start..=end).contains(&pn) => Some(start),
+            _ => self.ranges.get(self.search(pn)).map(|&(start, _)| start),
+        };
+        start.is_none_or(|start| start > largest)
+    }
+
+    /// Returns the index of the first range that ends at or above `pn`.
+    fn search(&self, pn: u64) -> usize {
+        #[cfg(test)]
+        {
+            self.searches.set(self.searches.get() + 1);
+        }
+        self.ranges.partition_point(|&(_, end)| end < pn)
     }
 
     /// Adds `pn` to the ranges, or returns `false` if it is already there.
@@ -171,7 +194,7 @@ impl ReceivedPackets {
         if self.is_duplicate(pn) {
             return false;
         }
-        let i = self.ranges.partition_point(|&(_, end)| end < pn);
+        let i = self.search(pn);
         let joins_prev = i > 0 && self.ranges[i - 1].1 + 1 == pn;
         let joins_next = i < self.ranges.len() && self.ranges[i].0 == pn + 1;
         match (joins_prev, joins_next) {
@@ -234,6 +257,12 @@ impl ReceivedPackets {
     /// count as duplicates.
     pub fn on_ack_frame_acked(&mut self, largest: u64) {
         self.report_floor = self.report_floor.max(largest + 1);
+    }
+
+    /// Returns how many times the ranges were searched.
+    #[cfg(test)]
+    pub(crate) fn searches(&self) -> u64 {
+        self.searches.get()
     }
 
     /// Returns the ranges to acknowledge, largest first, as the ACK encoder takes them. The
@@ -435,6 +464,64 @@ mod tests {
         assert!(due_now_after(&[(1, true), (3, false), (5, true)]));
         // A non-eliciting packet never makes an ACK due.
         assert!(!due_now_after(&[(1, true), (3, false)]));
+    }
+
+    #[test]
+    fn in_order_packets_are_recorded_without_searching() {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert!(r.on_packet(0, true, Ecn::NotEct, t0));
+        let before = r.searches();
+        // Each packet is checked for a duplicate before it is recorded, as a connection does.
+        for pn in 1..=100 {
+            assert!(!r.is_duplicate(pn), "{pn} reported duplicate");
+            assert!(r.on_packet(pn, true, Ecn::NotEct, t0));
+        }
+        assert_eq!(ranges(&r), vec![0..=100]);
+        assert_eq!(
+            r.ack_due(t0, u8::MAX, 25 * MS),
+            AckDue::At(t0 + 25 * MS),
+            "an in-order packet made an ACK due at once"
+        );
+        assert_eq!(r.searches() - before, 0);
+    }
+
+    /// Feeds `(pn, ack_eliciting)` packets to a fresh 1-RTT tracker with a threshold of 10, the
+    /// last one checked for a duplicate first, as a connection does. Returns whether an ACK is due
+    /// at once and how many searches were made for the last packet.
+    fn due_now_and_searches(packets: &[(u64, bool)]) -> (bool, u64) {
+        let t0 = crate::recovery::test_epoch();
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        let (&(last, eliciting), earlier) = packets.split_last().expect("a packet");
+        for &(pn, eliciting) in earlier {
+            assert!(r.on_packet(pn, eliciting, Ecn::NotEct, t0));
+        }
+        let before = r.searches();
+        assert!(!r.is_duplicate(last), "{last} reported duplicate");
+        assert!(r.on_packet(last, eliciting, Ecn::NotEct, t0));
+        (
+            r.ack_due(t0, 10, 25 * MS) == AckDue::Now,
+            r.searches() - before,
+        )
+    }
+
+    #[test]
+    fn a_back_range_that_starts_above_the_largest_eliciting_packet_is_a_gap() {
+        // Each case gives whether an ACK is due at once and the searches made for the last packet.
+        let cases = [
+            // The newest range holds the new packet but starts at a non-eliciting packet above
+            // the largest ack-eliciting one, so a packet between them is missing.
+            due_now_and_searches(&[(1, true), (3, false), (4, true)]),
+            due_now_and_searches(&[(1, false), (2, true), (4, false), (5, true)]),
+            // The range runs from the largest ack-eliciting packet through non-eliciting ones.
+            due_now_and_searches(&[(1, true), (2, false), (3, false), (4, true)]),
+            // The new packet opens the newest range above a gap.
+            due_now_and_searches(&[(1, true), (2, true), (4, true)]),
+        ];
+        assert_eq!(cases, [(true, 0), (true, 0), (false, 0), (true, 0)]);
+        // Below a newer non-eliciting packet, the range that holds the new packet decides.
+        assert!(!due_now_and_searches(&[(1, true), (5, false), (2, true)]).0);
+        assert!(due_now_and_searches(&[(1, true), (5, false), (3, true)]).0);
     }
 
     #[test]

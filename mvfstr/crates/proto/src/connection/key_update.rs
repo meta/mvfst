@@ -144,13 +144,29 @@ impl KeyPhases {
         }
     }
 
+    /// Returns whether a packet opened with `read` keys sets the discard time of the previous read
+    /// keys: a packet under the next keys does, and so does the first under the current ones while
+    /// previous keys are held.
+    pub(super) fn sets_discard_time(&self, read: ReadKey) -> bool {
+        match read {
+            ReadKey::Previous => false,
+            ReadKey::Current => self.first_recv.is_none() && self.previous.is_some(),
+            ReadKey::Next => true,
+        }
+    }
+
     /// Records that a packet with number `pn` opened with the current keys; the previous keys go at
-    /// `discard_at` if this is the first.
-    pub(super) fn on_received(&mut self, pn: u64, discard_at: Instant) {
+    /// `discard_at` if this is the first. `discard_at` is `None` only where `sets_discard_time` is
+    /// false.
+    pub(super) fn on_received(&mut self, pn: u64, discard_at: Option<Instant>) {
         if self.first_recv.is_none()
             && let Some(previous) = &mut self.previous
         {
-            previous.discard_at.get_or_insert(discard_at);
+            debug_assert!(
+                previous.discard_at.is_some() || discard_at.is_some(),
+                "the first packet under the current keys came without a discard time"
+            );
+            previous.discard_at = previous.discard_at.or(discard_at);
         }
         self.first_recv = Some(self.first_recv.map_or(pn, |first| first.min(pn)));
         self.largest_recv = Some(self.largest_recv.map_or(pn, |largest| largest.max(pn)));

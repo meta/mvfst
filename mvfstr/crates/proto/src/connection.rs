@@ -426,6 +426,9 @@ pub struct Connection {
     /// The received datagrams whose header a client parsed to look for a Retry.
     #[cfg(test)]
     retry_probes: u64,
+    /// Discard times computed for the previous 1-RTT read keys, for tests of their cost.
+    #[cfg(test)]
+    key_discard_times: u64,
     /// 0-RTT keys and parameters while they are in use.
     early: Option<Box<EarlyState>>,
     /// When an ack-eliciting packet last went out or the keepalive last fired: the keepalive
@@ -603,6 +606,8 @@ impl Connection {
             retry: None,
             #[cfg(test)]
             retry_probes: 0,
+            #[cfg(test)]
+            key_discard_times: 0,
             early: None,
             keepalive_base: setup.now,
             now: setup.now,
