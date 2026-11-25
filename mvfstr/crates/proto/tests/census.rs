@@ -8,7 +8,8 @@
 //! A census of the heap one connection holds. Each scenario runs a connected pair, takes one
 //! side's connection out of it and drops it: the bytes that the drop frees are the heap that this
 //! connection alone held. Each scenario prints that number and asserts that it is at most a pinned
-//! bound. The scenarios are (a) an idle pair after a handshake without session tickets, (b) a pair
+//! bound. The scenarios are (a) an idle pair after a handshake without session tickets, with a
+//! small certificate and again with a certificate chain the size of a production one, (b) a pair
 //! after one request and response, (c) a pair after an HTTP/3-shaped flight, and (d) an idle
 //! client after its session tickets arrive.
 //!
@@ -45,6 +46,7 @@ use mvfstr_tls::ManualTimeProvider;
 use mvfstr_tls::ServerVerification;
 use rustls::NamedGroup;
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::pki_types::UnixTime;
 
@@ -111,19 +113,25 @@ fn pages() -> u64 {
 }
 
 /// The most heap that an idle server holds after a handshake without session tickets.
-const IDLE_SERVER: usize = 4_147;
+const IDLE_SERVER: usize = 3_618;
 /// The most heap that an idle client holds after a handshake without session tickets.
-const IDLE_CLIENT: usize = 7_332;
+const IDLE_CLIENT: usize = 7_084;
 /// The most heap that a server holds after one request and response.
-const REQUEST_SERVER: usize = 24_859;
+const REQUEST_SERVER: usize = 24_330;
 /// The most heap that a client holds after one request and response.
-const REQUEST_CLIENT: usize = 28_044;
+const REQUEST_CLIENT: usize = 27_796;
 /// The most heap that a server holds after an HTTP/3-shaped flight.
-const H3_SERVER: usize = 77_907;
+const H3_SERVER: usize = 77_378;
 /// The most heap that a client holds after an HTTP/3-shaped flight.
-const H3_CLIENT: usize = 64_668;
+const H3_CLIENT: usize = 64_420;
 /// The most heap that an idle client holds after its session tickets arrive.
-const TICKETS_CLIENT: usize = 7_492;
+const TICKETS_CLIENT: usize = 7_244;
+/// The most heap that an idle server holds after a handshake with a production-size chain: no
+/// more than with a small certificate, since the server keeps nothing of its flight.
+const CHAIN_IDLE_SERVER: usize = IDLE_SERVER;
+/// The most heap that an idle client holds after a handshake with a production-size chain. The
+/// client keeps the server's certificates.
+const CHAIN_IDLE_CLIENT: usize = 14_565;
 
 /// Returns what ring adds to the heap of a connection on `side` when it is the only crypto
 /// backend: ring keeps its keys in Rust allocations, where aws-lc-rs keeps them in C.
@@ -131,7 +139,7 @@ fn ring_extra(side: Side) -> usize {
     match side {
         _ if cfg!(feature = "aws-lc-rs") => 0,
         Side::Server => 1_584,
-        Side::Client => 2_600,
+        Side::Client => 2_608,
     }
 }
 
@@ -155,34 +163,106 @@ const ORDER: SendOrder = SendOrder {
     order: 0,
 };
 
-/// Returns a lossless pair config. Its server sends session tickets after each handshake if
-/// `tickets`, as rustls does by default.
-fn config(tickets: bool) -> PairConfig {
+/// A certificate chain, the server's certificate first, and the server's key.
+type Identity = (Vec<CertificateDer<'static>>, PrivatePkcs8KeyDer<'static>);
+
+/// Returns the Ed25519 key with this seed. Ed25519 signatures have a fixed length and are
+/// deterministic, so each certificate, and each handshake, has the same size in every run.
+fn ed25519(seed: &[u8; 32]) -> PrivatePkcs8KeyDer<'static> {
     // RFC 8410: a PKCS #8 v1 document with the id-Ed25519 algorithm around the seed.
     const PREFIX: [u8; 16] = [
         0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
         0x20,
     ];
-    let key = PrivatePkcs8KeyDer::from([&PREFIX[..], b"mvfstr census test key 000000001"].concat());
-    let signing_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&key, &rcgen::PKCS_ED25519)
-        .expect("rcgen takes the Ed25519 key");
+    PrivatePkcs8KeyDer::from([&PREFIX[..], &seed[..]].concat())
+}
+
+fn key_pair(key: &PrivatePkcs8KeyDer<'_>) -> rcgen::KeyPair {
+    rcgen::KeyPair::from_pkcs8_der_and_sign_algo(key, &rcgen::PKCS_ED25519)
+        .expect("rcgen takes the Ed25519 key")
+}
+
+/// Returns a small self-signed certificate for localhost.
+fn self_signed() -> Identity {
+    let key = ed25519(b"mvfstr census test key 000000001");
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-        .and_then(|params| params.self_signed(&signing_key))
+        .and_then(|params| params.self_signed(&key_pair(&key)))
         .expect("rcgen makes a certificate");
+    (vec![cert.der().clone()], key)
+}
+
+/// The names in the server certificate of [`production_chain`].
+const CHAIN_NAMES: usize = 64;
+
+/// Returns a chain the size of a production one: a server certificate with many names, issued
+/// by an intermediate CA that a root CA issued, sent with the intermediate's certificate.
+fn production_chain() -> Identity {
+    let ca = |name: &str, constraints| {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("CA params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CountryName, "US");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "Example Trust Services");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.is_ca = rcgen::IsCa::Ca(constraints);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        params
+    };
+    let root = rcgen::CertifiedIssuer::self_signed(
+        ca("Example Root CA", rcgen::BasicConstraints::Unconstrained),
+        key_pair(&ed25519(b"mvfstr census root CA key 000001")),
+    )
+    .expect("rcgen makes the root certificate");
+    let intermediate = rcgen::CertifiedIssuer::signed_by(
+        ca(
+            "Example TLS Issuing CA 2026",
+            rcgen::BasicConstraints::Constrained(0),
+        ),
+        key_pair(&ed25519(b"mvfstr census issuing CA key 001")),
+        &root,
+    )
+    .expect("the root issues the intermediate certificate");
+    let names = std::iter::once("localhost".to_owned())
+        .chain(
+            (1..CHAIN_NAMES)
+                .map(|i| format!("service-{i:02}.frontend-pool.production-example.test")),
+        )
+        .collect::<Vec<_>>();
+    let mut params = rcgen::CertificateParams::new(names).expect("server params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "Example Services");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "edge.example.test");
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let key = ed25519(b"mvfstr census server key 0000001");
+    let cert = params
+        .signed_by(&key_pair(&key), &intermediate)
+        .expect("the intermediate issues the server certificate");
+    (vec![cert.der().clone(), intermediate.der().clone()], key)
+}
+
+/// Returns a lossless pair config whose server presents `identity`. Its server sends session
+/// tickets after each handshake if `tickets`, as rustls does by default.
+fn config(tickets: bool, (chain, key): Identity) -> PairConfig {
     let time = Arc::new(ManualTimeProvider::new(unix_now()));
     // One key share keeps the ClientHello in one datagram.
     let mut provider: CryptoProvider = mvfstr_crypto::default_provider();
     provider
         .kx_groups
         .retain(|group| group.name() == NamedGroup::X25519);
-    let mut server_tls = mvfstr_tls::server_config(
-        provider.clone(),
-        time.clone(),
-        vec![cert.der().clone()],
-        key.into(),
-        &[b"h3"],
-    )
-    .expect("a server TLS config");
+    let mut server_tls =
+        mvfstr_tls::server_config(provider.clone(), time.clone(), chain, key.into(), &[b"h3"])
+            .expect("a server TLS config");
     if !tickets {
         server_tls.send_tls13_tickets = 0;
     }
@@ -373,7 +453,7 @@ fn the_allocator_counts_live_bytes_and_allocations_of_a_page() {
 
 #[test]
 fn census_of_an_idle_pair_after_a_handshake_without_tickets() {
-    let mut pair = connected(config(false));
+    let mut pair = connected(config(false, self_signed()));
     println!(
         "census: a Connection takes {} bytes inline, which are not counted",
         size_of::<Connection>()
@@ -386,7 +466,7 @@ fn census_of_an_idle_pair_after_a_handshake_without_tickets() {
 
 #[test]
 fn census_after_one_request_and_response() {
-    let mut pair = connected(config(true));
+    let mut pair = connected(config(true, self_signed()));
     let id = send(&mut pair, Side::Client, Dir::Bi, REQUEST, true);
     let mut apps = Apps::default();
     apps.run(&mut pair, Duration::from_secs(1));
@@ -402,7 +482,7 @@ fn census_after_one_request_and_response() {
 
 #[test]
 fn census_after_an_http3_shaped_flight() {
-    let mut pair = connected(config(true));
+    let mut pair = connected(config(true, self_signed()));
     // Each side opens its control and QPACK streams, which stay open, and the client sends its
     // request in the same flight.
     let uni = [Side::Client, Side::Server]
@@ -424,7 +504,7 @@ fn census_after_an_http3_shaped_flight() {
 
 #[test]
 fn census_of_a_client_after_its_tickets_arrive() {
-    let mut pair = connected(config(true));
+    let mut pair = connected(config(true, self_signed()));
     let client = held(&mut pair, Side::Client);
     // The next connection resumes, so the client had stored a ticket before it was dropped.
     pair.reconnect();
@@ -437,4 +517,21 @@ fn census_of_a_client_after_its_tickets_arrive() {
     );
     let scenario = "(d) idle after the tickets arrive";
     check(scenario, Side::Client, client, TICKETS_CLIENT);
+}
+
+#[test]
+fn census_of_an_idle_pair_after_a_handshake_with_a_production_size_chain() {
+    let identity = production_chain();
+    let chain: usize = identity.0.iter().map(|cert| cert.len()).sum();
+    println!("census: the production-size chain takes {chain} bytes");
+    // A production chain, a server certificate and an intermediate's, takes 3 to 5 KB.
+    assert!((3_000..=5_000).contains(&chain), "a chain of {chain} bytes");
+    let mut pair = connected(config(false, identity));
+    let scenario = "(a) idle after a handshake with a production-size chain";
+    for (side, bound) in [
+        (Side::Server, CHAIN_IDLE_SERVER),
+        (Side::Client, CHAIN_IDLE_CLIENT),
+    ] {
+        check(scenario, side, held(&mut pair, side), bound);
+    }
 }

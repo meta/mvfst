@@ -1097,6 +1097,10 @@ impl Connection {
         if !self.handshake.complete && self.tls.is_handshake_complete() {
             self.complete_handshake()?;
         }
+        // After the handshake, TLS writes only rare session tickets, so the buffer is not kept.
+        if self.handshake.complete {
+            self.tls_out = Vec::new();
+        }
         Ok(())
     }
 

@@ -2809,3 +2809,46 @@ fn discarded_spaces_free_their_ack_ranges_and_sent_packet_rings() {
     let none: Vec<_> = held.iter().map(|&(case, ..)| (case, 0, [0; 4])).collect();
     assert_eq!(held, none, "the memory of the discarded spaces");
 }
+
+#[test]
+fn the_tls_output_buffer_is_freed_once_the_handshake_completes() {
+    fn conn(pair: &Pair, side: Side) -> &Connection {
+        match side {
+            Side::Client => pair.client.conn(),
+            Side::Server => pair.server.conn(),
+        }
+    }
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let mut held = Vec::new();
+    // The client completes its handshake a round trip before HANDSHAKE_DONE confirms it; the
+    // server completes and confirms it at once.
+    for side in [Side::Client, Side::Server] {
+        assert!(pair.run_until(epoch + LIMIT, |pair| conn(pair, side).handshake.complete));
+        let completed = conn(&pair, side);
+        if side == Side::Client {
+            assert!(
+                !completed.handshake.confirmed,
+                "the client is not yet confirmed"
+            );
+        }
+        held.push((side, "complete", completed.tls_out.capacity()));
+    }
+    // A client reads session tickets after its handshake, and TLS writes nothing in answer.
+    let quiet = pair.now + Duration::from_millis(200);
+    pair.run(quiet);
+    assert!(
+        conn(&pair, Side::Client).spaces[Space::Data.index()]
+            .crypto_recv
+            .read_offset()
+            > 0,
+        "the client read the server's session tickets"
+    );
+    for side in [Side::Client, Side::Server] {
+        held.push((side, "quiet", conn(&pair, side).tls_out.capacity()));
+    }
+    let none: Vec<_> = held
+        .iter()
+        .map(|&(side, moment, _)| (side, moment, 0))
+        .collect();
+    assert_eq!(held, none, "the capacity of the TLS output buffer");
+}

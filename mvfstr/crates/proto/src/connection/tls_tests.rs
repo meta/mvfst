@@ -8,6 +8,7 @@
 //! Tests of connections whose handshake runs on a TLS host outside them, over the pair harness of
 //! [`crate::testing`], with [`RustlsHost`] as the host.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -1033,4 +1034,89 @@ fn a_server_reuses_the_crypto_page_of_the_client_hello_for_the_finished() {
         "the server's ClientHello and the client's Finished share one CRYPTO page"
     );
     assert!(pair.handshake(epoch + LIMIT));
+}
+
+/// A server's host that holds back the session tickets rustls writes in the step that completes
+/// the handshake, and sends them in its answer to the `WriteTicket` input instead, as a host that
+/// writes tickets on request does. `sent` is the number of ticket bytes in that answer.
+struct TicketsOnRequest {
+    inner: RustlsHost,
+    tickets: Vec<u8>,
+    sent: Rc<Cell<usize>>,
+}
+
+impl TlsHost for TicketsOnRequest {
+    fn handle(&mut self, conn: TlsConnId, input: TlsInput<'_>) -> TlsPoll {
+        let ticket = matches!(input, TlsInput::WriteTicket { .. });
+        let TlsPoll::Ready(mut step) = self.inner.handle(conn, input) else {
+            return TlsPoll::Pending;
+        };
+        let one_rtt = &mut step.crypto[Level::OneRtt as usize];
+        if ticket {
+            *one_rtt = std::mem::take(&mut self.tickets);
+            self.sent.set(one_rtt.len());
+        } else {
+            self.tickets.append(one_rtt);
+        }
+        TlsPoll::Ready(step)
+    }
+
+    fn poll_ready(&mut self) -> Option<(TlsConnId, TlsStep)> {
+        self.inner.poll_ready()
+    }
+
+    fn cancel(&mut self, conn: TlsConnId) {
+        self.inner.cancel(conn);
+    }
+}
+
+#[test]
+fn a_hosts_tickets_after_the_handshake_leave_no_tls_output_buffer() {
+    let setup = Setup::default();
+    let mut held = Vec::new();
+    for external_client in [false, true] {
+        // Each run has its own configs, so that both runs make a full handshake.
+        let (server_tls, client_tls) = setup.rustls();
+        let client = if external_client {
+            ClientTls::External
+        } else {
+            ClientTls::Rustls(client_tls.clone())
+        };
+        let epoch = crate::recovery::test_epoch();
+        let config = setup.pair_with(ServerTls::External, client);
+        let mut pair = Pair::new(epoch, unix_now(), config);
+        let sent = Rc::new(Cell::new(0));
+        let host = TicketsOnRequest {
+            inner: RustlsHost::server(server_tls),
+            tickets: Vec::new(),
+            sent: sent.clone(),
+        };
+        pair.set_tls_host(Side::Server, Box::new(host), Duration::ZERO);
+        if external_client {
+            let host = RustlsHost::client(client_tls);
+            pair.set_tls_host(Side::Client, Box::new(host), Duration::ZERO);
+        }
+        assert!(pair.handshake(epoch + LIMIT));
+        pair.run(pair.now + Duration::from_millis(200));
+        // The tickets pass through the server's TLS output buffer after its handshake completed.
+        assert!(sent.get() > 0, "the host sends the tickets when asked");
+        assert!(
+            pair.client.conn().spaces[Space::Data.index()]
+                .crypto_recv
+                .read_offset()
+                > 0,
+            "the client reads the tickets"
+        );
+        for (side, peer) in [(Side::Server, &pair.server), (Side::Client, &pair.client)] {
+            held.push((external_client, side, peer.conn().tls_out.capacity()));
+        }
+    }
+    let none: Vec<_> = held
+        .iter()
+        .map(|&(external_client, side, _)| (external_client, side, 0))
+        .collect();
+    assert_eq!(
+        held, none,
+        "the capacity of the TLS output buffer, by whether the client runs on a host"
+    );
 }

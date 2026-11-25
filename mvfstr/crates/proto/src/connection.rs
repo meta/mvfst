@@ -410,7 +410,7 @@ pub struct Connection {
     /// Whether keys or handshake progress may have made buffered packets processable.
     replay_due: bool,
     crypto_pool: PagePool,
-    /// TLS output, reused.
+    /// TLS output, reused during the handshake.
     tls_out: Vec<u8>,
     /// The sent-frame records of the packets being built, one list per space, reused.
     sent_frames: [Vec<crate::recovery::SentFrame>; 3],
