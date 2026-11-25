@@ -481,7 +481,7 @@ impl Connection {
                 TlsSession::external_client(setup.version, &server_name.to_str(), params)?
             }
         };
-        let mut conn = Self::new(Side::Client, setup, session)?;
+        let mut conn = Self::new(setup.cids.reset_token(&setup.local_cid), setup, session)?;
         // A client does not need to validate the path, which it chose.
         conn.path.validated = true;
         let now = conn.idle.base;
@@ -501,6 +501,7 @@ impl Connection {
         without_alpn: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<Self, TlsError> {
         let setup = setup.with_capped_horizon();
+        let token = setup.cids.reset_token(&setup.local_cid);
         let params = params::local_params(
             &setup.transport,
             setup.horizon,
@@ -508,8 +509,7 @@ impl Connection {
                 initial_scid: setup.local_cid,
                 original_dcid: Some(setup.original_dcid),
                 // With zero-length IDs every connection would share one token.
-                reset_token: (!setup.local_cid.is_empty())
-                    .then(|| setup.cids.reset_token(&setup.local_cid)),
+                reset_token: (!setup.local_cid.is_empty()).then_some(token),
                 retry_scid: None,
             },
         );
@@ -527,13 +527,13 @@ impl Connection {
             (ServerTls::External, _) => TlsSession::external_server(setup.version, params)?,
         };
         let peer_scid = setup.remote_cid;
-        let mut conn = Self::new(Side::Server, setup, session)?;
+        let mut conn = Self::new(token, setup, session)?;
         conn.peer_initial_scid = Some(peer_scid);
         Ok(conn)
     }
 
-    fn new(side: Side, setup: ConnSetup, tls: TlsSession) -> Result<Self, TlsError> {
-        let version = setup.version;
+    fn new(token: ResetToken, setup: ConnSetup, tls: TlsSession) -> Result<Self, TlsError> {
+        let (side, version) = (tls.side(), setup.version);
         let initial = mvfstr_crypto::initial_keys(version, &setup.original_dcid, side)
             .map_err(|_| TlsError::UnsupportedVersion(version))?;
         let config = setup.transport;
@@ -551,7 +551,7 @@ impl Connection {
         let mut spaces: [PacketSpace; 3] = Default::default();
         spaces[Space::Initial.index()].keys = Some(initial);
         let cids = Cids {
-            local: LocalCids::new(setup.local_cid, setup.cids.reset_token(&setup.local_cid)),
+            local: LocalCids::new(setup.local_cid, token),
             peer: PeerCids::new(setup.remote_cid, config.active_connection_id_limit()),
         };
         Ok(Self {

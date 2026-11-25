@@ -146,6 +146,8 @@ pub fn parse_v2(cid: &[u8]) -> Option<MvfstCid> {
 thread_local! {
     /// How many IDs [`parse_v2`] has read on this thread.
     pub(crate) static V2_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// How many reset tokens [`CidGenerator::reset_token`] has derived on this thread.
+    pub(crate) static RESET_TOKENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Where the version bits of an mvfst server connection ID start, at the top of its first byte.
@@ -197,6 +199,8 @@ impl CidGenerator {
 
     /// Returns the stateless reset token of `cid`.
     pub(crate) fn reset_token(&self, cid: &ConnectionId) -> ResetToken {
+        #[cfg(test)]
+        RESET_TOKENS.with(|tokens| tokens.set(tokens.get() + 1));
         let mut token = [0; ResetToken::LEN];
         hkdf_expand_label(&self.reset_prk, b"mvfstr reset", cid, &mut token)
             .expect("should fit: a 32-byte key, a short label and an ID of at most 20 bytes");

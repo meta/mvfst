@@ -223,6 +223,45 @@ fn both_sides_issue_connection_ids_up_to_the_peer_limit() {
 }
 
 #[test]
+fn each_side_derives_the_reset_token_of_its_handshake_id_once() {
+    let derived = || crate::cid::RESET_TOKENS.with(std::cell::Cell::get);
+    let before = derived();
+    let (epoch, mut pair) = start(Setup::default().pair());
+    assert_eq!(
+        derived() - before,
+        1,
+        "a client derives the token once, for its own IDs"
+    );
+    let before = derived();
+    assert!(pair.run_until(epoch + LIMIT, |pair| pair.server.conn.is_some()));
+    assert_eq!(
+        derived() - before,
+        1,
+        "a server derives the token once, for its transport parameters and its own IDs"
+    );
+
+    let mut config = Setup::default().pair();
+    config.client_endpoint = Some(config.endpoint.clone());
+    config.endpoint = EndpointConfig::builder([7; 32])
+        .local_cid_len(0)
+        .build()
+        .unwrap();
+    let (epoch, mut pair) = start(config);
+    let before = derived();
+    assert!(pair.run_until(epoch + LIMIT, |pair| pair.server.conn.is_some()));
+    assert!(
+        derived() - before <= 1,
+        "a server with zero-length IDs derives the token at most once"
+    );
+    assert!(pair.handshake(epoch + LIMIT));
+    let params = pair.client.conn().handshake.peer_params.as_ref().unwrap();
+    assert_eq!(
+        params.decoded.stateless_reset_token, None,
+        "with zero-length IDs every connection would share one token, so the server leaves it out"
+    );
+}
+
+#[test]
 fn a_retired_connection_id_is_replaced_and_no_longer_routed() {
     let mut pair = settled(&Setup::default());
     let now = pair.now;
