@@ -31,6 +31,7 @@ impl ConnectionId {
     };
 
     /// Copies an ID of at most [`MAX_LEN`](Self::MAX_LEN) bytes.
+    #[inline]
     pub fn new(id: &[u8]) -> Result<Self, CidTooLong> {
         if id.len() > Self::MAX_LEN {
             return Err(CidTooLong);
@@ -44,8 +45,21 @@ impl ConnectionId {
     }
 
     /// Returns the ID's bytes.
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
+    }
+
+    /// Returns the ID's length in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    /// Returns whether this is the zero-length ID.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -58,12 +72,14 @@ impl Default for ConnectionId {
 impl Deref for ConnectionId {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &[u8] {
         self.as_slice()
     }
 }
 
 impl AsRef<[u8]> for ConnectionId {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
@@ -156,6 +172,27 @@ mod tests {
         }
         assert!(ConnectionId::new(&[]).unwrap().is_empty());
         assert_eq!(ConnectionId::new(&[]).unwrap(), ConnectionId::EMPTY);
+    }
+
+    // These call `len` and `is_empty` by path: without them, `id.len()` would still compile
+    // through `Deref` to the slice.
+
+    #[test]
+    fn len_is_the_slice_length() {
+        let twenty: Vec<u8> = (1..=20).collect();
+        for n in [0, 8, 20] {
+            let id = ConnectionId::new(&twenty[..n]).unwrap();
+            assert_eq!(ConnectionId::len(&id), id.as_slice().len(), "{n}-byte ID");
+        }
+    }
+
+    #[test]
+    fn is_empty_only_for_the_zero_length_id() {
+        let twenty: Vec<u8> = (1..=20).collect();
+        for n in [0, 8, 20] {
+            let id = ConnectionId::new(&twenty[..n]).unwrap();
+            assert_eq!(ConnectionId::is_empty(&id), n == 0, "{n}-byte ID");
+        }
     }
 
     #[test]

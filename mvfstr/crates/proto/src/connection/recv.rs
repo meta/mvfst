@@ -650,13 +650,7 @@ impl Connection {
                 });
             }
             received.ack_eliciting |= kind.is_ack_eliciting();
-            received.probing &= matches!(
-                kind,
-                FrameKind::Padding
-                    | FrameKind::PathChallenge
-                    | FrameKind::PathResponse
-                    | FrameKind::NewConnectionId
-            );
+            received.probing &= kind.is_probing();
             match frame {
                 Frame::Padding { .. } | Frame::Ping => {}
                 Frame::Ack(ack) => self.recv_ack(ack_time, space, &ack)?,

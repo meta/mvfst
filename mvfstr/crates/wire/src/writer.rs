@@ -475,6 +475,7 @@ impl<'a> PacketWriter<'a> {
     /// Appends `bytes`, ack-eliciting frames the caller encoded, possibly one frame in several
     /// pieces written in order: the stream and CRYPTO send buffers write their frames this way.
     /// Fails with [`Full`], leaving the packet unchanged, if the bytes do not fit.
+    #[inline]
     pub fn put_ack_eliciting_bytes(&mut self, bytes: &[u8]) -> Result<(), Full> {
         let end = self
             .pos

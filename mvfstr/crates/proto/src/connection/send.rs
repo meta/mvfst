@@ -621,18 +621,19 @@ impl Connection {
     /// packet number's start, and the AEAD tag follows the payload.
     pub(super) fn packet_room(&self, space: Space, path: PathId, payload: usize) -> usize {
         let dcid = self.dcid_of(path).map_or(0, |cid| cid.len());
-        let scid = self.local_cid.len();
+        // Type, version, both connection IDs with their lengths and a Length field of up to 4
+        // bytes.
+        let long = || 1 + 4 + 1 + dcid + 1 + self.local_cid.len() + 4;
         let pn_offset = match space {
-            // Type, version, both connection IDs with their lengths, the token with its length
-            // and a Length field of up to 4 bytes.
+            // An Initial packet's long header also holds the token with its length.
             Space::Initial => {
                 let token = self.retry.as_ref().map_or(0, |retry| retry.token.len());
                 let token_len = VarInt::from_u64(token as u64).map_or(8, VarInt::encoded_size);
-                1 + 4 + 1 + dcid + 1 + scid + token_len + token + 4
+                long() + token_len + token
             }
-            Space::Handshake => 1 + 4 + 1 + dcid + 1 + scid + 4,
+            Space::Handshake => long(),
             // A 0-RTT packet's long header is laid out as a Handshake packet's.
-            Space::Data if self.zero_rtt_write_keys().is_some() => 1 + 4 + 1 + dcid + 1 + scid + 4,
+            Space::Data if self.zero_rtt_write_keys().is_some() => long(),
             Space::Data => 1 + dcid,
         };
         (pn_offset + 4 + TAG_LEN).saturating_add(payload.max(1))

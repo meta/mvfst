@@ -67,6 +67,7 @@ impl VarInt {
     /// Encodings longer than necessary are accepted, as RFC 9000 allows; callers that must reject
     /// them, such as the frame type decoder, compare the length read with
     /// [`encoded_size`](Self::encoded_size).
+    #[inline]
     pub fn decode(input: &[u8]) -> Result<(VarInt, usize), UnexpectedEnd> {
         let first = *input.first().ok_or(UnexpectedEnd)?;
         let size = Self::size_from_first_byte(first);
@@ -81,6 +82,7 @@ impl VarInt {
 
     /// Writes the shortest encoding at the start of `out` and returns its length. On error `out` is
     /// unchanged.
+    #[inline]
     pub fn encode(self, out: &mut [u8]) -> Result<usize, BufferTooShort> {
         let size = self.encoded_size();
         let out = out.get_mut(..size).ok_or(BufferTooShort)?;
@@ -106,6 +108,7 @@ impl VarInt {
 
     /// Writes the value big-endian over all of `out` (1, 2, 4 or 8 bytes, large enough for the
     /// value) with the length prefix in the top two bits.
+    #[inline]
     fn write(self, out: &mut [u8]) {
         let prefix = match out.len() {
             1 => 0b00,

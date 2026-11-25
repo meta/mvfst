@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use mvfstr_crypto::PacketKeys;
+use mvfstr_crypto::TAG_LEN;
 use mvfstr_crypto::retry_integrity_tag;
 use mvfstr_crypto::unprotect_header;
 use mvfstr_wire::ConnectionId;
@@ -21,7 +22,9 @@ use mvfstr_wire::Dir;
 use mvfstr_wire::Frame;
 use mvfstr_wire::Frames;
 use mvfstr_wire::Header;
+use mvfstr_wire::HeaderSpec;
 use mvfstr_wire::PacketType;
+use mvfstr_wire::PacketWriter;
 use mvfstr_wire::Side;
 use mvfstr_wire::StreamId;
 use mvfstr_wire::TransportErrorCode;
@@ -47,10 +50,12 @@ use crate::Initiator;
 use crate::InlineSealer;
 use crate::KeepAlive;
 use crate::OpenError;
+use crate::PathId;
 use crate::ServerConfig;
 use crate::StreamReady;
 use crate::TransportConfig;
 use crate::config::TransportConfigBuilder;
+use crate::recovery::Space;
 use crate::testing::Loss;
 use crate::testing::Pair;
 use crate::testing::PairConfig;
@@ -1073,6 +1078,78 @@ fn a_retry_after_0rtt_sends_the_early_data_again() {
     assert_eq!(client.poll_event(), Some(ConnEvent::EarlyDataWritable));
     assert_eq!(client.poll_event(), None);
     assert_eq!(client.readiness().count(), 0);
+}
+
+/// Checks that `packet_room` in `space` is the header a writer lays out for a `ty` packet on the
+/// first path, at a 4-byte packet number and Length field, plus the payload and the AEAD tag.
+fn assert_room_is_the_written_header(conn: &Connection, space: Space, ty: PacketType) {
+    let (version, dcid, scid) = (conn.version, conn.remote_cid(), conn.local_cid);
+    let token = conn
+        .retry
+        .as_ref()
+        .map_or(&[][..], |retry| &retry.token[..]);
+    let header = match ty {
+        PacketType::Initial => HeaderSpec::Initial {
+            version,
+            dcid,
+            scid,
+            token,
+        },
+        PacketType::ZeroRtt => HeaderSpec::ZeroRtt {
+            version,
+            dcid,
+            scid,
+        },
+        PacketType::Handshake => HeaderSpec::Handshake {
+            version,
+            dcid,
+            scid,
+        },
+        PacketType::OneRtt => HeaderSpec::OneRtt {
+            dcid,
+            spin: false,
+            key_phase: false,
+        },
+    };
+    // The writer sizes the Length field for its buffer: 4 bytes from 2^14 bytes on.
+    let mut buf = vec![0; 1 << 14];
+    let writer = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
+    for payload in [1, 1_000] {
+        assert_eq!(
+            conn.packet_room(space, PathId(0), payload),
+            writer.header_len() + payload + TAG_LEN,
+            "{ty:?} packet with {payload} payload bytes, {}-byte source ID",
+            scid.len()
+        );
+    }
+}
+
+#[test]
+fn packet_room_holds_the_header_of_every_packet_type() {
+    let config = resumable(&early_setup());
+    let (epoch, mut pair) = start(config.clone());
+    let client = pair.client.conn_mut();
+    assert!(!client.local_cid.is_empty());
+    assert!(client.zero_rtt_write_keys().is_some());
+    assert_room_is_the_written_header(client, Space::Initial, PacketType::Initial);
+    assert_room_is_the_written_header(client, Space::Handshake, PacketType::Handshake);
+    assert_room_is_the_written_header(client, Space::Data, PacketType::ZeroRtt);
+
+    let odcid = client.original_dcid;
+    let retry = retry_packet(client, cid(0xab), b"retry token", odcid);
+    deliver(client, epoch, server_addr(), retry);
+    assert!(client.retry.is_some());
+    assert_room_is_the_written_header(client, Space::Initial, PacketType::Initial);
+    assert_room_is_the_written_header(client, Space::Data, PacketType::ZeroRtt);
+
+    let (_, pair) = handshake(config);
+    let server = pair.server.conn();
+    assert!(!server.local_cid.is_empty());
+    assert_room_is_the_written_header(server, Space::Initial, PacketType::Initial);
+    assert_room_is_the_written_header(server, Space::Handshake, PacketType::Handshake);
+    for conn in [pair.client.conn(), server] {
+        assert_room_is_the_written_header(conn, Space::Data, PacketType::OneRtt);
+    }
 }
 
 #[test]
