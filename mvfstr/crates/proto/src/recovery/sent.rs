@@ -883,6 +883,14 @@ impl SentPackets {
         self.pkts.len()
     }
 
+    /// Returns whether the oldest record is outstanding and in flight; while it is,
+    /// [`SentPackets::prune`] has nothing to drop.
+    pub fn front_in_flight(&self) -> bool {
+        self.pkts.front().is_some_and(|p| {
+            p.state == PktState::Outstanding && p.flags.contains(SentFlags::IN_FLIGHT)
+        })
+    }
+
     /// Returns the largest packet number the peer has acknowledged.
     pub fn largest_acked(&self) -> Option<u64> {
         self.largest_acked
@@ -1430,6 +1438,77 @@ mod tests {
         s.push_frame(SentFrame::Ping);
         s.on_sent(3, t0 + 2 * MS, 40, ELICITING, 2).unwrap();
         assert_eq!(frames(&s.get(3).unwrap()), vec![SentFrame::Ping]);
+    }
+
+    #[test]
+    fn the_front_is_in_flight_only_while_outstanding_and_counted_in_flight() {
+        let t0 = crate::recovery::test_epoch();
+        let mut s = SentPackets::new(t0, 0);
+        assert!(!s.front_in_flight(), "an empty ring");
+        s.on_sent(0, t0, 1200, ELICITING, 0).unwrap();
+        s.on_sent(1, t0 + MS, 1200, ELICITING, 1).unwrap();
+        assert!(s.front_in_flight(), "an outstanding in-flight packet");
+        ack(&mut s, &[0..=0], t0 + 10 * MS).unwrap();
+        assert!(!s.front_in_flight(), "an acknowledged packet");
+        s.prune(t0);
+        assert!(
+            s.front_in_flight(),
+            "the next packet, once the acknowledged one is pruned"
+        );
+
+        let mut s = ring(t0, 4);
+        ack(&mut s, &[3..=3], t0 + 10 * MS).unwrap();
+        let (_, events) = detect(&mut s, t0 + 10 * MS, &params(Duration::from_secs(1)));
+        assert_eq!(events.iter().map(|e| e.1).collect::<Vec<_>>(), [0]);
+        assert!(!s.front_in_flight(), "a packet declared lost");
+
+        let mut s = ring(t0, 2);
+        s.on_tx_dropped(TxSeqRange { start: 0, end: 1 }, |_| {});
+        assert!(
+            !s.front_in_flight(),
+            "a packet whose datagram did not leave"
+        );
+
+        let mut s = SentPackets::new(t0, 0);
+        s.on_sent(0, t0, 40, SentFlags::empty(), 0).unwrap();
+        s.on_sent(1, t0, 1200, ELICITING, 1).unwrap();
+        assert!(!s.front_in_flight(), "an ACK-only packet");
+
+        let mut s = SentPackets::new(t0, 0);
+        s.on_sent(1, t0, 1200, ELICITING, 0).unwrap();
+        assert!(!s.front_in_flight(), "a skipped packet number");
+
+        // Pruning keeps any outstanding in-flight record, whatever else it carried and wherever it
+        // went.
+        let mut s = SentPackets::new(t0, 0);
+        s.on_sent(0, t0, 1200, SentFlags::IN_FLIGHT, 0).unwrap();
+        assert!(s.front_in_flight(), "a PADDING-only packet");
+        let mut s = SentPackets::new(t0, 0);
+        s.on_sent(0, t0, 1200, ELICITING | SentFlags::OFF_PATH, 0)
+            .unwrap();
+        assert!(
+            s.front_in_flight(),
+            "a packet sent to the alternate path's address"
+        );
+    }
+
+    #[test]
+    fn pruning_changes_nothing_while_the_front_is_in_flight() {
+        // Behind the outstanding front are records that this cutoff would drop from the front:
+        // acknowledged, ACK-only, skipped and dropped ones.
+        let t0 = crate::recovery::test_epoch();
+        let mut s = ring(t0, 2);
+        s.on_sent(2, t0, 40, SentFlags::empty(), 2).unwrap();
+        s.on_sent(4, t0, 1200, ELICITING, 3).unwrap();
+        s.on_sent(5, t0, 1200, ELICITING, 4).unwrap();
+        s.on_sent(6, t0, 1200, ELICITING, 5).unwrap();
+        ack(&mut s, &[1..=1], t0 + 10 * MS).unwrap();
+        s.on_tx_dropped(TxSeqRange { start: 4, end: 5 }, |_| {});
+        ack(&mut s, &[6..=6], t0 + 10 * MS).unwrap();
+        assert!(s.front_in_flight());
+        let before = format!("{s:?}");
+        assert_eq!(s.prune(t0 + Duration::from_secs(3600)), 0);
+        assert_eq!(format!("{s:?}"), before);
     }
 
     #[test]

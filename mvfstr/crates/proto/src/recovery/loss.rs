@@ -231,6 +231,10 @@ pub struct LossRecovery {
     delivery: Delivery,
     /// The per-packet losses of the last ACK frame or loss timeout, reused.
     lost_samples: Vec<LostSample>,
+    /// How many times [`LossRecovery::prune`] computed how long records are kept, for tests of
+    /// its cost.
+    #[cfg(test)]
+    keep_computed: u64,
 }
 
 /// The connection's delivery state across the spaces, as the BBR draft defines it, with the
@@ -354,6 +358,8 @@ impl LossRecovery {
             loss_confirmed: false,
             delivery: Delivery::new(epoch),
             lost_samples: Vec::new(),
+            #[cfg(test)]
+            keep_computed: 0,
         })
     }
 
@@ -788,6 +794,13 @@ impl LossRecovery {
     /// that, as one found after a PTO usually is, is forgotten at once and counts as real: the
     /// ACK that declared it lost would have covered the packet had it reached the peer in time.
     fn prune(&mut self, space: Space, now: Instant) {
+        if self.spaces[space.index()].front_in_flight() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.keep_computed += 1;
+        }
         let keep = self.loss_delay()
             + self.rtt.pto_base(self.config.granularity)
             + self.peer_max_ack_delay;
@@ -1789,5 +1802,37 @@ mod tests {
             "{}",
             r.space(Space::Data).tracked()
         );
+    }
+
+    #[test]
+    fn sends_behind_an_in_flight_front_skip_the_prune_time_math() {
+        // On the send path the oldest record is usually outstanding and in flight, so pruning has
+        // nothing to drop and does not compute how long records are kept.
+        let t0 = crate::recovery::test_epoch();
+        let mut r = recovery(Side::Server, t0);
+        send(&mut r, Space::Data, 100, t0);
+        assert_eq!(r.keep_computed, 0);
+        assert_eq!(r.space(Space::Data).tracked(), 100);
+        // After an ACK that leaves the in-flight front unacknowledged, pruning skips that math too.
+        ack(&mut r, Space::Data, &[1..=2], Duration::ZERO, t0 + 100 * MS);
+        assert_eq!((r.keep_computed, r.space(Space::Data).tracked()), (0, 100));
+        // An acknowledged front is pruned at once.
+        ack(
+            &mut r,
+            Space::Data,
+            &[0..=99],
+            Duration::ZERO,
+            t0 + 200 * MS,
+        );
+        assert_eq!((r.keep_computed, r.space(Space::Data).tracked()), (1, 0));
+
+        // An ACK-only sender's records age out only when it sends, so each of its sends prunes.
+        let mut r = recovery(Side::Client, t0);
+        for pn in 0..100 {
+            let at = t0 + pn as u32 * MS;
+            r.on_packet_sent(Space::Data, pn, at, 50, SentFlags::empty(), pn)
+                .unwrap();
+        }
+        assert_eq!(r.keep_computed, 100);
     }
 }
