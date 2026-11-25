@@ -21,7 +21,7 @@ using namespace testing;
 
 namespace quic::test {
 
-using UnderlyingFrameType = std::underlying_type<FrameType>::type;
+using UnderlyingFrameType = std::underlying_type_t<FrameType>;
 
 class DecodeTest : public Test {};
 
