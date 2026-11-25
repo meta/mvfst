@@ -67,7 +67,7 @@ class HaberdasheryCipher final : public ContiguousAead {
     return Init(&context_, key->key->data(), key->key->length()) != 0;
   }
 
-  bool seal(
+  [[nodiscard]] bool seal(
       std::span<const uint8_t> nonce,
       std::span<const uint8_t> aad,
       std::span<const uint8_t> plaintext,
@@ -87,7 +87,7 @@ class HaberdasheryCipher final : public ContiguousAead {
                tag.size()) != 0;
   }
 
-  bool open(
+  [[nodiscard]] bool open(
       std::span<const uint8_t> nonce,
       std::span<const uint8_t> aad,
       std::span<const uint8_t> ciphertext,
