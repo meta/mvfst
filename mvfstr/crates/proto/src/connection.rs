@@ -26,6 +26,8 @@ mod buffered;
 #[cfg(test)]
 mod cc_tests;
 #[cfg(test)]
+mod client_auth_tests;
+#[cfg(test)]
 mod client_tests;
 #[cfg(test)]
 mod datagram_tests;
@@ -84,6 +86,7 @@ use mvfstr_wire::Version;
 pub use params::RawTransportParams;
 pub use params::RawTransportParamsIter;
 use path::AltPath;
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::ServerName;
 
 use crate::AlpnPolicy;
@@ -1020,6 +1023,17 @@ impl Connection {
     /// Returns the negotiated ALPN protocol, once the handshake has agreed on one.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.tls.alpn()
+    }
+
+    /// Returns the certificate chain the peer presented, end-entity certificate first, once TLS has
+    /// verified it, and through the rest of the connection; on a resumed connection, the chain is
+    /// the one verified when the session was first established. A client has the server's chain. A
+    /// server has the client's when it is configured to request client certificates
+    /// ([`mvfstr_tls::server_config_with_client_auth`]) and the client presented one; a client that
+    /// did not present one leaves it `None`. A connection whose handshake runs on a
+    /// [`TlsHost`](mvfstr_tls::TlsHost) returns `None`.
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        self.tls.peer_certificates()
     }
 
     /// Returns the build horizon H_conn: how far ahead of now the connection builds paced runs,

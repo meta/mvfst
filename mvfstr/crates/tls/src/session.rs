@@ -21,6 +21,7 @@ use rustls::ClientConfig;
 use rustls::HandshakeType;
 use rustls::PeerMisbehaved;
 use rustls::ServerConfig;
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::ServerName;
 use rustls::quic;
 
@@ -328,6 +329,7 @@ enum RustlsState {
     Finished {
         peer_transport_params: Option<Box<[u8]>>,
         alpn: Option<Box<[u8]>>,
+        peer_certificates: Option<Box<[CertificateDer<'static>]>>,
         early_data_accepted: bool,
     },
 }
@@ -568,6 +570,19 @@ impl TlsSession {
         }
     }
 
+    /// Returns the certificate chain the peer presented, end-entity certificate first, once TLS has
+    /// verified it and the peer's signature over the handshake; on a resumed connection, the chain
+    /// is the one verified when the session was first established. A client has the server's chain.
+    /// A server has the client's only when it is configured to request client certificates and the
+    /// client presented one, and keeps it after [`finish`](Self::finish). An External session
+    /// returns `None`: its host does not report the chain.
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        match self {
+            Self::Rustls(session) => session.peer_certificates(),
+            Self::External(_) => None,
+        }
+    }
+
     /// Returns whether the handshake is complete (RFC 9001): this endpoint has sent its Finished,
     /// that is, drained it with [`write_crypto`](Self::write_crypto), and verified the peer's.
     pub fn is_handshake_complete(&self) -> bool {
@@ -611,8 +626,8 @@ impl TlsSession {
     }
 
     /// Returns the rustls connection of a session on rustls until [`finish`](Self::finish) frees
-    /// it, for what this wrapper does not expose (negotiated suite and key exchange group, peer
-    /// certificates, exporters).
+    /// it, for what this wrapper does not expose (negotiated suite and key exchange group,
+    /// exporters).
     pub fn rustls(&self) -> Option<&quic::Connection> {
         match self {
             Self::Rustls(session) => session.conn(),
@@ -823,6 +838,15 @@ impl RustlsSession {
         }
     }
 
+    fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        match &self.state {
+            RustlsState::Running(conn) => conn.peer_certificates(),
+            RustlsState::Finished {
+                peer_certificates, ..
+            } => peer_certificates.as_deref(),
+        }
+    }
+
     fn is_early_data_accepted(&self) -> bool {
         match &self.state {
             RustlsState::Running(conn) => match &**conn {
@@ -857,6 +881,7 @@ impl RustlsSession {
         self.state = RustlsState::Finished {
             peer_transport_params: self.peer_transport_params().map(Box::from),
             alpn: self.alpn().map(Box::from),
+            peer_certificates: self.peer_certificates().map(Box::from),
             early_data_accepted: self.is_early_data_accepted(),
         };
     }

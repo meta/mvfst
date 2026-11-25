@@ -1003,3 +1003,51 @@ fn webpki_verification_checks_the_name_and_expiry_at_the_callers_time() {
     time.set(unix(1_900_000_000));
     assert_eq!(crypto_error(handshake("localhost")), (Side::Client, 0x012d));
 }
+
+#[test]
+fn each_side_has_the_others_certificate_chain_and_a_server_keeps_it_after_finish() {
+    let (ca, client_chain, client_key) = ca_and_leaf();
+    let (server_chain, server_key) = self_signed("localhost");
+    let provider = mvfstr_crypto::default_provider();
+    let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca).unwrap();
+    let server_config = mvfstr_tls::server_config_with_client_auth(
+        provider.clone(),
+        time.clone(),
+        server_chain.clone(),
+        server_key,
+        &[b"h3"],
+        Arc::new(roots),
+    )
+    .unwrap();
+    let client_config = mvfstr_tls::client_config_with_cert(
+        provider,
+        time,
+        ServerVerification::AcceptAnyCertificate,
+        &[b"h3"],
+        client_chain.clone(),
+        client_key,
+    )
+    .unwrap();
+    let client = TlsSession::client(
+        Arc::new(client_config),
+        Version::V1,
+        localhost(),
+        Vec::new(),
+    );
+    let server = TlsSession::server(Arc::new(server_config), Version::V1, Vec::new());
+    let (mut client, mut server) = (Peer::new(client.unwrap()), Peer::new(server.unwrap()));
+    assert_eq!(server.tls.peer_certificates(), None, "nothing received yet");
+    run(&mut client, &mut server).unwrap();
+
+    assert!(server.tls.is_handshake_complete());
+    assert_eq!(server.tls.peer_certificates(), Some(&client_chain[..]));
+    assert_eq!(client.tls.peer_certificates(), Some(&server_chain[..]));
+    server.tls.finish();
+    assert!(
+        server.tls.rustls().is_none(),
+        "finish dropped the rustls connection"
+    );
+    assert_eq!(server.tls.peer_certificates(), Some(&client_chain[..]));
+}

@@ -978,7 +978,8 @@ pub const SUPPORTED_VERSIONS: [Version; 5] = [
 #[derive(Clone, Debug)]
 pub enum ServerTls {
     /// On rustls, inside each connection, with this config, which supplies certificates, cipher
-    /// suites, key exchange groups and ALPN protocols.
+    /// suites, key exchange groups, ALPN protocols and whether clients are asked for a
+    /// certificate.
     Rustls(Arc<rustls::ServerConfig>),
     /// On a [`TlsHost`](mvfstr_tls::TlsHost) outside the connection, which the caller drives
     /// through [`Connection::tls_input`](crate::Connection::tls_input) and
@@ -1214,7 +1215,8 @@ fn check_server_tls(tls: &Arc<rustls::ServerConfig>, alpn: AlpnPolicy) -> Result
 #[derive(Clone, Debug)]
 pub enum ClientTls {
     /// On rustls, inside each connection, with this config, which supplies the certificate
-    /// verifier, cipher suites, key exchange groups and the ALPN protocols to offer.
+    /// verifier, cipher suites, key exchange groups, the ALPN protocols to offer and any
+    /// certificate to present when the server asks for one.
     Rustls(Arc<rustls::ClientConfig>),
     /// On a [`TlsHost`](mvfstr_tls::TlsHost) outside the connection, which the caller drives
     /// through [`Connection::tls_input`](crate::Connection::tls_input) and

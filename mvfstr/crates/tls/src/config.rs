@@ -7,9 +7,10 @@
 
 //! rustls configs for QUIC (RFC 9001).
 //!
-//! Both helpers allow TLS 1.3 only, rewrite the caller's crypto provider so that every packet
-//! key is an mvfstr key ([`mvfstr_crypto::with_quic_suites`]), and take the time from the
-//! caller's [`TimeProvider`] instead of the system clock.
+//! The helpers allow TLS 1.3 only, rewrite the caller's crypto provider so that every packet key
+//! is an mvfstr key ([`mvfstr_crypto::with_quic_suites`]), and take the time from the caller's
+//! [`TimeProvider`] instead of the system clock. Client certificates are off unless the server
+//! and client configs are built with them.
 
 use std::fmt;
 use std::sync::Arc;
@@ -28,6 +29,8 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
+use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::ClientCertVerifier;
 use rustls::time_provider::TimeProvider;
 
 /// Builds a server config for QUIC with one certificate chain and its key.
@@ -48,9 +51,48 @@ pub fn server_config(
     alpn: &[&[u8]],
 ) -> Result<ServerConfig, rustls::Error> {
     let provider = Arc::new(mvfstr_crypto::with_quic_suites(provider));
+    let verifier = WebPkiClientVerifier::no_client_auth();
+    build_server_config(provider, time, verifier, cert_chain, key, alpn)
+}
+
+/// Builds a server config for QUIC, like [`server_config`], under which the server also requests a
+/// certificate from each client.
+///
+/// webpki verifies a certificate the client presents against `client_roots`, and a chain that
+/// does not lead to one of them fails the handshake with a TLS alert, such as unknown_ca. A
+/// client that does not present a certificate is accepted.
+/// [`TlsSession::peer_certificates`](crate::TlsSession::peer_certificates) then returns the
+/// client's chain, or `None`.
+///
+/// Fails as [`server_config`] does, and also when `client_roots` is empty.
+pub fn server_config_with_client_auth(
+    provider: CryptoProvider,
+    time: Arc<dyn TimeProvider>,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    alpn: &[&[u8]],
+    client_roots: Arc<RootCertStore>,
+) -> Result<ServerConfig, rustls::Error> {
+    let provider = Arc::new(mvfstr_crypto::with_quic_suites(provider));
+    let verifier = WebPkiClientVerifier::builder_with_provider(client_roots, provider.clone())
+        .allow_unauthenticated()
+        .build()
+        .map_err(|error| rustls::Error::General(format!("client certificate roots: {error}")))?;
+    build_server_config(provider, time, verifier, cert_chain, key, alpn)
+}
+
+/// Builds a TLS 1.3-only server config on `provider` whose client certificate policy is `verifier`.
+fn build_server_config(
+    provider: Arc<CryptoProvider>,
+    time: Arc<dyn TimeProvider>,
+    verifier: Arc<dyn ClientCertVerifier>,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    alpn: &[&[u8]],
+) -> Result<ServerConfig, rustls::Error> {
     let mut config = ServerConfig::builder_with_details(provider, time)
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
+        .with_client_cert_verifier(verifier)
         .with_single_cert(cert_chain, key)?;
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(config)
@@ -80,16 +122,47 @@ pub fn client_config(
     verification: ServerVerification,
     alpn: &[&[u8]],
 ) -> Result<ClientConfig, rustls::Error> {
+    build_client_config(provider, time, verification, alpn, None)
+}
+
+/// Builds a client config for QUIC, like [`client_config`], under which the client presents
+/// `cert_chain` and proves that it holds `key` when the server requests a certificate.
+///
+/// Fails as [`client_config`] does, and also when the provider cannot load `key` or `key` does
+/// not match the first certificate of `cert_chain`.
+pub fn client_config_with_cert(
+    provider: CryptoProvider,
+    time: Arc<dyn TimeProvider>,
+    verification: ServerVerification,
+    alpn: &[&[u8]],
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ClientConfig, rustls::Error> {
+    build_client_config(provider, time, verification, alpn, Some((cert_chain, key)))
+}
+
+/// Builds a TLS 1.3-only client config under which the client presents `cert`, a chain and its
+/// key, when the server requests a certificate; without `cert`, it does not present one.
+fn build_client_config(
+    provider: CryptoProvider,
+    time: Arc<dyn TimeProvider>,
+    verification: ServerVerification,
+    alpn: &[&[u8]],
+    cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<ClientConfig, rustls::Error> {
     let provider = Arc::new(mvfstr_crypto::with_quic_suites(provider));
     let builder = ClientConfig::builder_with_details(provider.clone(), time)
         .with_protocol_versions(&[&rustls::version::TLS13])?;
-    let mut config = match verification {
+    let builder = match verification {
         ServerVerification::Roots(roots) => builder.with_root_certificates(roots),
         ServerVerification::AcceptAnyCertificate => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert::new(&provider))),
-    }
-    .with_no_client_auth();
+    };
+    let mut config = match cert {
+        Some((cert_chain, key)) => builder.with_client_auth_cert(cert_chain, key)?,
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(config)
 }
@@ -211,5 +284,25 @@ mod tests {
         time.set(later);
         assert_eq!(client.time_provider.current_time(), Some(later));
         assert!(!client.enable_early_data);
+    }
+
+    #[test]
+    fn a_server_that_asks_for_client_certificates_needs_a_root_to_verify_them() {
+        let time = Arc::new(ManualTimeProvider::new(UnixTime::since_unix_epoch(
+            Duration::from_secs(1_790_000_000),
+        )));
+        let (chain, key) = self_signed();
+        let refused = server_config_with_client_auth(
+            mvfstr_crypto::default_provider(),
+            time,
+            chain,
+            key,
+            &[b"h3"],
+            Arc::new(RootCertStore::empty()),
+        );
+        assert!(
+            matches!(refused, Err(rustls::Error::General(_))),
+            "{refused:?}"
+        );
     }
 }

@@ -15,9 +15,10 @@
 //! [`TlsStep`]s the host returns, which carry raw traffic secrets; [`testing::RustlsHost`] is a
 //! host on rustls for tests.
 //! The config helpers [`server_config`] and [`client_config`] build TLS 1.3-only rustls configs
-//! whose suites carry mvfstr's packet protection, and [`ManualTimeProvider`] keeps rustls off the
-//! system clock. [`app_token`] holds session-ticket app tokens in mvfst's format and mvfst's
-//! 0-RTT checks on them.
+//! whose suites carry mvfstr's packet protection, [`server_config_with_client_auth`] and
+//! [`client_config_with_cert`] add client certificates to them, and [`ManualTimeProvider`] keeps
+//! rustls off the system clock. [`app_token`] holds session-ticket app tokens in mvfst's format
+//! and mvfst's 0-RTT checks on them.
 //!
 //! The crate does not do I/O or read a clock.
 
@@ -33,7 +34,9 @@ mod time;
 pub use config::AcceptAnyServerCert;
 pub use config::ServerVerification;
 pub use config::client_config;
+pub use config::client_config_with_cert;
 pub use config::server_config;
+pub use config::server_config_with_client_auth;
 pub use external::AppTokenVerdict;
 pub use external::EarlyDataOutcome;
 pub use external::EchOutcome;
