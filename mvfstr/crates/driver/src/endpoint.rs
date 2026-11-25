@@ -61,7 +61,9 @@ pub struct EndpointDriver<A: QuicApplication, B: Backend> {
 
 impl<A: QuicApplication, B: Backend> EndpointDriver<A, B> {
     /// Starts building a driver for `application`, whose connections share `config`. The
-    /// backend type is named here, as in `EndpointDriver::<_, SomeBackend>::builder(..)`.
+    /// backend type is named here, as in `EndpointDriver::<_, SomeBackend>::builder(..)`. With an
+    /// [`AlpnRouter`](crate::AlpnRouter) as `application`, the driver serves the applications of
+    /// several ALPN protocols on one port.
     pub fn builder(config: Arc<EndpointConfig>, application: A) -> EndpointDriverBuilder<A, B> {
         EndpointDriverBuilder {
             config,

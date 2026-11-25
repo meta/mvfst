@@ -15,11 +15,13 @@ use std::time::Instant;
 
 use mvfstr_io::MmsgOptions;
 use mvfstr_io::SocketOptions;
+use mvfstr_proto::AlpnPolicy;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::SendOrder;
 use mvfstr_proto::ServerConfig;
 use mvfstr_proto::TransportConfig;
+use mvfstr_proto::Version;
 use mvfstr_proto::config::TransportConfigBuilder;
 use mvfstr_proto::testing::Pair;
 use mvfstr_proto::testing::PairConfig;
@@ -48,10 +50,28 @@ pub(crate) fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointCo
 fn configs_carrying(
     transport: Option<Arc<TransportConfig>>,
 ) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
+    configs_listing(&[b"h3"], &[b"h3"], transport)
+}
+
+/// Like [`configs`], with a server that takes the ALPN protocols `server` and a client that offers
+/// the protocols `client`.
+pub(crate) fn configs_offering(
+    server: &[&[u8]],
+    client: &[&[u8]],
+) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
+    configs_listing(server, client, None)
+}
+
+/// Like [`configs_offering`], with `transport`, if any, for both sides.
+fn configs_listing(
+    server: &[&[u8]],
+    client: &[&[u8]],
+    transport: Option<Arc<TransportConfig>>,
+) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
     let key = rcgen::KeyPair::generate().expect("rcgen makes a key");
     let params =
         rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("rcgen takes the name");
-    configs_of(params, &key, transport)
+    configs_of(params, &key, (server, client), transport)
 }
 
 /// Returns the configs of [`configs`] for the certificate that `params` describes, signed by
@@ -60,31 +80,32 @@ pub(crate) fn configs_with(
     params: rcgen::CertificateParams,
     key: &rcgen::KeyPair,
 ) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
-    configs_of(params, key, None)
+    configs_of(params, key, (&[b"h3"], &[b"h3"]), None)
 }
 
-/// Like [`configs_with`], with `transport`, if any, for both sides.
+/// Like [`configs_with`], with the server's and the client's ALPN protocols and with `transport`,
+/// if any, for both sides.
 fn configs_of(
     params: rcgen::CertificateParams,
     key: &rcgen::KeyPair,
+    (server_alpn, client_alpn): (&[&[u8]], &[&[u8]]),
     transport: Option<Arc<TransportConfig>>,
 ) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
     let cert = params.self_signed(key).expect("rcgen makes a certificate");
     let time = Arc::new(ManualTimeProvider::new(UnixTime::now()));
-    let alpn: &[&[u8]] = &[b"h3"];
     let server_tls = mvfstr_tls::server_config(
         provider(),
         time.clone(),
         vec![cert.der().clone()],
         PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
-        alpn,
+        server_alpn,
     )
     .expect("a server TLS config");
     let client_tls = mvfstr_tls::client_config(
         provider(),
         time,
         ServerVerification::AcceptAnyCertificate,
-        alpn,
+        client_alpn,
     )
     .expect("a client TLS config");
     let mut server = ServerConfig::builder(Arc::new(server_tls));
@@ -170,6 +191,54 @@ pub(crate) fn handshaken_datagram_pair_with(
         .build()
         .expect("a transport config");
     handshake(configs_carrying(Some(transport)))
+}
+
+/// Returns a pair harness whose server takes the ALPN protocols `server` and whose client offers
+/// `client`, with its handshake completed.
+pub(crate) fn handshaken_pair_offering(server: &[&[u8]], client: &[&[u8]]) -> Pair {
+    handshake(configs_offering(server, client))
+}
+
+/// Returns a pair harness whose client offers mvfst's version without ALPN to a server that takes
+/// `h3` and such clients, with its handshake completed.
+pub(crate) fn handshaken_pair_without_alpn() -> Pair {
+    let key = rcgen::KeyPair::generate().expect("rcgen makes a key");
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .and_then(|params| params.self_signed(&key))
+        .expect("rcgen makes a certificate");
+    let time = Arc::new(ManualTimeProvider::new(UnixTime::now()));
+    let server_tls = |alpn: &[&[u8]]| {
+        let tls = mvfstr_tls::server_config(
+            provider(),
+            time.clone(),
+            vec![cert.der().clone()],
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            alpn,
+        )
+        .expect("a server TLS config");
+        Arc::new(tls)
+    };
+    let server = ServerConfig::builder(server_tls(&[b"h3"]))
+        .versions(vec![Version::V1, Version::MVFST])
+        .mvfst_tls(server_tls(&[]))
+        .build()
+        .expect("a server config");
+    let client_tls = mvfstr_tls::client_config(
+        provider(),
+        time.clone(),
+        ServerVerification::AcceptAnyCertificate,
+        &[],
+    )
+    .expect("a client TLS config");
+    let client = ClientConfig::builder(Arc::new(client_tls))
+        .versions(vec![Version::MVFST])
+        .alpn(AlpnPolicy::AllowMissing)
+        .build()
+        .expect("a client config");
+    let endpoint = EndpointConfig::builder([7; 32])
+        .build()
+        .expect("an endpoint config");
+    handshake((client, server, endpoint))
 }
 
 /// Returns a pair harness of `configs` whose handshake has completed.

@@ -19,9 +19,13 @@
 //! impossible. A panic in a session or its connection tears down that connection alone.
 //! Server drivers of several workers that share an address spread new connections evenly over
 //! the workers through a [`Steering`] group.
+//! An [`AlpnRouter`] serves several applications on one endpoint, and picks the application of
+//! each connection by the ALPN protocol that its handshake negotiated.
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod alpn_tests;
 mod app;
 mod budget;
 #[cfg(test)]
@@ -44,6 +48,8 @@ mod tls_tests;
 mod turn;
 mod wake;
 
+pub use app::AlpnRouter;
+pub use app::AlpnSession;
 pub use app::ConnInfo;
 pub use app::QuicApplication;
 pub use app::QuicSession;
