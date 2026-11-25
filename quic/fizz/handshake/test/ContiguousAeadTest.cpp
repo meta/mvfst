@@ -43,7 +43,7 @@ class OpenSSLContiguousAead : public ContiguousAead {
         fail_(fail) {}
 
  private:
-  bool seal(
+  [[nodiscard]] bool seal(
       std::span<const uint8_t> nonce,
       std::span<const uint8_t> aad,
       std::span<const uint8_t> plaintext,
@@ -68,7 +68,7 @@ class OpenSSLContiguousAead : public ContiguousAead {
             tag.data()) == 1;
   }
 
-  bool open(
+  [[nodiscard]] bool open(
       std::span<const uint8_t> nonce,
       std::span<const uint8_t> aad,
       std::span<const uint8_t> ciphertext,
@@ -90,7 +90,7 @@ class OpenSSLContiguousAead : public ContiguousAead {
         EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + len, &len) == 1;
   }
 
-  folly::ssl::EvpCipherCtxUniquePtr init(
+  [[nodiscard]] folly::ssl::EvpCipherCtxUniquePtr init(
       std::span<const uint8_t> nonce,
       std::span<const uint8_t> aad,
       bool encrypt) const {

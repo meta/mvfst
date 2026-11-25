@@ -12,16 +12,17 @@
 namespace quic {
 
 class QuicFizzFactory : public ::fizz::DefaultFactory {
-  std::unique_ptr<fizz::PlaintextReadRecordLayer> makePlaintextReadRecordLayer()
-      const override;
+  [[nodiscard]] std::unique_ptr<fizz::PlaintextReadRecordLayer>
+  makePlaintextReadRecordLayer() const override;
 
-  std::unique_ptr<fizz::PlaintextWriteRecordLayer>
+  [[nodiscard]] std::unique_ptr<fizz::PlaintextWriteRecordLayer>
   makePlaintextWriteRecordLayer() const override;
 
-  std::unique_ptr<fizz::EncryptedReadRecordLayer> makeEncryptedReadRecordLayer(
+  [[nodiscard]] std::unique_ptr<fizz::EncryptedReadRecordLayer>
+  makeEncryptedReadRecordLayer(
       fizz::EncryptionLevel encryptionLevel) const override;
 
-  std::unique_ptr<fizz::EncryptedWriteRecordLayer>
+  [[nodiscard]] std::unique_ptr<fizz::EncryptedWriteRecordLayer>
   makeEncryptedWriteRecordLayer(
       fizz::EncryptionLevel encryptionLevel) const override;
 };
