@@ -273,6 +273,9 @@ pub(crate) struct Sources {
     pub(crate) streams: StreamState,
     /// The connection IDs whose frames the Control source sends after the streams'.
     pub(crate) cids: Cids,
+    /// The calls of [`Sources::fill`] into a packet without room left.
+    #[cfg(test)]
+    pub(crate) fills_without_room: u64,
 }
 
 impl Sources {
@@ -288,6 +291,8 @@ impl Sources {
             ping: PingSource::default(),
             streams,
             cids,
+            #[cfg(test)]
+            fills_without_room: 0,
         }
     }
 
@@ -318,7 +323,7 @@ impl Sources {
 
     /// Writes source `id`'s candidates into the packet while `admit` accepts their class and
     /// they fit.
-    // The attempt calls this for each active source of every packet it builds. `#[inline]` here
+    // The attempt calls this for the active sources of every packet it builds. `#[inline]` here
     // and on `fill_from` puts a copy of both into the attempt's codegen unit, so LLVM can inline
     // them however rustc partitions the crate that instantiates the attempt.
     #[inline]
@@ -329,6 +334,10 @@ impl Sources {
         cx: &mut SendCx<'_>,
         admit: impl Fn(Class) -> bool,
     ) {
+        #[cfg(test)]
+        if w.remaining() == 0 {
+            self.fills_without_room += 1;
+        }
         let space = cx.space.index();
         match id {
             SourceId::Close => fill_from(&mut self.close, w, cx, admit),
@@ -538,7 +547,8 @@ fn candidate_of<S: FrameSource>(source: &S, cx: &SendCx<'_>) -> Option<Candidate
     })
 }
 
-/// Joins `source`'s candidates to the packet while `admit` accepts their class and they fit.
+/// Joins `source`'s candidates to the packet while room is left, `admit` accepts their class and
+/// they fit.
 // Inlined with `Sources::fill`; see there.
 #[inline]
 fn fill_from<S: FrameSource>(
@@ -547,7 +557,9 @@ fn fill_from<S: FrameSource>(
     cx: &mut SendCx<'_>,
     admit: impl Fn(Class) -> bool,
 ) {
-    while let Some((class, cand)) = source.next(cx)
+    // Every frame takes at least one byte.
+    while w.remaining() > 0
+        && let Some((class, cand)) = source.next(cx)
         && admit(class)
     {
         if source.write(cand, w, cx).is_err() {
@@ -560,6 +572,7 @@ fn fill_from<S: FrameSource>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -946,6 +959,116 @@ mod tests {
                 "{frames:?}"
             );
         }
+    }
+
+    /// A source with a candidate for each of its `left` frames, each taking `len` bytes or the
+    /// rest of the packet if less is left. It counts the calls of `next` and `write`, and the
+    /// writes that fail with [`Full`].
+    struct Counting {
+        left: usize,
+        len: usize,
+        nexts: Cell<usize>,
+        writes: usize,
+        full: usize,
+    }
+
+    impl Counting {
+        fn new(left: usize, len: usize) -> Self {
+            Self {
+                left,
+                len,
+                nexts: Cell::new(0),
+                writes: 0,
+                full: 0,
+            }
+        }
+
+        /// Returns the calls of `next` and `write` so far, and how many of the writes failed.
+        fn calls(&self) -> (usize, usize, usize) {
+            (self.nexts.get(), self.writes, self.full)
+        }
+    }
+
+    impl FrameSource for Counting {
+        type Cand = ();
+
+        fn next(&self, _cx: &SendCx<'_>) -> Option<(Class, ())> {
+            self.nexts.set(self.nexts.get() + 1);
+            (self.left > 0).then_some((Class::NewStream, ()))
+        }
+
+        fn min_len(&self, _cand: (), _cx: &SendCx<'_>) -> usize {
+            1
+        }
+
+        fn write(
+            &mut self,
+            _cand: (),
+            w: &mut PacketWriter<'_>,
+            _cx: &mut SendCx<'_>,
+        ) -> Result<(), Full> {
+            self.writes += 1;
+            // Every frame takes at least one byte.
+            let written = w.put_ack_eliciting_bytes(&vec![0; self.len.min(w.remaining()).max(1)]);
+            match written {
+                Ok(()) => self.left -= 1,
+                Err(Full) => self.full += 1,
+            }
+            written
+        }
+    }
+
+    #[test]
+    fn filling_stops_once_a_frame_fills_the_packet() {
+        let dcid = ConnectionId::new(&[1; 8]).unwrap();
+        let header = HeaderSpec::OneRtt {
+            dcid,
+            spin: false,
+            key_phase: false,
+        };
+        let mut sent = Vec::new();
+        let mut cx = SendCx {
+            now: test_epoch(),
+            release: test_epoch(),
+            space: Space::Data,
+            path: crate::PathId(0),
+            probes_due: 0,
+            ack_delay_exponent: 3,
+            packet: PacketCx::default(),
+            sent: &mut sent,
+        };
+        // A frame that takes the rest of the packet, as a STREAM frame without its Length does.
+        let mut buf = vec![0; 1_200];
+        let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
+        let mut fills = Counting::new(usize::MAX, usize::MAX);
+        fill_from(&mut fills, &mut w, &mut cx, |_| true);
+        assert_eq!(w.remaining(), 0);
+        assert_eq!(
+            fills.calls(),
+            (1, 1, 0),
+            "one candidate, whose frame fills the packet, and one write"
+        );
+
+        // Frames that leave room let their source and the next one write, until a frame fills
+        // the packet; then a later source is not called at all.
+        let payload = 10;
+        let mut buf = vec![0; 1 + dcid.len() + 4 + payload + TAG_LEN];
+        let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
+        assert_eq!(w.remaining(), payload);
+        let mut short = Counting::new(2, 3);
+        let mut fills = Counting::new(usize::MAX, usize::MAX);
+        let mut later = Counting::new(usize::MAX, usize::MAX);
+        for source in [&mut short, &mut fills, &mut later] {
+            fill_from(source, &mut w, &mut cx, |_| true);
+        }
+        assert_eq!(
+            short.calls(),
+            (3, 2, 0),
+            "two 3-byte frames, then the source has no more candidates"
+        );
+        assert_eq!(fills.calls(), (1, 1, 0), "one frame in the last 4 bytes");
+        assert_eq!(later.calls(), (0, 0, 0), "the packet is full");
+        assert_eq!(w.finish().payload_len, payload);
     }
 
     /// Writes every candidate of `source` into one 1-RTT packet; returns their records.

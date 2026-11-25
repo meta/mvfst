@@ -755,6 +755,9 @@ impl Connection {
                     && self.source_active(id, space, start.path, &cx.packet)
                 {
                     self.sources.fill(id, &mut w, &mut cx, admit);
+                    if w.remaining() == 0 {
+                        break;
+                    }
                 }
             }
             let packet = cx.packet;
@@ -1065,7 +1068,64 @@ fn full_size(side: Side, space: Space, class: Class) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use mvfstr_wire::Dir;
+    use mvfstr_wire::Frame;
+    use mvfstr_wire::Frames;
+
     use super::*;
+    use crate::connection::stream_tests::ORDER;
+    use crate::connection::stream_tests::pattern;
+    use crate::connection::tests::LIMIT;
+    use crate::connection::tests::handshake;
+    use crate::connection::tests::open_own_one_rtt;
+    use crate::testing::fixtures::Setup;
+
+    #[test]
+    fn building_a_packet_stops_at_the_frame_that_fills_it() {
+        let (_, mut pair) = handshake(Setup::default().pair());
+        let from = pair.server.sent.len();
+        let server = pair.server.conn_mut();
+        let id = server.open_stream(Dir::Uni, ORDER).unwrap();
+        let mut short = Bytes::from_static(b"short");
+        assert_eq!(server.stream(id).unwrap().send(&mut short), Ok(5));
+        server.ping();
+        pair.step();
+        // A STREAM frame that keeps its Length leaves room for the Ping source after it.
+        let server = pair.server.conn();
+        let packets: Vec<Vec<u8>> = pair.server.sent[from..]
+            .iter()
+            .flat_map(|(_, datagram)| open_own_one_rtt(server, &datagram.data))
+            .collect();
+        assert!(
+            packets.iter().any(|plaintext| {
+                let frames: Vec<_> = Frames::new(plaintext).map(Result::unwrap).collect();
+                frames
+                    .windows(2)
+                    .any(|pair| matches!(pair, [Frame::Stream { data: b"short", .. }, Frame::Ping]))
+            }),
+            "the short STREAM frame and a PING after it are not in one packet"
+        );
+
+        // Full packets end in a STREAM frame without its Length, which leaves no room.
+        let from = pair.server.sent.len();
+        let len = 32 * 1024;
+        let mut bulk = Bytes::from(pattern(len));
+        let server = pair.server.conn_mut();
+        assert_eq!(server.stream(id).unwrap().send(&mut bulk), Ok(len));
+        pair.run(pair.now + LIMIT);
+        let full = pair.server.sent[from..]
+            .iter()
+            .filter(|(_, datagram)| datagram.data.len() == usize::from(MIN_DATAGRAM))
+            .count();
+        // 32 KiB take 28 datagrams of 1,200 bytes, each with about 1,170 stream bytes.
+        assert!(full >= 25, "only {full} full datagrams");
+        assert_eq!(
+            pair.server.conn().sources.fills_without_room,
+            0,
+            "a source was offered a packet without room in it"
+        );
+    }
 
     #[test]
     fn an_unpaced_datagram_in_a_paced_run_takes_no_tokens_and_counts_toward_its_burst() {
