@@ -392,6 +392,19 @@ impl std::fmt::Debug for StreamState {
     }
 }
 
+/// Feeds formatted text to a hasher, so the empty-attempt digest hashes `Debug` output without
+/// building a `String`.
+#[cfg(debug_assertions)]
+pub(crate) struct HashWriter<'a, H>(pub(crate) &'a mut H);
+
+#[cfg(debug_assertions)]
+impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl StreamState {
     /// Creates the streams of a new connection at the endpoint whose role is `side`.
     pub(crate) fn new(side: Side, config: &TransportConfig) -> Self {
@@ -440,15 +453,17 @@ impl StreamState {
         self.acked.as_mut()?.pop()
     }
 
-    /// Returns what a later transmit attempt reads of the streams, for the empty-attempt digest:
+    /// Hashes what a later transmit attempt reads of the streams, for the empty-attempt digest:
     /// the connection's flow control and lists, and each stream's state, data parts and scheduler
     /// record.
     #[cfg(debug_assertions)]
-    pub(crate) fn digest(&self) -> String {
+    pub(crate) fn digest(&self, h: &mut impl std::hash::Hasher) {
         use std::fmt::Write;
 
         let lists = List::ALL.map(|l| self.streams.len(l));
-        let mut out = format!(
+        let mut out = HashWriter(h);
+        let _ = write!(
+            out,
             "{:?} {:?} {} {} {:?} {:?} {:?} {:?} {}",
             self.conn_send,
             self.conn_recv,
@@ -476,7 +491,7 @@ impl StreamState {
                 .map(|recv| (recv.buf.digest(), &recv.flow, recv.stop_delivered));
             let _ = write!(
                 out,
-                "; {} {} {:?} {:?} {:?}",
+                "; {} {:?} {:?} {:?} {:?}",
                 stream.id(),
                 stream.digest(),
                 send,
@@ -484,7 +499,6 @@ impl StreamState {
                 self.streams.scheduler().digest(stream.slot()),
             );
         }
-        out
     }
 
     /// Takes the peer's transport parameters: our stream limits and send credit. Returns, by
@@ -1567,6 +1581,15 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
+    fn digest(s: &StreamState) -> u64 {
+        use std::hash::Hasher;
+
+        let mut h = std::hash::DefaultHasher::new();
+        s.digest(&mut h);
+        h.finish()
+    }
+
+    #[cfg(debug_assertions)]
     #[test]
     fn the_digest_covers_the_state_of_each_stream() {
         let now = test_epoch();
@@ -1574,18 +1597,18 @@ mod tests {
         let mut s = state();
         let a = StreamId::new(Side::Client, Dir::Bi, 0).unwrap();
         s.on_stream_frame(a, 0, &[0; 10], false, now, srtt).unwrap();
-        let before = s.digest();
+        let before = digest(&s);
         s.streams.stream(a).unwrap().set_order(SendOrder {
             urgency: 0,
             ..PEER_ORDER
         });
-        let moved = s.digest();
+        let moved = digest(&s);
         assert_ne!(moved, before, "the stream's place in the wire order");
         // With the FIN staged, more stream credit does not change list or scheduler membership.
         s.finish(a).unwrap();
-        let finished = s.digest();
+        let finished = digest(&s);
         s.on_max_stream_data(a, 100).unwrap();
-        assert_ne!(s.digest(), finished, "the stream's send credit");
+        assert_ne!(digest(&s), finished, "the stream's send credit");
     }
 
     #[test]

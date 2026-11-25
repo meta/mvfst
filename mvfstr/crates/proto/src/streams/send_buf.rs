@@ -129,10 +129,15 @@ enum FinState {
 impl SendBuffer {
     /// Returns the buffer's offsets and ranges, without its bytes, for the empty-attempt digest.
     #[cfg(debug_assertions)]
-    pub(crate) fn digest(&self) -> String {
-        format!(
-            "{} {} {} {:?} {} {:?} {:?}",
-            self.base, self.end, self.sent, self.lost, self.acked, self.acked_above, self.fin
+    pub(crate) fn digest(&self) -> impl std::fmt::Debug + '_ {
+        (
+            self.base,
+            self.end,
+            self.sent,
+            &self.lost,
+            self.acked,
+            &self.acked_above,
+            self.fin,
         )
     }
 

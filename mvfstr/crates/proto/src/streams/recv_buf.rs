@@ -327,16 +327,15 @@ impl RecvBuffer {
 
     /// Returns the buffer's offsets, without its bytes, for the empty-attempt digest.
     #[cfg(debug_assertions)]
-    pub(crate) fn digest(&self) -> String {
-        format!(
-            "{} {} {:?} {:?} {} {} {}",
+    pub(crate) fn digest(&self) -> impl std::fmt::Debug + '_ {
+        (
             self.read_offset,
             self.highest,
             self.final_size,
-            self.pending,
+            &self.pending,
             self.readable.chain_length(),
             self.discarding,
-            self.tracking
+            self.tracking,
         )
     }
 

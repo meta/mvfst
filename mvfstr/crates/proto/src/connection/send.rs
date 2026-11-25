@@ -1010,6 +1010,8 @@ impl Connection {
         use std::hash::Hash;
         use std::hash::Hasher;
 
+        use crate::streams::conn::HashWriter;
+
         let mut h = DefaultHasher::new();
         for space in Space::ALL {
             let sent = self.recovery.space(space);
@@ -1020,9 +1022,13 @@ impl Connection {
                 self.recovery.probes_due(space),
             )
                 .hash(&mut h);
-            format!("{:?}", self.sources.ack[space.index()].state()).hash(&mut h);
+            let _ = write!(
+                HashWriter(&mut h),
+                "{:?}",
+                self.sources.ack[space.index()].state()
+            );
             let crypto = &self.sources.crypto[space.index()];
-            format!("{:?}", crypto.offsets()).hash(&mut h);
+            let _ = write!(HashWriter(&mut h), "{:?}", crypto.offsets());
             crypto.handshake_done().hash(&mut h);
             self.spaces[space.index()].discarded.hash(&mut h);
         }
@@ -1033,9 +1039,9 @@ impl Connection {
             .map(|alt| (alt.remote, alt.credit.sent))
             .hash(&mut h);
         self.sources.ping.is_pending().hash(&mut h);
-        self.sources.streams.digest().hash(&mut h);
+        self.sources.streams.digest(&mut h);
         // Only a commit stamps the pacer and reports a send to the controller.
-        format!("{:?} {:?}", self.pacer, self.cc).hash(&mut h);
+        let _ = write!(HashWriter(&mut h), "{:?} {:?}", self.pacer, self.cc);
         (
             self.tx_seq,
             self.path.sent,
@@ -1045,7 +1051,7 @@ impl Connection {
             self.idle.sent_since_receive,
         )
             .hash(&mut h);
-        format!("{:?}", self.state).hash(&mut h);
+        let _ = write!(HashWriter(&mut h), "{:?}", self.state);
         h.finish()
     }
 }

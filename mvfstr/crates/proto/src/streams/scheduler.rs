@@ -329,11 +329,16 @@ impl Scheduler {
 
     /// Returns what the scheduler keeps for `slot`, for the empty-attempt digest.
     #[cfg(debug_assertions)]
-    pub fn digest(&self, slot: u32) -> Option<String> {
+    pub fn digest(&self, slot: u32) -> Option<impl std::fmt::Debug> {
         let n = self.nodes.get(slot as usize)?;
-        Some(format!(
-            "{} {} {:?} {} {} {} {}",
-            n.scheduled, n.bucket, n.order, n.id, n.served, n.turn, n.ticket
+        Some((
+            n.scheduled,
+            n.bucket,
+            n.order,
+            n.id,
+            n.served,
+            n.turn,
+            n.ticket,
         ))
     }
 

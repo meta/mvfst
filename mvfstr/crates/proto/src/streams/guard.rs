@@ -1077,10 +1077,9 @@ impl<'a, D> StreamRef<'a, D> {
 
     /// Returns the stream's own state, for the empty-attempt digest.
     #[cfg(debug_assertions)]
-    pub(crate) fn digest(&self) -> String {
+    pub(crate) fn digest(&self) -> impl std::fmt::Debug {
         let s = self.stream;
-        format!(
-            "{:?} {:?} {:?} {:?} {:?} {:?} {} {}",
+        (
             s.order,
             s.halves,
             s.edges,
@@ -1088,7 +1087,7 @@ impl<'a, D> StreamRef<'a, D> {
             s.stop_code,
             s.peer_stop,
             s.producer_pending,
-            s.closed_delivered
+            s.closed_delivered,
         )
     }
 }
