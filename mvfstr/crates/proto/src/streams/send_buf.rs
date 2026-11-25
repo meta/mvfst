@@ -15,8 +15,8 @@
 //! set) and staged. [`SendBuffer::emit`] writes the next STREAM or CRYPTO frame into a
 //! [`FrameWriter`] under a byte limit, lost bytes before new ones, reading retransmitted bytes by
 //! offset so that the records of sent packets do not hold frame data. A STREAM frame whose data
-//! fills the writer leaves out its Length field. The ACK and loss callbacks take the sent-frame
-//! record's `(offset, len, fin)`.
+//! fills the writer leaves out its Length field. The loss callback takes a sent-frame record's
+//! `(offset, len, fin)`, and the ACK callback a run of acknowledged frames in the same form.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -106,6 +106,9 @@ pub struct SendBuffer {
     /// The offset set by [`track`](Self::track), or 0, which every stream has reached, when the
     /// buffer does not track one.
     tracked: u64,
+    /// The acks that moved `acked` without touching `acked_above`.
+    #[cfg(test)]
+    direct_acks: usize,
 }
 
 /// Where the FIN is; the final size is `end` once the FIN is staged.
@@ -204,7 +207,7 @@ impl SendBuffer {
         fin_lost || known < range.end - range.start
     }
 
-    /// Records that the frame `(offset, len, fin)` was acknowledged and returns the bytes freed.
+    /// Records the acknowledged run `(offset, len, fin)` of sent frames; returns the bytes freed.
     pub fn on_ack(&mut self, offset: u64, len: usize, fin: bool) -> usize {
         if self.fin == FinState::Reset {
             return 0;
@@ -214,7 +217,13 @@ impl SendBuffer {
         }
         let end = offset + len as u64;
         self.lost.remove(offset..end);
-        if end > self.acked {
+        if offset <= self.acked && self.acked_above.is_empty() {
+            self.acked = self.acked.max(end);
+            #[cfg(test)]
+            {
+                self.direct_acks += 1;
+            }
+        } else if end > self.acked {
             self.acked_above.insert(offset.max(self.acked)..end);
         }
         while let Some(r) = self.acked_above.first() {
@@ -1138,6 +1147,107 @@ mod tests {
         assert_eq!((fin.offset, fin.len, fin.fin), (0, 0, true));
         buf.on_ack(fin.offset, fin.len, fin.fin);
         assert!(buf.is_acked());
+    }
+
+    #[test]
+    fn in_order_acks_move_the_acknowledged_prefix_directly() {
+        let mut buf = SendBuffer::new();
+        for fill in 1..=3u8 {
+            buf.push(Bytes::from(vec![fill; 100])).unwrap();
+        }
+        buf.finish().unwrap();
+        let a = emit_one(&mut buf, 104).unwrap();
+        let b = emit_one(&mut buf, 106).unwrap();
+        let c = emit_one(&mut buf, 106).unwrap();
+        assert_eq!((c.offset, c.len, c.fin), (200, 100, true));
+        let freed = [a, b, c].map(|f| buf.on_ack(f.offset, f.len, f.fin));
+        assert_eq!(freed, [100, 100, 100]);
+        assert_eq!(buf.acked_end(), 300);
+        assert!(buf.is_acked());
+        assert_eq!(buf.entries().count(), 0);
+        assert_eq!(
+            (buf.direct_acks, buf.acked_above.capacity()),
+            (3, 0),
+            "each ack moves the prefix, and the ranges above it stay unallocated"
+        );
+    }
+
+    /// Emits the next frame, with new bytes only up to `credit_end`.
+    fn emit_to(buf: &mut SendBuffer, credit_end: u64) -> Emitted {
+        let mut w = TestWriter::new(1000);
+        buf.emit(stream(0), &mut w, 1000, credit_end).unwrap()
+    }
+
+    #[test]
+    fn an_in_order_ack_goes_directly_once_an_out_of_order_ack_is_joined() {
+        let mut buf = SendBuffer::new();
+        for _ in 0..4 {
+            buf.push(Bytes::from(vec![1u8; 50])).unwrap();
+        }
+        let [a, b, c, d] = [50, 100, 150, 200].map(|end| emit_to(&mut buf, end));
+        assert_eq!(buf.on_ack(c.offset, c.len, c.fin), 0, "out of order");
+        assert_eq!(buf.acked_end(), 0);
+        assert_eq!(buf.on_ack(a.offset, a.len, a.fin), 50);
+        assert_eq!(buf.acked_end(), 50);
+        assert_eq!(buf.on_ack(b.offset, b.len, b.fin), 100, "b joins c");
+        assert_eq!(buf.acked_end(), 150);
+        let joined = buf.direct_acks;
+        assert_eq!(buf.on_ack(d.offset, d.len, d.fin), 50);
+        assert_eq!(buf.acked_end(), 200);
+        assert_eq!(
+            (joined, buf.direct_acks),
+            (0, 1),
+            "only the ack after the join goes directly"
+        );
+    }
+
+    #[test]
+    fn an_in_order_ack_of_lost_bytes_cancels_their_retransmission() {
+        let mut buf = SendBuffer::new();
+        for _ in 0..3 {
+            buf.push(Bytes::from(vec![1u8; 100])).unwrap();
+        }
+        let a = emit_one(&mut buf, 104).unwrap();
+        let b = emit_one(&mut buf, 106).unwrap();
+        let c = emit_one(&mut buf, 1000).unwrap();
+        assert_eq!((c.offset, c.len), (200, 100));
+        assert_eq!(buf.on_ack(a.offset, a.len, a.fin), 100);
+        buf.on_lost(b.offset, b.len, b.fin);
+        buf.on_lost(c.offset, c.len, c.fin);
+        // The packet carrying `b` was only late: its ACK arrives after the loss.
+        assert_eq!(buf.on_ack(b.offset, b.len, b.fin), 100);
+        let again = emit_one(&mut buf, 1000).unwrap();
+        assert_eq!(
+            (again.offset, again.len, again.retransmit),
+            (200, 100, true)
+        );
+        assert_eq!(emit_one(&mut buf, 1000), None);
+        assert_eq!(buf.on_ack(again.offset, again.len, again.fin), 100);
+        assert!(!buf.has_lost());
+        assert_eq!(buf.acked_end(), 300);
+        assert_eq!(buf.direct_acks, 3);
+    }
+
+    #[test]
+    fn duplicate_and_overlapping_acks_free_each_entry_once() {
+        let mut buf = SendBuffer::new();
+        for _ in 0..3 {
+            buf.push(Bytes::from(vec![1u8; 100])).unwrap();
+        }
+        let a = emit_one(&mut buf, 104).unwrap();
+        let b = emit_one(&mut buf, 106).unwrap();
+        let c = emit_one(&mut buf, 106).unwrap();
+        assert_eq!(buf.on_ack(a.offset, a.len, a.fin), 100);
+        assert_eq!(buf.on_ack(a.offset, a.len, a.fin), 0, "a duplicate");
+        // A run that starts inside the acknowledged prefix extends it.
+        assert_eq!(buf.on_ack(50, 100, false), 0);
+        assert_eq!(buf.acked_end(), 150);
+        assert_eq!(buf.on_ack(b.offset, b.len, b.fin), 100);
+        assert_eq!(buf.on_ack(b.offset, b.len, b.fin), 0, "a duplicate");
+        assert_eq!(buf.on_ack(c.offset, c.len, c.fin), 100);
+        assert_eq!(buf.acked_end(), 300);
+        assert_eq!(buf.buffered(), 0);
+        assert_eq!((buf.direct_acks, buf.acked_above.capacity()), (6, 0));
     }
 
     #[test]

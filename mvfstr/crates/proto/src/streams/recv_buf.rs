@@ -13,10 +13,10 @@
 //! In-order bytes are readable as slices of those pages in a `roxygen_bufqueue::BufQueue` until
 //! consumed; out-of-order bytes are held in at most [`MAX_RANGES`] disjoint ranges, each byte once
 //! whatever the duplicates and overlaps. Pages are never shared between streams, so unread bytes
-//! keep only their own stream's pages alive, and [`RecvBuffer::memory`] charges each page held.
-//! A page goes back to a [`PagePool`] once consumed, or once the buffer is empty and every slice
-//! of it has been dropped. Final sizes are checked as RFC 9000 requires; flow control is counted
-//! separately by [`StreamRecvFlow`](crate::flow_control::StreamRecvFlow).
+//! keep only their own stream's pages alive. A page goes back to a [`PagePool`] once consumed, or
+//! once the buffer is empty and every slice of it has been dropped. Final sizes are checked as
+//! RFC 9000 requires; flow control is counted separately by
+//! [`StreamRecvFlow`](crate::flow_control::StreamRecvFlow).
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -36,16 +36,16 @@ pub const PAGE_SIZE: usize = 16 * 1024;
 
 const PAGE: u64 = PAGE_SIZE as u64;
 
-/// The memory a readable segment may take in the readable queue's segment container: its
-/// `Bytes` and as much again for the container's doubling.
-const SEGMENT_COST: usize = 2 * size_of::<bytes::Bytes>();
-
 /// The most free pages a [`PagePool::new`] pool keeps.
 const POOL_PAGES: usize = 4;
 
-/// The room for ranges, or for pages, that a buffer keeps once they empty: a container's first
-/// allocation, so a stream that fills and drains every read cycle does not allocate again.
+/// The room for ranges that a buffer keeps once they empty: a container's first allocation, so a
+/// stream that fills and drains every read cycle does not allocate again.
 const KEPT_SLOTS: usize = 4;
+
+/// The most segments that an emptied readable queue may have held and still keep its container.
+/// Each in-order frame takes a slot, so the cap keeps 1-byte frames from pinning more than 32 KiB.
+const KEPT_SEGMENTS: usize = 1024;
 
 /// Free receive pages. Receive buffers give pages back as they release them and take pages
 /// from here before allocating; a page is pooled only after every slice of it has been dropped.
@@ -132,9 +132,6 @@ pub struct RecvBuffer {
     /// offset it covers is consumed, once the buffer is empty and every slice of the page has
     /// been dropped, or once the stream has been read to its final size.
     pages: VecDeque<Page>,
-    /// The most segments the readable queue has held since it was last empty: its segment
-    /// container keeps room for them until then.
-    segment_peak: usize,
     final_size: Option<u64>,
     /// The offset after the highest byte received.
     highest: u64,
@@ -143,6 +140,12 @@ pub struct RecvBuffer {
     /// Whether `stop`, not a reset, discarded the stream: dropped ingress still records which
     /// offsets arrived in `pending`, to report when every byte up to the final size has arrived.
     tracking: bool,
+    /// Whether the readable queue has held more than [`KEPT_SEGMENTS`] segments since it was last
+    /// replaced.
+    oversized: bool,
+    /// The inserts that wrote and published in-order bytes without touching `pending`.
+    #[cfg(test)]
+    direct_inserts: usize,
 }
 
 /// One page of a stream: it covers offsets `index * PAGE_SIZE..(index + 1) * PAGE_SIZE`.
@@ -169,11 +172,13 @@ impl RecvBuffer {
             pending: RangeSet::default(),
             pending_bytes: 0,
             pages: VecDeque::new(),
-            segment_peak: 0,
             final_size: None,
             highest: 0,
             discarding: false,
             tracking: false,
+            oversized: false,
+            #[cfg(test)]
+            direct_inserts: 0,
         }
     }
 
@@ -228,6 +233,22 @@ impl RecvBuffer {
             }
             return Ok(Inserted {
                 readable: 0,
+                complete: !was_complete && self.is_complete(),
+            });
+        }
+        if at == readable_end && at < end && self.pending.is_empty() {
+            // After the publish the buffer holds unread bytes, its pages lie at or above the read
+            // offset and its empty ranges keep at most `KEPT_SLOTS` of room, so `release_pages`
+            // would not change anything.
+            let new = &data[(at - offset) as usize..];
+            Self::write(&mut self.pages, at, new, readable_end, pool);
+            self.publish(end);
+            #[cfg(test)]
+            {
+                self.direct_inserts += 1;
+            }
+            return Ok(Inserted {
+                readable: new.len(),
                 complete: !was_complete && self.is_complete(),
             });
         }
@@ -296,7 +317,6 @@ impl RecvBuffer {
         self.readable.trim_start(n).map_err(|_| BeyondReadable)?;
         self.read_offset += n as u64;
         self.release_pages(pool);
-        self.release_segments();
         Ok(())
     }
 
@@ -347,16 +367,6 @@ impl RecvBuffer {
     /// Returns the number of bytes held, readable and out of order.
     pub fn buffered(&self) -> usize {
         self.readable.chain_length() + self.pending_bytes
-    }
-
-    /// Returns the memory the buffer keeps alive, in bytes, for the connection's budget: every
-    /// page it holds, whole, however few of its bytes are still unread, the readable queue's
-    /// segments, and the room its containers keep for ranges and pages.
-    pub fn memory(&self) -> usize {
-        self.pages.len() * PAGE_SIZE
-            + self.segment_peak * SEGMENT_COST
-            + self.pending.capacity() * size_of::<Range<u64>>()
-            + self.pages.capacity() * size_of::<Page>()
     }
 
     /// Returns the offset after the last readable byte.
@@ -412,14 +422,16 @@ impl RecvBuffer {
             at += n as u64;
             i += 1;
         }
-        self.segment_peak = self.segment_peak.max(self.readable.segment_count());
+        self.oversized |= self.readable.segment_count() > KEPT_SEGMENTS;
     }
 
     /// Gives back to `pool` the pages whose offsets are all consumed, and every page once the
     /// stream has been read to its final size. An empty buffer gives back its last page too,
     /// unless the application still holds a slice of it: the stream's next bytes then fill the
-    /// rest of that page instead of pinning another. An empty container gives up its room once
-    /// it grew past [`KEPT_SLOTS`] or the stream has been read to its end.
+    /// rest of that page instead of pinning another. The page list keeps its room for the next
+    /// read cycle until the stream has been read to its end, and so does the readable queue unless
+    /// it empties after holding more than [`KEPT_SEGMENTS`] segments. Empty ranges give up their
+    /// room at the end of the stream, or once it grew past [`KEPT_SLOTS`].
     fn release_pages(&mut self, pool: &mut PagePool) {
         let all = self.is_finished();
         let empty = self.readable.is_empty() && self.pending.is_empty();
@@ -431,29 +443,23 @@ impl RecvBuffer {
         }) {
             pool.put(page.buf);
         }
-        if self.pages.is_empty() && (all || self.pages.capacity() > KEPT_SLOTS) {
+        if all {
             self.pages = VecDeque::new();
+        }
+        if all || (self.oversized && self.readable.is_empty()) {
+            self.readable = BufQueue::new(usize::MAX);
+            self.oversized = false;
         }
         if self.pending.is_empty() && (all || self.pending.capacity() > KEPT_SLOTS) {
             self.pending = RangeSet::default();
         }
     }
 
-    /// Frees a segment container the readable queue grew, once the queue is empty.
-    fn release_segments(&mut self) {
-        if !self.readable.is_empty() {
-            return;
-        }
-        if self.segment_peak > 1 {
-            self.readable = BufQueue::new(usize::MAX);
-        }
-        self.segment_peak = 0;
-    }
-
     /// Drops every held byte and all later ingress.
     fn discard(&mut self, pool: &mut PagePool) {
-        self.read_offset += self.readable.trim_start_at_most(usize::MAX) as u64;
-        self.release_segments();
+        self.read_offset += self.readable.chain_length() as u64;
+        self.readable = BufQueue::new(usize::MAX);
+        self.oversized = false;
         self.pending = RangeSet::default();
         self.pending_bytes = 0;
         for page in std::mem::take(&mut self.pages) {
@@ -810,7 +816,7 @@ mod tests {
         buf.insert(0, &[1u8; PAGE_SIZE], false, &mut pool).unwrap();
         let kept = buf.readable().front().unwrap().clone();
         buf.consume(PAGE_SIZE, &mut pool).unwrap();
-        assert_eq!(buf.memory(), containers(&buf));
+        assert!(buf.pages.is_empty(), "the consumed page leaves the buffer");
         assert_eq!(
             pool.memory(),
             0,
@@ -907,45 +913,23 @@ mod tests {
     }
 
     #[test]
-    fn memory_counts_every_page_that_holds_a_byte() {
-        let page = PAGE_SIZE as u64;
-        let mut pool = PagePool::new();
-        let mut buf = RecvBuffer::new();
-        assert_eq!(buf.memory(), 0);
-        buf.insert(1, b"x", false, &mut pool).unwrap();
-        buf.insert(5, b"y", false, &mut pool).unwrap();
-        assert_eq!(
-            buf.memory(),
-            PAGE_SIZE + containers(&buf),
-            "two bytes in one page"
-        );
-        buf.insert(3 * page + 5, b"z", false, &mut pool).unwrap();
-        // A frame across a page boundary holds bytes in both pages.
-        buf.insert(10 * page - 1, b"ab", false, &mut pool).unwrap();
-        assert_eq!(buf.buffered(), 5);
-        assert_eq!(buf.memory(), 4 * PAGE_SIZE + containers(&buf));
-        buf.on_reset(10 * page + 1, &mut pool).unwrap();
-        assert_eq!(buf.memory(), 0);
-    }
-
-    #[test]
     fn a_stream_read_to_its_end_holds_no_pages() {
         let mut pool = PagePool::new();
         let mut buf = RecvBuffer::new();
         buf.insert(0, b"abc", true, &mut pool).unwrap();
         buf.consume(3, &mut pool).unwrap();
         assert!(buf.is_finished());
-        assert_eq!(buf.memory(), 0);
+        assert_eq!((buf.pages.len(), containers(&buf)), (0, 0));
         assert_eq!(pool.memory(), PAGE_SIZE, "the page went back to the pool");
 
         // The FIN may come after the last byte was read.
         let mut buf = RecvBuffer::new();
         buf.insert(0, b"abc", false, &mut pool).unwrap();
         buf.consume(3, &mut pool).unwrap();
-        assert_eq!(buf.memory(), containers(&buf));
+        assert!(buf.pages.is_empty());
         buf.insert(3, b"", true, &mut pool).unwrap();
         assert!(buf.is_finished());
-        assert_eq!(buf.memory(), 0);
+        assert_eq!(containers(&buf), 0);
     }
 
     #[test]
@@ -961,9 +945,7 @@ mod tests {
             1,
             "each stream's page went back for the next one"
         );
-        for buf in &streams {
-            assert_eq!(buf.memory(), containers(buf));
-        }
+        assert!(streams.iter().all(|buf| buf.pages.is_empty()));
     }
 
     #[test]
@@ -974,8 +956,8 @@ mod tests {
         let kept = buf.readable().front().unwrap().clone();
         buf.consume(100, &mut pool).unwrap();
         assert_eq!(
-            buf.memory(),
-            PAGE_SIZE + containers(&buf),
+            buf.pages.len(),
+            1,
             "the page stays with the stream while a slice of it lives"
         );
         buf.insert(100, &[2u8; 100], false, &mut pool).unwrap();
@@ -1007,41 +989,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_counts_the_readable_queues_segments() {
-        let mut pool = PagePool::new();
-        let mut buf = RecvBuffer::new();
-        // Single-byte frames in order and unread: one readable segment each.
-        for k in 0..1000u64 {
-            buf.insert(k, b"x", false, &mut pool).unwrap();
-        }
-        assert_eq!(buf.readable().segment_count(), 1000);
-        assert_eq!(
-            buf.memory(),
-            PAGE_SIZE + 1000 * SEGMENT_COST + containers(&buf)
-        );
-        // The queue keeps room for them until it is empty.
-        buf.consume(600, &mut pool).unwrap();
-        assert_eq!(
-            buf.memory(),
-            PAGE_SIZE + 1000 * SEGMENT_COST + containers(&buf)
-        );
-        buf.consume(400, &mut pool).unwrap();
-        assert_eq!(buf.memory(), containers(&buf));
-    }
-
-    #[test]
-    fn memory_counts_the_room_held_for_ranges_and_pages() {
-        let mut pool = PagePool::new();
-        let mut buf = RecvBuffer::new();
-        // One-byte ranges at 2, 4, 6, ..., all in the first page.
-        for k in 1..=MAX_RANGES as u64 {
-            buf.insert(2 * k, b"x", false, &mut pool).unwrap();
-        }
-        assert!(containers(&buf) >= MAX_RANGES * size_of::<Range<u64>>());
-        assert_eq!(buf.memory(), PAGE_SIZE + containers(&buf));
-    }
-
-    #[test]
     fn a_reset_or_stop_frees_the_room_held_for_ranges_and_pages() {
         let mut pool = PagePool::new();
         let mut reset = RecvBuffer::new();
@@ -1052,24 +999,21 @@ mod tests {
         }
         reset.on_reset(4096, &mut pool).unwrap();
         stopped.stop(&mut pool);
-        assert_eq!(containers(&reset), 0);
-        assert_eq!(reset.memory(), 0);
+        assert_eq!((reset.pages.len(), containers(&reset)), (0, 0));
         // A stopped buffer keeps only which offsets arrived, to report when the rest has arrived.
         assert_eq!(stopped.buffered(), 0);
         assert_eq!(stopped.ranges(), MAX_RANGES);
-        assert_eq!(stopped.memory(), containers(&stopped), "no pages");
+        assert!(stopped.pages.is_empty(), "no pages");
         stopped
             .insert(0, &[0; 2 * MAX_RANGES + 1], true, &mut pool)
             .unwrap();
         assert!(stopped.is_complete());
-        assert_eq!(containers(&stopped), 0);
-        assert_eq!(stopped.memory(), 0);
+        assert_eq!((stopped.pages.len(), containers(&stopped)), (0, 0));
     }
 
     #[test]
-    fn room_grown_for_ranges_and_pages_is_freed_once_they_empty() {
+    fn room_grown_for_ranges_is_freed_once_they_empty_and_room_for_pages_is_kept() {
         let pages = 64;
-        let kept = KEPT_SLOTS * (size_of::<Range<u64>>() + size_of::<Page>());
         let mut pool = PagePool::new();
         let mut buf = RecvBuffer::new();
         // The last byte of each of 64 pages, each behind a gap.
@@ -1077,17 +1021,301 @@ mod tests {
             buf.insert(k * PAGE - 1, b"x", false, &mut pool).unwrap();
         }
         assert_eq!(buf.ranges(), pages);
-        assert!(containers(&buf) > kept);
+        assert!(buf.pending.capacity() > KEPT_SLOTS);
         buf.insert(0, &vec![b'x'; pages * PAGE_SIZE], false, &mut pool)
             .unwrap();
         assert_eq!(buf.ranges(), 0);
         buf.consume(pages * PAGE_SIZE, &mut pool).unwrap();
-        assert_eq!(buf.memory(), containers(&buf), "no page is held");
+        assert!(buf.pages.is_empty(), "no page is held");
         assert!(
-            containers(&buf) <= kept,
-            "{} bytes of room kept",
-            containers(&buf)
+            buf.pending.capacity() <= KEPT_SLOTS,
+            "room for {} ranges kept",
+            buf.pending.capacity()
         );
+        // The stream's next read cycle may hold as many pages again.
+        assert!(
+            buf.pages.capacity() >= pages,
+            "room for {} pages kept",
+            buf.pages.capacity()
+        );
+    }
+
+    #[test]
+    fn in_order_frames_are_published_without_touching_the_held_ranges() {
+        let data: Vec<u8> = (0..18_000u32).map(|i| (i % 251) as u8).collect();
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        // Frames of 1,200 bytes in order; the fourteenth crosses the first page boundary.
+        for (k, frame) in data.chunks(1200).enumerate() {
+            let got = buf
+                .insert(1200 * k as u64, frame, false, &mut pool)
+                .unwrap();
+            assert_eq!(
+                got,
+                Inserted {
+                    readable: 1200,
+                    complete: false
+                }
+            );
+        }
+        assert_eq!(readable(&buf), data);
+        assert_eq!(buf.readable().segment_count(), 16);
+        assert_eq!(buf.buffered(), data.len());
+        assert_eq!(buf.ranges(), 0);
+        assert_eq!(pool.pages_allocated(), 2);
+        assert_eq!(
+            (buf.direct_inserts, buf.pending.capacity()),
+            (15, 0),
+            "each frame is published past the held ranges, which stay unallocated"
+        );
+    }
+
+    #[test]
+    fn an_in_order_frame_over_consumed_and_unread_bytes_adds_only_its_new_bytes() {
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        buf.insert(0, b"hello", false, &mut pool).unwrap();
+        buf.consume(3, &mut pool).unwrap();
+        // Bytes 1..3 are consumed and 3..5 unread. Retransmitted bytes are dropped whatever they
+        // hold, so the frame's first four bytes do not overwrite anything.
+        let got = buf.insert(1, b"XXXX world", false, &mut pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 6,
+                complete: false
+            }
+        );
+        assert_eq!(readable(&buf), b"lo world");
+        buf.consume(8, &mut pool).unwrap();
+        let got = buf
+            .insert(0, b"XXXXXXXXXXX, again", false, &mut pool)
+            .unwrap();
+        assert_eq!(got.readable, 7);
+        assert_eq!(readable(&buf), b", again");
+        // A frame wholly below the readable end does not add any bytes.
+        let got = buf.insert(4, b"XXXXXXX", false, &mut pool).unwrap();
+        assert_eq!(got, Inserted::default());
+        assert_eq!(readable(&buf), b", again");
+        assert_eq!(
+            (buf.read_offset(), buf.highest(), buf.buffered()),
+            (11, 18, 7)
+        );
+        assert_eq!(buf.direct_inserts, 3);
+    }
+
+    #[test]
+    fn an_in_order_frame_with_the_fin_completes_the_stream() {
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        buf.insert(0, b"abc", false, &mut pool).unwrap();
+        let got = buf.insert(3, b"def", true, &mut pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 3,
+                complete: true
+            }
+        );
+        assert_eq!(buf.final_size(), Some(6));
+        assert!(buf.is_complete());
+        assert_eq!(
+            buf.insert(3, b"def", true, &mut pool),
+            Ok(Inserted::default()),
+            "a retransmitted FIN"
+        );
+        assert_eq!(
+            buf.insert(3, b"defg", true, &mut pool),
+            Err(RecvError::FinalSize)
+        );
+        buf.consume(6, &mut pool).unwrap();
+        assert!(buf.is_finished());
+        assert_eq!(pool.memory(), PAGE_SIZE, "the page went back to the pool");
+        let first = buf.direct_inserts;
+
+        // An empty FIN gives the final size first; the bytes before it then arrive in order.
+        let mut buf = RecvBuffer::new();
+        buf.insert(0, b"ab", false, &mut pool).unwrap();
+        assert_eq!(buf.insert(6, b"", true, &mut pool), Ok(Inserted::default()));
+        assert_eq!((buf.ranges(), buf.highest()), (0, 6));
+        assert_eq!(
+            buf.insert(2, b"cdefg", false, &mut pool),
+            Err(RecvError::FinalSize),
+            "past the final size"
+        );
+        assert_eq!(
+            buf.insert(2, b"cd", true, &mut pool),
+            Err(RecvError::FinalSize),
+            "a FIN that moves the final size"
+        );
+        assert_eq!(
+            readable(&buf),
+            b"ab",
+            "a refused frame does not store any bytes"
+        );
+        let got = buf.insert(2, b"cd", false, &mut pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 2,
+                complete: false
+            }
+        );
+        let got = buf.insert(4, b"ef", false, &mut pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 2,
+                complete: true
+            }
+        );
+        assert_eq!(readable(&buf), b"abcdef");
+        assert_eq!((first, buf.direct_inserts), (2, 3));
+    }
+
+    #[test]
+    fn in_order_frames_after_a_filled_gap_are_published_directly() {
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        buf.insert(5, b"fgh", false, &mut pool).unwrap();
+        buf.insert(12, b"mno", false, &mut pool).unwrap();
+        assert_eq!(
+            buf.insert(0, b"abcde", false, &mut pool).unwrap().readable,
+            8
+        );
+        assert_eq!(buf.ranges(), 1);
+        // A range is still held, so this frame joins it.
+        assert_eq!(
+            buf.insert(8, b"ijkl", false, &mut pool).unwrap().readable,
+            7
+        );
+        assert_eq!(buf.ranges(), 0);
+        let held = buf.direct_inserts;
+        assert_eq!(buf.insert(15, b"pq", false, &mut pool).unwrap().readable, 2);
+        assert_eq!(readable(&buf), b"abcdefghijklmnopq");
+        assert_eq!(buf.buffered(), 17);
+        assert_eq!((held, buf.direct_inserts), (0, 1));
+    }
+
+    #[test]
+    fn a_stopped_or_reset_buffer_drops_in_order_frames() {
+        let mut pool = PagePool::new();
+        let mut stopped = RecvBuffer::new();
+        stopped.insert(0, b"abc", false, &mut pool).unwrap();
+        stopped.stop(&mut pool);
+        assert_eq!(
+            stopped.insert(3, b"def", false, &mut pool),
+            Ok(Inserted::default())
+        );
+        assert_eq!(
+            stopped.insert(6, b"g", true, &mut pool),
+            Ok(Inserted {
+                readable: 0,
+                complete: true
+            })
+        );
+        assert!(stopped.readable().is_empty());
+        assert!(stopped.pages.is_empty());
+        assert_eq!((stopped.read_offset(), stopped.buffered()), (7, 0));
+
+        let mut reset = RecvBuffer::new();
+        reset.insert(0, b"abc", false, &mut pool).unwrap();
+        reset.on_reset(10, &mut pool).unwrap();
+        assert_eq!(
+            reset.insert(3, b"def", false, &mut pool),
+            Ok(Inserted::default())
+        );
+        assert_eq!(
+            reset.insert(3, b"defghijk", false, &mut pool),
+            Err(RecvError::FinalSize)
+        );
+        assert!(reset.readable().is_empty());
+        assert!(reset.pages.is_empty());
+        assert_eq!(reset.buffered(), 0);
+        assert_eq!(
+            (stopped.direct_inserts, reset.direct_inserts),
+            (1, 1),
+            "only the frame before the stream was discarded goes directly"
+        );
+    }
+
+    #[test]
+    fn the_readable_queue_keeps_its_container_until_the_buffer_is_discarded() {
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        // Single-byte frames in order: one readable segment each.
+        for k in 0..10u64 {
+            buf.insert(k, b"x", false, &mut pool).unwrap();
+        }
+        assert_eq!(buf.readable().segment_count(), 10);
+        buf.consume(10, &mut pool).unwrap();
+        let kept = buf.readable().segment_growth_hint();
+        assert!(
+            kept >= 10,
+            "an emptied queue keeps room for its 10 segments: {kept}"
+        );
+        for k in 10..13u64 {
+            buf.insert(k, b"x", false, &mut pool).unwrap();
+        }
+        buf.stop(&mut pool);
+        assert_eq!(buf.readable().segment_growth_hint(), 0, "stop");
+
+        let mut buf = RecvBuffer::new();
+        for k in 0..10u64 {
+            buf.insert(k, b"x", false, &mut pool).unwrap();
+        }
+        buf.consume(4, &mut pool).unwrap();
+        buf.on_reset(20, &mut pool).unwrap();
+        assert_eq!(buf.readable().segment_growth_hint(), 0, "reset");
+    }
+
+    #[test]
+    fn a_stream_read_to_its_end_gives_up_its_readable_container() {
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        for k in 0..10u64 {
+            buf.insert(k, b"x", k == 9, &mut pool).unwrap();
+        }
+        buf.consume(10, &mut pool).unwrap();
+        assert!(buf.is_finished());
+        assert_eq!(buf.readable().segment_growth_hint(), 0, "read with the FIN");
+
+        // The FIN may come after the last byte was read.
+        let mut buf = RecvBuffer::new();
+        for k in 0..10u64 {
+            buf.insert(k, b"x", false, &mut pool).unwrap();
+        }
+        buf.consume(10, &mut pool).unwrap();
+        assert!(buf.readable().segment_growth_hint() >= 10);
+        buf.insert(10, b"", true, &mut pool).unwrap();
+        assert!(buf.is_finished());
+        assert_eq!(
+            buf.readable().segment_growth_hint(),
+            0,
+            "a FIN after the read"
+        );
+    }
+
+    #[test]
+    fn an_emptied_readable_queue_gives_up_a_container_grown_past_1024_segments() {
+        let mut pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        // A read cycle of `frames` single-byte frames in order, one readable segment each, read to
+        // empty. It returns the room that the emptied queue keeps, which the hint caps at 64.
+        let mut cycle = |buf: &mut RecvBuffer, frames: u64| {
+            let from = buf.read_offset();
+            for k in from..from + frames {
+                buf.insert(k, b"x", false, &mut pool).unwrap();
+            }
+            assert_eq!(buf.readable().segment_count(), frames as usize);
+            buf.consume(frames as usize, &mut pool).unwrap();
+            buf.readable().segment_growth_hint()
+        };
+        assert_eq!(cycle(&mut buf, 1024), 64, "1,024 segments");
+        assert_eq!(cycle(&mut buf, 1025), 0, "1,025 segments");
+        assert!(cycle(&mut buf, 10) >= 10, "a new queue keeps its room");
+        // A peer that fills a 64 KiB stream window with 1-byte frames.
+        assert_eq!(cycle(&mut buf, 65_536), 0, "65,536 segments");
     }
 
     #[test]
@@ -1124,7 +1352,7 @@ mod tests {
     /// Feeds a buffer random frames and random reads, a quarter of them whole. Frames start
     /// anywhere in the data or, with `near`, are at most `near` bytes long and start from `near`
     /// bytes before to a quarter of that past the first missing byte. After each step it checks
-    /// the readable bytes, the held bytes and the memory charge against a byte-map reference.
+    /// the readable bytes, the held bytes and the pages held against a byte-map reference.
     /// Returns how often the buffer was empty before the end.
     fn check_reads_against_a_byte_map(mut seed: u64, near: Option<usize>) -> usize {
         let data: Vec<u8> = (0..3 * PAGE_SIZE as u32 + 1000)
@@ -1141,7 +1369,6 @@ mod tests {
         let mut have = vec![false; data.len()];
         let mut held = vec![false; data.len().div_ceil(PAGE_SIZE)];
         let mut read = 0;
-        let mut peak = 0;
         let mut emptied = 0;
         while read < data.len() {
             let prefix = have.iter().position(|h| !h).unwrap_or(have.len());
@@ -1164,16 +1391,12 @@ mod tests {
                 held[i / PAGE_SIZE] |= !have[i];
                 have[i] = true;
             }
-            peak = peak.max(buf.readable().segment_count());
             let n = match next(4) {
                 0 => buf.readable().chain_length(),
                 _ => next(buf.readable().chain_length() + 1),
             };
             buf.consume(n, &mut pool).unwrap();
             read += n;
-            if buf.readable().is_empty() {
-                peak = 0;
-            }
             let empty = !have[read..].contains(&true);
             emptied += usize::from(empty && read < data.len());
             for (k, held) in held.iter_mut().enumerate() {
@@ -1183,21 +1406,17 @@ mod tests {
             let prefix = have.iter().position(|h| !h).unwrap_or(have.len());
             assert_eq!(readable(&buf), data[read..prefix]);
             assert_eq!(buf.buffered(), have[read..].iter().filter(|h| **h).count());
-            assert_eq!(
-                buf.memory(),
-                pages * PAGE_SIZE + peak * SEGMENT_COST + containers(&buf)
-            );
+            assert_eq!(buf.pages.len(), pages);
         }
-        assert_eq!(
-            buf.memory(),
-            containers(&buf),
+        assert!(
+            buf.pages.is_empty(),
             "a buffer that holds no byte holds no page"
         );
         emptied
     }
 
     #[test]
-    fn seeded_random_reads_across_pages_keep_the_page_charge_exact() {
+    fn seeded_random_reads_across_pages_keep_the_held_pages_exact() {
         // Out-of-order bytes spread over all four pages.
         check_reads_against_a_byte_map(0x2545_f491_4f6c_dd1d, None);
         // Packet-sized frames close to the readable end, so the buffer often empties and gives

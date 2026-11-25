@@ -10,14 +10,17 @@
 //! parts or an attempt that seals a PING. Census tests count what one side of a connected pair
 //! allocates on a steady path after a warm-up: bulk send with ACK processing, bulk receive with
 //! consume, DATAGRAM receive, and a loss and retransmit cycle, plus a forged Initial through route
-//! and accept. The census of a path that is already clean asserts 0, and the other censuses assert
-//! their count as an upper bound. A global allocator counts every allocation on each test's
-//! thread, and the binary holds only these tests.
+//! and accept. Stream censuses count what a receive buffer allocates for in-order read cycles and
+//! for a short request, and what a send buffer allocates for in-order ACKs. The census of a path
+//! that is already clean asserts 0, and the other censuses assert their count as an upper bound. A
+//! global allocator counts every allocation on each test's thread, and the binary holds only these
+//! tests.
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
 use std::cell::Cell;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -51,6 +54,11 @@ use mvfstr_proto::TxClass;
 use mvfstr_proto::TxLimits;
 use mvfstr_proto::TxMeta;
 use mvfstr_proto::config::TransportConfigBuilder;
+use mvfstr_proto::streams::recv_buf::PagePool;
+use mvfstr_proto::streams::recv_buf::RecvBuffer;
+use mvfstr_proto::streams::send_buf::FrameKind;
+use mvfstr_proto::streams::send_buf::FrameWriter;
+use mvfstr_proto::streams::send_buf::SendBuffer;
 use mvfstr_proto::testing::Loss;
 use mvfstr_proto::testing::Pair;
 use mvfstr_proto::testing::PairConfig;
@@ -724,12 +732,10 @@ fn census_bulk_receive_with_consume_in_batches_of_64() {
         window.largest_batch, BATCH,
         "the client receives full batches"
     );
-    // In each read cycle, the readable queue gives up its segment container once it empties and
-    // grows a new one (192 in all); the cycle releases more pages than the connection's page pool
-    // keeps, so it allocates and shares pages again (100); and the stream's page list, grown past
-    // the room it keeps, gives up that room once it empties (64).
+    // Each read cycle releases more pages than the connection's page pool keeps, so it allocates
+    // and shares pages again.
     assert!(
-        window.allocations <= 356,
+        window.allocations <= 100,
         "bulk receive with consume: {}",
         window.allocations
     );
@@ -749,6 +755,127 @@ fn census_a_loss_and_retransmit_cycle_allocates_nothing() {
         window.lost
     );
     assert_eq!(window.allocations, 0, "a loss and retransmit cycle");
+}
+
+/// The STREAM frames of a census read cycle.
+const CYCLE_FRAMES: u64 = 48;
+/// The length of each census STREAM frame.
+const FRAME_LEN: usize = 1200;
+
+/// Inserts [`CYCLE_FRAMES`] in-order frames into `buf` from `offset`, then consumes every byte.
+/// Returns what that allocated and the offset after the cycle.
+fn read_cycle(buf: &mut RecvBuffer, pool: &mut PagePool, offset: u64) -> (usize, u64) {
+    let before = ALLOCATIONS.with(Cell::get);
+    for k in 0..CYCLE_FRAMES {
+        let at = offset + k * FRAME_LEN as u64;
+        let got = buf
+            .insert(at, &PAYLOAD[..FRAME_LEN], false, pool)
+            .expect("an in-order frame");
+        assert_eq!(got.readable, FRAME_LEN);
+    }
+    let n = buf.readable().chain_length();
+    buf.consume(n, pool)
+        .expect("the readable bytes are consumed");
+    let allocations = ALLOCATIONS.with(Cell::get) - before;
+    (allocations, offset + CYCLE_FRAMES * FRAME_LEN as u64)
+}
+
+#[test]
+fn census_in_order_read_cycles_allocate_nothing_once_warm() {
+    // The pool keeps every page a cycle gives back, so page reuse is not what is counted.
+    let mut pool = PagePool::with_max_free(8);
+    let mut buf = RecvBuffer::new();
+    let mut offset = 0;
+    let mut counts = [0; 4];
+    for count in &mut counts {
+        (*count, offset) = read_cycle(&mut buf, &mut pool, offset);
+    }
+    // A cycle spans 4 and 5 pages in turn, so the first two warm up.
+    assert_eq!(pool.pages_allocated(), 5);
+    assert_eq!(counts[2..], [0, 0], "in-order read cycles: {counts:?}");
+}
+
+/// Receives a short request, one frame of `request` with the FIN, on a new receive buffer, and
+/// consumes it. Returns what that allocated.
+fn short_request(request: &[u8], pool: &mut PagePool) -> usize {
+    let before = ALLOCATIONS.with(Cell::get);
+    let mut buf = RecvBuffer::new();
+    let got = buf
+        .insert(0, request, true, pool)
+        .expect("a frame with the FIN");
+    assert!(got.complete);
+    buf.consume(request.len(), pool)
+        .expect("the request is consumed");
+    assert!(buf.is_finished());
+    drop(buf);
+    ALLOCATIONS.with(Cell::get) - before
+}
+
+#[test]
+fn census_a_short_request_with_its_fin_allocates_only_room_for_its_page() {
+    let request = &PAYLOAD[..200];
+    let mut pool = PagePool::new();
+    // The first request's page goes back to the pool for the second.
+    short_request(request, &mut pool);
+    let allocations = short_request(request, &mut pool);
+    assert_eq!(pool.pages_allocated(), 1);
+    assert!(
+        allocations <= 1,
+        "a short request with its FIN allocates only the page list's room for its page: \
+         {allocations}"
+    );
+}
+
+/// A frame writer over a fixed buffer, so that emitting into it does not allocate.
+struct FixedWriter {
+    buf: [u8; 1500],
+    len: usize,
+}
+
+impl FrameWriter for FixedWriter {
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.len
+    }
+
+    fn put_slice(&mut self, bytes: &[u8]) {
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    fn put_payload(&mut self, data: &Bytes, range: Range<usize>) {
+        self.put_slice(&data[range]);
+    }
+}
+
+#[test]
+fn census_a_send_buffer_acknowledged_in_order_allocates_nothing() {
+    let id = StreamId::try_from(0).expect("a stream ID");
+    let mut buf = SendBuffer::new();
+    for _ in 0..3 {
+        buf.push(Bytes::from_static(&PAYLOAD[..1000]))
+            .expect("the buffer takes a chunk");
+    }
+    buf.finish().expect("the stream ends");
+    // One frame per chunk.
+    let frames = [1000, 2000, 3000].map(|credit_end| {
+        let mut w = FixedWriter {
+            buf: [0; 1500],
+            len: 0,
+        };
+        buf.emit(FrameKind::Stream(id), &mut w, usize::MAX, credit_end)
+            .expect("a frame")
+    });
+    assert_eq!(
+        frames.map(|f| (f.offset, f.len, f.fin)),
+        [(0, 1000, false), (1000, 1000, false), (2000, 1000, true)]
+    );
+    let before = ALLOCATIONS.with(Cell::get);
+    for f in &frames {
+        buf.on_ack(f.offset, f.len, f.fin);
+    }
+    let allocations = ALLOCATIONS.with(Cell::get) - before;
+    assert!(buf.is_acked());
+    assert_eq!(allocations, 0, "three chunks acknowledged in order");
 }
 
 /// The application of a DATAGRAM transfer from the server to the client: the server queues
