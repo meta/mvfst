@@ -998,7 +998,7 @@ fn census_a_forged_initial_through_route_and_accept() {
     // The route copies the datagram. The accept then builds the whole connection, its rustls
     // session and its Initial keys before it finds that the packet does not open.
     assert!(
-        allocations <= 17,
+        allocations <= 15,
         "a forged Initial through route and accept: {allocations}"
     );
 }

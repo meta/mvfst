@@ -402,6 +402,7 @@ pub struct Connection {
     idle: IdleTimer,
     state: State,
     shutdown: bool,
+    /// Keeps its peak capacity: each receive batch that carries DATAGRAM frames queues an event.
     events: VecDeque<ConnEvent>,
     endpoint_events: VecDeque<EndpointEvent>,
     /// The peer reset tokens last reported to the endpoint.
@@ -591,8 +592,8 @@ impl Connection {
             },
             state: State::Open,
             shutdown: false,
-            events: VecDeque::with_capacity(8),
-            endpoint_events: VecDeque::with_capacity(4),
+            events: VecDeque::new(),
+            endpoint_events: VecDeque::new(),
             reported_tokens: [None; 2],
             buffered: BufferedPackets::new(setup.pool),
             replay_due: false,
@@ -963,7 +964,12 @@ impl Connection {
                     .push_back(EndpointEvent::PeerResetTokens { current, alternate });
             }
         }
-        self.endpoint_events.pop_front()
+        let event = self.endpoint_events.pop_front();
+        // Endpoint events are rare, so a drained queue is freed rather than kept.
+        if event.is_none() && self.endpoint_events.capacity() > 0 {
+            self.endpoint_events = VecDeque::new();
+        }
+        event
     }
 
     /// Closes the connection with an application CONNECTION_CLOSE and enters the closing period

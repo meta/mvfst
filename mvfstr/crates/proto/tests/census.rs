@@ -113,25 +113,25 @@ fn pages() -> u64 {
 }
 
 /// The most heap that an idle server holds after a handshake without session tickets.
-const IDLE_SERVER: usize = 3_618;
+const IDLE_SERVER: usize = 2_978;
 /// The most heap that an idle client holds after a handshake without session tickets.
-const IDLE_CLIENT: usize = 7_084;
+const IDLE_CLIENT: usize = 6_444;
 /// The most heap that a server holds after one request and response.
-const REQUEST_SERVER: usize = 24_330;
+const REQUEST_SERVER: usize = 23_690;
 /// The most heap that a client holds after one request and response.
-const REQUEST_CLIENT: usize = 27_796;
+const REQUEST_CLIENT: usize = 27_156;
 /// The most heap that a server holds after an HTTP/3-shaped flight.
-const H3_SERVER: usize = 77_378;
+const H3_SERVER: usize = 76_738;
 /// The most heap that a client holds after an HTTP/3-shaped flight.
-const H3_CLIENT: usize = 64_420;
+const H3_CLIENT: usize = 63_780;
 /// The most heap that an idle client holds after its session tickets arrive.
-const TICKETS_CLIENT: usize = 7_244;
+const TICKETS_CLIENT: usize = 6_604;
 /// The most heap that an idle server holds after a handshake with a production-size chain: no
 /// more than with a small certificate, since the server keeps nothing of its flight.
 const CHAIN_IDLE_SERVER: usize = IDLE_SERVER;
 /// The most heap that an idle client holds after a handshake with a production-size chain. The
 /// client keeps the server's certificates.
-const CHAIN_IDLE_CLIENT: usize = 14_565;
+const CHAIN_IDLE_CLIENT: usize = 13_925;
 
 /// Returns what ring adds to the heap of a connection on `side` when it is the only crypto
 /// backend: ring keeps its keys in Rust allocations, where aws-lc-rs keeps them in C.

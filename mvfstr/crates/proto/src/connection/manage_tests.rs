@@ -367,6 +367,70 @@ fn retire_prior_to_moves_the_client_to_a_new_server_id() {
 }
 
 #[test]
+fn endpoint_events_after_the_handshake_leave_no_heap_once_drained() {
+    let mut pair = settled(&Setup::default());
+    let now = pair.now;
+    let mut held = Vec::new();
+    // The client retires one of the server's IDs, so the server reports the retired ID and the
+    // one that replaces it.
+    let frames = [Frame::RetireConnectionId {
+        seq: VarInt::from_u32(1),
+    }];
+    let datagram =
+        Forge::of(pair.client.conn(), Space::Data, 1000, &frames).seal(pair.client.conn());
+    let server = pair.server.conn_mut();
+    deliver(server, now, client_addr(), datagram);
+    let events = endpoint_events(server);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EndpointEvent::RetiredLocalCid { .. }))
+            && events
+                .iter()
+                .any(|event| matches!(event, EndpointEvent::NewLocalCid { .. })),
+        "{events:?}"
+    );
+    held.push((
+        "server after a retirement",
+        server.endpoint_events.capacity(),
+    ));
+    // The server moves the client to a new ID. Once a packet went out with it, the poll itself
+    // queues the client's new reset token.
+    let token = ResetToken([42; 16]);
+    let frames = [Frame::NewConnectionId {
+        seq: VarInt::from_u32(2),
+        retire_prior_to: VarInt::from_u32(2),
+        cid: ConnectionId::new(&[42; 8]).unwrap(),
+        reset_token: token,
+    }];
+    let datagram =
+        Forge::of(pair.server.conn(), Space::Data, 1000, &frames).seal(pair.server.conn());
+    let client = pair.client.conn_mut();
+    deliver(client, now, server_addr(), datagram);
+    assert!(
+        !sent_frames(client).is_empty(),
+        "the client sends with the new ID"
+    );
+    let events = endpoint_events(client);
+    assert_eq!(
+        events,
+        [EndpointEvent::PeerResetTokens {
+            current: Some((server_addr(), token)),
+            alternate: None,
+        }]
+    );
+    held.push((
+        "client after a new reset token",
+        client.endpoint_events.capacity(),
+    ));
+    let none: Vec<_> = held.iter().map(|&(case, _)| (case, 0)).collect();
+    assert_eq!(
+        held, none,
+        "the capacity of the drained endpoint event queues"
+    );
+}
+
+#[test]
 fn a_reset_token_counts_only_once_a_packet_went_out_with_its_id() {
     let mut pair = settled(&Setup::default());
     let now = pair.now;

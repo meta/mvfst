@@ -55,6 +55,7 @@ use crate::EndpointEvent;
 use crate::Initiator;
 use crate::InlineSealer;
 use crate::Inputs;
+use crate::PathEvent;
 use crate::RecvSummary;
 use crate::Route;
 use crate::RxDatagram;
@@ -2851,4 +2852,114 @@ fn the_tls_output_buffer_is_freed_once_the_handshake_completes() {
         .map(|&(side, moment, _)| (side, moment, 0))
         .collect();
     assert_eq!(held, none, "the capacity of the TLS output buffer");
+}
+
+#[test]
+fn a_drained_endpoint_event_queue_holds_no_heap_after_the_handshake() {
+    let mut held = Vec::new();
+    // At the largest limit each side issues the most connection IDs, one NewLocalCid event each.
+    for limit in [2, TransportConfig::MAX_ACTIVE_CONNECTION_ID_LIMIT] {
+        let transport = TransportConfig::builder()
+            .active_connection_id_limit(limit)
+            .build()
+            .expect("a valid transport config");
+        let (_, mut pair) = handshake(Setup::default().transport(transport).pair());
+        pair.run(pair.now + Duration::from_millis(200));
+        // The pair drains each side's endpoint events as a driver does, until the queue is empty.
+        for (side, peer) in [(Side::Server, &pair.server), (Side::Client, &pair.client)] {
+            let conn = peer.conn();
+            assert_eq!(
+                conn.sources.cids.local.active(),
+                limit,
+                "the {side:?} issued its connection IDs"
+            );
+            assert!(conn.endpoint_events.is_empty(), "{side:?}");
+            held.push(((limit, side), conn.endpoint_events.capacity()));
+        }
+    }
+    let none: Vec<_> = held.iter().map(|&(case, _)| (case, 0)).collect();
+    assert_eq!(
+        held, none,
+        "the capacity of the endpoint event queues, by active_connection_id_limit"
+    );
+}
+
+#[test]
+fn the_event_queue_grows_only_as_far_as_the_events_queued_at_once_and_keeps_that_room() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    // The pair drains each side's events at the end of every round of a step, so the events that
+    // a side reports in one step bound those that its queue held at once.
+    let (mut reported, mut most) = ([0; 2], [0; 2]);
+    let mut track = |pair: &Pair| {
+        for (at, peer) in [&pair.client, &pair.server].into_iter().enumerate() {
+            most[at] = most[at].max(peer.events.len() - reported[at]);
+            reported[at] = peer.events.len();
+        }
+    };
+    assert!(pair.run_until(epoch + LIMIT, |pair| {
+        track(pair);
+        pair.client.has_event(&ConnEvent::Confirmed) && pair.server.has_event(&ConnEvent::Confirmed)
+    }));
+    pair.run_until(pair.now + Duration::from_millis(200), |pair| {
+        track(pair);
+        false
+    });
+    let held: Vec<_> = [(Side::Client, &pair.client), (Side::Server, &pair.server)]
+        .into_iter()
+        .zip(most)
+        .map(|((side, peer), most)| (side, most, peer.conn().events.capacity()))
+        .collect();
+    assert!(
+        held.iter().all(|&(_, most, _)| (1..=4).contains(&most)),
+        "each side queues between 1 and 4 events at once: {held:?}"
+    );
+    assert!(
+        held.iter().all(|&(.., capacity)| capacity <= 4),
+        "the capacity of the event queues, after at most 4 events at once: {held:?}"
+    );
+    // A burst of more events grows the queue, which keeps that room once drained, so events that
+    // arrive with every receive batch, such as DatagramsReadable, do not allocate each time. An
+    // event equal to a queued one is dropped, and the others come out in order.
+    let migrated = PathEvent::Migrated {
+        remote: client_addr(),
+    };
+    let failed = PathEvent::ValidationFailed {
+        remote: server_addr(),
+    };
+    let burst = [
+        ConnEvent::StreamsAvailable { dir: Dir::Bi },
+        ConnEvent::DatagramsReadable,
+        ConnEvent::StreamsAvailable { dir: Dir::Uni },
+        ConnEvent::DatagramsReadable,
+        ConnEvent::Path(migrated),
+        ConnEvent::Quiet,
+        ConnEvent::StreamsAvailable { dir: Dir::Bi },
+        ConnEvent::Path(failed),
+    ];
+    let server = pair.server.conn_mut();
+    for event in burst {
+        server.push_event(event);
+    }
+    let room = server.events.capacity();
+    let polled: Vec<_> = std::iter::from_fn(|| server.poll_event()).collect();
+    assert_eq!(
+        polled,
+        [
+            ConnEvent::StreamsAvailable { dir: Dir::Bi },
+            ConnEvent::DatagramsReadable,
+            ConnEvent::StreamsAvailable { dir: Dir::Uni },
+            ConnEvent::Path(migrated),
+            ConnEvent::Quiet,
+            ConnEvent::Path(failed),
+        ],
+        "the burst, once each and in order"
+    );
+    assert!(room >= polled.len(), "a queue of {room} events");
+    server.push_event(ConnEvent::DatagramsReadable);
+    assert_eq!(server.poll_event(), Some(ConnEvent::DatagramsReadable));
+    assert_eq!(
+        server.events.capacity(),
+        room,
+        "the drained queue keeps the room of the burst"
+    );
 }
