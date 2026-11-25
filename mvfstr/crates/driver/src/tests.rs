@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! End-to-end tests: endpoint drivers on Roxygen workers over loopback UDP.
+//! End-to-end tests: endpoint drivers on Roxygen workers over loopback UDP, or in the lab where a
+//! scenario needs exact timing.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -21,6 +22,7 @@ use std::net::UdpSocket;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::pin::pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -105,6 +107,15 @@ use crate::gated::GatedOptions;
 use crate::gated::Run;
 use crate::gated::Valve;
 use crate::gated::Valves;
+use crate::lab::Bulk as LabBulk;
+use crate::lab::Costs;
+use crate::lab::Lab;
+use crate::lab::LabApp;
+use crate::lab::MemBackend;
+use crate::lab::MemOptions;
+use crate::lab::SERVER;
+use crate::lab::lab_configs;
+use crate::lab::transport as lab_transport;
 use crate::steer::INBOX_CAPACITY;
 use crate::steer::handoff_lifetime;
 use crate::test_support::ORDER;
@@ -8688,40 +8699,16 @@ impl Paced {
     }
 }
 
-/// What [`stalled_paced`] varies.
-struct PacedSetup {
-    /// The bytes each server sends.
-    len: usize,
-    /// The clients' transport settings.
-    client: Arc<TransportConfig>,
-    /// The attempts after which the server's worker is held.
-    stalls: usize,
-}
-
-impl Default for PacedSetup {
-    /// Returns a setup in which each server sends eight datagrams, within the window, to a
-    /// sluggish client, and the first 40 attempts are stalled.
-    fn default() -> Self {
-        Self {
-            len: 9_000,
-            client: sluggish_and_paced(),
-            stalls: 40,
-        }
-    }
-}
-
-/// Has three paced [`Bulk`] servers on one endpoint send `setup.len` bytes each to their own
-/// client through a relay that delays each datagram 10 ms, while the server's worker is held
-/// [`PACED_STALL`] after each of its next `setup.stalls` attempts. At a window per round trip
-/// and a minimum burst of 1, each connection releases a datagram every 1.6 ms, and without
-/// kernel release does not build ahead.
-fn stalled_paced(setup: PacedSetup) -> Paced {
+/// Has three paced [`Bulk`] servers on one endpoint send eight datagrams each, within the window,
+/// to their own sluggish client through a relay that delays each datagram 10 ms, while the
+/// server's worker is held [`PACED_STALL`] after each of its next 40 attempts. At a window per
+/// round trip and a minimum burst of 1, each connection releases a datagram every 1.6 ms, and
+/// without kernel release does not build ahead.
+fn stalled_paced() -> Paced {
     const CLIENTS: usize = 3;
-    let PacedSetup {
-        len,
-        client,
-        stalls,
-    } = setup;
+    const LEN: usize = 9_000;
+    const STALLS: usize = 40;
+    let client = sluggish_and_paced();
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
         mmsg: mmsg_options(),
@@ -8730,7 +8717,7 @@ fn stalled_paced(setup: PacedSetup) -> Paced {
     let (tx, rx) = mpsc::channel();
     let server_reports = tx.clone();
     let addr = harness.serve(move || {
-        let mut app = App::new(move |_| Ok(Bulk::new("server", len, None, server_reports.clone())));
+        let mut app = App::new(move |_| Ok(Bulk::new("server", LEN, None, server_reports.clone())));
         app.transport = Some(sluggish_and_paced());
         app
     });
@@ -8753,13 +8740,13 @@ fn stalled_paced(setup: PacedSetup) -> Paced {
     let confirmed = || Report::Event("client", ConnEvent::Confirmed);
     await_reports(&rx, (0..CLIENTS).map(|_| confirmed()).collect());
     valves.server.clear();
-    valves.server.stall(PACED_STALL, stalls);
+    valves.server.stall(PACED_STALL, STALLS);
     let asked = Instant::now();
     go.store(true, Ordering::SeqCst);
     for conn in &conns {
         conn.wake().expect("the connection is live");
     }
-    let received = || Report::Received(uni(3), len);
+    let received = || Report::Received(uni(3), LEN);
     await_reports_within(&rx, (0..CLIENTS).map(|_| received()).collect(), STALL);
     let (record, (events, started, runs)) = tx_record::<Bulk, _>(&harness.server, move || {
         let valve = &valves.server;
@@ -8816,7 +8803,7 @@ fn each_run_flushed_before_the_next_attempt(events: &[Event]) -> bool {
 #[test]
 fn without_kernel_release_a_paced_attempt_builds_at_a_fresh_reading_and_is_flushed_before_the_next_attempt()
  {
-    let paced = stalled_paced(PacedSetup::default());
+    let paced = stalled_paced();
     let events = &paced.events;
     assert!(
         each_run_flushed_before_the_next_attempt(events),
@@ -8894,7 +8881,7 @@ fn a_paced_attempt_requeued_on_a_full_batch_is_flushed_on_its_own_socket_before_
 
 #[test]
 fn a_pacing_wake_that_comes_due_during_a_transmit_phase_is_served_before_the_next_attempt() {
-    let paced = stalled_paced(PacedSetup::default());
+    let paced = stalled_paced();
     // A wake that comes due during a stall waits at least for the stall's end. The margin
     // allows for a loaded host.
     let late: Vec<&WakeRecord> = paced
@@ -8972,58 +8959,105 @@ fn served_attempts(wakes: &[WakeRecord]) -> Vec<usize> {
         .collect()
 }
 
+/// Starts in `lab` a server driver without a work budget, whose connections pace and send nothing,
+/// and a client driver with `conns` connections to it, and runs until they are established and the
+/// lab is quiet. The server's connections take its slots in accept order. Returns the server's
+/// handle and task, and the client's handle.
+fn lab_paced_server(
+    lab: &Lab,
+    conns: usize,
+) -> (
+    EndpointHandle<LabApp, MemBackend>,
+    usize,
+    EndpointHandle<LabApp, MemBackend>,
+) {
+    let (client_config, server_config, endpoint) = lab_configs();
+    let sockets = MemOptions {
+        net: Some(lab.net.clone()),
+        ..MemOptions::default()
+    };
+    let probes = Rc::new(RefCell::new(Vec::new()));
+    let (net, accepted) = (lab.net.clone(), Rc::clone(&probes));
+    let app = LabApp::new(&lab.net, move |_, options| {
+        options.transport = Some(lab_transport(true));
+        let (session, probe) = LabBulk::new(&net, 0, Some(0));
+        accepted.borrow_mut().push(probe);
+        session
+    });
+    let socket = MemBackend::bind(SERVER, &sockets).expect("the lab binds");
+    let server = EndpointDriver::builder(Arc::clone(&endpoint), app)
+        .serve(socket, server_config)
+        .backend_options(sockets.clone())
+        .host_timers(Lab::timers())
+        .spawn(lab.ctx())
+        .expect("the server starts");
+    let server_task = lab.last_spawned();
+    let client = EndpointDriver::builder(endpoint, LabApp::client(&lab.net))
+        .backend_options(sockets)
+        .host_timers(Lab::timers())
+        .spawn(lab.ctx())
+        .expect("the client starts");
+    for _ in 0..conns {
+        let (session, probe) = LabBulk::new(&lab.net, 0, Some(0));
+        let options = ConnOptions {
+            transport: Some(lab_transport(false)),
+        };
+        let name = ServerName::try_from("localhost").expect("a name");
+        client
+            .connect(SERVER, name, Arc::clone(&client_config), options, session)
+            .expect("the client connects");
+        probes.borrow_mut().push(probe);
+    }
+    lab.run_until(|| {
+        let probes = probes.borrow();
+        probes.len() == 2 * conns && probes.iter().all(|probe| probe.connected.get())
+    });
+    lab.run_quiet(Duration::from_millis(500));
+    (server, server_task, client)
+}
+
 #[test]
 fn a_connection_served_while_it_waits_in_the_phase_queue_makes_one_attempt_for_both() {
-    // Clients that acknowledge each packet at once: over a transfer of several round trips,
-    // with every attempt stalled, their acknowledgments dirty the server's connections while
-    // their pacing wakes are armed and come due. That happens in most runs, not all.
-    let client = TransportConfig::builder()
-        .ack_policy(AckPolicy {
-            eliciting_threshold: 1,
-            ..AckPolicy::default()
-        })
-        .pacing(true)
-        .pacing_min_burst(1)
-        .build()
-        .expect("a transport config");
-    let mut checked = 0;
-    for _ in 0..5 {
-        let paced = stalled_paced(PacedSetup {
-            len: 60_000,
-            client: Arc::clone(&client),
-            stalls: usize::MAX,
-            ..PacedSetup::default()
-        });
-        let served = served_attempts(&paced.wakes);
-        for wake in paced.wakes.iter().filter(|wake| wake.queued) {
-            let (Some(phase), Some(next)) = (wake.phase, wake.next) else {
-                panic!("a wake taken from the queue gave no attempt: {wake:?}");
-            };
-            // With room for every paced run in one attempt, attempts are not requeued, so any
-            // later attempt of the connection in the phase is another serve.
-            let again: Vec<&Joined> = paced
-                .attempts
-                .iter()
-                .enumerate()
-                .filter(|&(n, attempt)| {
-                    paced.first + n > next
-                        && attempt.phase == phase
-                        && attempt.key.index == wake.index
-                        && !served.contains(&(paced.first + n))
-                })
-                .map(|(_, attempt)| attempt)
-                .collect();
-            assert!(
-                again.is_empty(),
-                "the connection of {wake:?} attempted again from the queue: {again:?}"
-            );
-            checked += 1;
-        }
-        if checked > 0 {
-            return;
-        }
+    // Three paced server connections wait in the transmit queue in slot order, and the pacing wake
+    // of the last comes due during the first one's attempt, so it is served at the check before the
+    // next pop, while it still waits behind the second.
+    const ATTEMPT: Duration = Duration::from_micros(100);
+    let lab = Lab::new();
+    let (server, server_task, _client) = lab_paced_server(&lab, 3);
+    let core = server.core().expect("the server runs");
+    for index in 0..3 {
+        core.mark_dirty_at(index);
     }
-    panic!("in five runs no wake was served while its connection waited in the queue");
+    core.arm_pacing_at(2, lab.net.now() + ATTEMPT / 2);
+    lab.net.set_costs(Costs {
+        attempt: ATTEMPT,
+        ..Costs::default()
+    });
+    let before = server.tx_record();
+    assert!(lab.poll(server_task), "the server is woken");
+    let record = server.tx_record();
+    let [wake] = record.wakes[before.wakes.len()..] else {
+        panic!("not one wake was taken: {:?}", record.wakes);
+    };
+    let (2, true, Some(phase), Some(next)) = (wake.index, wake.queued, wake.phase, wake.next)
+    else {
+        panic!("the wake was not served while its connection waited in the queue: {wake:?}");
+    };
+    assert_eq!(
+        record.attempts[next].key.index, 2,
+        "the serve gave another connection the attempt: {:?}",
+        record.attempts
+    );
+    let slots: Vec<u32> = record.attempts[before.attempts.len()..]
+        .iter()
+        .filter(|attempt| attempt.phase == phase)
+        .map(|attempt| attempt.key.index)
+        .collect();
+    assert_eq!(
+        slots,
+        [0, 2, 1],
+        "the slots attempted in the phase of {wake:?}"
+    );
 }
 
 /// Has a [`Bulk`] client connection for each of `transports` send 9,000 bytes, within the
