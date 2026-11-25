@@ -99,6 +99,13 @@ fn next_stream(state: &StreamState) -> Option<(Class, ScheduledCand)> {
     let conn_credit = state.conn_send.available();
     let scheduler = state.streams.scheduler();
     let mut cursor = Cursor::default();
+    // When the credit is spent and the streams do not hold lost data or a lone FIN, every
+    // scheduled stream waits for credit, and the walk below would offer the first.
+    if conn_credit == 0 && state.streams.lost() == 0 && state.streams.fin_only() == 0 {
+        return scheduler
+            .next(&mut cursor)
+            .map(|slot| (Class::NewStream, slot));
+    }
     let mut blocked = None;
     while let Some(slot) = scheduler.next(&mut cursor) {
         let Some(send) = state
@@ -239,6 +246,7 @@ mod tests {
     use mvfstr_wire::TransportParameters;
 
     use super::*;
+    use crate::AppCode;
     use crate::SendOrder;
     use crate::TransportConfig;
     use crate::recovery::test_epoch;
@@ -248,12 +256,19 @@ mod tests {
     /// Returns a server's streams with `count` sequential streams in one bucket, in the wire order
     /// they were opened in, each with 100 new bytes staged within its stream and connection credit.
     fn staged(count: u32) -> (StreamState, Vec<StreamId>) {
+        staged_with(count, 1 << 20, false)
+    }
+
+    /// Returns a server's streams with `count` streams in one bucket, sequential or `incremental`,
+    /// in the wire order they were opened in, each with 100 new bytes staged within its stream
+    /// credit, and `max_data` bytes of connection credit.
+    fn staged_with(count: u32, max_data: u32, incremental: bool) -> (StreamState, Vec<StreamId>) {
         let config = TransportConfig::builder()
             .build()
             .expect("a valid transport config");
         let mut s = StreamState::new(Side::Server, &config);
         s.on_peer_params(&TransportParameters {
-            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_data: VarInt::from_u32(max_data),
             initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
             initial_max_streams_uni: VarInt::from_u32(count),
             ..TransportParameters::default()
@@ -264,8 +279,8 @@ mod tests {
                 let order = SendOrder {
                     class: 1,
                     urgency: 3,
-                    incremental: false,
-                    order: u128::from(order),
+                    incremental,
+                    order: if incremental { 0 } else { u128::from(order) },
                 };
                 let id = s.open(Dir::Uni, order).unwrap();
                 let staged = s.send(id, &mut Bytes::from_static(&[7; 100]), u64::MAX);
@@ -363,5 +378,159 @@ mod tests {
             "a lost FIN goes first under probes"
         );
         assert_eq!(candidate(&s, 0), first);
+    }
+
+    /// Returns the streams counted with lost data and with a lone FIN, after checking that every
+    /// list and the scheduler hold exactly the streams whose state calls for them.
+    fn counts(s: &StreamState) -> (u32, u32) {
+        s.streams.assert_indexed();
+        (s.streams.lost(), s.streams.fin_only())
+    }
+
+    #[test]
+    fn conn_blocked_next_visits_one_stream() {
+        for incremental in [false, true] {
+            // The first stream's write spends the connection credit; every stream holds only new
+            // bytes.
+            let (mut s, ids) = staged_with(1_000, 50, incremental);
+            write(&mut s, ids[0]);
+            assert_eq!(s.conn_send.available(), 0, "the connection window is spent");
+            assert_eq!(counts(&s), (0, 0));
+            let (offered, visits) = next_with_visits(&s, 0);
+            assert_eq!(
+                offered,
+                Some((Class::NewStream, slot(&s, ids[0]))),
+                "the first stream in the wire order, for the admission table to refuse"
+            );
+            assert_eq!(
+                visits, 1,
+                "incremental {incremental}: a connection-blocked `next` visited {visits} streams"
+            );
+            // The first stream leaves the scheduler, so the next one is offered.
+            s.reset(ids[0], AppCode::from_u32(1)).unwrap();
+            assert_eq!(counts(&s), (0, 0));
+            let (offered, visits) = next_with_visits(&s, 0);
+            assert_eq!(offered, Some((Class::NewStream, slot(&s, ids[1]))));
+            assert_eq!(
+                visits, 1,
+                "incremental {incremental}: after a reset, `next` visited {visits} streams"
+            );
+        }
+    }
+
+    #[test]
+    fn conn_blocked_next_offers_a_lone_fin_or_lost_bytes_wherever_their_streams_stand() {
+        for incremental in [false, true] {
+            let (mut s, ids) = staged_with(10, 350, incremental);
+            // Streams 5, 7 and 8 send their bytes; stream 5's FIN waits alone and stream 7's
+            // bytes are lost. Stream 0 spends the rest of the connection credit.
+            for i in [5, 7, 8] {
+                write(&mut s, ids[i]);
+            }
+            s.finish(ids[5]).unwrap();
+            assert!(s.on_stream_lost(ids[7], 0, 100, false));
+            write(&mut s, ids[0]);
+            assert_eq!(s.conn_send.available(), 0, "the connection window is spent");
+            let offered = |s: &StreamState| next_with_visits(s, 0);
+            let first = Some((Class::NewStream, slot(&s, ids[0])));
+
+            assert_eq!(
+                offered(&s).0,
+                Some((Class::Control, slot(&s, ids[5]))),
+                "incremental {incremental}: a lone FIN does not take connection credit"
+            );
+            assert_eq!(counts(&s), (1, 1), "stream 7's lost bytes, stream 5's FIN");
+
+            write(&mut s, ids[5]);
+            assert_eq!(counts(&s), (1, 0), "stream 5's FIN is sent");
+            assert_eq!(
+                offered(&s).0,
+                Some((Class::Lost, slot(&s, ids[7]))),
+                "incremental {incremental}: lost bytes do not take connection credit"
+            );
+
+            write(&mut s, ids[7]);
+            assert_eq!(counts(&s), (0, 0), "stream 7's bytes are resent");
+            assert_eq!(offered(&s), (first, 1), "incremental {incremental}");
+
+            // A FIN late in the order is found as well.
+            s.finish(ids[8]).unwrap();
+            assert_eq!(counts(&s), (0, 1), "stream 8's FIN");
+            assert_eq!(
+                offered(&s).0,
+                Some((Class::Control, slot(&s, ids[8]))),
+                "incremental {incremental}: a late stream's lone FIN"
+            );
+            write(&mut s, ids[8]);
+            assert_eq!(counts(&s), (0, 0));
+            assert_eq!(offered(&s), (first, 1), "incremental {incremental}");
+        }
+    }
+
+    #[test]
+    fn fin_only_counts_the_streams_with_only_an_unsent_fin_to_send() {
+        let (mut s, ids) = staged_with(3, 1 << 20, false);
+        s.finish(ids[0]).unwrap();
+        assert_eq!(
+            counts(&s),
+            (0, 0),
+            "a FIN behind unsent bytes goes with them"
+        );
+        write(&mut s, ids[0]);
+        assert_eq!(counts(&s), (0, 0), "the FIN went with the last bytes");
+
+        write(&mut s, ids[1]);
+        s.finish(ids[1]).unwrap();
+        assert_eq!(
+            counts(&s),
+            (0, 1),
+            "a FIN staged after every byte was sent goes alone"
+        );
+        s.on_max_streams(Dir::Uni, 4).unwrap();
+        let order = SendOrder {
+            class: 1,
+            urgency: 3,
+            incremental: false,
+            order: 3,
+        };
+        let empty = s.open(Dir::Uni, order).unwrap();
+        s.finish(empty).unwrap();
+        assert_eq!(
+            counts(&s),
+            (0, 2),
+            "a stream that ends without bytes has a lone FIN"
+        );
+
+        write(&mut s, ids[1]);
+        assert_eq!(counts(&s), (0, 1), "a sent FIN leaves the count");
+        assert!(s.on_stream_lost(ids[1], 100, 0, true));
+        assert_eq!(
+            counts(&s),
+            (1, 1),
+            "a lost FIN counts as lost data, not as a lone FIN"
+        );
+        write(&mut s, ids[1]);
+        assert_eq!(counts(&s), (0, 1), "the lost FIN is resent");
+
+        write(&mut s, ids[2]);
+        s.finish(ids[2]).unwrap();
+        assert_eq!(counts(&s), (0, 2));
+        assert!(s.on_stream_lost(ids[2], 0, 100, false));
+        assert_eq!(
+            counts(&s),
+            (1, 1),
+            "lost bytes ahead of the FIN count as lost data"
+        );
+        write(&mut s, ids[2]);
+        assert_eq!(
+            counts(&s),
+            (0, 2),
+            "once the lost bytes are resent, the FIN goes alone"
+        );
+
+        s.reset(ids[2], AppCode::from_u32(1)).unwrap();
+        assert_eq!(counts(&s), (0, 1), "a reset drops the FIN");
+        s.on_stop_sending(empty, AppCode::from_u32(2)).unwrap();
+        assert_eq!(counts(&s), (0, 0), "the peer's STOP_SENDING drops the FIN");
     }
 }

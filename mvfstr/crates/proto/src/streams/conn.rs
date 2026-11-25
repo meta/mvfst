@@ -177,10 +177,9 @@ pub(crate) struct StreamParts {
 }
 
 impl StreamData for StreamParts {
-    fn has_wire_data(&self) -> bool {
-        self.send
-            .as_ref()
-            .is_some_and(|send| send.buf.pending(send.credit.limit()).is_some())
+    fn wire_data(&self) -> Option<Pending> {
+        let send = self.send.as_ref()?;
+        send.buf.pending(send.credit.limit())
     }
 
     fn has_pull_room(&self) -> bool {
@@ -197,19 +196,6 @@ impl StreamData for StreamParts {
         self.send
             .as_ref()
             .map_or_else(Holding::default, |send| send.figures().holding())
-    }
-
-    fn has_lost(&self) -> bool {
-        self.send.as_ref().is_some_and(|send| send.buf.has_lost())
-    }
-
-    fn wire_data(&self) -> (bool, bool) {
-        // `pending` returns `Retransmit` while lost data waits, so one call gives both.
-        let pending = self
-            .send
-            .as_ref()
-            .and_then(|send| send.buf.pending(send.credit.limit()));
-        (pending.is_some(), pending == Some(Pending::Retransmit))
     }
 }
 

@@ -44,6 +44,7 @@ use super::map::Half;
 use super::map::PeerStream;
 use super::map::StreamTable;
 use super::scheduler::Scheduler;
+use super::send_buf::Pending;
 use super::share::Holding;
 use super::share::Peer;
 use super::share::Place;
@@ -63,9 +64,10 @@ use crate::StreamReady;
 /// What a stream's data parts (send and receive buffers, flow control) contribute to its list
 /// membership.
 pub(crate) trait StreamData {
-    /// Returns whether lost bytes, staged bytes within stream credit, or an unsent FIN wait for
-    /// the wire. Connection credit is not considered.
-    fn has_wire_data(&self) -> bool;
+    /// Returns what the next STREAM frame would carry: lost bytes or a lost FIN, staged bytes
+    /// within stream credit, or an unsent FIN alone; `None` if the stream does not have anything
+    /// for the wire. Connection credit is not considered.
+    fn wire_data(&self) -> Option<Pending>;
 
     /// Returns whether the stream accepts more application bytes: it has stream credit beyond its
     /// staged bytes, its staged bytes are below the per-stream cap, and the FIN is not staged.
@@ -78,16 +80,6 @@ pub(crate) trait StreamData {
     /// Returns what the stream holds of the staging budget's split while it has demand: its room
     /// and staged bytes.
     fn holding(&self) -> Holding;
-
-    /// Returns whether lost bytes or a lost FIN wait for retransmission.
-    fn has_lost(&self) -> bool;
-
-    /// Returns [`StreamData::has_wire_data`] and whether [`StreamData::has_lost`] also holds, both
-    /// of which an implementation may read from its send buffer in one call.
-    fn wire_data(&self) -> (bool, bool) {
-        let wire = self.has_wire_data();
-        (wire, wire && self.has_lost())
-    }
 }
 
 /// A readiness edge the connection marks after updating the data parts.
@@ -189,8 +181,8 @@ struct Stream<D> {
 struct Entry<D> {
     stream: Stream<D>,
     links: [Link; LISTS],
-    /// One bit per [`List`] the stream is on, and [`LOST_DATA`] while it is counted in
-    /// [`Streams::lost`].
+    /// One bit per [`List`] the stream is on, and [`LOST_DATA`] or [`FIN_ONLY`] while it is counted
+    /// in [`Streams::lost`] or [`Streams::fin_only`].
     member: u8,
     /// Whether the shares record the stream as the only peer of its order's bucket; cleared when
     /// the order changes, until the next reindex checks again.
@@ -224,7 +216,8 @@ const EMPTY_LIST: ListHead = ListHead {
 /// The membership a stream's state calls for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Membership {
-    /// One bit per [`List`], and [`LOST_DATA`] if the stream counts in [`Streams::lost`].
+    /// One bit per [`List`], and [`LOST_DATA`] or [`FIN_ONLY`] if the stream counts in
+    /// [`Streams::lost`] or [`Streams::fin_only`].
     lists: u8,
     scheduled: Option<SendOrder>,
     reap: bool,
@@ -233,6 +226,10 @@ struct Membership {
 /// The membership bit of a stream whose send buffer holds lost bytes or a lost FIN. It sits
 /// beside the [`List`] bits, so a reindex counts the stream without another load.
 const LOST_DATA: u8 = 1 << 7;
+/// The membership bit of a stream whose next frame is its FIN alone: every byte was sent, and the
+/// stream does not have lost data.
+const FIN_ONLY: u8 = 1 << 6;
+// The list bits sit below `FIN_ONLY` and `LOST_DATA`; bits `LISTS` to 5 are free.
 const _: () = assert!(LISTS < 7);
 
 impl List {
@@ -290,19 +287,21 @@ impl<D: StreamData> Stream<D> {
         if !self.due().is_empty() {
             lists |= List::Control.bit();
         }
-        // Lost data counts as a sendable stream's wire data, so only a scheduled stream can have
-        // lost data waiting.
-        let (scheduled, lost) = if send.is_some_and(|s| s.may_send_stream()) {
+        // Lost data and a lone FIN are a sendable stream's wire data, so only a scheduled stream
+        // carries either bit.
+        let wire = if send.is_some_and(|s| s.may_send_stream()) {
             self.data.wire_data()
         } else {
-            (false, false)
+            None
         };
-        if lost {
-            lists |= LOST_DATA;
+        match wire {
+            Some(Pending::Retransmit) => lists |= LOST_DATA,
+            Some(Pending::Fin) => lists |= FIN_ONLY,
+            Some(Pending::New { .. }) | None => {}
         }
         Membership {
             lists,
-            scheduled: scheduled.then_some(self.order),
+            scheduled: wire.is_some().then_some(self.order),
             reap: self.halves.is_closed() && self.closed_delivered && self.edges.0 == 0,
         }
     }
@@ -319,6 +318,8 @@ pub(crate) struct Streams<D> {
     /// that every guard runs when dropped, so every change to a send buffer's lost state is
     /// counted: a loss, a retransmission, an acknowledgment of lost bytes or a reset.
     lost: u32,
+    /// How many streams have only an unsent FIN to send, kept by the same reindex.
+    fin_only: u32,
     /// The reindexes run so far, one per dropped guard.
     #[cfg(test)]
     reindexes: u64,
@@ -353,6 +354,7 @@ impl<D: StreamData> Streams<D> {
             scheduler: Scheduler::new(quantum),
             shares: Shares::new(),
             lost: 0,
+            fin_only: 0,
             #[cfg(test)]
             reindexes: 0,
         }
@@ -361,6 +363,12 @@ impl<D: StreamData> Streams<D> {
     /// Returns how many streams have lost bytes or a lost FIN in their send buffers.
     pub(crate) fn lost(&self) -> u32 {
         self.lost
+    }
+
+    /// Returns how many streams have only an unsent FIN to send: every byte is sent, and the stream
+    /// does not count in [`lost`](Self::lost).
+    pub(crate) fn fin_only(&self) -> u32 {
+        self.fin_only
     }
 
     /// Returns how many reindexes ran, one per dropped guard.
@@ -630,6 +638,13 @@ impl<D: StreamData> Streams<D> {
                     self.lost += 1;
                 } else {
                     self.lost -= 1;
+                }
+            }
+            if changed & FIN_ONLY != 0 {
+                if want.lists & FIN_ONLY != 0 {
+                    self.fin_only += 1;
+                } else {
+                    self.fin_only -= 1;
                 }
             }
         }
@@ -1255,6 +1270,13 @@ impl<D: StreamData> Streams<D> {
             .filter(|(_, _, e)| e.member & LOST_DATA != 0)
             .count();
         assert_eq!(self.lost as usize, lost, "streams with lost data");
+        let fin_only = self
+            .table
+            .map()
+            .iter()
+            .filter(|(_, _, e)| e.member & FIN_ONLY != 0)
+            .count();
+        assert_eq!(self.fin_only as usize, fin_only, "streams with a lone FIN");
     }
 }
 
@@ -1270,8 +1292,8 @@ mod tests {
     }
 
     impl StreamData for Data {
-        fn has_wire_data(&self) -> bool {
-            self.wire
+        fn wire_data(&self) -> Option<Pending> {
+            self.wire.then_some(Pending::New { bytes: 1 })
         }
 
         fn has_pull_room(&self) -> bool {
@@ -1284,10 +1306,6 @@ mod tests {
 
         fn holding(&self) -> Holding {
             Holding::default()
-        }
-
-        fn has_lost(&self) -> bool {
-            false
         }
     }
 
