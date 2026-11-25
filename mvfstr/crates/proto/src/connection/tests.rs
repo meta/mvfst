@@ -36,6 +36,9 @@ use rustls::pki_types::ServerName;
 
 use super::ConnError;
 use super::Connection;
+use super::Handshake;
+use super::PacketSpace;
+use super::PeerParams;
 use super::stream_tests::ORDER;
 use crate::AlpnPolicy;
 use crate::AppCode;
@@ -46,6 +49,7 @@ use crate::ConnOptions;
 use crate::DropReason;
 use crate::Ecn;
 use crate::Endpoint;
+use crate::EndpointEvent;
 use crate::Initiator;
 use crate::InlineSealer;
 use crate::Inputs;
@@ -68,7 +72,10 @@ use crate::TxSeqRange;
 use crate::recovery::RecoveryConfig;
 use crate::recovery::Space;
 use crate::recovery::sent::SentFlags;
+use crate::recovery::sent::SentPackets;
 use crate::recovery::test_epoch;
+use crate::sources::AckSource;
+use crate::sources::CryptoSource;
 use crate::streams::guard::List;
 use crate::testing::LinkConfig;
 use crate::testing::Loss;
@@ -2653,5 +2660,62 @@ fn ack_frames_leave_the_streams_as_acknowledging_each_frame_alone_does() {
         reindexed[0] < reindexed[1],
         "the ACK frames did not coalesce any run: {} reindexes, as many as the reference",
         reindexed[0]
+    );
+}
+
+/// Returns the size of the connection and of the parts that it holds per packet number space, for
+/// the handshake and per queued event. These are the sizes of a test build, whose types carry
+/// test-only fields that a production build does not have.
+fn layout() -> [(&'static str, usize); 9] {
+    [
+        ("Connection", size_of::<Connection>()),
+        ("PacketSpace", size_of::<PacketSpace>()),
+        ("AckSource", size_of::<AckSource>()),
+        ("CryptoSource", size_of::<CryptoSource>()),
+        ("SentPackets", size_of::<SentPackets>()),
+        ("PeerParams", size_of::<PeerParams>()),
+        ("Handshake", size_of::<Handshake>()),
+        ("ConnEvent", size_of::<ConnEvent>()),
+        ("EndpointEvent", size_of::<EndpointEvent>()),
+    ]
+}
+
+#[test]
+fn the_size_print_gives_the_connection_and_the_parts_it_holds() {
+    let sizes = layout();
+    println!("sizes in a test build, test-only fields included:");
+    for (name, size) in sizes {
+        println!("{name:>13}: {size:>5} bytes");
+    }
+    assert_eq!(
+        sizes.map(|(name, _)| name),
+        [
+            "Connection",
+            "PacketSpace",
+            "AckSource",
+            "CryptoSource",
+            "SentPackets",
+            "PeerParams",
+            "Handshake",
+            "ConnEvent",
+            "EndpointEvent"
+        ]
+    );
+    // The connection holds the other parts inline, and its queues hold the events on the heap.
+    let [
+        (_, connection),
+        inline @ ..,
+        (_, conn_event),
+        (_, endpoint_event),
+    ] = sizes;
+    for (name, size) in inline {
+        assert!(
+            size > 0 && size < connection,
+            "a {name} of {size} bytes inside a connection of {connection} bytes"
+        );
+    }
+    assert!(
+        conn_event > 0 && endpoint_event > 0,
+        "events of {conn_event} and {endpoint_event} bytes"
     );
 }
