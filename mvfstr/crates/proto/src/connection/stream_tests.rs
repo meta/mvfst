@@ -53,6 +53,7 @@ use crate::config::TransportConfigBuilder;
 use crate::recovery::Space;
 use crate::streams::guard::List;
 use crate::streams::guard::Owed;
+use crate::streams::guard::census;
 use crate::streams::state::RecvState;
 use crate::streams::state::SendState;
 use crate::testing::Loss;
@@ -1338,12 +1339,7 @@ fn stop_sending_makes_the_peer_reset_whatever_its_application_does() {
 /// Hands the client one server 1-RTT packet built by hand carrying `frames`. The pair must not
 /// run afterwards: the server never sent this packet number.
 fn to_client(pair: &mut Pair, frames: &[Frame<'_>]) {
-    let server = pair.server.conn();
-    let pn = server.recovery.space(Space::Data).next_pn() + 10;
-    let packet = Forge::of(server, Space::Data, pn, frames).seal(server);
-    let now = pair.now;
-    let summary = deliver(pair.client.conn_mut(), now, server_addr(), packet);
-    assert_eq!(summary.packets, 1);
+    to_client_numbered(pair, 10, frames);
 }
 
 /// Returns the send state of stream `id` at `peer`, if the stream is open there.
@@ -2350,6 +2346,210 @@ fn a_streams_producer_is_pending_until_woken_and_again_once_parked() {
     // What it does when `poll_send` returns `Pending`.
     conn.stream(local).unwrap().park_producer();
     assert_eq!(pull_ready_ids(conn), [peer]);
+}
+
+/// Delivers `frames` to the client in a forged 1-RTT packet of the server's, numbered `skip`
+/// past the server's next packet number, so that each packet a test forges has its own number.
+/// The pair must not run afterwards: the server never sent this packet number.
+fn to_client_numbered(pair: &mut Pair, skip: u64, frames: &[Frame<'_>]) {
+    let server = pair.server.conn();
+    let pn = server.recovery.space(Space::Data).next_pn() + skip;
+    let packet = Forge::of(server, Space::Data, pn, frames).seal(server);
+    let now = pair.now;
+    let summary = deliver(pair.client.conn_mut(), now, server_addr(), packet);
+    assert_eq!(summary.packets, 1);
+}
+
+/// Opens 1,024 streams at `ORDER` on a client whose peer grants 200 bytes of credit per stream,
+/// each staging 100 bytes as a push sender, then a push sender after them that is refused once
+/// its credit is spent, and returns that sender. Each of the 1,024 streams has demand and room
+/// that the staging budget covers, so each is ranked with an allowance.
+fn many_senders_and_a_refused_one() -> (Pair, StreamId) {
+    let setup = Setup {
+        server_transport: config(|c| {
+            c.max_data(1 << 30)
+                .max_streams_uni(2048)
+                .max_stream_data_uni(200)
+        }),
+        ..Setup::default()
+    };
+    let (_, mut pair) = handshake(setup.pair());
+    let conn = pair.client.conn_mut();
+    let ids: Vec<_> = (0..1024)
+        .map(|_| conn.open_stream(Dir::Uni, ORDER).unwrap())
+        .collect();
+    for &id in &ids {
+        let mut data = Bytes::from_static(&ZEROS[..100]);
+        assert_eq!(conn.stream(id).unwrap().send(&mut data), Ok(100));
+    }
+    let refused = conn.open_stream(Dir::Uni, ORDER).unwrap();
+    let mut data = Bytes::from_static(&ZEROS[..300]);
+    assert_eq!(conn.stream(refused).unwrap().send(&mut data), Ok(200));
+    assert_eq!(
+        conn.stream(ids[1023]).unwrap().send_capacity(),
+        100,
+        "the staging budget covers the room of every stream ahead of the refused sender"
+    );
+    (pair, refused)
+}
+
+#[test]
+fn wake_writable_reindexes_only_refused_senders() {
+    let (mut pair, refused) = many_senders_and_a_refused_one();
+    census::reset();
+    let credit = [Frame::MaxStreamData {
+        id: refused,
+        max: varint(1_000),
+    }];
+    to_client_numbered(&mut pair, 10, &credit);
+    let reindexes = census::read().reindexes;
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [(refused, StreamReady::Writable)]
+    );
+    assert!(
+        reindexes <= 2,
+        "only the credit frame and the wake reindex, both on the refused sender, not each \
+         stream with an allowance: {reindexes} reindexes"
+    );
+}
+
+#[test]
+fn pull_ready_without_pull_ready_streams_does_not_rank() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    // Push senders stage bytes, so each has demand, and their producers stay pending.
+    let ids = [(); 3].map(|()| conn.open_stream(Dir::Uni, ORDER).unwrap());
+    for id in ids {
+        let mut data = Bytes::from_static(&ZEROS[..1_000]);
+        assert_eq!(conn.stream(id).unwrap().send(&mut data), Ok(1_000));
+    }
+    let streams = &conn.sources.streams.streams;
+    assert!(
+        ids.iter()
+            .all(|&id| streams.is_on(List::Demand, streams.get(id).unwrap().slot())),
+        "every sender has demand"
+    );
+    // A woken producer is ranked and listed.
+    conn.stream(ids[0]).unwrap().wake_producer();
+    census::reset();
+    assert_eq!(pull_ready_ids(conn), [ids[0]]);
+    assert_eq!(
+        census::read().ranks,
+        1,
+        "a ranking for the pull-ready stream"
+    );
+    // Once it is parked, no stream is pull-ready, and the list is empty without a ranking.
+    conn.stream(ids[0]).unwrap().park_producer();
+    census::reset();
+    assert_eq!(pull_ready_ids(conn), [], "nothing left from the last list");
+    assert_eq!(
+        census::read().ranks,
+        0,
+        "no ranking without a pull-ready stream"
+    );
+}
+
+#[test]
+fn refused_push_senders_across_buckets_hear_writable_in_wire_order() {
+    let setup = Setup {
+        server_transport: config(|c| c.max_stream_data_uni(0)),
+        ..Setup::default()
+    };
+    let (_, mut pair) = handshake(setup.pair());
+    let conn = pair.client.conn_mut();
+    let at = |urgency, incremental, order| SendOrder {
+        class: 1,
+        urgency,
+        incremental,
+        order,
+    };
+    // The wire order goes by urgency, then by order and stream ID in a sequential bucket. An
+    // incremental bucket goes by the scheduler's turns, and its streams without a place in the
+    // scheduler follow those on the bucket's turn, by stream ID. The streams open in another
+    // order.
+    let low = conn.open_stream(Dir::Uni, at(5, false, 0)).unwrap();
+    let [unplaced_a, unplaced_b] =
+        [(); 2].map(|()| conn.open_stream(Dir::Uni, at(3, true, 0)).unwrap());
+    let second = conn.open_stream(Dir::Uni, at(0, false, 2)).unwrap();
+    let placed = conn.open_stream(Dir::Uni, at(3, true, 0)).unwrap();
+    let first = conn.open_stream(Dir::Uni, at(0, false, 1)).unwrap();
+    let busy = conn.open_stream(Dir::Uni, at(0, false, 1)).unwrap();
+    let quiet = conn.open_stream(Dir::Uni, at(0, false, 0)).unwrap();
+    // `placed` stages bytes, which give it a place in the scheduler, and is refused the rest;
+    // `busy` stages bytes within its credit and is not refused.
+    let credit = [placed, busy].map(|id| Frame::MaxStreamData {
+        id,
+        max: varint(1_000),
+    });
+    to_client_numbered(&mut pair, 10, &credit);
+    let conn = pair.client.conn_mut();
+    let mut data = Bytes::from_static(&ZEROS[..2_000]);
+    assert_eq!(conn.stream(placed).unwrap().send(&mut data), Ok(1_000));
+    let mut data = Bytes::from_static(&ZEROS[..500]);
+    assert_eq!(conn.stream(busy).unwrap().send(&mut data), Ok(500));
+    // The others are refused at zero credit, in yet another order.
+    for id in [low, unplaced_b, unplaced_a, second, first, quiet] {
+        let mut data = Bytes::from_static(&ZEROS[..1_000]);
+        assert_eq!(conn.stream(id).unwrap().send(&mut data), Ok(0));
+    }
+    assert_eq!(edges(conn), [], "no credit came back yet");
+    // Credit for every refused sender but `quiet`, which comes first in the wire order and keeps
+    // a zero allowance.
+    let credit = [
+        (placed, 2_000),
+        (low, 1_000),
+        (unplaced_a, 1_000),
+        (unplaced_b, 1_000),
+        (second, 1_000),
+        (first, 1_000),
+    ]
+    .map(|(id, max)| Frame::MaxStreamData {
+        id,
+        max: varint(max),
+    });
+    to_client_numbered(&mut pair, 11, &credit);
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [first, second, placed, unplaced_a, unplaced_b, low].map(|id| (id, StreamReady::Writable)),
+        "woken in the wire order"
+    );
+    let credit = [Frame::MaxStreamData {
+        id: quiet,
+        max: varint(1_000),
+    }];
+    to_client_numbered(&mut pair, 12, &credit);
+    assert_eq!(
+        edges(pair.client.conn_mut()),
+        [(quiet, StreamReady::Writable)],
+        "a refused sender passed over at a zero allowance is woken once credit comes"
+    );
+}
+
+/// A microbenchmark of a push-mode application's receive and app phase over many streams: 1,024
+/// streams hold staged bytes and room, and a refused push sender waits for credit that does not
+/// come. Each iteration receives a packet holding a PING and asks for the pull-ready streams.
+/// `MVFSTR_PUSH_LOOP_ITERATIONS` sets the number of iterations, 10,000 by default, so the cost of
+/// one iteration is the difference between two runs divided by the difference of their counts.
+#[test]
+#[ignore = "a microbenchmark, run alone under an instruction counter"]
+fn push_mode_receive_and_pull_ready_over_1024_streams() {
+    let iterations = std::env::var("MVFSTR_PUSH_LOOP_ITERATIONS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(10_000u64);
+    let (mut pair, refused) = many_senders_and_a_refused_one();
+    let now = pair.now;
+    let first = pair.server.conn().recovery.space(Space::Data).next_pn() + 10;
+    for pn in first..first + iterations {
+        let server = pair.server.conn();
+        let packet = Forge::of(server, Space::Data, pn, &[Frame::Ping]).seal(server);
+        let conn = pair.client.conn_mut();
+        assert_eq!(deliver(conn, now, server_addr(), packet).packets, 1);
+        assert_eq!(conn.pull_ready().next(), None);
+    }
+    let conn = pair.client.conn_mut();
+    assert_eq!(edges(conn), [], "{refused} is still refused");
 }
 
 /// An incremental order in the default bucket.

@@ -218,11 +218,14 @@ pub(crate) struct SendBacklog {
 #[derive(Clone, Copy, Debug)]
 struct Ranked {
     id: StreamId,
+    slot: u32,
     /// Whether it is on the pull-ready list.
     pull: bool,
     /// The allowance if it reaches the stream's low-water mark, zero otherwise.
     allowance: u64,
 }
+
+const _: () = assert!(size_of::<Ranked>() == 24);
 
 /// Initial stream windows of one side, by the kind of stream they apply to.
 #[derive(Clone, Copy, Debug, Default)]
@@ -778,17 +781,26 @@ impl StreamState {
             if ranked.allowance == 0 {
                 continue;
             }
-            let Some(mut stream) = self.streams.stream(ranked.id) else {
+            // Read before guarding: the reindex on a guard's drop changes nothing for a stream
+            // that was not refused.
+            let refused = self
+                .streams
+                .get_slot(ranked.slot)
+                .and_then(|stream| stream.data().send.as_ref())
+                .is_some_and(|send| send.push_blocked);
+            if !refused {
+                continue;
+            }
+            let Some(mut stream) = self.streams.by_slot(ranked.slot) else {
                 continue;
             };
-            let woken = stream
-                .data_mut()
-                .send
-                .as_mut()
-                .is_some_and(|send| std::mem::take(&mut send.push_blocked));
-            if woken {
-                stream.mark(Edge::Writable);
-                self.push_blocked -= 1;
+            if let Some(send) = stream.data_mut().send.as_mut() {
+                send.push_blocked = false;
+            }
+            stream.mark(Edge::Writable);
+            self.push_blocked -= 1;
+            if self.push_blocked == 0 {
+                break;
             }
         }
         self.ranked.clear();
@@ -814,6 +826,10 @@ impl StreamState {
     /// turn order, with their allowances when the connection stages at most `budget` bytes, for
     /// [`pulled`](Self::pulled).
     pub(crate) fn collect_pull_ready(&mut self, budget: u64) {
+        if !self.has_pull_ready() {
+            self.ranked.clear();
+            return;
+        }
         self.rank(budget);
         self.ranked.retain(|r| r.pull && r.allowance > 0);
     }
@@ -861,6 +877,7 @@ impl StreamState {
                 let reached = reaches_low_water(allowance, share, figures.credit);
                 ranked.push(Ranked {
                     id: stream.id(),
+                    slot,
                     pull: self.streams.is_on(List::PullReady, slot),
                     allowance: if reached { allowance } else { 0 },
                 });
