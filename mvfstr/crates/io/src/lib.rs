@@ -47,6 +47,7 @@ pub use backend::ReleaseSupport;
 pub use backend::RxBackend;
 pub use backend::TxBackend;
 pub use backend::TxCaps;
+pub use backend::TxCounters;
 #[cfg(target_os = "linux")]
 pub use host::HostBackend;
 #[cfg(target_os = "linux")]

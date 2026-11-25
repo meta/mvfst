@@ -47,6 +47,7 @@ use crate::MmsgOptions;
 use crate::RxBackend;
 use crate::TxBackend;
 use crate::TxCaps;
+use crate::TxCounters;
 use crate::mmsg::open_connected;
 use crate::mmsg::ready;
 use crate::rx::Rx;
@@ -251,6 +252,10 @@ impl<H: IoHost> TxBackend for HostBackend<H> {
 
     fn drain_reports(&mut self, f: impl FnMut(ConnKey, TxReport)) {
         self.tx.drain_reports(f);
+    }
+
+    fn take_counters(&mut self) -> TxCounters {
+        self.tx.take_counters()
     }
 }
 

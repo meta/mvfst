@@ -20,6 +20,7 @@ use mvfstr_crypto::TAG_LEN;
 use mvfstr_crypto::unprotect_header;
 use mvfstr_tls::Level;
 use mvfstr_wire::ConnectionId;
+use mvfstr_wire::Dir;
 use mvfstr_wire::Frame;
 use mvfstr_wire::Frames;
 use mvfstr_wire::Header;
@@ -27,6 +28,7 @@ use mvfstr_wire::HeaderSpec;
 use mvfstr_wire::PacketType;
 use mvfstr_wire::PacketWriter;
 use mvfstr_wire::Side;
+use mvfstr_wire::StreamId;
 use mvfstr_wire::TransportErrorCode;
 use mvfstr_wire::VarInt;
 use mvfstr_wire::Version;
@@ -34,6 +36,7 @@ use rustls::pki_types::ServerName;
 
 use super::ConnError;
 use super::Connection;
+use super::stream_tests::ORDER;
 use crate::AlpnPolicy;
 use crate::AppCode;
 use crate::CloseReason;
@@ -1539,6 +1542,86 @@ fn new_token_from_a_client_is_a_protocol_violation() {
     let summary = deliver(client, now, server_addr(), packet);
     assert_eq!(summary.packets, 1);
     assert_eq!(local_close(client), None);
+}
+
+#[test]
+fn every_ack_frame_received_is_counted() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let now = pair.now;
+    let largest = pair
+        .client
+        .conn()
+        .recovery
+        .space(Space::Data)
+        .next_pn()
+        .checked_sub(1)
+        .expect("the client sent a 1-RTT packet");
+    let server = pair.server.conn();
+    let pn = server.recovery.space(Space::Data).next_pn() + 10;
+    let acking = Forge {
+        ack: Some(largest..=largest),
+        ..Forge::of(server, Space::Data, pn, &[Frame::Ping])
+    }
+    .seal(server);
+    let pinging = Forge::of(server, Space::Data, pn + 1, &[Frame::Ping]).seal(server);
+    let client = pair.client.conn_mut();
+    let before = client.stats().acks_received;
+
+    assert_eq!(deliver(client, now, server_addr(), acking).packets, 1);
+    assert_eq!(
+        client.stats().acks_received - before,
+        1,
+        "a packet with an ACK frame"
+    );
+    assert_eq!(deliver(client, now, server_addr(), pinging).packets, 1);
+    assert_eq!(
+        client.stats().acks_received - before,
+        1,
+        "a packet without one"
+    );
+    assert_eq!(local_close(client), None);
+}
+
+/// Writes twelve bytes on stream `id` and transmits at `at`.
+fn write_and_transmit(conn: &mut Connection, id: StreamId, at: Instant) {
+    let mut data = Bytes::from_static(b"twelve bytes");
+    conn.stream(id).unwrap().send(&mut data).unwrap();
+    conn.poll_transmit(&limits(at), &mut VecSink::new(1500), &mut InlineSealer);
+}
+
+#[test]
+fn the_loss_timer_moves_with_every_transmit_of_ack_eliciting_data() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    pair.run(pair.now + Duration::from_millis(500));
+    let now = pair.now;
+    let client = pair.client.conn_mut();
+    let loss_timer = |conn: &Connection| {
+        conn.recovery
+            .loss_detection_timer(conn.amplification_blocked())
+            .map(|(at, _)| at)
+    };
+    assert_eq!(loss_timer(client), None, "nothing in flight once settled");
+    let id = client.open_stream(Dir::Uni, ORDER).unwrap();
+    let pto = client.recovery.pto_period(Space::Data);
+
+    write_and_transmit(client, id, now);
+    assert_eq!(loss_timer(client), Some(now + pto), "a PTO after the write");
+    let later = now + pto / 2;
+    write_and_transmit(client, id, later);
+    assert_eq!(
+        loss_timer(client),
+        Some(later + pto),
+        "a later write moves it"
+    );
+    let fired = later + pto;
+    client.on_deadline(fired);
+    assert_eq!(client.recovery.pto_period(Space::Data), 2 * pto);
+    client.poll_transmit(&limits(fired), &mut VecSink::new(1500), &mut InlineSealer);
+    assert_eq!(
+        loss_timer(client),
+        Some(fired + 2 * pto),
+        "the probe moves it a doubled PTO on"
+    );
 }
 
 #[test]

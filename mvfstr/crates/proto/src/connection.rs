@@ -1766,4 +1766,6 @@ pub struct ConnStats {
     pub rtt_var: Duration,
     /// Candidates that did not fit an empty packet and were skipped; expected to stay zero.
     pub tx_inconsistent: u64,
+    /// ACK frames received, in every packet number space.
+    pub acks_received: u64,
 }

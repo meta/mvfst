@@ -863,6 +863,7 @@ impl Connection {
         space: Space,
         ack: &AckFrame<'_>,
     ) -> Result<(), ConnError> {
+        self.stats.acks_received += 1;
         let exponent = u32::from(self.peer_ack_delay_exponent);
         let micros = ack
             .delay()

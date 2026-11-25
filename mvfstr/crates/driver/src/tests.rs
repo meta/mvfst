@@ -7630,6 +7630,261 @@ fn the_driver_counts_the_packets_and_datagrams_its_connections_send() {
     harness.shutdown();
 }
 
+/// Bytes an [`Answer`] session sends back, in one packet.
+const ANSWER: usize = 100;
+
+/// A server session that answers its peer's unidirectional stream, once it finishes, with
+/// [`ANSWER`] bytes and the FIN on a unidirectional stream of its own, and then moves its own
+/// deadline a second earlier. The deadline starts 10 s after the accept, before any of a sluggish
+/// connection's, so it is the connection's.
+struct Answer {
+    deadline: Instant,
+    answered: bool,
+}
+
+impl QuicSession for Answer {
+    fn on_event(&mut self, _: &mut Conn<'_>, _: ConnEvent) {}
+
+    fn on_stream(&mut self, conn: &mut Conn<'_>, id: StreamId, ready: StreamReady) {
+        if !matches!(ready, StreamReady::Readable | StreamReady::Finished) {
+            return;
+        }
+        read_all(conn, id);
+        if ready == StreamReady::Finished && !self.answered {
+            self.answered = true;
+            let reply = conn.open_stream(Dir::Uni, ORDER).expect("a stream opens");
+            let mut queue = VecDeque::from([payload(ANSWER)]);
+            assert!(
+                push_all(conn, reply, &mut queue, true),
+                "the stream takes it all"
+            );
+            self.deadline -= Duration::from_secs(1);
+        }
+    }
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, _: &mut SendSink<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, _: &mut Conn<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        Some(self.deadline)
+    }
+}
+
+/// Returns, on the server worker, the counters of its driver for [`Answer`] sessions and the ACK
+/// frames each of its connections has received.
+fn answer_counters() -> (crate::EndpointStats, Vec<u64>) {
+    with_backend_handle::<Answer, Gated, _>(|handle| {
+        let acks = handle
+            .conn_stats()
+            .iter()
+            .map(|stats| stats.acks_received)
+            .collect();
+        (handle.stats(), acks)
+    })
+}
+
+#[test]
+fn two_connections_whose_packets_leave_in_one_flush_move_each_counter_as_expected() {
+    let valves = Arc::new(Valves::default());
+    let harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg: MmsgOptions::default(),
+        valves: Arc::clone(&valves),
+    });
+    let transport = sluggish();
+    let server_transport = Arc::clone(&transport);
+    let addr = harness.serve(move || {
+        let mut app = App::new(|_| {
+            Ok(Answer {
+                deadline: Instant::now() + Duration::from_secs(10),
+                answered: false,
+            })
+        });
+        app.transport = Some(server_transport);
+        app
+    });
+    let (tx, rx) = mpsc::channel();
+    let go = Arc::new(AtomicBool::new(false));
+    let conns: Vec<ConnHandle> = (0..2)
+        .map(|_| {
+            let (go, tx) = (Arc::clone(&go), tx.clone());
+            harness.connect_with(
+                addr,
+                ConnOptions {
+                    transport: Some(Arc::clone(&transport)),
+                },
+                move || Bulk::new("client", 50, Some(go), tx),
+            )
+        })
+        .collect();
+    await_reports(
+        &rx,
+        vec![
+            Report::Event("client", ConnEvent::Confirmed),
+            Report::Event("client", ConnEvent::Confirmed),
+        ],
+    );
+
+    // The server worker reads the counters and then blocks, so that the clients' datagrams wait
+    // for one turn on its socket.
+    let (counted_tx, counted_rx) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    harness
+        .server
+        .handle()
+        .submit(move |_| {
+            let _ = counted_tx.send(answer_counters());
+            let _ = released.recv();
+        })
+        .expect("the server worker takes commands");
+    let (before, acks_before) = counted_rx.recv_timeout(WAIT).expect("the server blocks");
+    let client_before = harness.client_stats::<Bulk>();
+    let handed = valves.client.datagrams();
+    go.store(true, Ordering::SeqCst);
+    for conn in &conns {
+        conn.wake().expect("the connection is live");
+    }
+    let deadline = Instant::now() + WAIT;
+    while valves.client.datagrams() < handed + 2 {
+        assert!(Instant::now() < deadline, "the clients never sent");
+        std::thread::yield_now();
+    }
+    // A command runs between the client driver's turns, so the turn that sent has flushed.
+    harness.client_stats::<Bulk>();
+    drop(release);
+    await_reports(
+        &rx,
+        vec![
+            Report::Received(uni(3), ANSWER),
+            Report::Received(uni(3), ANSWER),
+        ],
+    );
+
+    let (counted_tx, counted_rx) = mpsc::channel();
+    harness
+        .server
+        .handle()
+        .submit(move |_| {
+            let _ = counted_tx.send(answer_counters());
+        })
+        .expect("the server worker takes commands");
+    let (after, acks_after) = counted_rx.recv_timeout(WAIT).expect("the server answers");
+    let moved = |name, counter: fn(&crate::EndpointStats) -> u64| {
+        (name, counter(&after) - counter(&before))
+    };
+    assert_eq!(
+        [
+            moved("sent_datagrams", |s| s.sent_datagrams),
+            moved("sendmmsg_calls", |s| s.sendmmsg_calls),
+            moved("sendmmsg_messages", |s| s.sendmmsg_messages),
+            moved("multi_connection_calls", |s| s.multi_connection_calls),
+            moved("gso_retries", |s| s.gso_retries),
+            moved("gso_disabled", |s| s.gso_disabled),
+            moved("recv_batch_calls", |s| s.recv_batch_calls),
+            moved("receive_passes", |s| s.receive_passes),
+            moved("deadline_rearms", |s| s.deadline_rearms),
+        ],
+        [
+            ("sent_datagrams", 2),
+            ("sendmmsg_calls", 1),
+            ("sendmmsg_messages", 2),
+            ("multi_connection_calls", 1),
+            ("gso_retries", 0),
+            ("gso_disabled", 0),
+            ("recv_batch_calls", 2),
+            ("receive_passes", 2),
+            ("deadline_rearms", 2),
+        ],
+        "one receive batch with a datagram from each client, one pass over each connection, \
+         each session's deadline moved once, and both answers in one call"
+    );
+    let acks: Vec<u64> = acks_after
+        .iter()
+        .zip(&acks_before)
+        .map(|(after, before)| after - before)
+        .collect();
+    assert_eq!(
+        acks,
+        vec![1, 1],
+        "each client's packet carried one ACK frame"
+    );
+
+    // Each client connection sends and receives on its own socket.
+    let client_after = harness.client_stats::<Bulk>();
+    let moved = |name, counter: fn(&crate::EndpointStats) -> u64| {
+        (name, counter(&client_after) - counter(&client_before))
+    };
+    assert_eq!(
+        [
+            moved("sendmmsg_calls", |s| s.sendmmsg_calls),
+            moved("sendmmsg_messages", |s| s.sendmmsg_messages),
+            moved("multi_connection_calls", |s| s.multi_connection_calls),
+            moved("recv_batch_calls", |s| s.recv_batch_calls),
+            moved("receive_passes", |s| s.receive_passes),
+        ],
+        [
+            ("sendmmsg_calls", 2),
+            ("sendmmsg_messages", 2),
+            ("multi_connection_calls", 0),
+            ("recv_batch_calls", 2),
+            ("receive_passes", 2),
+        ],
+        "each client's datagram in a call of its own, and each answer in a receive batch of its own"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn a_backlog_the_server_socket_sends_when_polled_writable_is_counted_with_its_flush() {
+    let ping = GatedPing::new();
+    let before = ping.harness.server_stats::<Echo>();
+    // The flush of the echo meets an EAGAIN, and the poll for writability right after it sends
+    // the echo.
+    ping.valves.server.block_next_flush_until_polled();
+    ping.ping();
+    ping.await_echo(0);
+    // Nothing else makes the sluggish server flush again before this runs.
+    let after = ping.harness.server_stats::<Echo>();
+    let events = ping.valves.server.events();
+    assert!(
+        events.contains(&Event::SentAtPoll),
+        "the poll sent nothing: {events:?}"
+    );
+    assert_eq!(
+        (
+            after.sendmmsg_calls - before.sendmmsg_calls,
+            after.sendmmsg_messages - before.sendmmsg_messages,
+        ),
+        (1, 1),
+        "the poll's call that sent the echo"
+    );
+    ping.harness.shutdown();
+}
+
+#[test]
+fn the_gso_counts_of_the_server_socket_reach_the_endpoint_counters() {
+    let ping = GatedPing::new();
+    let before = ping.harness.server_stats::<Echo>();
+    // The socket counts three GSO retries and one disable, which the flush of the echo takes.
+    ping.valves.server.count_gso(3, 1);
+    ping.ping();
+    ping.await_echo(0);
+    let after = ping.harness.server_stats::<Echo>();
+    assert_eq!(
+        (
+            after.gso_retries - before.gso_retries,
+            after.gso_disabled - before.gso_disabled,
+        ),
+        (3, 1),
+        "the socket's retries and disable, each in its own counter"
+    );
+    ping.harness.shutdown();
+}
+
 #[test]
 fn a_finished_drivers_handle_keeps_its_last_counters() {
     let harness = Harness::new();

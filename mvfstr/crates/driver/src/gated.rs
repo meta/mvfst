@@ -7,8 +7,9 @@
 
 //! A backend for the driver's tests: [`MmsgBackend`] behind a [`Valve`] that the test thread
 //! controls. A valve can hold its sockets' flushes behind a simulated EAGAIN, which loopback never
-//! returns, drop a run as the backend drops one that must not leave, fail a receive, and hold the
-//! worker after an attempt. It records what the sockets did.
+//! returns, drop a run as the backend drops one that must not leave, fail a receive, add GSO counts
+//! to what the sockets count, and hold the worker after an attempt. It records what the sockets
+//! did.
 
 use std::io;
 use std::mem;
@@ -30,6 +31,7 @@ use mvfstr_io::MmsgSink;
 use mvfstr_io::RxBackend;
 use mvfstr_io::TxBackend;
 use mvfstr_io::TxCaps;
+use mvfstr_io::TxCounters;
 use mvfstr_proto::ClockEpoch;
 use mvfstr_proto::ConnKey;
 use mvfstr_proto::Release;
@@ -53,6 +55,9 @@ pub(crate) enum Event {
     Flush,
     /// A flush met the simulated EAGAIN.
     Blocked,
+    /// A poll for writability found the socket writable again and sent the backlog, as set up by
+    /// [`Valve::block_next_flush_until_polled`].
+    SentAtPoll,
     /// Datagrams arrived.
     Received,
     /// A run ended; [`Valve::runs`] has its attempt and release.
@@ -85,6 +90,11 @@ pub(crate) struct Started {
 struct State {
     /// The next flush meets the simulated EAGAIN.
     block_next_flush: bool,
+    /// The simulated EAGAIN ends at the next poll for writability, which sends the backlog.
+    writable_at_poll: bool,
+    /// GSO counts the sockets add to what they count when they are next taken.
+    gso_retries: u64,
+    gso_disabled: u64,
     /// The sockets keep their queued runs and refuse every segment until the test opens them.
     blocked: bool,
     /// The waker of the last `poll_writable` while blocked.
@@ -135,6 +145,23 @@ impl Valve {
     /// segments until [`open`](Self::open).
     pub(crate) fn block_next_flush(&self) {
         self.state().block_next_flush = true;
+    }
+
+    /// Makes the next flush meet the simulated EAGAIN, and the poll for writability after it find
+    /// the socket writable again and send the backlog itself, as the real backends' polls do.
+    pub(crate) fn block_next_flush_until_polled(&self) {
+        let mut state = self.state();
+        state.block_next_flush = true;
+        state.writable_at_poll = true;
+    }
+
+    /// Adds `retries` GSO retries and `disabled` GSO disables to the counters the sockets return
+    /// when they are next taken, as a socket whose kernel refused GSO sends counts them. A real
+    /// refusal needs SO_NO_CHECK on the socket, which takes unsafe code this crate forbids.
+    pub(crate) fn count_gso(&self, retries: u64, disabled: u64) {
+        let mut state = self.state();
+        state.gso_retries += retries;
+        state.gso_disabled += disabled;
     }
 
     /// Returns whether the sockets are blocked and the driver is waiting for them to be writable.
@@ -367,18 +394,31 @@ impl TxBackend for Gated {
     }
 
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        {
+        let writable_again = {
             let mut state = self.valve().state();
-            if state.blocked {
+            if state.blocked && !mem::take(&mut state.writable_at_poll) {
                 state.writable = Some(cx.waker().clone());
                 return Poll::Pending;
             }
+            mem::take(&mut state.blocked)
+        };
+        if writable_again {
+            self.valve().record(Event::SentAtPoll);
+            self.inner.flush(Instant::now());
         }
         self.inner.poll_writable(cx)
     }
 
     fn drain_reports(&mut self, f: impl FnMut(ConnKey, TxReport)) {
         self.inner.drain_reports(f);
+    }
+
+    fn take_counters(&mut self) -> TxCounters {
+        let mut counted = self.inner.take_counters();
+        let mut state = self.valve().state();
+        counted.gso_retries += mem::take(&mut state.gso_retries);
+        counted.gso_disabled += mem::take(&mut state.gso_disabled);
+        counted
     }
 }
 

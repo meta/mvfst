@@ -37,6 +37,7 @@ use crate::RxBackend;
 use crate::SocketOptions;
 use crate::TxBackend;
 use crate::TxCaps;
+use crate::TxCounters;
 use crate::rx::Rx;
 use crate::socket;
 use crate::tx::MmsgSink;
@@ -218,6 +219,10 @@ impl TxBackend for MmsgBackend {
 
     fn drain_reports(&mut self, f: impl FnMut(ConnKey, TxReport)) {
         self.tx.drain_reports(f);
+    }
+
+    fn take_counters(&mut self) -> TxCounters {
+        self.tx.take_counters()
     }
 }
 

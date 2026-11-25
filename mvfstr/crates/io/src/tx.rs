@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::mem;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -29,6 +30,7 @@ use socket2::SockAddr;
 
 use crate::ReleaseSupport;
 use crate::TxCaps;
+use crate::TxCounters;
 use crate::cmsg::CmsgSpace;
 use crate::cmsg::Encoder;
 use crate::sys;
@@ -36,6 +38,10 @@ use crate::sys;
 /// The most payload one UDP send carries over IPv4: 65,535 bytes less the IPv4 and UDP headers.
 /// IPv6 allows 20 bytes more; one limit keeps dual-stack sockets simple.
 const MAX_SEND_BYTES: usize = 65_507;
+
+/// GSO sends a socket's kernel may refuse, each then taking the send's first datagram alone,
+/// before the socket sends without GSO.
+const GSO_REFUSALS: u8 = 3;
 
 /// How the transmit half is sized, from [`MmsgOptions`](crate::MmsgOptions).
 pub(crate) struct TxConfig {
@@ -71,6 +77,14 @@ struct Msg {
 
 pub(crate) struct Tx {
     caps: TxCaps,
+    /// The most segments one send carries: the socket's limit, or 1 once GSO is off.
+    max_segments: u16,
+    /// GSO sends the kernel refused and then took as single datagrams.
+    gso_refusals: u8,
+    /// Whether the front message is the first datagram of a refused GSO send. If the kernel takes
+    /// it, GSO caused the refusal, which counts toward turning GSO off; if not, the cause was
+    /// something the datagrams share, such as their destination.
+    refused: bool,
     connected: bool,
     ipv6: bool,
     batch: usize,
@@ -101,6 +115,11 @@ pub(crate) struct Tx {
     iovs: Vec<libc::iovec>,
     names: Vec<SockAddr>,
     control: Vec<CmsgSpace>,
+    counters: TxCounters,
+    /// Errors that the next calls with a GSO send at the front fail with, without reaching the
+    /// kernel.
+    #[cfg(test)]
+    injected: VecDeque<i32>,
 }
 
 impl Tx {
@@ -108,6 +127,9 @@ impl Tx {
         let slot_size = usize::from(caps.max_datagram);
         let slots = config.slots as usize;
         Self {
+            max_segments: caps.max_segments.max(1),
+            gso_refusals: 0,
+            refused: false,
             caps,
             connected: config.connected,
             ipv6: config.ipv6,
@@ -131,6 +153,9 @@ impl Tx {
             iovs: Vec::with_capacity(slots),
             names: Vec::with_capacity(config.batch),
             control: vec![CmsgSpace::default(); config.batch],
+            counters: TxCounters::default(),
+            #[cfg(test)]
+            injected: VecDeque::new(),
         }
     }
 
@@ -147,12 +172,30 @@ impl Tx {
         let mut sent = 0;
         while !self.queue.is_empty() {
             let n = self.prepare();
-            // SAFETY: `prepare` pointed every header at names, iovecs, control data and slot
-            // bytes owned by `self`, and these do not change until the call returns.
-            match unsafe { sys::sendmmsg(fd.as_raw_fd(), &mut self.hdrs[..n]) } {
+            let result = self.sendmmsg(fd, n);
+            self.counters.calls += 1;
+            match result {
                 Ok(accepted) => {
+                    self.counters.messages += accepted as u64;
+                    if let Some(first) = self.queue.front()
+                        && self
+                            .queue
+                            .iter()
+                            .take(accepted)
+                            .any(|msg| msg.conn != first.conn)
+                    {
+                        self.counters.multi_connection_calls += 1;
+                    }
                     for _ in 0..accepted {
                         sent += self.retire_front(Retire::Flushed);
+                    }
+                    if accepted > 0 && mem::take(&mut self.refused) {
+                        self.gso_refusals += 1;
+                        if self.gso_refusals == GSO_REFUSALS {
+                            self.max_segments = 1;
+                            self.counters.gso_disabled += 1;
+                            self.split(self.queue.len());
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -161,8 +204,20 @@ impl Tx {
                     self.blocked = true;
                     return sent;
                 }
+                // A GSO send the kernel refuses goes again as single datagrams. Once the kernel
+                // has taken the first datagram of a few such sends, every send does, those
+                // already queued included.
+                Err(e)
+                    if matches!(e.raw_os_error(), Some(libc::EIO | libc::EINVAL))
+                        && self.queue.front().is_some_and(|msg| msg.segments > 1) =>
+                {
+                    self.counters.gso_retries += 1;
+                    self.refused = true;
+                    self.split(1);
+                }
                 // `sendmmsg` reports an error only for the first message it was given.
                 Err(e) => {
+                    self.refused = false;
                     self.retire_front(match did_not_leave(&e) {
                         Some(reason) => Retire::Dropped(reason),
                         None => Retire::Unknown,
@@ -173,6 +228,23 @@ impl Tx {
         self.blocked = false;
         self.urgent_taken.clear();
         sent
+    }
+
+    /// Sends the `n` messages `prepare` built in one call.
+    fn sendmmsg(&mut self, fd: BorrowedFd<'_>, n: usize) -> io::Result<usize> {
+        #[cfg(test)]
+        if self.queue.front().is_some_and(|msg| msg.segments > 1)
+            && let Some(errno) = self.injected.pop_front()
+        {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        // SAFETY: `prepare` pointed every header at names, iovecs, control data and slot bytes
+        // owned by `self`, and these do not change until the call returns.
+        unsafe { sys::sendmmsg(fd.as_raw_fd(), &mut self.hdrs[..n]) }
+    }
+
+    pub(crate) fn take_counters(&mut self) -> TxCounters {
+        mem::take(&mut self.counters)
     }
 
     pub(crate) fn drain_reports(&mut self, mut f: impl FnMut(ConnKey, TxReport)) {
@@ -321,7 +393,7 @@ impl Tx {
         // Cut the run into GSO sends: each send's segment size is its first segment's length,
         // and a send ends after a shorter segment, before a longer one, at the kernel's segment
         // limit, or before it would carry more than one UDP datagram can.
-        let max_segments = self.caps.max_segments.max(1);
+        let max_segments = self.max_segments;
         let mut next = meta.tx.start;
         let mut i = 0;
         while i < self.open.len() {
@@ -364,6 +436,36 @@ impl Tx {
         if self.queue.len() >= self.batch && !self.blocked {
             self.send(fd);
         }
+    }
+
+    /// Replaces each of the first `messages` queued messages with one message per datagram, in
+    /// order. The queue does not grow past its capacity, the pool's slots, as every message holds
+    /// at least one.
+    fn split(&mut self, messages: usize) {
+        let rest = self.queue.len() - messages;
+        let mut slots = 0;
+        for _ in 0..messages {
+            let msg = self
+                .queue
+                .pop_front()
+                .expect("should hold the messages to split");
+            for i in 0..msg.segments {
+                let len = self.lens[self.queued[slots] as usize];
+                let start = msg.tx.start + u64::from(i);
+                self.queue.push_back(Msg {
+                    segment_size: len,
+                    segments: 1,
+                    bytes: u32::from(len),
+                    tx: TxSeqRange {
+                        start,
+                        end: start + 1,
+                    },
+                    ..msg
+                });
+                slots += 1;
+            }
+        }
+        self.queue.rotate_left(rest);
     }
 
     /// Queues a report, merging a `Flushed` that continues the previous one.
@@ -695,6 +797,86 @@ mod tests {
                 ipv6: false,
             },
         )
+    }
+
+    /// Queues one sealed run of datagrams of `lens` bytes to `dst`, sent as soon as possible.
+    fn queue_run(tx: &mut Tx, fd: BorrowedFd<'_>, conn: ConnKey, dst: SocketAddr, lens: &[u16]) {
+        tx.begin_sink(conn);
+        for (i, &len) in lens.iter().enumerate() {
+            let (_, slot) = tx.lend(fd, conn, len, TxClass::Data).expect("a slot");
+            slot.fill(i as u8);
+            tx.end_segment(conn, len);
+        }
+        tx.end_run(
+            fd,
+            conn,
+            TxMeta {
+                path: PathId(0),
+                dst,
+                src_ip: None,
+                tos: 0,
+                segment_size: lens[0],
+                segments: lens.len() as u16,
+                release: Release::Asap,
+                class: TxClass::Data,
+                tx: TxSeqRange {
+                    start: 0,
+                    end: lens.len() as u64,
+                },
+                sealed: true,
+            },
+        );
+        tx.end_sink(conn);
+    }
+
+    #[test]
+    fn a_gso_send_refused_with_eio_goes_again_as_single_datagrams() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let fd = socket.as_fd();
+        let mut tx = tx(4, ReleaseSupport::None);
+        tx.injected.push_back(libc::EIO);
+        let conn = ConnKey {
+            index: 5,
+            generation: 1,
+        };
+        queue_run(
+            &mut tx,
+            fd,
+            conn,
+            peer.local_addr().unwrap(),
+            &[100, 100, 40],
+        );
+        assert_eq!(tx.send(fd), 3);
+
+        let mut buf = [0; 200];
+        let got: Vec<usize> = (0..3)
+            .map(|_| peer.recv(&mut buf).expect("a datagram"))
+            .collect();
+        assert_eq!(got, vec![100, 100, 40]);
+        let mut reports = Vec::new();
+        tx.drain_reports(|conn, report| reports.push((conn, report)));
+        assert_eq!(
+            reports,
+            vec![(
+                conn,
+                TxReport::Flushed {
+                    tx: TxSeqRange { start: 0, end: 3 }
+                }
+            )]
+        );
+        assert_eq!(
+            tx.take_counters(),
+            TxCounters {
+                calls: 2,
+                messages: 3,
+                gso_retries: 1,
+                ..TxCounters::default()
+            },
+            "the refused GSO send, then one call with its three datagrams"
+        );
     }
 
     #[test]

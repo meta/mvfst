@@ -39,6 +39,7 @@ use bytes::Bytes;
 use mvfstr_io::Backend;
 use mvfstr_io::FlushOutcome;
 use mvfstr_io::TxCaps;
+use mvfstr_io::TxCounters;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::ClientTls;
 use mvfstr_proto::ConnEvent;
@@ -270,6 +271,11 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     sent_packets: Cell<u64>,
     sent_datagrams: Cell<u64>,
     phase_pacing_wakes: Cell<u64>,
+    /// The sockets' transmit counters, taken after each flush.
+    tx_counters: Cell<TxCounters>,
+    recv_batch_calls: Cell<u64>,
+    receive_passes: Cell<u64>,
+    deadline_rearms: Cell<u64>,
     /// The endpoint's count of datagrams dropped for their source port, read without borrowing
     /// the endpoint, because a certificate resolver running inside it may read the counters.
     src_port_drops: SrcPortDrops,
@@ -605,6 +611,28 @@ pub struct EndpointStats {
     /// connections, and those that would have moved a server connection to a blocked port
     /// (mvfst's `INVALID_SRC_PORT`).
     pub invalid_src_port: u64,
+    /// `sendmmsg` calls on the driver's sockets, those that failed included.
+    pub sendmmsg_calls: u64,
+    /// Messages of those calls that the kernel accepted: GSO sends and single datagrams. A failed
+    /// call does not add to it, and a partial call adds only its accepted prefix.
+    pub sendmmsg_messages: u64,
+    /// `sendmmsg` calls whose accepted messages carried the runs of more than one connection, so a
+    /// failed call does not count and a partial call counts by its accepted prefix alone.
+    pub multi_connection_calls: u64,
+    /// GSO sends the kernel refused with EIO or EINVAL, whose datagrams went again as single
+    /// messages.
+    pub gso_retries: u64,
+    /// Sockets that stopped using GSO after the kernel refused three GSO sends whose datagrams it
+    /// then took alone.
+    pub gso_disabled: u64,
+    /// `recv_batch` calls the driver makes on its connections. The call inside `Endpoint::accept`
+    /// on a new server connection's first datagram is not counted.
+    pub recv_batch_calls: u64,
+    /// Passes over a connection after one or more of those calls, which queue its application,
+    /// TLS and transmit work and resync its deadline.
+    pub receive_passes: u64,
+    /// Moves of a connection's deadline timer.
+    pub deadline_rearms: u64,
 }
 
 /// A graceful shutdown in progress. A step's time is `None` once the step is taken, or when it lies
@@ -788,6 +816,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sent_packets: Cell::new(0),
             sent_datagrams: Cell::new(0),
             phase_pacing_wakes: Cell::new(0),
+            tx_counters: Cell::new(TxCounters::default()),
+            recv_batch_calls: Cell::new(0),
+            receive_passes: Cell::new(0),
+            deadline_rearms: Cell::new(0),
             src_port_drops,
             last: Rc::default(),
             aborted: Cell::new(false),
@@ -876,6 +908,20 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     #[cfg(test)]
     pub(crate) fn issued_cids(&self) -> Vec<mvfstr_proto::ConnectionId> {
         self.issued.borrow().clone()
+    }
+
+    /// Returns every connection's counters, in slot order.
+    #[cfg(test)]
+    pub(crate) fn conn_stats(&self) -> Vec<mvfstr_proto::ConnStats> {
+        let slab = self.slab.borrow();
+        (0..slab.end())
+            .filter_map(|index| {
+                let key = slab.key_at(index)?;
+                let slot = slab.slot(index)?;
+                let mut slot = slot.borrow_mut();
+                slot.get(key).map(|entry| entry.conn.stats())
+            })
+            .collect()
     }
 
     /// Returns every connection's build horizon and the timers that hold its pacing wakes, in
@@ -978,6 +1024,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
 
     /// Returns the endpoint's counters.
     pub(crate) fn stats(&self) -> EndpointStats {
+        let tx = self.tx_counters.get();
         EndpointStats {
             turns: self.turns.get(),
             empty_ready_polls: self.empty_ready_polls.get(),
@@ -991,7 +1038,26 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sent_datagrams: self.sent_datagrams.get(),
             phase_pacing_wakes: self.phase_pacing_wakes.get(),
             invalid_src_port: self.src_port_drops.get(),
+            sendmmsg_calls: tx.calls,
+            sendmmsg_messages: tx.messages,
+            multi_connection_calls: tx.multi_connection_calls,
+            gso_retries: tx.gso_retries,
+            gso_disabled: tx.gso_disabled,
+            recv_batch_calls: self.recv_batch_calls.get(),
+            receive_passes: self.receive_passes.get(),
+            deadline_rearms: self.deadline_rearms.get(),
         }
+    }
+
+    /// Adds the transmit counters a socket kept since they were last taken.
+    fn add_tx_counters(&self, counted: TxCounters) {
+        let mut total = self.tx_counters.get();
+        total.calls += counted.calls;
+        total.messages += counted.messages;
+        total.multi_connection_calls += counted.multi_connection_calls;
+        total.gso_retries += counted.gso_retries;
+        total.gso_disabled += counted.gso_disabled;
+        self.tx_counters.set(total);
     }
 
     /// Replaces the source ports the endpoint refuses.
@@ -2290,6 +2356,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let mut socket = server.socket.borrow_mut();
         let flushed = socket.flush(now);
         let blocked = flushed.blocked && socket.poll_writable(cx).is_pending();
+        self.add_tx_counters(socket.take_counters());
         let mut reports = mem::take(&mut self.sched.borrow_mut().reports);
         socket.drain_reports(|key, report| reports.push((key, report)));
         drop(socket);
@@ -2385,6 +2452,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             && socket
                 .poll_writable(&mut Context::from_waker(tx_waker))
                 .is_pending();
+        self.add_tx_counters(socket.take_counters());
         socket.drain_reports(|_, report| {
             conn.on_tx_report(now, report);
             dropped |= matches!(report, TxReport::Dropped { .. });
@@ -2545,6 +2613,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                             data: &mut waiting.datagram,
                         };
                         let summary = entry.conn.recv_batch(now, &mut [datagram]);
+                        self.recv_batch_calls.set(self.recv_batch_calls.get() + 1);
                         self.after_receive(key, entry, summary.tls_due);
                     });
                 }
@@ -2661,6 +2730,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             );
             self.with_entry(key, "receive", |entry| {
                 let summary = entry.conn.recv_batch(now, &mut datagrams);
+                self.recv_batch_calls.set(self.recv_batch_calls.get() + 1);
                 self.after_receive(key, entry, summary.tls_due);
             });
         }
@@ -2855,6 +2925,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 end: at.handled,
             });
             tls_due = conn.recv_batch(now, &mut datagrams).tls_due;
+            self.recv_batch_calls.set(self.recv_batch_calls.get() + 1);
             spare = recycle(datagrams);
             received = true;
             if more {
@@ -2886,6 +2957,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// Queues the work a receive batch makes. `tls_due` is whether the batch left the connection
     /// work for its TLS host.
     fn after_receive(&self, key: ConnKey, entry: &mut Entry<A::Session, B>, tls_due: bool) {
+        self.receive_passes.set(self.receive_passes.get() + 1);
         self.mark_dirty(key, entry);
         self.queue_app(key, entry);
         if tls_due {
@@ -3236,6 +3308,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             .chain(entry.session_deadline)
             .min();
         if at != entry.deadline {
+            self.deadline_rearms.set(self.deadline_rearms.get() + 1);
             self.sched
                 .borrow_mut()
                 .timers

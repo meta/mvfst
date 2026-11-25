@@ -85,6 +85,25 @@ pub struct FlushOutcome {
     pub blocked: bool,
 }
 
+/// Counters of a backend's transmit half, from [`TxBackend::take_counters`]. Each event costs one
+/// add, without a clock read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TxCounters {
+    /// `sendmmsg` calls, those that failed included.
+    pub calls: u64,
+    /// Messages the kernel accepted: GSO sends and single datagrams.
+    pub messages: u64,
+    /// Calls whose accepted messages came from more than one connection.
+    pub multi_connection_calls: u64,
+    /// GSO sends the kernel refused with EIO or EINVAL, whose datagrams went again as single
+    /// messages.
+    pub gso_retries: u64,
+    /// Sockets that stopped using GSO after refused GSO sends whose datagrams the kernel then took
+    /// alone: at most one per socket.
+    pub gso_disabled: u64,
+}
+
 /// The transmit half of a backend.
 ///
 /// A backend flushes on its own when its slot pool or system-call vector fills, so a refused
@@ -111,6 +130,12 @@ pub trait TxBackend {
 
     /// Hands every pending report to `f`, with the connection that built the datagrams.
     fn drain_reports(&mut self, f: impl FnMut(ConnKey, TxReport));
+
+    /// Returns the counters since the last call and starts them again from zero. A backend
+    /// that does not count returns zeros.
+    fn take_counters(&mut self) -> TxCounters {
+        TxCounters::default()
+    }
 }
 
 /// The receive half of a backend.

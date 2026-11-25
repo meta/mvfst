@@ -30,6 +30,7 @@ use mvfstr_io::ReleaseSupport;
 use mvfstr_io::RxBackend;
 use mvfstr_io::SocketOptions;
 use mvfstr_io::TxBackend;
+use mvfstr_io::TxCounters;
 use mvfstr_io::socket;
 use mvfstr_proto::ConnKey;
 use mvfstr_proto::DropReason;
@@ -255,6 +256,40 @@ fn coalesced_datagrams_arrive_as_one_buffer_with_their_stride() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].0.stride, 1200);
     assert_eq!(got[0].1, payload);
+}
+
+#[test]
+fn each_batch_receives_into_every_slots_own_buffer_with_its_whole_control_space() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("sender");
+    let mut receiver = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("receiver");
+    let to = receiver.local_addr().unwrap();
+    // The kernel shortens the first slot's control length to what a single datagram's
+    // IP_PKTINFO and IP_TOS take; a GRO run adds UDP_GRO.
+    let single = vec![vec![1; 100]];
+    send_run(&mut sender, conn(20), &single, meta(to, &single, 0));
+    sender.flush(Instant::now());
+    assert_eq!(recv_batch(&rt, &mut receiver).len(), 1);
+
+    let run = segments(3, 200, 200);
+    send_run(&mut sender, conn(20), &run, meta(to, &run, 1));
+    let tail = vec![vec![2; 50]];
+    send_run(&mut sender, conn(20), &tail, meta(to, &tail, 4));
+    sender.flush(Instant::now());
+    let mut got = Vec::new();
+    while got
+        .iter()
+        .map(|(_, d): &(RxMeta, Vec<u8>)| d.len())
+        .sum::<usize>()
+        < 650
+    {
+        got.extend(recv_batch(&rt, &mut receiver));
+    }
+    let shapes: Vec<_> = got.iter().map(|(m, d)| (m.stride, d.len())).collect();
+    assert_eq!(shapes, vec![(200, 600), (50, 50)]);
+    assert_eq!(got[0].1, run.concat());
+    assert_eq!(got[1].1, tail[0]);
 }
 
 #[test]
@@ -549,6 +584,45 @@ fn each_run_carries_its_own_tos() {
 }
 
 #[test]
+fn one_call_carries_the_runs_of_several_connections_each_with_its_own_tos() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("sender");
+    let mut receiver = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("receiver");
+    let to = receiver.local_addr().unwrap();
+    for (index, tos) in [(1, 0b10), (2, 0b01), (3, 0b10)] {
+        let run = vec![vec![index as u8; 64]];
+        send_run(
+            &mut sender,
+            conn(index),
+            &run,
+            TxMeta {
+                tos,
+                ..meta(to, &run, 0)
+            },
+        );
+    }
+    assert_eq!(sender.flush(Instant::now()).datagrams, 3);
+
+    let mut got = Vec::new();
+    while got.len() < 3 {
+        got.extend(recv_batch(&rt, &mut receiver));
+    }
+    let seen: Vec<_> = got.iter().map(|(m, d)| (d[0], m.ecn)).collect();
+    assert_eq!(seen, vec![(1, Ecn::Ect0), (2, Ecn::Ect1), (3, Ecn::Ect0)]);
+    let counted = sender.take_counters();
+    assert_eq!(
+        (
+            counted.calls,
+            counted.messages,
+            counted.multi_connection_calls
+        ),
+        (1, 3, 1),
+        "one call carried the three connections' runs"
+    );
+}
+
+#[test]
 fn a_dual_stack_sender_sets_tos_for_ipv4_and_ipv6_destinations() {
     let rt = runtime();
     let _guard = rt.enter();
@@ -692,6 +766,44 @@ fn the_backend_flushes_on_its_own_when_its_vector_fills() {
                 tx: TxSeqRange { start: 0, end: 3 }
             }
         )]
+    );
+}
+
+#[test]
+fn the_backend_counts_its_sendmmsg_calls_and_the_messages_they_carry() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let options = MmsgOptions {
+        tx_batch: 2,
+        ..MmsgOptions::default()
+    };
+    let mut sender = MmsgBackend::bind(v4(0), &options).expect("sender");
+    let peer = receiver(v4(0));
+    let to = peer.local_addr().unwrap();
+    let runs = [vec![vec![0; 10]], segments(3, 10, 10), vec![vec![2; 10]]];
+    let mut seq = 0;
+    for run in &runs {
+        send_run(&mut sender, conn(10), run, meta(to, run, seq));
+        seq += run.len() as u64;
+    }
+    assert_eq!(sender.flush(Instant::now()).datagrams, 1);
+    assert_eq!(recv_plain(&peer, 5).len(), 5);
+
+    // The first two runs, one a GSO send of three datagrams, filled the vector and left in one
+    // call; the flush sent the third in a second.
+    let counted = sender.take_counters();
+    assert_eq!(
+        (
+            counted.calls,
+            counted.messages,
+            counted.multi_connection_calls
+        ),
+        (2, 3, 0)
+    );
+    assert_eq!(
+        sender.take_counters(),
+        TxCounters::default(),
+        "taking the counters starts them again from zero"
     );
 }
 
@@ -881,6 +993,205 @@ fn a_run_the_kernel_rejects_is_dropped_and_later_runs_still_leave() {
                 }
             ),
         ]
+    );
+}
+
+#[test]
+fn after_partial_progress_the_rest_of_the_call_goes_again() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("sender");
+    let peer = receiver(v4(0));
+    let to = peer.local_addr().unwrap();
+    // An IPv6 destination on an IPv4 socket fails with EAFNOSUPPORT, so the kernel accepts only
+    // the first of the three messages.
+    let unreachable = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+    for (index, dst) in [(1, to), (2, unreachable), (3, to)] {
+        let run = vec![vec![index as u8; 20]];
+        send_run(&mut sender, conn(index), &run, meta(dst, &run, 0));
+    }
+    assert_eq!(sender.flush(Instant::now()).datagrams, 2);
+
+    let got: Vec<_> = recv_plain(&peer, 2).into_iter().map(|(_, d)| d).collect();
+    assert_eq!(got, vec![vec![1; 20], vec![3; 20]]);
+    let tx = TxSeqRange { start: 0, end: 1 };
+    assert_eq!(
+        reports(&mut sender),
+        vec![
+            (conn(1), TxReport::Flushed { tx }),
+            (
+                conn(2),
+                TxReport::Dropped {
+                    tx,
+                    reason: DropReason::Error
+                }
+            ),
+            (conn(3), TxReport::Flushed { tx }),
+        ]
+    );
+    let counted = sender.take_counters();
+    assert_eq!(
+        (
+            counted.calls,
+            counted.messages,
+            counted.multi_connection_calls
+        ),
+        (3, 2, 0),
+        "the first call took one message, the second failed on the next, the third took the last"
+    );
+}
+
+/// Opens a backend on a socket that sends without UDP checksums (SO_NO_CHECK). The kernel needs
+/// checksums for GSO, so it refuses every GSO send from the socket with EINVAL and sends single
+/// datagrams.
+fn gso_refusing_backend() -> MmsgBackend {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    let on: libc::c_int = 1;
+    // SAFETY: the kernel reads `len` bytes from `on`, which is live.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NO_CHECK,
+            (&raw const on).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    socket.bind(&v4(0).into()).unwrap();
+    let backend = MmsgBackend::from_socket(socket, &MmsgOptions::default()).expect("backend");
+    assert!(backend.caps().max_segments > 1, "the kernel offers GSO");
+    backend
+}
+
+#[test]
+fn a_gso_send_the_kernel_refuses_goes_again_as_single_datagrams() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = gso_refusing_backend();
+    let peer = receiver(v4(0));
+    let to = peer.local_addr().unwrap();
+    let run = segments(3, 100, 40);
+    send_run(&mut sender, conn(15), &run, meta(to, &run, 0));
+    assert_eq!(sender.flush(Instant::now()).datagrams, 3);
+
+    let got: Vec<_> = recv_plain(&peer, 3).into_iter().map(|(_, d)| d).collect();
+    assert_eq!(got, run);
+    assert_eq!(
+        reports(&mut sender),
+        vec![(
+            conn(15),
+            TxReport::Flushed {
+                tx: TxSeqRange { start: 0, end: 3 }
+            }
+        )]
+    );
+    let counted = sender.take_counters();
+    assert_eq!(
+        (
+            counted.calls,
+            counted.messages,
+            counted.gso_retries,
+            counted.gso_disabled
+        ),
+        (2, 3, 1, 0),
+        "the refused GSO send, then one call with its three datagrams"
+    );
+}
+
+#[test]
+fn after_three_refused_gso_sends_the_socket_sends_without_gso() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = gso_refusing_backend();
+    let peer = receiver(v4(0));
+    let to = peer.local_addr().unwrap();
+    let run = segments(3, 100, 40);
+    let mut flush = |conns: &[u32]| {
+        for &index in conns {
+            send_run(&mut sender, conn(index), &run, meta(to, &run, 0));
+        }
+        let datagrams = sender.flush(Instant::now()).datagrams as usize;
+        assert_eq!(recv_plain(&peer, datagrams).len(), 3 * conns.len());
+        let counted = sender.take_counters();
+        (
+            counted.calls,
+            counted.messages,
+            counted.gso_retries,
+            counted.gso_disabled,
+        )
+    };
+
+    assert_eq!(flush(&[16]), (2, 3, 1, 0), "the first refusal");
+    assert_eq!(flush(&[16]), (2, 3, 1, 0), "the second refusal");
+    // The kernel takes the third refused send's datagrams but refuses the GSO send behind them
+    // without an error, as it reports one only for a call's first message.
+    assert_eq!(
+        flush(&[16, 17]),
+        (3, 6, 1, 1),
+        "the third refusal turns GSO off once its datagrams leave, for the run queued behind it too"
+    );
+    assert_eq!(
+        flush(&[16]),
+        (1, 3, 0, 0),
+        "a later run leaves as single datagrams without a refusal"
+    );
+}
+
+#[test]
+fn gso_sends_refused_for_a_cause_their_datagrams_share_never_turn_gso_off() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("sender");
+    assert!(sender.caps().max_segments > 1, "the kernel offers GSO");
+    let peer = receiver(v4(0));
+    let to = peer.local_addr().unwrap();
+    let run = segments(3, 100, 40);
+    // The kernel refuses every send to port 0 with EINVAL, GSO or not.
+    for refused in 1..=4 {
+        send_run(&mut sender, conn(18), &run, meta(v4(0), &run, 0));
+        assert_eq!(sender.flush(Instant::now()).datagrams, 0);
+        let dropped = |start| {
+            (
+                conn(18),
+                TxReport::Dropped {
+                    tx: TxSeqRange {
+                        start,
+                        end: start + 1,
+                    },
+                    reason: DropReason::Error,
+                },
+            )
+        };
+        assert_eq!(
+            reports(&mut sender),
+            vec![dropped(0), dropped(1), dropped(2)]
+        );
+        let counted = sender.take_counters();
+        assert_eq!(
+            (
+                counted.calls,
+                counted.messages,
+                counted.gso_retries,
+                counted.gso_disabled
+            ),
+            (4, 0, 1, 0),
+            "refusal {refused}: the GSO send, then each of its datagrams alone"
+        );
+    }
+    send_run(&mut sender, conn(18), &run, meta(to, &run, 0));
+    assert_eq!(sender.flush(Instant::now()).datagrams, 3);
+    assert_eq!(recv_plain(&peer, 3).len(), 3);
+    let counted = sender.take_counters();
+    assert_eq!(
+        (
+            counted.calls,
+            counted.messages,
+            counted.gso_retries,
+            counted.gso_disabled
+        ),
+        (1, 1, 0, 0),
+        "the socket still sends a run as one GSO send"
     );
 }
 

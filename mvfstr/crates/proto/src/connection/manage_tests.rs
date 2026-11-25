@@ -74,6 +74,8 @@ use crate::cc::CongestionSignal;
 use crate::cid::CidGenerator;
 use crate::cid::PeerCids;
 use crate::recovery::Space;
+use crate::sources::path::CHALLENGES;
+use crate::sources::path::CURRENT;
 use crate::testing::Pair;
 use crate::testing::PairConfig;
 use crate::testing::SentDatagram;
@@ -255,6 +257,57 @@ fn a_retired_connection_id_is_replaced_and_no_longer_routed() {
     };
     assert!(!matches!(route(retired), Route::Existing(_)));
     assert!(matches!(route(replacement.unwrap()), Route::Existing(_)));
+}
+
+#[test]
+fn two_connection_ids_retired_in_one_packet_are_both_replaced_and_no_longer_routed() {
+    let mut pair = settled(&Setup::default().transport(transport(4)));
+    let now = pair.now;
+    let ids = pair.client.conn().sources.cids.peer.ids();
+    assert_eq!(ids.len(), 4);
+    let retired = [ids[1].1, ids[2].1];
+    let frames = [
+        Frame::RetireConnectionId {
+            seq: VarInt::from_u32(1),
+        },
+        Frame::RetireConnectionId {
+            seq: VarInt::from_u32(2),
+        },
+    ];
+    let datagram =
+        Forge::of(pair.client.conn(), Space::Data, 1000, &frames).seal(pair.client.conn());
+    let server = pair.server.conn_mut();
+    deliver(server, now, client_addr(), datagram);
+    let events = endpoint_events(server);
+    for cid in retired {
+        assert!(
+            events.contains(&EndpointEvent::RetiredLocalCid { cid }),
+            "{events:?}"
+        );
+    }
+    let replacements: Vec<ConnectionId> = events
+        .iter()
+        .filter_map(|event| match event {
+            EndpointEvent::NewLocalCid { cid, .. } => Some(*cid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replacements.len(), 2, "{events:?}");
+    assert_eq!(server.sources.cids.local.active(), 4);
+    for event in events {
+        pair.server.endpoint.handle_event(pair.server.key, event);
+    }
+    let mut route = |cid| {
+        pair.server
+            .endpoint
+            .route(now, &meta(client_addr(), now), &short_header(&cid))
+    };
+    for cid in retired {
+        assert!(!matches!(route(cid), Route::Existing(_)), "{cid:?}");
+    }
+    for cid in replacements {
+        assert!(matches!(route(cid), Route::Existing(_)), "{cid:?}");
+    }
 }
 
 #[test]
@@ -2206,6 +2259,77 @@ fn an_unanswered_challenge_goes_again_after_a_pto_even_once_acknowledged_three_a
     );
     let data: BTreeSet<_> = challenges.iter().map(|(_, data)| *data).collect();
     assert_eq!(data.len(), 3, "each challenge has its own data");
+}
+
+#[test]
+fn eight_chances_to_challenge_send_three_distinct_challenges_within_one_deadline_any_one_answers() {
+    let mut pair = settled(&Setup::default());
+    let now = pair.now;
+    let moved = from_client(&pair, 10, &[Frame::Ping, Frame::Padding { len: 1200 }]);
+    let server = pair.server.conn_mut();
+    deliver(server, now, stranger(), moved);
+    let validation = |server: &Connection| {
+        server.sources.path.slots[CURRENT]
+            .validation
+            .expect("the new path is being validated")
+    };
+    let deadline = validation(server).deadline;
+    // Eight transmits to the new address, spread over the validation's time: after the first,
+    // each follows two full-size PINGs from the client, which the server acknowledges at once,
+    // and the deadlines due by then, among them the challenges' retries.
+    let mut challenges = Vec::new();
+    let mut at = now;
+    for chance in 0..8u32 {
+        at = now + (deadline - now) * chance / 8;
+        if chance > 0 {
+            let pings = [0, 1].map(|n| {
+                from_client(
+                    &pair,
+                    10 + 2 * u64::from(chance) + n,
+                    &[Frame::Ping, Frame::Padding { len: 1200 }],
+                )
+            });
+            let server = pair.server.conn_mut();
+            for ping in pings {
+                deliver(server, at, stranger(), ping);
+            }
+            if server.next_deadline().is_some_and(|due| due <= at) {
+                server.on_deadline(at);
+            }
+        }
+        let server = pair.server.conn_mut();
+        let sent: Vec<_> = transmit(server, at)
+            .into_iter()
+            .filter(|datagram| datagram.meta.dst == stranger())
+            .collect();
+        assert!(!sent.is_empty(), "chance {chance} sent nothing");
+        challenges.extend(
+            sent.iter()
+                .flat_map(|datagram| path_frames(server, &datagram.data))
+                .filter_map(|frame| match frame {
+                    PathFrame::Challenge(data) => Some(data),
+                    PathFrame::Response(_) => None,
+                }),
+        );
+        assert_eq!(
+            validation(server).deadline,
+            deadline,
+            "after chance {chance}"
+        );
+    }
+    assert_eq!(challenges.len(), CHALLENGES, "{challenges:?}");
+    let data: BTreeSet<_> = challenges.iter().collect();
+    assert_eq!(data.len(), CHALLENGES, "each challenge has its own data");
+
+    let answer = from_client(&pair, 30, &[Frame::PathResponse(challenges[0])]);
+    let server = pair.server.conn_mut();
+    deliver(server, at, stranger(), answer);
+    assert!(server.path.validated);
+    assert_eq!(server.remote_address(), stranger());
+    assert!(
+        events(server).contains(&ConnEvent::Path(PathEvent::Migrated { remote: stranger() })),
+        "the first challenge's answer validated the path"
+    );
 }
 
 #[test]

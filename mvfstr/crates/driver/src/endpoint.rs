@@ -371,6 +371,14 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
             .map_or_else(Vec::new, |core| core.issued_cids())
     }
 
+    /// Returns every connection's counters, in slot order.
+    #[cfg(test)]
+    pub(crate) fn conn_stats(&self) -> Vec<mvfstr_proto::ConnStats> {
+        self.core
+            .upgrade()
+            .map_or_else(Vec::new, |core| core.conn_stats())
+    }
+
     /// Returns every connection's build horizon and the timers that hold its pacing wakes, in
     /// slot order.
     #[cfg(test)]
