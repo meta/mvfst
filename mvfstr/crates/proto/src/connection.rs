@@ -731,7 +731,7 @@ impl Connection {
             ..
         } = self;
         let lost = recovery.on_tx_dropped(tx, |event| {
-            sources.on_packet_event(None, event, true);
+            sources.on_packet_event(None, event, true, None);
         });
         stats.lost_packets += u64::from(lost.lost_packets);
     }
@@ -817,7 +817,7 @@ impl Connection {
             ..
         } = self;
         let outcome = recovery.on_timeout(now, amplification_blocked, |event| {
-            sources.on_packet_event(None, event, false);
+            sources.on_packet_event(None, event, false, None);
         });
         match outcome {
             TimeoutOutcome::Lost(_, lost) => {

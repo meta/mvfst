@@ -66,6 +66,7 @@ use crate::recovery::RecoveryConfig;
 use crate::recovery::Space;
 use crate::recovery::sent::PacketEvent;
 use crate::recovery::sent::SentFlags;
+use crate::sources::AckedRun;
 use crate::streams::conn::StreamState;
 use crate::streams::recv_buf::RecvError;
 
@@ -284,7 +285,7 @@ impl Connection {
         } = self;
         for space in [Space::Initial, Space::Data] {
             for packet in recovery.space(space).outstanding() {
-                sources.on_packet_event(Some(space), PacketEvent::Lost(packet), false);
+                sources.on_packet_event(Some(space), PacketEvent::Lost(packet), false, None);
             }
         }
         let next_pn = Space::ALL.map(|space| self.recovery.space(space).next_pn());
@@ -881,22 +882,23 @@ impl Connection {
             ..
         } = self;
         let mut acked_in_recovery = 0;
-        let outcome = recovery
-            .on_ack_received(space, ack.ranges(), delay, ack_time, |event| {
-                if let PacketEvent::Acked(packet) = &event
-                    && packet.flags.contains(SentFlags::IN_FLIGHT)
-                    && packet.on_path
-                    && cc.in_recovery(packet.time_sent)
-                {
-                    acked_in_recovery += u64::from(packet.size);
-                }
-                sources.on_packet_event(Some(space), event, false);
-            })
-            .map_err(|e| ConnError {
-                code: e.code(),
-                frame_type: Some(frame_type(FrameKind::Ack)),
-                reason: "ACK of a packet never sent",
-            })?;
+        let mut run = AckedRun::default();
+        let outcome = recovery.on_ack_received(space, ack.ranges(), delay, ack_time, |event| {
+            if let PacketEvent::Acked(packet) = &event
+                && packet.flags.contains(SentFlags::IN_FLIGHT)
+                && packet.on_path
+                && cc.in_recovery(packet.time_sent)
+            {
+                acked_in_recovery += u64::from(packet.size);
+            }
+            sources.on_packet_event(Some(space), event, false, Some(&mut run));
+        });
+        run.flush(&mut sources.streams);
+        let outcome = outcome.map_err(|e| ConnError {
+            code: e.code(),
+            frame_type: Some(frame_type(FrameKind::Ack)),
+            reason: "ACK of a packet never sent",
+        })?;
         stats.lost_packets += u64::from(outcome.loss.lost_packets);
         on_losses(cc, ack_time, &outcome.loss);
         if let Some((_, sent)) = outcome.ack.largest_newly_acked {

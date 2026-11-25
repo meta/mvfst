@@ -56,16 +56,20 @@ use crate::RxMeta;
 use crate::SealError;
 use crate::SealJob;
 use crate::Sealer;
+use crate::SendOrder;
 use crate::ServerConfig;
 use crate::SlotId;
 use crate::Stop;
+use crate::StreamReady;
 use crate::TransportConfig;
 use crate::TxLimits;
 use crate::TxReport;
 use crate::TxSeqRange;
 use crate::recovery::RecoveryConfig;
 use crate::recovery::Space;
+use crate::recovery::sent::SentFlags;
 use crate::recovery::test_epoch;
+use crate::streams::guard::List;
 use crate::testing::LinkConfig;
 use crate::testing::Loss;
 use crate::testing::Pair;
@@ -237,8 +241,10 @@ pub(super) struct Forge<'a> {
     space: Space,
     header: HeaderSpec<'a>,
     pn: u64,
-    /// An ACK frame of one range, written first.
+    /// An ACK frame of this range and `older`, written first.
     pub(super) ack: Option<RangeInclusive<u64>>,
+    /// The other ranges of that frame, in descending order.
+    pub(super) older: &'a [RangeInclusive<u64>],
     /// The ACK Delay field of that frame.
     pub(super) ack_delay: VarInt,
     frames: &'a [Frame<'a>],
@@ -278,6 +284,7 @@ impl<'a> Forge<'a> {
             header,
             pn,
             ack: None,
+            older: &[],
             ack_delay: VarInt::ZERO,
             frames,
             raw: &[],
@@ -292,7 +299,7 @@ impl<'a> Forge<'a> {
         let mut buf = vec![0; 1500];
         let mut w = PacketWriter::new(&mut buf, self.header, self.pn, 4, TAG_LEN).unwrap();
         if let Some(range) = self.ack.clone() {
-            w.ack(range, std::iter::empty(), self.ack_delay, None)
+            w.ack(range, self.older.iter().cloned(), self.ack_delay, None)
                 .unwrap();
         }
         for frame in self.frames {
@@ -2008,4 +2015,643 @@ fn the_handshake_and_its_acks_hold_up_over_a_reordering_link() {
             assert_eq!(acked, expected);
         }
     }
+}
+
+/// Returns how many times `conn` reindexed one of its streams.
+fn reindexes(conn: &Connection) -> u64 {
+    conn.sources.streams.streams.reindexes()
+}
+
+/// Returns the packet number `conn` sends next in the 1-RTT space.
+fn next_pn(conn: &Connection) -> u64 {
+    conn.recovery.space(Space::Data).next_pn()
+}
+
+/// Builds a 1-RTT packet from `peer` with packet number `pn`, carrying one ACK frame of the range
+/// `largest` and the `older` ones, in descending order.
+fn ack_frame(
+    peer: &Connection,
+    pn: u64,
+    largest: RangeInclusive<u64>,
+    older: &[RangeInclusive<u64>],
+) -> Vec<u8> {
+    Forge {
+        ack: Some(largest),
+        older,
+        ..Forge::of(peer, Space::Data, pn, &[])
+    }
+    .seal(peer)
+}
+
+/// Returns the connection of `side` in `pair`, which sends the stream data, and its peer.
+fn sender_and_peer(pair: &mut Pair, side: Side) -> (&mut Connection, &Connection) {
+    let Pair { client, server, .. } = pair;
+    match side {
+        Side::Client => (client.conn_mut(), server.conn()),
+        Side::Server => (server.conn_mut(), client.conn()),
+    }
+}
+
+/// Returns the address of the peer of the connection of `side`.
+fn peer_addr(side: Side) -> SocketAddr {
+    match side {
+        Side::Client => server_addr(),
+        Side::Server => client_addr(),
+    }
+}
+
+/// Stages `len` bytes on stream `id` and transmits at `now`; returns how many packets went out.
+fn send_on(conn: &mut Connection, id: StreamId, len: usize, now: Instant) -> u64 {
+    let first = next_pn(conn);
+    let mut data = Bytes::from(vec![0x5a; len]);
+    assert_eq!(conn.stream(id).unwrap().send(&mut data), Ok(len));
+    conn.poll_transmit(&limits(now), &mut VecSink::new(1500), &mut InlineSealer);
+    next_pn(conn) - first
+}
+
+/// Returns a pair after the handshake and a quiet half second, from `config`.
+fn settled(config: PairConfig) -> Pair {
+    let (_, mut pair) = handshake(config);
+    let until = pair.now + Duration::from_millis(500);
+    pair.run(until);
+    pair
+}
+
+#[test]
+fn an_ack_frame_covering_a_run_of_one_streams_packets_reindexes_it_once() {
+    let mut pair = settled(Setup::default().pair());
+    let now = pair.now;
+    let (server, client) = sender_and_peer(&mut pair, Side::Server);
+    let id = server.open_stream(Dir::Uni, ORDER).unwrap();
+    let first = next_pn(server);
+    // More than the initial window takes, so that ten full packets fill it.
+    let mut data = Bytes::from(vec![0x5a; 16_000]);
+    server.stream(id).unwrap().send(&mut data).unwrap();
+    server.poll_transmit(&limits(now), &mut VecSink::new(1500), &mut InlineSealer);
+    assert_eq!(next_pn(server), first + 10, "ten packets fill the window");
+    let sent = server.stream_send_buf(id).unwrap().sent_end();
+    let ack = ack_frame(client, next_pn(client) + 10, first..=first + 9, &[]);
+    let before = reindexes(server);
+
+    deliver(server, now + Duration::from_millis(20), client_addr(), ack);
+    assert_eq!(
+        reindexes(server) - before,
+        1,
+        "one reindex for the stream's run of ten packets"
+    );
+    assert_eq!(server.stream_send_buf(id).unwrap().acked_end(), sent);
+    server.sources.streams.streams.assert_indexed();
+}
+
+#[test]
+fn an_ack_frame_covering_more_than_65535_bytes_of_one_stream_acknowledges_them_in_one_run() {
+    let setup = Setup {
+        server_transport: TransportConfig::builder()
+            .initial_window(64)
+            .build()
+            .unwrap(),
+        client_transport: TransportConfig::builder()
+            .max_stream_data_uni(1 << 20)
+            .build()
+            .unwrap(),
+        ..Setup::default()
+    };
+    let mut pair = settled(setup.pair());
+    let now = pair.now;
+    let (server, client) = sender_and_peer(&mut pair, Side::Server);
+    let id = server.open_stream(Dir::Uni, ORDER).unwrap();
+    let first = next_pn(server);
+    // A stream stages at most 64 KiB at a time, so it stages more as bytes leave, until the
+    // window of 64 datagrams is full.
+    let mut data = Bytes::from(vec![0x5a; 200_000]);
+    loop {
+        server.stream(id).unwrap().send(&mut data).unwrap();
+        let attempt =
+            server.poll_transmit(&limits(now), &mut VecSink::new(1500), &mut InlineSealer);
+        if attempt.datagrams == 0 {
+            break;
+        }
+    }
+    let last = next_pn(server) - 1;
+    let sent = server.stream_send_buf(id).unwrap().sent_end();
+    assert!(sent > 70_000, "{sent} bytes sent");
+    let ack = ack_frame(client, next_pn(client) + 10, first..=last, &[]);
+    let before = reindexes(server);
+
+    deliver(server, now + Duration::from_millis(20), client_addr(), ack);
+    assert_eq!(
+        reindexes(server) - before,
+        1,
+        "one reindex for the stream's run of {} packets",
+        last + 1 - first
+    );
+    assert_eq!(server.stream_send_buf(id).unwrap().acked_end(), sent);
+    server.sources.streams.streams.assert_indexed();
+}
+
+/// Returns two settled pairs from one config whose connections of `side` send the stream data.
+/// The second applies each STREAM frame that an ACK frame acknowledges on its own: the
+/// reference.
+fn ack_twins(setup: &Setup, side: Side) -> [Pair; 2] {
+    let config = setup.pair();
+    let mut twins = [(); 2].map(|()| settled(config.clone()));
+    sender_and_peer(&mut twins[1], side)
+        .0
+        .sources
+        .per_frame_acks = true;
+    twins
+}
+
+/// Runs `op` on each twin's connection of `side` with its peer, checks that both gave the same
+/// result, and returns it.
+fn on_twins<R: PartialEq + std::fmt::Debug>(
+    twins: &mut [Pair; 2],
+    side: Side,
+    at: &str,
+    mut op: impl FnMut(&mut Connection, &Connection) -> R,
+) -> R {
+    let [a, b] = twins;
+    let (conn, peer) = sender_and_peer(a, side);
+    let first = op(conn, peer);
+    let (conn, peer) = sender_and_peer(b, side);
+    let second = op(conn, peer);
+    assert_eq!(first, second, "{at}: the twins diverged");
+    first
+}
+
+/// Delivers to each twin's connection of `side`, at `now`, an ACK frame of the range `largest`
+/// and the `older` ones from its peer, with packet number `ahead` past the peer's next; returns
+/// how many reindexes each ran.
+fn ack_twins_at(
+    twins: &mut [Pair; 2],
+    side: Side,
+    now: Instant,
+    ahead: u64,
+    largest: &RangeInclusive<u64>,
+    older: &[RangeInclusive<u64>],
+) -> [u64; 2] {
+    twins.each_mut().map(|pair| {
+        let (conn, peer) = sender_and_peer(pair, side);
+        let packet = ack_frame(peer, next_pn(peer) + ahead, largest.clone(), older);
+        let before = reindexes(conn);
+        assert_eq!(deliver(conn, now, peer_addr(side), packet).packets, 1);
+        reindexes(conn) - before
+    })
+}
+
+/// Returns, line by line, what the streams of `conn` show that an acknowledgment may change:
+/// whether each of `ids` is still open and its half states, send buffer, lists and scheduling,
+/// then each list and the scheduler in order, and the number of streams with lost data.
+fn ack_view(conn: &Connection, ids: &[StreamId]) -> Vec<String> {
+    let streams = &conn.sources.streams.streams;
+    let id_of = |slot| streams.get_slot(slot).map(|stream| stream.id());
+    let mut view: Vec<String> = ids
+        .iter()
+        .map(|&id| {
+            let Some(stream) = streams.get(id) else {
+                return format!("{id} reaped");
+            };
+            let send = stream.data().send.as_ref().map(|send| {
+                let buf = &send.buf;
+                (
+                    buf.acked_end(),
+                    buf.buffered(),
+                    buf.has_lost(),
+                    buf.is_acked(),
+                    buf.final_size(),
+                )
+            });
+            let lists = List::ALL.map(|list| streams.is_on(list, stream.slot()));
+            format!(
+                "{} {:?} {:?} {send:?} {lists:?} {:?}",
+                stream.id(),
+                stream.send_state(),
+                stream.recv_state(),
+                streams.scheduler().order(stream.slot()),
+            )
+        })
+        .collect();
+    for list in List::ALL {
+        let order: Vec<_> =
+            std::iter::successors(streams.first(list), |&slot| streams.next_on(list, slot))
+                .map(id_of)
+                .collect();
+        view.push(format!("{list:?} {order:?}"));
+    }
+    let scheduled: Vec<_> = streams.scheduler().iter().map(id_of).collect();
+    view.push(format!("scheduled {scheduled:?}, lost {}", streams.lost()));
+    view
+}
+
+/// Checks that the twins' connections of `side` show the same streams `ids`, with consistent
+/// indexes.
+fn assert_twins_agree(twins: &mut [Pair; 2], side: Side, ids: &[StreamId], at: &str) {
+    let [coalesced, reference] = twins.each_mut().map(|pair| {
+        let conn = sender_and_peer(pair, side).0;
+        conn.sources.streams.streams.assert_indexed();
+        ack_view(conn, ids)
+    });
+    assert_eq!(
+        coalesced, reference,
+        "{at}: the streams after the ACK frame"
+    );
+}
+
+#[test]
+fn an_ack_frame_over_interleaved_runs_of_two_streams_reindexes_once_per_run() {
+    let side = Side::Server;
+    let mut twins = ack_twins(&Setup::default(), side);
+    let now = twins[0].now;
+    let (first, ids) = on_twins(&mut twins, side, "sending", |server, _| {
+        let a = server.open_stream(Dir::Uni, ORDER).unwrap();
+        let b = server.open_stream(Dir::Uni, ORDER).unwrap();
+        let first = next_pn(server);
+        // Two packets of A, two of B, two more of A and two more of B.
+        for id in [a, b, a, b] {
+            assert_eq!(send_on(server, id, 2_000, now), 2);
+        }
+        (first, [a, b])
+    });
+
+    let reindexed = ack_twins_at(
+        &mut twins,
+        side,
+        now + Duration::from_millis(20),
+        10,
+        &(first..=first + 7),
+        &[],
+    );
+    assert_eq!(
+        reindexed,
+        [4, 8],
+        "one reindex per run, and one per packet for the reference"
+    );
+    assert_twins_agree(&mut twins, side, &ids, "interleaved runs");
+    for id in ids {
+        let acked = on_twins(&mut twins, side, "acknowledged", |server, _| {
+            server.stream_send_buf(id).unwrap().acked_end()
+        });
+        assert_eq!(acked, 4_000, "{id}");
+    }
+}
+
+#[test]
+fn an_ack_frame_that_fails_after_a_run_still_applies_the_run() {
+    let side = Side::Server;
+    let mut twins = ack_twins(&Setup::default(), side);
+    let now = twins[0].now;
+    let (id, acked) = on_twins(&mut twins, side, "sending", |server, _| {
+        let id = server.open_stream(Dir::Uni, ORDER).unwrap();
+        let first = next_pn(server);
+        assert_eq!(send_on(server, id, 4_000, now), 4);
+        // Skips a packet number above the stream's packets: an ACK frame that covers it fails
+        // after acknowledging the packets below it.
+        let pn = next_pn(server) + 1;
+        let last = server.recovery.space(Space::Data).outstanding().last();
+        let tx_seq = last.unwrap().tx_seq;
+        let recovery = &mut server.recovery;
+        let recorded =
+            recovery.on_packet_sent(Space::Data, pn, now, 50, SentFlags::empty(), tx_seq);
+        assert_eq!(recorded, Ok(()));
+        (id, first..=pn)
+    });
+
+    let at = now + Duration::from_millis(20);
+    let reindexed = twins.each_mut().map(|pair| {
+        let (conn, peer) = sender_and_peer(pair, side);
+        let packet = ack_frame(peer, next_pn(peer) + 10, acked.clone(), &[]);
+        let before = reindexes(conn);
+        deliver(conn, at, peer_addr(side), packet);
+        assert_eq!(
+            local_close(conn),
+            Some((
+                TransportErrorCode::PROTOCOL_VIOLATION,
+                Some(VarInt::from_u32(0x02))
+            ))
+        );
+        reindexes(conn) - before
+    });
+    assert_eq!(
+        reindexed,
+        [1, 4],
+        "one reindex for the run, and one per packet for the reference"
+    );
+    assert_twins_agree(&mut twins, side, &[id], "a failed ACK frame");
+    let acked_end = on_twins(&mut twins, side, "acknowledged", |server, _| {
+        server.stream_send_buf(id).unwrap().acked_end()
+    });
+    assert_eq!(acked_end, 4_000);
+}
+
+/// What the equivalence runs reached, so that runs that miss a case fail.
+#[derive(Debug, Default)]
+struct AckRunsSeen {
+    /// ACK frames with more than one range.
+    multi_range: usize,
+    /// Packets declared lost.
+    lost: usize,
+    /// Acknowledgments of packets declared lost before.
+    late: usize,
+    /// Transmits that went out while a stream had lost data to send again.
+    retransmits: usize,
+    /// Streams whose bytes and FIN were all acknowledged.
+    fins: usize,
+    /// Streams reset with bytes in flight.
+    resets: usize,
+    /// The most streams taking bytes at once.
+    most_streams: usize,
+    /// `Progress` edges.
+    progress: usize,
+    /// Growths of acknowledged prefixes polled.
+    acked: usize,
+}
+
+/// Returns a value below `n` from `rng`.
+fn below(rng: &mut TestRng, n: u64) -> u64 {
+    rng.next_u64() % n
+}
+
+/// Returns the packet numbers of the 1-RTT packets `conn` has in flight.
+fn outstanding(conn: &Connection) -> BTreeSet<u64> {
+    conn.recovery
+        .space(Space::Data)
+        .outstanding()
+        .map(|packet| packet.pn)
+        .collect()
+}
+
+/// Returns the ranges of a random ACK frame for packets `first..next`, from the largest down,
+/// with gaps, and sometimes a range for a packet of `lost` below the others. Returns an empty list
+/// for a step without an ACK frame.
+fn random_ack_ranges(
+    rng: &mut TestRng,
+    first: u64,
+    next: u64,
+    lost: &BTreeSet<u64>,
+) -> Vec<RangeInclusive<u64>> {
+    let mut ranges = Vec::new();
+    if next == first || below(rng, 6) == 0 {
+        return ranges;
+    }
+    // The newest packets stay unacknowledged now and then.
+    let mut hi = next - 1 - below(rng, 3).min(next - 1 - first);
+    let floor = hi.saturating_sub(48).max(first);
+    loop {
+        let lo = hi.saturating_sub(below(rng, 12)).max(floor);
+        ranges.push(lo..=hi);
+        let gap = 1 + below(rng, 3);
+        if ranges.len() == 4 || lo < floor + gap + 1 {
+            break;
+        }
+        hi = lo - gap - 1;
+    }
+    let lowest = *ranges.last().expect("a range").start();
+    let late: Vec<u64> = lost.range(..lowest.saturating_sub(1)).copied().collect();
+    if !late.is_empty() && below(rng, 2) == 0 {
+        let pn = late[below(rng, late.len() as u64) as usize];
+        ranges.push(pn..=pn);
+    }
+    ranges
+}
+
+/// Runs `steps` random steps from `seed` on twins whose connections of `side` send on up to four
+/// streams at a time: each step stages, finishes, resets and tracks, transmits, and delivers one
+/// ACK frame, after which the twins must agree. Returns the reindexes each twin ran for its ACK
+/// frames.
+fn run_ack_twins(seed: u64, side: Side, steps: u64, seen: &mut AckRunsSeen) -> [u64; 2] {
+    let window = 1 << 20;
+    let transport = TransportConfig::builder()
+        .max_data(16 * window)
+        .max_stream_data_bidi_remote(window)
+        .max_stream_data_uni(window)
+        .stream_ack_progress(true)
+        .build()
+        .unwrap();
+    let mut twins = ack_twins(&Setup::default().transport(transport), side);
+    let mut rng = TestRng::new(seed);
+    let streams = 1 + below(&mut rng, 4) as usize;
+    // Streams that take bytes, streams that are not reaped yet, and every stream opened.
+    let mut open: Vec<StreamId> = Vec::new();
+    let mut live: Vec<StreamId> = Vec::new();
+    let mut opened: Vec<StreamId> = Vec::new();
+    let mut fins = BTreeSet::new();
+    // Packets declared lost and not acknowledged since.
+    let mut lost = BTreeSet::new();
+    let first = on_twins(&mut twins, side, "start", |conn, _| next_pn(conn));
+    let mut reindexed = [0; 2];
+    for step in 0..steps {
+        let at = format!("seed {seed}, step {step}");
+        let now = twins[0].now;
+        while open.len() < streams {
+            let dir = if below(&mut rng, 2) == 0 {
+                Dir::Uni
+            } else {
+                Dir::Bi
+            };
+            let order = SendOrder {
+                class: 1,
+                urgency: 2 + below(&mut rng, 2) as u8,
+                incremental: below(&mut rng, 2) == 0,
+                order: 0,
+            };
+            let id = on_twins(&mut twins, side, &at, |conn, _| {
+                conn.open_stream(dir, order)
+            })
+            .expect("a stream within the limit");
+            open.push(id);
+            live.push(id);
+            opened.push(id);
+        }
+        seen.most_streams = seen.most_streams.max(open.len());
+        for id in open.clone() {
+            let (acked, end, in_flight) = on_twins(&mut twins, side, &at, |conn, _| {
+                let buf = conn.stream_send_buf(id).unwrap();
+                (
+                    buf.acked_end(),
+                    buf.staged_end(),
+                    buf.sent_end() > buf.acked_end(),
+                )
+            });
+            match below(&mut rng, 24) {
+                0 => {
+                    on_twins(&mut twins, side, &at, |conn, _| {
+                        conn.stream(id).unwrap().reset(AppCode::from_u32(7))
+                    })
+                    .unwrap();
+                    seen.resets += usize::from(in_flight);
+                    open.retain(|&other| other != id);
+                }
+                1 | 2 => {
+                    on_twins(&mut twins, side, &at, |conn, _| {
+                        conn.stream(id).unwrap().finish()
+                    })
+                    .unwrap();
+                    open.retain(|&other| other != id);
+                }
+                3..=5 => {
+                    // Sometimes past the end, which the FIN reaches.
+                    let offset = acked + 1 + below(&mut rng, end - acked + 2);
+                    on_twins(&mut twins, side, &at, |conn, _| {
+                        conn.stream(id).unwrap().track(offset)
+                    })
+                    .unwrap();
+                }
+                _ => {
+                    let len = below(&mut rng, 6_000) as usize;
+                    on_twins(&mut twins, side, &at, |conn, _| {
+                        let mut data = Bytes::from(vec![0x5a; len]);
+                        conn.stream(id).unwrap().send(&mut data)
+                    })
+                    .unwrap();
+                }
+            }
+        }
+        for _ in 0..1 + below(&mut rng, 2) {
+            let limits = TxLimits {
+                max_segments: 1 + below(&mut rng, 16) as u16,
+                ..limits(now)
+            };
+            let (had_lost, datagrams) = on_twins(&mut twins, side, &at, |conn, _| {
+                let had_lost = conn.sources.streams.streams.lost() > 0;
+                let sent = conn.poll_transmit(&limits, &mut VecSink::new(1500), &mut InlineSealer);
+                (had_lost, sent.datagrams)
+            });
+            seen.retransmits += usize::from(had_lost && datagrams > 0);
+        }
+
+        let next = on_twins(&mut twins, side, &at, |conn, _| next_pn(conn));
+        let ranges = random_ack_ranges(&mut rng, first, next, &lost);
+        let before = on_twins(&mut twins, side, &at, |conn, _| outstanding(conn));
+        let acked: BTreeSet<u64> = ranges.iter().flat_map(|range| range.clone()).collect();
+        seen.late += on_twins(&mut twins, side, &at, |conn, _| {
+            let sent = conn.recovery.space(Space::Data);
+            acked
+                .iter()
+                .filter(|&&pn| lost.contains(&pn) && sent.get(pn).is_some())
+                .count()
+        });
+        let dt = Duration::from_millis(1 + below(&mut rng, 25));
+        for pair in &mut twins {
+            pair.now += dt;
+        }
+        let now = twins[0].now;
+        if let Some((largest, older)) = ranges.split_first() {
+            seen.multi_range += usize::from(!older.is_empty());
+            let [coalesced, reference] =
+                ack_twins_at(&mut twins, side, now, 10 + step, largest, older);
+            assert!(
+                coalesced <= reference,
+                "{at}: {coalesced} reindexes, {reference} for the reference"
+            );
+            reindexed[0] += coalesced;
+            reindexed[1] += reference;
+        }
+        assert_twins_agree(&mut twins, side, &opened, &at);
+        on_twins(&mut twins, side, &at, |conn, _| {
+            if conn.next_deadline().is_some_and(|deadline| deadline <= now) {
+                conn.on_deadline(now);
+            }
+        });
+        let after = on_twins(&mut twins, side, &at, |conn, _| outstanding(conn));
+        for &pn in before.difference(&after) {
+            if !acked.contains(&pn) && lost.insert(pn) {
+                seen.lost += 1;
+            }
+        }
+        for pn in &acked {
+            lost.remove(pn);
+        }
+
+        assert_twins_agree(&mut twins, side, &opened, &at);
+        on_twins(&mut twins, side, &at, |conn, _| {
+            let s = conn.stats();
+            (
+                s.sent_packets,
+                s.lost_packets,
+                s.cwnd,
+                s.bytes_in_flight,
+                s.acks_received,
+            )
+        });
+        for &id in &live {
+            let done = on_twins(&mut twins, side, &at, |conn, _| {
+                conn.stream_send_buf(id).is_some_and(|buf| buf.is_acked())
+            });
+            if done {
+                fins.insert(id);
+            }
+        }
+        let edges = on_twins(&mut twins, side, &at, |conn, _| {
+            conn.readiness().collect::<Vec<_>>()
+        });
+        seen.progress += edges
+            .iter()
+            .filter(|(_, edge)| *edge == StreamReady::Progress)
+            .count();
+        let growths = on_twins(&mut twins, side, &at, |conn, _| {
+            std::iter::from_fn(|| conn.poll_stream_acked()).collect::<Vec<_>>()
+        });
+        seen.acked += growths.len();
+        let reaped: Vec<StreamId> = live
+            .iter()
+            .copied()
+            .filter(|&id| {
+                on_twins(&mut twins, side, &at, |conn, _| {
+                    conn.sources.streams.streams.get(id).is_none()
+                })
+            })
+            .collect();
+        live.retain(|id| !reaped.contains(id));
+        open.retain(|id| !reaped.contains(id));
+    }
+    seen.fins += fins.len();
+    reindexed
+}
+
+#[test]
+fn ack_frames_leave_the_streams_as_acknowledging_each_frame_alone_does() {
+    let mut seen = AckRunsSeen::default();
+    let mut reindexed = [0; 2];
+    for seed in 0..16 {
+        let side = if seed % 2 == 0 {
+            Side::Client
+        } else {
+            Side::Server
+        };
+        let [coalesced, reference] = run_ack_twins(seed, side, 48, &mut seen);
+        reindexed[0] += coalesced;
+        reindexed[1] += reference;
+    }
+    let AckRunsSeen {
+        multi_range,
+        lost,
+        late,
+        retransmits,
+        fins,
+        resets,
+        most_streams,
+        progress,
+        acked,
+    } = seen;
+    assert!(
+        [
+            multi_range,
+            lost,
+            late,
+            retransmits,
+            fins,
+            resets,
+            progress,
+            acked
+        ]
+        .iter()
+        .all(|&n| n > 0),
+        "{seen:?}"
+    );
+    assert_eq!(most_streams, 4, "{seen:?}");
+    assert!(
+        reindexed[0] < reindexed[1],
+        "the ACK frames did not coalesce any run: {} reindexes, as many as the reference",
+        reindexed[0]
+    );
 }

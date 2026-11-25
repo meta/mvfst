@@ -319,6 +319,9 @@ pub(crate) struct Streams<D> {
     /// that every guard runs when dropped, so every change to a send buffer's lost state is
     /// counted: a loss, a retransmission, an acknowledgment of lost bytes or a reset.
     lost: u32,
+    /// The reindexes run so far, one per dropped guard.
+    #[cfg(test)]
+    reindexes: u64,
 }
 
 /// Exclusive access to one stream; dropping it reindexes the stream.
@@ -350,12 +353,20 @@ impl<D: StreamData> Streams<D> {
             scheduler: Scheduler::new(quantum),
             shares: Shares::new(),
             lost: 0,
+            #[cfg(test)]
+            reindexes: 0,
         }
     }
 
     /// Returns how many streams have lost bytes or a lost FIN in their send buffers.
     pub(crate) fn lost(&self) -> u32 {
         self.lost
+    }
+
+    /// Returns how many reindexes ran, one per dropped guard.
+    #[cfg(test)]
+    pub(crate) fn reindexes(&self) -> u64 {
+        self.reindexes
     }
 
     /// Opens a local stream at `order` with data parts `data`.
@@ -592,6 +603,10 @@ impl<D: StreamData> Streams<D> {
     /// Recomputes the stream's list and scheduler membership from its state, and reaps it if
     /// it is closed and its last edge was delivered.
     fn reindex(&mut self, slot: u32, id: StreamId) {
+        #[cfg(test)]
+        {
+            self.reindexes += 1;
+        }
         let Some(entry) = self.entry(slot) else {
             return;
         };

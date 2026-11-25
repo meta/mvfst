@@ -1379,9 +1379,9 @@ impl StreamState {
         Ok(())
     }
 
-    /// Records that a packet carrying stream `id`'s bytes `offset..offset + len` (and its FIN if
-    /// `fin`) was acknowledged.
-    pub(crate) fn on_stream_acked(&mut self, id: StreamId, offset: u64, len: u16, fin: bool) {
+    /// Records that the packets carrying stream `id`'s bytes `offset..offset + len` (and its FIN
+    /// if `fin`) were acknowledged.
+    pub(crate) fn on_stream_acked(&mut self, id: StreamId, offset: u64, len: u64, fin: bool) {
         let Some(mut stream) = self.streams.stream(id) else {
             return;
         };
@@ -1389,7 +1389,8 @@ impl StreamState {
             return;
         };
         let before = send.buf.acked_end();
-        send.buf.on_ack(offset, usize::from(len), fin);
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        send.buf.on_ack(offset, len, fin);
         let after = send.buf.acked_end();
         let all_acked = send.buf.is_acked();
         let progress = send.buf.take_progress();

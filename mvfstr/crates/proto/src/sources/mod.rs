@@ -46,6 +46,7 @@ pub(crate) use crypto::CryptoSource;
 use mvfstr_wire::FrameKind;
 use mvfstr_wire::Full;
 use mvfstr_wire::PacketWriter;
+use mvfstr_wire::StreamId;
 use path::PathSource;
 pub(crate) use ping::PingSource;
 pub(crate) use probe::ProbeSource;
@@ -276,6 +277,48 @@ pub(crate) struct Sources {
     /// The calls of [`Sources::fill`] into a packet without room left.
     #[cfg(test)]
     pub(crate) fills_without_room: u64,
+    /// Whether [`Sources::on_packet_event`] ignores the run it is given and applies each STREAM
+    /// frame on its own: the reference that coalesced runs are checked against.
+    #[cfg(test)]
+    pub(crate) per_frame_acks: bool,
+}
+
+/// STREAM bytes that one ACK frame acknowledged and that have not reached their stream yet: a
+/// run of contiguous ranges of one stream, applied to it at once when the run ends. The holder
+/// flushes it once the ACK frame is processed.
+#[derive(Debug, Default)]
+pub(crate) struct AckedRun {
+    /// The stream, or `None` while the run is empty.
+    id: Option<StreamId>,
+    /// The first byte of the run.
+    start: u64,
+    /// The offset after the last byte of the run.
+    end: u64,
+    /// Whether the run ends with the FIN.
+    fin: bool,
+}
+
+impl AckedRun {
+    /// Adds the acknowledged frame `(offset, len, fin)` of stream `id`. Unless the frame continues
+    /// the run, the run goes to its stream first and a new one starts.
+    fn add(&mut self, streams: &mut StreamState, id: StreamId, offset: u64, len: u16, fin: bool) {
+        if self.id != Some(id) || offset != self.end {
+            self.flush(streams);
+            self.id = Some(id);
+            self.start = offset;
+            self.end = offset;
+        }
+        self.end += u64::from(len);
+        self.fin |= fin;
+    }
+
+    /// Applies the run to its stream, if it holds one, and empties it.
+    pub(crate) fn flush(&mut self, streams: &mut StreamState) {
+        let run = std::mem::take(self);
+        if let Some(id) = run.id {
+            streams.on_stream_acked(id, run.start, run.end - run.start, run.fin);
+        }
+    }
 }
 
 impl Sources {
@@ -293,6 +336,8 @@ impl Sources {
             cids,
             #[cfg(test)]
             fills_without_room: 0,
+            #[cfg(test)]
+            per_frame_acks: false,
         }
     }
 
@@ -418,18 +463,30 @@ impl Sources {
 
     /// Hands a packet's acknowledgment or loss to the sources that wrote its frames. `space` is
     /// the packet's space, if the caller has it. `dropped` is whether the backend reported that
-    /// its datagram never left, which re-arms the ACK it carried. Returns whether a loss made any
-    /// of its frames pending again.
+    /// its datagram never left, which re-arms the ACK it carried. `run` is given while one ACK
+    /// frame is processed and collects the STREAM bytes it acknowledges; without it, each STREAM
+    /// frame reaches its stream at once. Returns whether a loss made any of its frames pending
+    /// again.
     pub(crate) fn on_packet_event(
         &mut self,
         space: Option<Space>,
         event: PacketEvent<'_>,
         dropped: bool,
+        run: Option<&mut AckedRun>,
     ) -> bool {
+        let mut run = run;
+        #[cfg(test)]
+        if self.per_frame_acks {
+            run = None;
+        }
         let (packet, delivered) = match event {
             PacketEvent::Acked(packet) | PacketEvent::AckedAfterLoss(packet) => (packet, true),
             PacketEvent::Lost(packet) => (packet, false),
         };
+        // Loss handling depends on the acknowledged bytes, so the run reaches its stream first.
+        if !delivered && let Some(run) = run.as_deref_mut() {
+            run.flush(&mut self.streams);
+        }
         let mut pending = false;
         for frame in packet.frames() {
             match (sent_owner(frame), *frame) {
@@ -465,10 +522,13 @@ impl Sources {
                         fin,
                     },
                 ) => {
-                    if delivered {
-                        self.streams.on_stream_acked(id, offset, len, fin);
-                    } else {
+                    if !delivered {
                         pending |= self.streams.on_stream_lost(id, offset, len, fin);
+                    } else if let Some(run) = run.as_deref_mut() {
+                        run.add(&mut self.streams, id, offset, len, fin);
+                    } else {
+                        self.streams
+                            .on_stream_acked(id, offset, u64::from(len), fin);
                     }
                 }
                 (SourceId::Control, SentFrame::Control { kind, key, .. }) if is_cid_kind(kind) => {
@@ -479,6 +539,10 @@ impl Sources {
                     }
                 }
                 (SourceId::Control, SentFrame::Control { kind, key, value }) => {
+                    // The run reaches its stream first, so that edges keep the order of frames.
+                    if let Some(run) = run.as_deref_mut() {
+                        run.flush(&mut self.streams);
+                    }
                     if delivered {
                         self.streams.on_control_acked(kind, key, value);
                     } else {
@@ -500,7 +564,7 @@ impl Sources {
     /// probe without declaring the packet lost, as mvfst's non-cloning PTO does. Returns whether
     /// any of them became pending again.
     pub(crate) fn requeue(&mut self, packet: SentPacket<'_>) -> bool {
-        self.on_packet_event(Some(Space::Data), PacketEvent::Lost(packet), false)
+        self.on_packet_event(Some(Space::Data), PacketEvent::Lost(packet), false, None)
     }
 
     /// Clears the state of `space` when its keys are discarded.
@@ -1171,6 +1235,98 @@ mod tests {
             !requeue(&mut sources, &[stream(1_000, 0, true)]),
             "the FIN is lost already"
         );
+    }
+
+    /// Returns the sources of a server whose one unidirectional stream sent its 1,000 bytes and
+    /// its FIN in one frame, and that stream.
+    fn sent_stream() -> (Sources, StreamId) {
+        let mut s = server_streams(TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+            initial_max_streams_uni: VarInt::from_u32(1),
+            ..TransportParameters::default()
+        });
+        let id = s.open(Dir::Uni, ORDER).unwrap();
+        assert_eq!(
+            s.send(id, &mut Bytes::from(vec![7; 1_000]), 1 << 20),
+            Ok(1_000)
+        );
+        s.finish(id).unwrap();
+        assert_eq!(write_all(&mut ScheduledSource(&mut s)).len(), 1);
+        (sources(s), id)
+    }
+
+    /// Returns a record of 1-RTT packets in flight, numbered from 0, each carrying the frames of
+    /// its entry in `packets`.
+    fn sent_packets(packets: &[&[SentFrame]]) -> SentPackets {
+        let mut sent = SentPackets::new(test_epoch(), 0);
+        for (pn, frames) in (0..).zip(packets) {
+            for frame in *frames {
+                sent.push_frame(*frame);
+            }
+            let flags = SentFlags::ACK_ELICITING | SentFlags::IN_FLIGHT;
+            sent.on_sent(pn, test_epoch(), 1_200, flags, pn)
+                .expect("the next packet number");
+        }
+        sent
+    }
+
+    /// Returns what the send buffer of stream `id` shows, and how many streams hold lost data.
+    fn send_view(sources: &Sources, id: StreamId) -> (u64, usize, bool, bool, u32) {
+        let buf = sources.streams.send_buf(id).expect("a send half");
+        (
+            buf.acked_end(),
+            buf.buffered(),
+            buf.has_lost(),
+            buf.is_acked(),
+            sources.streams.streams.lost(),
+        )
+    }
+
+    #[test]
+    fn a_loss_after_a_run_in_the_same_ack_frame_is_pending_as_without_the_run() {
+        let (_, id) = sent_stream();
+        let stream = |offset, len, fin| SentFrame::Stream {
+            id,
+            offset,
+            len,
+            fin,
+        };
+        // Each case acknowledges one packet and then declares lost another that carried the same
+        // bytes again: a retransmission the run covers, one that reaches past it, and the FIN.
+        for (acked, lost) in [
+            (stream(0, 300, false), stream(0, 300, false)),
+            (stream(0, 300, false), stream(200, 200, false)),
+            (stream(700, 300, true), stream(1_000, 0, true)),
+        ] {
+            let sent = sent_packets(&[&[acked], &[lost]]);
+            let packet = |pn| sent.get(pn).expect("a packet in the record");
+            let space = Some(Space::Data);
+
+            let (mut reference, _) = sent_stream();
+            reference.on_packet_event(space, PacketEvent::Acked(packet(0)), false, None);
+            let want = reference.on_packet_event(space, PacketEvent::Lost(packet(1)), false, None);
+
+            let (mut sources, _) = sent_stream();
+            let mut run = AckedRun::default();
+            let before = sources.streams.streams.reindexes();
+            sources.on_packet_event(space, PacketEvent::Acked(packet(0)), false, Some(&mut run));
+            assert_eq!(
+                sources.streams.streams.reindexes(),
+                before,
+                "{acked:?}: the acknowledgment stays in the run"
+            );
+            let pending =
+                sources.on_packet_event(space, PacketEvent::Lost(packet(1)), false, Some(&mut run));
+            assert_eq!(pending, want, "{lost:?} after {acked:?}");
+            run.flush(&mut sources.streams);
+            assert_eq!(
+                send_view(&sources, id),
+                send_view(&reference, id),
+                "{lost:?} after {acked:?}"
+            );
+            sources.streams.streams.assert_indexed();
+        }
     }
 
     #[test]
