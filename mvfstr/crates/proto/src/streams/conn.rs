@@ -1716,4 +1716,103 @@ mod tests {
         assert_eq!(s.pulled(0).map(|(pulled, _)| pulled), Some(id));
         assert_eq!(census::read().ranks, 2, "one ranking per collection");
     }
+
+    /// Returns a client's streams after the server's transport parameters, which give the send
+    /// halves of the server's bidirectional streams credit.
+    fn client() -> StreamState {
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::new(Side::Client, &config);
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_bidi_local: VarInt::from_u32(1 << 20),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        s
+    }
+
+    /// Delivers `frames` STREAM frames of 1,200 bytes in order on peer stream `id` from offset 0,
+    /// and returns what the census counted for them.
+    fn receive(s: &mut StreamState, id: StreamId, frames: u64) -> census::Census {
+        let (now, srtt) = (test_epoch(), Duration::from_millis(20));
+        census::reset();
+        for frame in 0..frames {
+            s.on_stream_frame(id, frame * 1200, &[0; 1200], false, now, srtt)
+                .unwrap();
+        }
+        census::read()
+    }
+
+    #[test]
+    fn receive_only_frames_do_not_reshare() {
+        let mut s = client();
+        let uni = StreamId::new(Side::Server, Dir::Uni, 0).unwrap();
+        let bidi = StreamId::new(Side::Server, Dir::Bi, 0).unwrap();
+        let on_uni = receive(&mut s, uni, 10);
+        let on_bidi = receive(&mut s, bidi, 10);
+        assert_eq!(
+            (on_uni.reindexes, on_bidi.reindexes),
+            (10, 10),
+            "one reindex per frame"
+        );
+        assert!(s.check_send(bidi).is_ok(), "the send half takes bytes");
+        assert_eq!(s.streams.len(List::Demand), 0, "neither stream has demand");
+        assert_eq!(
+            (on_uni.reshares, on_bidi.reshares),
+            (0, 0),
+            "a frame on a stream without demand does not reshare it"
+        );
+        s.streams.assert_indexed();
+
+        // A reindex that adds or removes demand still records the stream in the shares.
+        census::reset();
+        let mut bytes = Bytes::from_static(&[0; 100]);
+        assert_eq!(s.send(bidi, &mut bytes, 1 << 20), Ok(100));
+        assert_eq!(census::read().reshares, 1, "joining the demand list");
+        s.streams.assert_indexed();
+        s.reset(bidi, AppCode::from_u32(1)).unwrap();
+        assert_eq!(census::read().reshares, 2, "leaving the demand list");
+        assert_eq!(s.streams.len(List::Demand), 0);
+        s.streams.assert_indexed();
+        assert_eq!(
+            receive(&mut s, bidi, 1).reshares,
+            0,
+            "a frame after the reset"
+        );
+    }
+
+    #[test]
+    fn reading_streams_without_demand_does_not_reshare() {
+        let mut s = client();
+        let uni = StreamId::new(Side::Server, Dir::Uni, 0).unwrap();
+        let bidi = StreamId::new(Side::Server, Dir::Bi, 0).unwrap();
+        receive(&mut s, uni, 10);
+        receive(&mut s, bidi, 10);
+        census::reset();
+        let edges: Vec<_> = std::iter::from_fn(|| s.next_edge()).collect();
+        for id in [uni, bidi] {
+            let len = s.readable(id).chain_length();
+            assert_eq!(len, 12_000, "every byte of stream {id} is readable");
+            s.consume(id, len, test_epoch(), Duration::from_millis(20))
+                .unwrap();
+        }
+        let counted = census::read();
+        assert_eq!(
+            edges,
+            [
+                (uni, StreamReady::Opened),
+                (uni, StreamReady::Readable),
+                (bidi, StreamReady::Opened),
+                (bidi, StreamReady::Readable),
+            ]
+        );
+        assert_eq!(counted.reindexes, 6, "one reindex per edge and per consume");
+        assert_eq!(
+            counted.reshares, 0,
+            "reading a stream without demand does not reshare it"
+        );
+        s.streams.assert_indexed();
+    }
 }

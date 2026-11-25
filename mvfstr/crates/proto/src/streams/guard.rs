@@ -652,8 +652,16 @@ impl<D: StreamData> Streams<D> {
             Some(order) => self.scheduler.insert(slot, id, order),
             None => self.scheduler.remove(slot),
         };
-        // The shares do not follow a lone peer that keeps its demand.
-        if !alone || want.lists & List::Demand.bit() == 0 {
+        let demand = List::Demand.bit();
+        if (have | want.lists) & demand == 0 {
+            // The shares hold only streams on the demand list, and a stream that leaves it is
+            // reshared, which clears `alone`.
+            debug_assert!(
+                !alone && !self.shares.alone(slot) && !self.shares.among(slot),
+                "stream {id} without demand is marked alone or is in the shares"
+            );
+        } else if !alone || want.lists & demand == 0 {
+            // The shares do not follow a lone peer that keeps its demand.
             self.reshare(slot, id, moved);
         }
         if want.reap {
@@ -2250,5 +2258,30 @@ mod tests {
         assert_eq!(census::read().neighbour_link_writes, 5);
         assert_eq!(s.first(List::Control), s.get(c).map(|r| r.slot()));
         s.assert_indexed();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "without demand is marked alone or is in the shares")]
+    fn a_reindex_asserts_that_a_stream_without_demand_is_not_alone() {
+        let mut s = streams();
+        let id = open(&mut s, Dir::Uni, Data::default());
+        let slot = s.table.map().key(id).unwrap().slot();
+        s.entry_mut(slot).alone = true;
+        drop(s.stream(id).unwrap());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "without demand is marked alone or is in the shares")]
+    fn a_reindex_asserts_that_the_shares_do_not_hold_a_stream_without_demand() {
+        let mut s = streams();
+        let (slot, id) = open_with_demand(&mut s, ORDER, false);
+        // Clearing the stream's demand without a reindex leaves it in the shares.
+        let entry = s.entry_mut(slot);
+        entry.member &= !List::Demand.bit();
+        entry.alone = false;
+        entry.stream.data.room = false;
+        drop(s.stream(id).unwrap());
     }
 }
