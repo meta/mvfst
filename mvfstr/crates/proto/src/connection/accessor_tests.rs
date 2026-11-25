@@ -28,6 +28,7 @@ use crate::AckPolicy;
 use crate::AppCode;
 use crate::OpenError;
 use crate::TransportConfig;
+use crate::streams::recv_buf::PagePool;
 use crate::testing::Link;
 use crate::testing::LinkConfig;
 use crate::testing::Pair;
@@ -101,6 +102,7 @@ fn start_sending(
         horizon: Duration::ZERO,
         src_ports: None,
         pool: DatagramPool::default(),
+        pages: PagePool::new(),
     };
     let raw = params(own.local_cid);
     let name = ServerName::try_from("localhost").unwrap();

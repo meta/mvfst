@@ -80,7 +80,7 @@ use crate::recovery::test_epoch;
 use crate::sources::AckSource;
 use crate::sources::CryptoSource;
 use crate::streams::guard::List;
-use crate::streams::recv_buf::RecvBuffer;
+use crate::streams::recv_buf::PAGE_SIZE;
 use crate::testing::LinkConfig;
 use crate::testing::Loss;
 use crate::testing::Pair;
@@ -2734,30 +2734,22 @@ fn confirmed_and_quiet() -> Pair {
 }
 
 #[test]
-fn a_confirmed_connection_neither_keeps_nor_pools_a_crypto_page() {
-    let mut pair = confirmed_and_quiet();
-    for side in [Side::Server, Side::Client] {
-        let conn = match side {
-            Side::Server => pair.server.conn_mut(),
-            Side::Client => pair.client.conn_mut(),
-        };
+fn a_confirmed_connection_gives_its_crypto_page_to_the_endpoints_pool() {
+    let pair = confirmed_and_quiet();
+    for (side, peer) in [(Side::Server, &pair.server), (Side::Client, &pair.client)] {
+        let conn = peer.conn();
+        for space in [Space::Initial, Space::Handshake, Space::Data] {
+            assert_eq!(
+                conn.spaces[space.index()].crypto_recv.held_pages(),
+                0,
+                "the {side:?} holds no {space:?} CRYPTO page once confirmed"
+            );
+        }
+        let pool = peer.endpoint.pages();
         assert_eq!(
-            conn.crypto_pool.memory(),
-            0,
-            "the {side:?} does not keep a free CRYPTO page once confirmed"
-        );
-        // A CRYPTO buffer that releases its page after confirmation, as a client's buffer of
-        // session tickets does.
-        let mut buf = RecvBuffer::new();
-        buf.insert(0, &[0; 100], false, &mut conn.crypto_pool)
-            .expect("the buffer takes in-order bytes");
-        buf.consume(100, &mut conn.crypto_pool)
-            .expect("the bytes are readable");
-        assert_eq!(buf.held_pages(), 0, "the buffer releases its page");
-        assert_eq!(
-            conn.crypto_pool.memory(),
-            0,
-            "the {side:?} frees a CRYPTO page released after confirmation"
+            (pool.pages_allocated(), pool.memory()),
+            (1, PAGE_SIZE),
+            "the {side:?}'s handshake allocated one CRYPTO page, which its endpoint's pool holds"
         );
     }
 }

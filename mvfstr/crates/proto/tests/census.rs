@@ -11,7 +11,10 @@
 //! bound. The scenarios are (a) an idle pair after a handshake without session tickets, with a
 //! small certificate and again with a certificate chain the size of a production one, (b) a pair
 //! after one request and response, (c) a pair after an HTTP/3-shaped flight, and (d) an idle
-//! client after its session tickets arrive.
+//! client after its session tickets arrive. Three more tests count the receive pages that
+//! connections allocate: later connections of the same endpoints after a full handshake, and a
+//! connection whose 0-RTT was rejected, during its handshake and after it. The endpoints' pools
+//! hold the pages that connections give back.
 //!
 //! A global allocator counts the bytes that each thread has allocated and not freed, and each
 //! thread's allocations of exactly 16 KiB, the size of a receive page. The counts are the sizes
@@ -30,6 +33,7 @@ use std::time::Instant;
 
 use mvfstr_proto::Bytes;
 use mvfstr_proto::ClientConfig;
+use mvfstr_proto::ConnEvent;
 use mvfstr_proto::Connection;
 use mvfstr_proto::Dir;
 use mvfstr_proto::EndpointConfig;
@@ -117,13 +121,13 @@ const IDLE_SERVER: usize = 2_978;
 /// The most heap that an idle client holds after a handshake without session tickets.
 const IDLE_CLIENT: usize = 6_444;
 /// The most heap that a server holds after one request and response.
-const REQUEST_SERVER: usize = 23_690;
+const REQUEST_SERVER: usize = 7_138;
 /// The most heap that a client holds after one request and response.
-const REQUEST_CLIENT: usize = 27_156;
+const REQUEST_CLIENT: usize = 10_604;
 /// The most heap that a server holds after an HTTP/3-shaped flight.
-const H3_SERVER: usize = 76_738;
+const H3_SERVER: usize = 10_914;
 /// The most heap that a client holds after an HTTP/3-shaped flight.
-const H3_CLIENT: usize = 63_780;
+const H3_CLIENT: usize = 14_380;
 /// The most heap that an idle client holds after its session tickets arrive.
 const TICKETS_CLIENT: usize = 6_604;
 /// The most heap that an idle server holds after a handshake with a production-size chain: no
@@ -288,6 +292,35 @@ fn config(tickets: bool, (chain, key): Identity) -> PairConfig {
     PairConfig::new(client, server, endpoint)
 }
 
+/// Returns two pair configs with tickets and a small certificate, whose client sends 0-RTT when it
+/// resumes. The first config's server accepts 0-RTT. The second's server shares the first's
+/// session tickets and rejects 0-RTT.
+fn early_data_configs() -> (PairConfig, PairConfig) {
+    let plain = config(true, self_signed());
+    let mut client_tls =
+        rustls::ClientConfig::clone(plain.client.tls().rustls().expect("a rustls client"));
+    client_tls.enable_early_data = true;
+    let transport = Arc::new(TransportConfig::default());
+    let client = ClientConfig::builder(Arc::new(client_tls))
+        .transport(transport.clone())
+        .build()
+        .expect("a client config");
+    let server_tls = plain.server.tls().rustls().expect("a rustls server");
+    let server = |accept| {
+        ServerConfig::builder(server_tls.clone())
+            .transport(transport.clone())
+            .accept_early_data(accept)
+            .build()
+            .expect("a server config")
+    };
+    let early = |server| PairConfig {
+        client: client.clone(),
+        server,
+        ..plain.clone()
+    };
+    (early(server(true)), early(server(false)))
+}
+
 fn unix_now() -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000))
 }
@@ -430,6 +463,14 @@ fn send(pair: &mut Pair, side: Side, dir: Dir, len: usize, fin: bool) -> StreamI
     id
 }
 
+/// Runs one request and its response on the pair, as in (b).
+fn exchange(pair: &mut Pair) {
+    let id = send(pair, Side::Client, Dir::Bi, REQUEST, true);
+    let mut apps = Apps::default();
+    apps.run(pair, Duration::from_secs(1));
+    apps.check_exchange(id);
+}
+
 #[test]
 fn the_allocator_counts_live_bytes_and_allocations_of_a_page() {
     let (live_before, pages_before) = (live(), pages());
@@ -534,4 +575,78 @@ fn census_of_an_idle_pair_after_a_handshake_with_a_production_size_chain() {
     ] {
         check(scenario, side, held(&mut pair, side), bound);
     }
+}
+
+#[test]
+fn connections_after_the_first_take_their_receive_pages_from_the_endpoints() {
+    let config = config(true, self_signed());
+    let before = pages();
+    let mut pair = connected(config);
+    exchange(&mut pair);
+    let mut allocated = vec![pages() - before];
+    for _ in 2..=4 {
+        let before = pages();
+        pair.reconnect();
+        let limit = pair.now + LIMIT;
+        assert!(pair.handshake(limit));
+        pair.run(pair.now + Duration::from_millis(200));
+        exchange(&mut pair);
+        allocated.push(pages() - before);
+    }
+    println!("census: receive pages allocated by each of four connections: {allocated:?}");
+    assert_eq!(
+        allocated[1..],
+        [0; 3],
+        "connections 2-4 take their STREAM and CRYPTO pages from the pages that connection 1 \
+         gave back: {allocated:?}"
+    );
+    assert_eq!(
+        allocated[0], 2,
+        "connection 1 allocates one page on each side, which its CRYPTO and STREAM data share"
+    );
+}
+
+/// Returns a pair whose client resumed with a 0-RTT request that the server rejected, once both
+/// sides are quiet after the handshake, and the receive pages allocated since the pair was created.
+fn rejected_0rtt() -> (Pair, u64) {
+    let (accepting, rejecting) = early_data_configs();
+    // The first connection leaves the client a ticket that allows 0-RTT.
+    drop(connected(accepting));
+    let before = pages();
+    let mut pair = Pair::new(epoch(), unix_now(), rejecting);
+    send(&mut pair, Side::Client, Dir::Bi, REQUEST, true);
+    let limit = pair.now + LIMIT;
+    assert!(pair.handshake(limit));
+    assert!(
+        pair.client
+            .has_event(&ConnEvent::EarlyData { accepted: false }),
+        "the server rejects the 0-RTT: {:?}",
+        pair.client.events
+    );
+    pair.run(pair.now + Duration::from_millis(200));
+    (pair, pages() - before)
+}
+
+#[test]
+fn a_client_whose_0rtt_was_rejected_takes_its_receive_pages_from_its_endpoint() {
+    let (mut pair, _) = rejected_0rtt();
+    // Both sides' CRYPTO pages went back to their endpoints' pools during the handshake, so the
+    // request and the response take those pages.
+    let before = pages();
+    exchange(&mut pair);
+    assert_eq!(
+        pages() - before,
+        0,
+        "receive pages allocated for a request and its response after a rejected 0-RTT"
+    );
+}
+
+#[test]
+fn a_handshake_whose_0rtt_was_rejected_allocates_one_page_on_each_side() {
+    let (_, allocated) = rejected_0rtt();
+    assert_eq!(
+        allocated, 2,
+        "the client's session tickets arrive after its streams are rebuilt for the rejected \
+         0-RTT, and take the page of its handshake from the endpoint's pool"
+    );
 }

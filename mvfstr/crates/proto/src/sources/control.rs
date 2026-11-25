@@ -296,6 +296,7 @@ mod tests {
     use crate::TransportConfig;
     use crate::recovery::test_epoch;
     use crate::sources::PacketCx;
+    use crate::streams::recv_buf::PagePool;
 
     const SRTT: Duration = Duration::from_millis(20);
 
@@ -309,7 +310,7 @@ mod tests {
             .max_stream_data_autotune(None)
             .build()
             .expect("a valid transport config");
-        StreamState::new(Side::Server, &config)
+        StreamState::new(Side::Server, &config, PagePool::new())
     }
 
     fn cx(now: Instant, sent: &mut Vec<SentFrame>) -> SendCx<'_> {
@@ -458,7 +459,7 @@ mod tests {
                 .max_streams_uni(1)
                 .build()
                 .expect("a valid transport config");
-            let mut s = StreamState::new(Side::Server, &config);
+            let mut s = StreamState::new(Side::Server, &config, PagePool::new());
             // The peer allows one uni stream of ours, and the one uni stream we allow is reaped.
             s.streams.on_peer_max_streams(Dir::Uni, 1).unwrap();
             s.open(Dir::Uni, order).unwrap();

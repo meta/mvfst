@@ -1675,7 +1675,7 @@ mod tests {
             at += n;
         }
         buf.finish().unwrap();
-        let mut pool = PagePool::new();
+        let pool = PagePool::new();
         let mut recv = RecvBuffer::new();
         let mut in_flight: Vec<(Emitted, Vec<u8>)> = Vec::new();
         for _ in 0..10_000 {
@@ -1696,7 +1696,7 @@ mod tests {
                     buf.on_lost(sent.offset, sent.len, sent.fin);
                 } else {
                     let p = parse(&frame);
-                    recv.insert(p.offset, &p.data, p.fin, &mut pool).unwrap();
+                    recv.insert(p.offset, &p.data, p.fin, &pool).unwrap();
                     buf.on_ack(sent.offset, sent.len, sent.fin);
                 }
             }

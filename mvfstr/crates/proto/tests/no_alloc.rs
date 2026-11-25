@@ -732,13 +732,8 @@ fn census_bulk_receive_with_consume_in_batches_of_64() {
         window.largest_batch, BATCH,
         "the client receives full batches"
     );
-    // Each read cycle releases more pages than the connection's page pool keeps, so it allocates
-    // and shares pages again.
-    assert!(
-        window.allocations <= 100,
-        "bulk receive with consume: {}",
-        window.allocations
-    );
+    // Each read cycle gives its pages back to the endpoint's pool, and the next takes them again.
+    assert_eq!(window.allocations, 0, "bulk receive with consume");
 }
 
 #[test]
@@ -764,7 +759,7 @@ const FRAME_LEN: usize = 1200;
 
 /// Inserts [`CYCLE_FRAMES`] in-order frames into `buf` from `offset`, then consumes every byte.
 /// Returns what that allocated and the offset after the cycle.
-fn read_cycle(buf: &mut RecvBuffer, pool: &mut PagePool, offset: u64) -> (usize, u64) {
+fn read_cycle(buf: &mut RecvBuffer, pool: &PagePool, offset: u64) -> (usize, u64) {
     let before = ALLOCATIONS.with(Cell::get);
     for k in 0..CYCLE_FRAMES {
         let at = offset + k * FRAME_LEN as u64;
@@ -783,12 +778,12 @@ fn read_cycle(buf: &mut RecvBuffer, pool: &mut PagePool, offset: u64) -> (usize,
 #[test]
 fn census_in_order_read_cycles_allocate_nothing_once_warm() {
     // The pool keeps every page a cycle gives back, so page reuse is not what is counted.
-    let mut pool = PagePool::with_max_free(8);
+    let pool = PagePool::new();
     let mut buf = RecvBuffer::new();
     let mut offset = 0;
     let mut counts = [0; 4];
     for count in &mut counts {
-        (*count, offset) = read_cycle(&mut buf, &mut pool, offset);
+        (*count, offset) = read_cycle(&mut buf, &pool, offset);
     }
     // A cycle spans 4 and 5 pages in turn, so the first two warm up.
     assert_eq!(pool.pages_allocated(), 5);
@@ -797,7 +792,7 @@ fn census_in_order_read_cycles_allocate_nothing_once_warm() {
 
 /// Receives a short request, one frame of `request` with the FIN, on a new receive buffer, and
 /// consumes it. Returns what that allocated.
-fn short_request(request: &[u8], pool: &mut PagePool) -> usize {
+fn short_request(request: &[u8], pool: &PagePool) -> usize {
     let before = ALLOCATIONS.with(Cell::get);
     let mut buf = RecvBuffer::new();
     let got = buf
@@ -814,10 +809,10 @@ fn short_request(request: &[u8], pool: &mut PagePool) -> usize {
 #[test]
 fn census_a_short_request_with_its_fin_allocates_only_room_for_its_page() {
     let request = &PAYLOAD[..200];
-    let mut pool = PagePool::new();
+    let pool = PagePool::new();
     // The first request's page goes back to the pool for the second.
-    short_request(request, &mut pool);
-    let allocations = short_request(request, &mut pool);
+    short_request(request, &pool);
+    let allocations = short_request(request, &pool);
     assert_eq!(pool.pages_allocated(), 1);
     assert!(
         allocations <= 1,

@@ -68,6 +68,7 @@ use crate::cid::CidGenerator;
 use crate::connection::ConnSetup;
 use crate::connection::DatagramPool;
 use crate::connection::MIN_DATAGRAM;
+use crate::streams::recv_buf::PagePool;
 
 /// The driver's slab key of a connection: its slot index and the slot's generation, so a stale
 /// key never reaches a newer connection in the same slot.
@@ -388,6 +389,8 @@ pub struct Endpoint {
     host_id_truncations: u64,
     /// Spare buffers for the packets its connections keep until their keys arrive.
     pool: DatagramPool,
+    /// Free pages for the data its connections receive.
+    pages: PagePool,
 }
 
 /// A token bucket for stateless replies: RFC 9000 lets a server limit the Version Negotiation
@@ -455,6 +458,7 @@ impl Endpoint {
             src_ports: None,
             shared_src_ports: Arc::default(),
             pool: DatagramPool::default(),
+            pages: PagePool::new(),
         }
     }
 
@@ -696,6 +700,7 @@ impl Endpoint {
             horizon: self.config.build_horizon().min(self.release_horizon),
             src_ports: Some(Arc::clone(&self.shared_src_ports)),
             pool: self.pool.clone(),
+            pages: self.pages.clone(),
         };
         let mut conn = Connection::server(setup, tls, without_alpn.cloned())
             .map_err(|e| AcceptError::Tls(rustls_error(e)))?;
@@ -758,6 +763,7 @@ impl Endpoint {
             horizon: Duration::ZERO,
             src_ports: None,
             pool: self.pool.clone(),
+            pages: self.pages.clone(),
         };
         let conn = Connection::client(setup, config.tls(), server_name)
             .map_err(|e| ConnectError::Tls(rustls_error(e)))?;
@@ -893,6 +899,12 @@ impl Endpoint {
     #[cfg(test)]
     pub(crate) fn route_count(&self) -> usize {
         self.routes.len()
+    }
+
+    /// Returns the free pages of its connections, for tests.
+    #[cfg(test)]
+    pub(crate) fn pages(&self) -> &PagePool {
+        &self.pages
     }
 }
 

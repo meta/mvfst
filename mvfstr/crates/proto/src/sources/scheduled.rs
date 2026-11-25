@@ -252,6 +252,7 @@ mod tests {
     use crate::recovery::test_epoch;
     use crate::sources::PacketCx;
     use crate::streams::guard::census;
+    use crate::streams::recv_buf::PagePool;
 
     /// Returns a server's streams with `count` sequential streams in one bucket, in the wire order
     /// they were opened in, each with 100 new bytes staged within its stream and connection credit.
@@ -266,7 +267,7 @@ mod tests {
         let config = TransportConfig::builder()
             .build()
             .expect("a valid transport config");
-        let mut s = StreamState::new(Side::Server, &config);
+        let mut s = StreamState::new(Side::Server, &config, PagePool::new());
         s.on_peer_params(&TransportParameters {
             initial_max_data: VarInt::from_u32(max_data),
             initial_max_stream_data_uni: VarInt::from_u32(1 << 20),

@@ -335,7 +335,7 @@ pub(crate) struct StreamState {
     /// Whether a `Writable` edge was delivered since the last wake: its stream's demand may have
     /// ended, which raises the shares of the streams after it.
     rewake: bool,
-    /// Pages for received stream data.
+    /// The endpoint's pages for received STREAM and CRYPTO data.
     pool: PagePool,
     /// The out-of-order ranges the streams' receive buffers hold.
     ranges: usize,
@@ -396,8 +396,9 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl StreamState {
-    /// Creates the streams of a new connection at the endpoint whose role is `side`.
-    pub(crate) fn new(side: Side, config: &TransportConfig) -> Self {
+    /// Creates the streams of a new connection at the endpoint whose role is `side`, with the
+    /// endpoint's receive pages.
+    pub(crate) fn new(side: Side, config: &TransportConfig, pool: PagePool) -> Self {
         Self {
             streams: Streams::new(
                 side,
@@ -428,7 +429,7 @@ impl StreamState {
             staged: 0,
             push_blocked: 0,
             rewake: false,
-            pool: PagePool::new(),
+            pool,
             ranges: 0,
             empty: BufQueue::new(0),
             ranked: Vec::new(),
@@ -436,6 +437,11 @@ impl StreamState {
             acked: (side == Side::Client && config.stream_ack_progress())
                 .then(AckedProgress::default),
         }
+    }
+
+    /// Returns the endpoint's receive pages.
+    pub(crate) fn pool(&self) -> &PagePool {
+        &self.pool
     }
 
     /// Takes the next growth of a send half's acknowledged prefix (see
@@ -981,7 +987,7 @@ impl StreamState {
         );
         stream.on_control_sent(Owed::MAX_STREAM_DATA);
         if let Some(recv) = stream.data_mut().recv.as_mut() {
-            recv.buf.stop(&mut self.pool);
+            recv.buf.stop(&self.pool);
             recv.flow.stop(&mut self.conn_recv, now, srtt);
         }
         Ok(())
@@ -1057,7 +1063,7 @@ impl StreamState {
             return Err(StreamError::NoReceiveHalf);
         };
         recv.buf
-            .consume(n, &mut self.pool)
+            .consume(n, &self.pool)
             .map_err(|_| StreamError::BeyondReadable)?;
         let due = recv
             .flow
@@ -1186,7 +1192,7 @@ impl StreamState {
         let held = recv.buf.ranges();
         let inserted = recv
             .buf
-            .insert(offset, data, fin, &mut self.pool)
+            .insert(offset, data, fin, &self.pool)
             .map_err(|e| ConnError::new(e.code(), "STREAM data the receive buffer refuses"))?;
         self.ranges = self.ranges - held + recv.buf.ranges();
         if self.ranges > MAX_CONN_RANGES {
@@ -1272,7 +1278,7 @@ impl StreamState {
         }
         let held = recv.buf.ranges();
         recv.buf
-            .on_reset(final_size, &mut self.pool)
+            .on_reset(final_size, &self.pool)
             .map_err(|_| final_size_error())?;
         self.ranges -= held;
         recv.flow
@@ -1594,7 +1600,7 @@ mod tests {
         let config = TransportConfig::builder()
             .build()
             .expect("a valid transport config");
-        StreamState::new(Side::Server, &config)
+        StreamState::new(Side::Server, &config, PagePool::new())
     }
 
     #[cfg(debug_assertions)]
@@ -1723,7 +1729,7 @@ mod tests {
         let config = TransportConfig::builder()
             .build()
             .expect("a valid transport config");
-        let mut s = StreamState::new(Side::Client, &config);
+        let mut s = StreamState::new(Side::Client, &config, PagePool::new());
         s.on_peer_params(&TransportParameters {
             initial_max_data: VarInt::from_u32(1 << 20),
             initial_max_stream_data_bidi_local: VarInt::from_u32(1 << 20),

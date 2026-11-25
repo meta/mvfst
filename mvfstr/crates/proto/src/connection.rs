@@ -332,6 +332,8 @@ pub(crate) struct ConnSetup {
     pub(crate) src_ports: Option<Arc<SrcPortState>>,
     /// The endpoint's buffers for packets kept until their keys arrive.
     pub(crate) pool: DatagramPool,
+    /// The endpoint's receive pages.
+    pub(crate) pages: PagePool,
 }
 
 impl ConnSetup {
@@ -410,7 +412,6 @@ pub struct Connection {
     buffered: BufferedPackets,
     /// Whether keys or handshake progress may have made buffered packets processable.
     replay_due: bool,
-    crypto_pool: PagePool,
     /// TLS output, reused during the handshake.
     tls_out: Vec<u8>,
     /// The sent-frame records of the packets being built, one list per space, reused.
@@ -565,7 +566,11 @@ impl Connection {
             tls,
             tls_host: HostState::Idle,
             spaces,
-            sources: Sources::new(MAX_ACK_RANGES, StreamState::new(side, &config), cids),
+            sources: Sources::new(
+                MAX_ACK_RANGES,
+                StreamState::new(side, &config, setup.pages),
+                cids,
+            ),
             cid_gen: setup.cids,
             rng,
             key_phases: None,
@@ -597,7 +602,6 @@ impl Connection {
             reported_tokens: [None; 2],
             buffered: BufferedPackets::new(setup.pool),
             replay_due: false,
-            crypto_pool: PagePool::new(),
             tls_out: Vec::new(),
             sent_frames: Default::default(),
             tx_seq: 0,
@@ -1564,11 +1568,6 @@ impl Connection {
         state.discarded = true;
         state.keys = None;
         state.crypto_recv = RecvBuffer::new();
-        if space == Space::Handshake {
-            // After the handshake, CRYPTO data carries only session tickets, so its pages are freed
-            // rather than pooled.
-            self.crypto_pool = PagePool::with_max_free(0);
-        }
         self.sources.discard(space, MAX_ACK_RANGES);
         self.recovery.discard_space(space, now);
         self.buffered.discard(space);

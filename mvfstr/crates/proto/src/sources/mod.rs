@@ -663,6 +663,7 @@ mod tests {
     use crate::recovery::sent::SentFlags;
     use crate::recovery::sent::SentPackets;
     use crate::recovery::test_epoch;
+    use crate::streams::recv_buf::PagePool;
 
     /// Checks that `source`'s candidate in `space` fits a packet with exactly the room for frames
     /// that `min_len` returns and, when `exact`, does not fit one with a byte less.
@@ -800,7 +801,7 @@ mod tests {
             .max_streams_uni(1)
             .build()
             .expect("a valid transport config");
-        let mut streams = StreamState::new(Side::Server, &config);
+        let mut streams = StreamState::new(Side::Server, &config, PagePool::new());
         streams.on_peer_params(&peer).expect("valid parameters");
         streams
     }

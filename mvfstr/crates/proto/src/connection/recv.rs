@@ -976,7 +976,8 @@ impl Connection {
                 "too much CRYPTO data out of order",
             ));
         }
-        buf.insert(offset.into_inner(), data, false, &mut self.crypto_pool)
+        let pool = self.sources.streams.pool();
+        buf.insert(offset.into_inner(), data, false, pool)
             .map_err(|e| match e {
                 RecvError::TooManyRanges => ConnError::new(
                     TransportErrorCode::CRYPTO_BUFFER_EXCEEDED,
@@ -1013,7 +1014,7 @@ impl Connection {
                 }
                 self.spaces[space]
                     .crypto_recv
-                    .consume(len, &mut self.crypto_pool)
+                    .consume(len, self.sources.streams.pool())
                     .expect("should consume bytes that are readable");
             }
             self.drain_tls()?;
@@ -1190,7 +1191,8 @@ impl Connection {
             self.sources.streams.raise_peer_params(peer)
         } else {
             self.recovery.forget_space(Space::Data);
-            self.sources.streams = StreamState::new(Side::Client, &self.config);
+            let pool = self.sources.streams.pool().clone();
+            self.sources.streams = StreamState::new(Side::Client, &self.config, pool);
             self.sources.streams.on_peer_params(peer)
         };
         self.push_event(ConnEvent::EarlyData { accepted });

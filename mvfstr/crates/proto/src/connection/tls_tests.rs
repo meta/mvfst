@@ -1029,7 +1029,7 @@ fn a_server_reuses_the_crypto_page_of_the_client_hello_for_the_finished() {
         "the server waits for its host's answer to the Finished"
     );
     assert_eq!(
-        server.crypto_pool.pages_allocated(),
+        server.sources.streams.pool().pages_allocated(),
         1,
         "the server's ClientHello and the client's Finished share one CRYPTO page"
     );
