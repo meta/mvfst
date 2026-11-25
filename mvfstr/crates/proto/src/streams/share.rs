@@ -668,6 +668,8 @@ impl Shares {
 
     /// Moves the peer in `slot` to `key` in order treap `tree` of its bucket.
     fn shift(&mut self, slot: u32, tree: usize, key: (u128, u64)) {
+        #[cfg(test)]
+        super::guard::census::count(|c| c.share_rekeys += 1);
         let entry = &mut self.entries[slot as usize];
         let b = &mut self.buckets[entry.bucket as usize];
         let weight = if b.key.2 { 0 } else { entry.holding.room };

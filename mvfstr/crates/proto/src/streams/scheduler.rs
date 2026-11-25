@@ -572,6 +572,8 @@ impl Scheduler {
 
     /// Moves the cursor to the stream in `slot` and returns `slot`.
     fn at(&self, cursor: &mut Cursor, bucket: u32, incremental: bool, slot: u32) -> u32 {
+        #[cfg(test)]
+        super::guard::census::count(|c| c.scheduler_visits += 1);
         cursor.pos = Pos::At {
             bucket,
             incremental,

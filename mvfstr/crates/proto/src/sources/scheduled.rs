@@ -52,7 +52,9 @@ pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, Sched
     if cx.space != Space::Data {
         return None;
     }
+    // The walk finds a stream exactly when `lost` counts one, so it runs only then.
     if cx.probes_due > 0
+        && state.streams.lost() > 0
         && let Some(slot) = retransmission(state)
     {
         return Some((Class::Lost, slot));
@@ -222,5 +224,144 @@ impl FrameSource for ScheduledSource<'_> {
             fin: emitted.fin,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use mvfstr_crypto::TAG_LEN;
+    use mvfstr_wire::ConnectionId;
+    use mvfstr_wire::Dir;
+    use mvfstr_wire::HeaderSpec;
+    use mvfstr_wire::Side;
+    use mvfstr_wire::StreamId;
+    use mvfstr_wire::TransportParameters;
+
+    use super::*;
+    use crate::SendOrder;
+    use crate::TransportConfig;
+    use crate::recovery::test_epoch;
+    use crate::sources::PacketCx;
+    use crate::streams::guard::census;
+
+    /// Returns a server's streams with `count` sequential streams in one bucket, in the wire order
+    /// they were opened in, each with 100 new bytes staged within its stream and connection credit.
+    fn staged(count: u32) -> (StreamState, Vec<StreamId>) {
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::new(Side::Server, &config);
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+            initial_max_streams_uni: VarInt::from_u32(count),
+            ..TransportParameters::default()
+        })
+        .expect("valid parameters");
+        let ids = (0..count)
+            .map(|order| {
+                let order = SendOrder {
+                    class: 1,
+                    urgency: 3,
+                    incremental: false,
+                    order: u128::from(order),
+                };
+                let id = s.open(Dir::Uni, order).unwrap();
+                let staged = s.send(id, &mut Bytes::from_static(&[7; 100]), u64::MAX);
+                assert_eq!(staged, Ok(100));
+                id
+            })
+            .collect();
+        (s, ids)
+    }
+
+    fn slot(s: &StreamState, id: StreamId) -> ScheduledCand {
+        s.streams.get(id).unwrap().slot()
+    }
+
+    fn cx(probes_due: u8, sent: &mut Vec<SentFrame>) -> SendCx<'_> {
+        SendCx {
+            now: test_epoch(),
+            release: test_epoch(),
+            space: Space::Data,
+            path: crate::PathId(0),
+            probes_due,
+            ack_delay_exponent: 3,
+            packet: PacketCx::default(),
+            sent,
+        }
+    }
+
+    /// Returns the candidate `next` offers with `probes_due` probes due, and how many streams its
+    /// scheduler walks visited.
+    fn next_with_visits(s: &StreamState, probes_due: u8) -> (Option<(Class, ScheduledCand)>, u64) {
+        let mut sent = Vec::new();
+        let cx = cx(probes_due, &mut sent);
+        census::reset();
+        let offered = next(s, &cx);
+        (offered, census::read().scheduler_visits)
+    }
+
+    /// Writes stream `id`'s next STREAM frame into a packet with room for all of its bytes.
+    fn write(s: &mut StreamState, id: StreamId) {
+        let cand = slot(s, id);
+        let mut sent = Vec::new();
+        let mut cx = cx(0, &mut sent);
+        let mut buf = vec![0; 1_200];
+        let header = HeaderSpec::OneRtt {
+            dcid: ConnectionId::new(&[1; 8]).unwrap(),
+            spin: false,
+            key_phase: false,
+        };
+        let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
+        ScheduledSource(s).write(cand, &mut w, &mut cx).unwrap();
+    }
+
+    #[test]
+    fn probe_without_lost_data_does_not_walk() {
+        let (s, ids) = staged(100);
+        assert_eq!(s.streams.lost(), 0);
+        let first = Some((Class::NewStream, slot(&s, ids[0])));
+        let (plain, plain_visits) = next_with_visits(&s, 0);
+        assert_eq!(plain, first);
+        assert_eq!(plain_visits, 1, "the walk stops at the first stream");
+        let (probe, probe_visits) = next_with_visits(&s, 1);
+        assert_eq!(
+            probe, first,
+            "without lost data, a probe carries new bytes in the wire order"
+        );
+        assert_eq!(
+            probe_visits, plain_visits,
+            "a probe without lost data visited {probe_visits} streams, not {plain_visits}"
+        );
+    }
+
+    #[test]
+    fn a_probe_takes_lost_data_first_whichever_stream_holds_it() {
+        let (mut s, ids) = staged(10);
+        let candidate = |s: &StreamState, probes_due| next_with_visits(s, probes_due).0;
+        let first = Some((Class::NewStream, slot(&s, ids[0])));
+        // Stream 5's bytes and stream 8's FIN are sent and lost, behind streams with new bytes.
+        write(&mut s, ids[5]);
+        assert!(s.on_stream_lost(ids[5], 0, 100, false));
+        s.finish(ids[8]).unwrap();
+        write(&mut s, ids[8]);
+        assert!(s.on_stream_lost(ids[8], 100, 0, true));
+        assert_eq!(s.streams.lost(), 2);
+        assert_eq!(candidate(&s, 0), first, "without probes, the wire order");
+        assert_eq!(
+            candidate(&s, 1),
+            Some((Class::Lost, slot(&s, ids[5]))),
+            "lost bytes go first under probes"
+        );
+        write(&mut s, ids[5]);
+        assert_eq!(s.streams.lost(), 1);
+        assert_eq!(
+            candidate(&s, 1),
+            Some((Class::Lost, slot(&s, ids[8]))),
+            "a lost FIN goes first under probes"
+        );
+        assert_eq!(candidate(&s, 0), first);
     }
 }

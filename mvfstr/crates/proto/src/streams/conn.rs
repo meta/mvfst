@@ -841,6 +841,8 @@ impl StreamState {
     /// Once `left` runs out, the rest of a sequential bucket and the buckets after it are not
     /// ranked, so their allowances are zero.
     fn rank(&mut self, budget: u64) {
+        #[cfg(test)]
+        super::guard::census::count(|c| c.ranks += 1);
         let mut ranked = std::mem::take(&mut self.ranked);
         ranked.clear();
         self.streams.settle_shares();
@@ -1579,8 +1581,11 @@ impl StreamState {
 
 #[cfg(test)]
 mod tests {
+    use mvfstr_wire::VarInt;
+
     use super::*;
     use crate::recovery::test_epoch;
+    use crate::streams::guard::census;
 
     fn state() -> StreamState {
         let config = TransportConfig::builder()
@@ -1687,5 +1692,25 @@ mod tests {
             None,
             "the peer has DATA_BLOCKED(0)"
         );
+    }
+
+    #[test]
+    fn the_census_counts_each_ranking() {
+        let mut s = state();
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+            initial_max_streams_uni: VarInt::from_u32(1),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let id = s.open(Dir::Uni, PEER_ORDER).unwrap();
+        s.streams.stream(id).unwrap().set_producer_pending(false);
+        assert!(s.has_pull_ready());
+        census::reset();
+        s.collect_pull_ready(1 << 20);
+        s.collect_pull_ready(1 << 20);
+        assert_eq!(s.pulled(0).map(|(pulled, _)| pulled), Some(id));
+        assert_eq!(census::read().ranks, 2, "one ranking per collection");
     }
 }

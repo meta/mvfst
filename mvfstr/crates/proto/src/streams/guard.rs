@@ -606,6 +606,7 @@ impl<D: StreamData> Streams<D> {
         #[cfg(test)]
         {
             self.reindexes += 1;
+            census::count(|c| c.reindexes += 1);
         }
         let Some(entry) = self.entry(slot) else {
             return;
@@ -656,6 +657,8 @@ impl<D: StreamData> Streams<D> {
     /// catches up with.
     #[inline(never)]
     fn reshare(&mut self, slot: u32, id: StreamId, moved: bool) {
+        #[cfg(test)]
+        census::count(|c| c.reshares += 1);
         if let Some(entry) = self.entry(slot)
             && entry.member & List::Demand.bit() != 0
         {
@@ -725,6 +728,8 @@ impl<D: StreamData> Streams<D> {
         if tail == NIL {
             self.lists[list as usize].head = slot;
         } else {
+            #[cfg(test)]
+            census::count(|c| c.neighbour_link_writes += 1);
             self.entry_mut(tail).links[list as usize].next = slot;
         }
         let head = &mut self.lists[list as usize];
@@ -738,11 +743,15 @@ impl<D: StreamData> Streams<D> {
         if prev == NIL {
             self.lists[list as usize].head = next;
         } else {
+            #[cfg(test)]
+            census::count(|c| c.neighbour_link_writes += 1);
             self.entry_mut(prev).links[list as usize].next = next;
         }
         if next == NIL {
             self.lists[list as usize].tail = prev;
         } else {
+            #[cfg(test)]
+            census::count(|c| c.neighbour_link_writes += 1);
             self.entry_mut(next).links[list as usize].prev = prev;
         }
         self.lists[list as usize].len -= 1;
@@ -1110,6 +1119,64 @@ impl<'a, D> StreamRef<'a, D> {
 impl<D: StreamData> Drop for StreamGuard<'_, D> {
     fn drop(&mut self) {
         self.streams.reindex(self.slot, self.id);
+    }
+}
+
+/// Counts of the bookkeeping the streams do, kept per thread in tests: a test resets the census,
+/// runs an operation and reads how much of each kind of work it did.
+#[cfg(test)]
+pub(crate) mod census {
+    use std::cell::Cell;
+
+    /// What the census counted on this thread since its last [`reset`].
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Census {
+        /// Reindexes of a stream: one per dropped guard or materialized stream.
+        pub(crate) reindexes: u64,
+        /// Calls of the reshare that brings a stream's record in the shares up to date.
+        pub(crate) reshares: u64,
+        /// Rankings of the streams with demand.
+        pub(crate) ranks: u64,
+        /// Streams that scheduler walks reached: one per stream a cursor steps onto.
+        pub(crate) scheduler_visits: u64,
+        /// Moves of a peer to a new place in its bucket of the shares, by a reshare or a commit,
+        /// while it stays a peer of that bucket.
+        pub(crate) share_rekeys: u64,
+        /// Writes to the links of another stream's list entry while a stream joins or leaves a
+        /// list.
+        pub(crate) neighbour_link_writes: u64,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Census> = const {
+            Cell::new(Census {
+                reindexes: 0,
+                reshares: 0,
+                ranks: 0,
+                scheduler_visits: 0,
+                share_rekeys: 0,
+                neighbour_link_writes: 0,
+            })
+        };
+    }
+
+    /// Sets every count of this thread to zero.
+    pub(crate) fn reset() {
+        COUNTS.set(Census::default());
+    }
+
+    /// Returns the counts of this thread.
+    pub(crate) fn read() -> Census {
+        COUNTS.get()
+    }
+
+    /// Adds what `f` adds to the counts of this thread.
+    pub(crate) fn count(f: impl FnOnce(&mut Census)) {
+        COUNTS.with(|counts| {
+            let mut census = counts.get();
+            f(&mut census);
+            counts.set(census);
+        });
     }
 }
 
@@ -2047,5 +2114,123 @@ mod tests {
         assert!(!due.contains(Owed::STREAM_DATA_BLOCKED), "reset");
         assert!(due.contains(Owed::MAX_STREAM_DATA));
         assert!(on(&s, id).control);
+    }
+
+    #[test]
+    fn the_census_counts_a_reindex_per_dropped_guard() {
+        let mut s = streams();
+        census::reset();
+        let before = s.reindexes();
+        let id = open(&mut s, Dir::Uni, Data::default());
+        for _ in 0..3 {
+            drop(s.stream(id).unwrap());
+        }
+        assert_eq!(s.reindexes() - before, 4, "one reindex per guard");
+        assert_eq!(census::read().reindexes, 4);
+        census::reset();
+        assert_eq!(
+            census::read(),
+            census::Census::default(),
+            "a reset zeroes every count"
+        );
+    }
+
+    /// Opens a local unidirectional stream at `order` whose woken producer has room: it has demand.
+    fn open_with_demand(s: &mut Streams<Data>, order: SendOrder, wire: bool) -> (u32, StreamId) {
+        let mut guard = s
+            .open_local(Dir::Uni, order, Data { wire, room: true })
+            .unwrap();
+        guard.set_producer_pending(false);
+        let id = guard.id();
+        drop(guard);
+        (s.table.map().key(id).unwrap().slot(), id)
+    }
+
+    #[test]
+    fn the_census_counts_the_reshares_of_a_peer_among_others_but_not_of_a_lone_one() {
+        let mut s = streams();
+        let (_, among) = open_with_demand(&mut s, ORDER, false);
+        open_with_demand(&mut s, ORDER, false);
+        let urgent = SendOrder {
+            urgency: 0,
+            ..ORDER
+        };
+        let (_, lone) = open_with_demand(&mut s, urgent, false);
+        census::reset();
+        for _ in 0..3 {
+            drop(s.stream(among).unwrap());
+        }
+        assert_eq!(
+            census::read().reshares,
+            3,
+            "a peer among others is reshared per reindex"
+        );
+        for _ in 0..3 {
+            drop(s.stream(lone).unwrap());
+        }
+        assert_eq!(
+            census::read().reshares,
+            3,
+            "a lone peer that keeps its demand is not reshared"
+        );
+    }
+
+    #[test]
+    fn the_census_counts_a_share_rekey_per_move_within_a_bucket() {
+        let mut s = streams();
+        let (_, a) = open_with_demand(&mut s, ORDER, false);
+        open_with_demand(&mut s, ORDER, false);
+        let incremental = SendOrder {
+            incremental: true,
+            ..ORDER
+        };
+        let (x, x_id) = open_with_demand(&mut s, incremental, true);
+        let (y, y_id) = open_with_demand(&mut s, incremental, true);
+        census::reset();
+        s.stream(a)
+            .unwrap()
+            .set_order(SendOrder { order: 5, ..ORDER });
+        assert_eq!(
+            census::read().share_rekeys,
+            1,
+            "a new order within the bucket"
+        );
+        drop(s.stream(a).unwrap());
+        assert_eq!(
+            census::read().share_rekeys,
+            1,
+            "a reshare in place does not move it"
+        );
+        s.commit(x, x_id, 1200);
+        assert_eq!(
+            census::read().share_rekeys,
+            2,
+            "a commit that moves it to the next turn"
+        );
+        s.commit(y, y_id, 100);
+        assert_eq!(
+            census::read().share_rekeys,
+            2,
+            "a commit within its quantum"
+        );
+        s.assert_indexed();
+    }
+
+    #[test]
+    fn the_census_counts_link_writes_into_neighbouring_entries() {
+        let mut s = streams();
+        let [a, b, c] = [(); 3].map(|()| open(&mut s, Dir::Bi, Data::default()));
+        census::reset();
+        // Joining writes the old tail's link, except for the first stream on the list.
+        for id in [a, b, c] {
+            s.stream(id).unwrap().owe(Owed::MAX_STREAM_DATA);
+        }
+        assert_eq!(census::read().neighbour_link_writes, 2);
+        // Leaving from the middle writes both neighbours' links, and from the head the next one's.
+        s.stream(b).unwrap().on_control_sent(Owed::MAX_STREAM_DATA);
+        s.stream(a).unwrap().on_control_sent(Owed::MAX_STREAM_DATA);
+        assert_eq!(census::read().neighbour_link_writes, 5);
+        assert_eq!(s.first(List::Control), s.get(c).map(|r| r.slot()));
+        s.assert_indexed();
     }
 }
