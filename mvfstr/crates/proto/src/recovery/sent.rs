@@ -7,6 +7,8 @@
 
 //! Sent-packet tracking for one packet number space (RFC 9002).
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::collections::vec_deque;
 use std::fmt;
@@ -268,6 +270,18 @@ pub struct AckSummary {
     pub spurious: u32,
 }
 
+/// The state of one ACK frame's walk over the ring. The counters are those of [`AckSummary`].
+#[derive(Default)]
+struct AckWalk {
+    newly_acked: u32,
+    acked_bytes: u64,
+    spurious: u32,
+    eliciting_acked: bool,
+    /// The packet number and send time offset of the largest packet newly acknowledged. Its
+    /// `Instant` is built once, when the walk ends.
+    largest_new: Option<(u64, u64)>,
+}
+
 /// The thresholds of one loss detection pass (RFC 9002).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LossParams {
@@ -431,6 +445,9 @@ pub struct SentPackets {
     /// Records visited by ACK processing and loss detection, for tests of their cost.
     #[cfg(test)]
     examined: u64,
+    /// Record times converted to an `Instant`, for tests of their cost.
+    #[cfg(test)]
+    instants: Cell<u64>,
 }
 
 impl SentPackets {
@@ -461,6 +478,8 @@ impl SentPackets {
             snapshots_from: 0,
             #[cfg(test)]
             examined: 0,
+            #[cfg(test)]
+            instants: Cell::new(0),
         }
     }
 
@@ -563,9 +582,8 @@ impl SentPackets {
     where
         I: IntoIterator<Item = RangeInclusive<u64>>,
     {
-        let mut summary = AckSummary::default();
+        let mut walk = AckWalk::default();
         let mut frame_largest = None;
-        let mut eliciting_acked = false;
         let old_largest = self.largest_acked;
         let above_old = old_largest.map_or(0, |l| l + 1);
         for range in ranges {
@@ -581,7 +599,7 @@ impl SentPackets {
             // `front` and the largest acknowledged, so every index is in range.
             for pn in lo.max(above_old).max(front)..=hi {
                 let i = (pn - front) as usize;
-                self.ack_record(i, &mut summary, &mut eliciting_acked, &mut on_event)?;
+                self.ack_record(i, &mut walk, &mut on_event)?;
             }
             if let Some(old) = old_largest
                 && lo <= old
@@ -590,9 +608,7 @@ impl SentPackets {
                 let end = self.holes.partition_point(|&h| h <= hi.min(old)).max(first);
                 for k in first..end {
                     let i = (self.holes[k] - front) as usize;
-                    if let Err(error) =
-                        self.ack_record(i, &mut summary, &mut eliciting_acked, &mut on_event)
-                    {
+                    if let Err(error) = self.ack_record(i, &mut walk, &mut on_event) {
                         self.holes.drain(first..k);
                         return Err(error);
                     }
@@ -612,14 +628,19 @@ impl SentPackets {
             }
         }
         self.largest_acked = self.largest_acked.max(frame_largest);
-        if let Some((largest, sent)) = summary.largest_newly_acked
-            && eliciting_acked
-            && Some(largest) == frame_largest
-            && self.sent_on_path(largest)
-        {
-            summary.rtt_sample = now.checked_duration_since(sent);
-        }
-        Ok(summary)
+        let largest_newly_acked = walk.largest_new.map(|(pn, sent)| (pn, self.instant(sent)));
+        let rtt_sample = largest_newly_acked
+            .filter(|&(largest, _)| {
+                walk.eliciting_acked && Some(largest) == frame_largest && self.sent_on_path(largest)
+            })
+            .and_then(|(_, sent)| now.checked_duration_since(sent));
+        Ok(AckSummary {
+            newly_acked: walk.newly_acked,
+            acked_bytes: walk.acked_bytes,
+            largest_newly_acked,
+            rtt_sample,
+            spurious: walk.spurious,
+        })
     }
 
     /// Returns whether packet `pn`, whose record the ring holds, went on the current path.
@@ -642,8 +663,7 @@ impl SentPackets {
     fn ack_record(
         &mut self,
         i: usize,
-        summary: &mut AckSummary,
-        eliciting_acked: &mut bool,
+        walk: &mut AckWalk,
         on_event: &mut impl FnMut(PacketEvent<'_>),
     ) -> Result<(), AckError> {
         #[cfg(test)]
@@ -654,13 +674,13 @@ impl SentPackets {
         match pkt.state {
             PktState::Outstanding => {
                 self.pkts[i].state = PktState::Acked;
-                summary.newly_acked += 1;
+                walk.newly_acked += 1;
                 if pkt.flags.contains(SentFlags::IN_FLIGHT) && self.on_path(&pkt) {
-                    summary.acked_bytes += u64::from(pkt.size);
+                    walk.acked_bytes += u64::from(pkt.size);
                 }
-                *eliciting_acked |= pkt.flags.contains(SentFlags::ACK_ELICITING);
-                if summary.largest_newly_acked.is_none_or(|(l, _)| pkt.pn > l) {
-                    summary.largest_newly_acked = Some((pkt.pn, self.instant(pkt.time_sent)));
+                walk.eliciting_acked |= pkt.flags.contains(SentFlags::ACK_ELICITING);
+                if walk.largest_new.is_none_or(|(l, _)| pkt.pn > l) {
+                    walk.largest_new = Some((pkt.pn, pkt.time_sent));
                 }
                 self.leave_flight(pkt);
                 on_event(PacketEvent::Acked(self.view(i)));
@@ -668,7 +688,7 @@ impl SentPackets {
             PktState::Lost | PktState::Dropped => {
                 self.pkts[i].state = PktState::Acked;
                 if pkt.state == PktState::Lost && pkt.flags.contains(SentFlags::IN_FLIGHT) {
-                    summary.spurious += 1;
+                    walk.spurious += 1;
                     self.declared_lost -= 1;
                 }
                 on_event(PacketEvent::AckedAfterLoss(self.view(i)));
@@ -986,6 +1006,10 @@ impl SentPackets {
     }
 
     fn instant(&self, offset: u64) -> Instant {
+        #[cfg(test)]
+        {
+            self.instants.set(self.instants.get() + 1);
+        }
         self.epoch + Duration::from_nanos(offset)
     }
 
@@ -1260,6 +1284,98 @@ mod tests {
         assert_eq!(summary.rtt_sample, None);
         let (summary, _) = ack(&mut s, &[2..=2, 0..=0], t0 + 10 * MS).unwrap();
         assert_eq!(summary.rtt_sample, Some(8 * MS));
+    }
+
+    /// Applies one ACK frame to `s` and returns its summary and how many send times the ring
+    /// converted to an `Instant` for it, besides the one in each reported packet.
+    fn ack_converting(
+        s: &mut SentPackets,
+        ranges: &[RangeInclusive<u64>],
+        now: Instant,
+    ) -> (AckSummary, u64) {
+        let before = s.instants.get();
+        let mut events = 0;
+        let summary = s
+            .on_ack(ranges.iter().cloned(), now, |_| events += 1)
+            .unwrap();
+        let conversions = (s.instants.get() - before)
+            .checked_sub(events)
+            .expect("each reported packet carries its converted send time");
+        (summary, conversions)
+    }
+
+    #[test]
+    fn an_ack_converts_one_send_time_for_its_summary() {
+        // Records keep send times as offsets from the ring's epoch. Each reported packet carries
+        // its own converted send time; for the summary, ACK processing converts only the largest
+        // newly acknowledged packet's, once per frame, not each larger one it walks past.
+        let t0 = crate::recovery::test_epoch();
+        let mut s = ring(t0, 32);
+        let (summary, conversions) = ack_converting(&mut s, &[0..=31], t0 + 40 * MS);
+        assert_eq!(summary.newly_acked, 32);
+        assert_eq!(summary.largest_newly_acked, Some((31, t0 + 31 * MS)));
+        assert_eq!(summary.rtt_sample, Some(9 * MS));
+        assert_eq!(
+            conversions, 1,
+            "send times converted for the summary of an ACK of 32 packets"
+        );
+    }
+
+    #[test]
+    fn the_summary_finds_the_largest_newly_acknowledged_packet_across_ranges_and_holes() {
+        let t0 = crate::recovery::test_epoch();
+        let now = t0 + 40 * MS;
+        let by_packet_threshold = params(Duration::from_secs(1));
+        // (newly acknowledged, spurious, largest newly acknowledged, RTT sample, conversions)
+        let outcome = |(summary, conversions): (AckSummary, u64)| {
+            (
+                summary.newly_acked,
+                summary.spurious,
+                summary.largest_newly_acked,
+                summary.rtt_sample,
+                conversions,
+            )
+        };
+
+        // Two ranges above the previous largest acknowledged; the largest is in the first.
+        let mut s = ring(t0, 32);
+        assert_eq!(
+            outcome(ack_converting(&mut s, &[20..=31, 0..=9], now)),
+            (22, 0, Some((31, t0 + 31 * MS)), Some(9 * MS), 1),
+            "two ranges"
+        );
+
+        // Only holes below the previous largest acknowledged are new, so the walk over the holes
+        // finds the largest. The frame's own largest is not new, so it does not give an RTT sample.
+        let mut s = ring(t0, 10);
+        ack(&mut s, &[9..=9], now).unwrap();
+        assert_eq!(
+            outcome(ack_converting(&mut s, &[0..=9], now)),
+            (9, 0, Some((8, t0 + 8 * MS)), None, 1),
+            "only holes"
+        );
+
+        // New packets above the previous largest, and holes both outstanding and declared lost, in
+        // one frame. Acknowledging 8 declares 0-5 lost and leaves 6 and 7 outstanding.
+        let mut s = ring(t0, 12);
+        ack(&mut s, &[8..=8], now).unwrap();
+        detect(&mut s, now, &by_packet_threshold);
+        assert_eq!(
+            outcome(ack_converting(&mut s, &[10..=11, 0..=7], now)),
+            (4, 6, Some((11, t0 + 11 * MS)), Some(29 * MS), 1),
+            "new packets, outstanding holes and lost holes"
+        );
+
+        // A frame that acknowledges only packets declared lost has no largest newly acknowledged
+        // packet, so its summary does not convert a send time.
+        let mut s = ring(t0, 5);
+        ack(&mut s, &[4..=4], now).unwrap();
+        detect(&mut s, now, &by_packet_threshold);
+        assert_eq!(
+            outcome(ack_converting(&mut s, &[4..=4, 0..=1], now)),
+            (0, 2, None, None, 0),
+            "only packets declared lost"
+        );
     }
 
     fn params(loss_delay: Duration) -> LossParams {
