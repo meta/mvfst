@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use mvfstr_wire::ConnectionId;
 use mvfstr_wire::ResetToken;
 use mvfstr_wire::Side;
@@ -75,6 +76,18 @@ pub(crate) fn local_params(
 ) -> TransportParameters {
     let varint = |value: u64| VarInt::from_u64(value).unwrap_or(VarInt::MAX);
     let ack = config.ack_policy();
+    let mut extra = config.extra_params().to_vec();
+    let datagram = config.max_datagram_frame_size();
+    if datagram > 0 {
+        let mut value = [0; 8];
+        let len = varint(datagram)
+            .encode(&mut value)
+            .expect("eight bytes hold any variable-length integer");
+        extra.push((
+            MAX_DATAGRAM_FRAME_SIZE,
+            Bytes::copy_from_slice(&value[..len]),
+        ));
+    }
     TransportParameters {
         original_destination_connection_id: ids.original_dcid,
         max_idle_timeout: varint(
@@ -96,7 +109,7 @@ pub(crate) fn local_params(
         initial_source_connection_id: Some(ids.initial_scid),
         stateless_reset_token: ids.reset_token,
         retry_source_connection_id: ids.retry_scid,
-        extra: config.extra_params().to_vec(),
+        extra,
         ..TransportParameters::default()
     }
 }
@@ -446,6 +459,25 @@ mod tests {
                 .unwrap()
                 .disable_active_migration
         );
+    }
+
+    #[test]
+    fn max_datagram_frame_size_is_advertised_only_when_set() {
+        let ids = LocalIds {
+            initial_scid: cid(2),
+            original_dcid: Some(cid(1)),
+            reset_token: Some(ResetToken([5; 16])),
+            retry_scid: None,
+        };
+        let params = local_params(&TransportConfig::default(), Duration::ZERO, ids);
+        assert!(params.extra.is_empty());
+        let config = TransportConfig::builder()
+            .max_datagram_frame_size(65535)
+            .build()
+            .unwrap();
+        let params = local_params(&config, Duration::ZERO, ids);
+        let peer = peer_params(&encode(&params), client_ids(Version::V1)).unwrap();
+        assert_eq!(max_datagram_frame_size(&peer), Ok(65535));
     }
 
     #[test]

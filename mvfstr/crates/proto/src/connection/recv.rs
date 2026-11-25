@@ -628,7 +628,12 @@ impl Connection {
             challenge: None,
         };
         let mut empty = true;
-        for frame in Frames::new(payload) {
+        let mut frames = Frames::new(payload);
+        loop {
+            let start = frames.offset();
+            let Some(frame) = frames.next() else {
+                break;
+            };
             let frame = frame.map_err(|e| ConnError {
                 code: e.code(),
                 frame_type: Some(e.frame_type()),
@@ -791,6 +796,25 @@ impl Connection {
                 Frame::PathChallenge(data) => received.challenge = Some(data),
                 Frame::PathResponse(data) => self.on_path_response(now, data),
                 Frame::StreamsBlocked { .. } => {}
+                Frame::Datagram { data, with_length } => {
+                    // RFC 9221: a DATAGRAM frame must fit the max_datagram_frame_size advertised,
+                    // and an endpoint that did not advertise one refuses every DATAGRAM frame.
+                    // The frame is measured as received, since its Length field may take more
+                    // bytes than its value needs.
+                    if (frames.offset() - start) as u64 > self.config.max_datagram_frame_size() {
+                        return Err(ConnError {
+                            code: TransportErrorCode::PROTOCOL_VIOLATION,
+                            frame_type: Some(VarInt::from_u32(if with_length {
+                                0x31
+                            } else {
+                                0x30
+                            })),
+                            reason: "DATAGRAM frame above max_datagram_frame_size",
+                        });
+                    }
+                    self.datagrams_received.push(data);
+                    self.push_event(ConnEvent::DatagramsReadable);
+                }
             }
         }
         // A packet must hold at least one frame (RFC 9000).
@@ -1272,5 +1296,6 @@ pub(super) fn frame_type(kind: FrameKind) -> VarInt {
         FrameKind::ConnectionClose => 0x1c,
         FrameKind::ApplicationClose => 0x1d,
         FrameKind::HandshakeDone => 0x1e,
+        FrameKind::Datagram => 0x30,
     })
 }

@@ -46,6 +46,7 @@ pub use frame::FrameError;
 pub use frame::FrameKind;
 pub use frame::Frames;
 pub use frame::InvalidFrame;
+pub use frame::datagram_frame_len;
 pub use header::EncodeError;
 pub use header::Header;
 pub use header::HeaderError;

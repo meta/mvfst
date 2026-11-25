@@ -52,6 +52,7 @@ use mvfstr_proto::ConnKey;
 use mvfstr_proto::ConnOptions;
 use mvfstr_proto::ConnectError;
 use mvfstr_proto::Connection;
+use mvfstr_proto::DatagramError;
 use mvfstr_proto::Dir;
 use mvfstr_proto::Endpoint;
 use mvfstr_proto::EndpointConfig;
@@ -66,6 +67,7 @@ use mvfstr_proto::StreamId;
 use mvfstr_proto::StreamReady;
 use mvfstr_proto::TransportConfig;
 use mvfstr_proto::TxLimits;
+use mvfstr_proto::datagram::datagram_frame_len;
 use mvfstr_proto::testing::TestRng;
 use mvfstr_proto::testing::VecSink;
 use roxygen_runtime::managed::RuntimeConfig;
@@ -85,6 +87,7 @@ use rustls::sign::CertifiedKey;
 use crate::Conn;
 use crate::ConnHandle;
 use crate::ConnInfo;
+use crate::DatagramSink;
 use crate::DriverConnectError;
 use crate::DriverError;
 use crate::EndpointDriver;
@@ -548,6 +551,19 @@ enum Report {
     Counters(crate::EndpointStats),
     /// In this turn of its driver, a producer staged this many bytes.
     Staged(u64, usize),
+    /// A datagram sink took or refused a datagram.
+    DatagramPushed(Result<(), DatagramError>),
+    /// A session had read this many datagrams; `true` if one was stale.
+    DatagramsRead(usize, bool),
+    /// A stream's producer was first polled while its session had this many datagrams left to
+    /// push, this many turns of its driver after the session first pushed one.
+    StreamFirstPolled(usize, Option<u64>),
+    /// A datagram producer found this allowance in its sink on its first poll after its stream
+    /// sent.
+    DatagramAllowance(usize),
+    /// A datagram producer that stays ready found these allowances in its sink, one per poll,
+    /// until a while after its waker fired.
+    DatagramPolls(Vec<usize>),
 }
 
 /// Reads and consumes every readable byte of stream `id`.
@@ -2229,6 +2245,448 @@ impl QuicSession for TimedPull {
     }
 }
 
+/// Returns transport settings under which a connection takes DATAGRAM frames.
+fn datagram_transport() -> Arc<TransportConfig> {
+    TransportConfig::builder()
+        .max_datagram_frame_size(65535)
+        .build()
+        .expect("a transport config")
+}
+
+/// A client session whose datagram producer pushes `left` datagrams of `len` bytes, as many as its
+/// allowance takes on each poll up to `per_poll`; its first poll also pushes one whose expiry is
+/// the driver's reading, and reports how the sink took it.
+struct DatagramProducer {
+    reports: mpsc::Sender<Report>,
+    left: usize,
+    len: usize,
+    per_poll: usize,
+    polled: bool,
+}
+
+impl DatagramProducer {
+    fn new(reports: mpsc::Sender<Report>, left: usize, len: usize, per_poll: usize) -> Self {
+        Self {
+            reports,
+            left,
+            len,
+            per_poll,
+            polled: false,
+        }
+    }
+}
+
+impl QuicSession for DatagramProducer {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event == ConnEvent::Connected {
+            conn.datagram_waker().wake();
+        }
+    }
+
+    fn on_stream(&mut self, _: &mut Conn<'_>, _: StreamId, _: StreamReady) {}
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, _: &mut SendSink<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn poll_datagrams(&mut self, _: &mut Context<'_>, sink: &mut DatagramSink<'_>) -> Poll<()> {
+        if !mem::replace(&mut self.polled, true) {
+            let stale = sink.push_parts(&[Bytes::from_static(b"stale")], ORDER, Some(sink.now()));
+            let _ = self.reports.send(Report::DatagramPushed(stale));
+        }
+        let mut pushed = 0;
+        while self.left > 0
+            && pushed < self.per_poll
+            && sink.allowance() >= datagram_frame_len(self.len)
+        {
+            sink.push_parts(&[payload(self.len)], ORDER, None)
+                .expect("within the allowance");
+            self.left -= 1;
+            pushed += 1;
+        }
+        if self.left == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, _: &mut Conn<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+/// A server session that reads every datagram it receives and reports how many it has read, and
+/// whether one of them was the stale datagram of [`DatagramProducer`].
+struct DatagramReader {
+    reports: mpsc::Sender<Report>,
+    read: usize,
+    stale: bool,
+}
+
+impl QuicSession for DatagramReader {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event != ConnEvent::DatagramsReadable {
+            return;
+        }
+        while let Some(datagram) = conn.read_datagram() {
+            self.read += 1;
+            self.stale |= &datagram[..] == b"stale";
+        }
+        let _ = self
+            .reports
+            .send(Report::DatagramsRead(self.read, self.stale));
+    }
+
+    fn on_stream(&mut self, _: &mut Conn<'_>, _: StreamId, _: StreamReady) {}
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, _: &mut SendSink<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, _: &mut Conn<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+/// A client session that wakes its datagram producer a while after the handshake. The producer's
+/// first pull step pushes datagrams that expire before the connection's next transmit attempt;
+/// a later pull step pushes `count` that do not expire.
+struct ExpiringProducer {
+    count: usize,
+    deadline: Option<Instant>,
+    /// The time of the first pull step.
+    first: Option<Instant>,
+}
+
+impl QuicSession for ExpiringProducer {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event == ConnEvent::Connected {
+            // Late enough that the handshake's last packets are out.
+            self.deadline = Some(conn.now() + Duration::from_millis(100));
+        }
+    }
+
+    fn on_stream(&mut self, _: &mut Conn<'_>, _: StreamId, _: StreamReady) {}
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, _: &mut SendSink<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn poll_datagrams(&mut self, _: &mut Context<'_>, sink: &mut DatagramSink<'_>) -> Poll<()> {
+        let now = sink.now();
+        match self.first {
+            None => {
+                self.first = Some(now);
+                let expiry = now + Duration::from_millis(1);
+                for _ in 0..4 {
+                    sink.push_parts(&[Bytes::from_static(b"stale")], ORDER, Some(expiry))
+                        .expect("a live datagram");
+                }
+                // A paced connection's attempt reads the clock after this, past the expiry.
+                std::thread::sleep(Duration::from_millis(5));
+                Poll::Ready(())
+            }
+            Some(first) if first == now => Poll::Ready(()),
+            Some(_) => {
+                for _ in 0..self.count {
+                    sink.push_parts(&[Bytes::from_static(b"fresh")], ORDER, None)
+                        .expect("within the allowance");
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, conn: &mut Conn<'_>) -> Poll<()> {
+        if self.deadline.is_some_and(|at| conn.now() >= at) {
+            self.deadline = None;
+            conn.datagram_waker().wake();
+        }
+        Poll::Pending
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
+/// A client session whose datagrams follow a stream at [`ORDER`]. A while after the handshake it
+/// wakes its datagram producer. Until the stream's producer has sent `hello` and the FIN, a
+/// datagram poll pushes nothing, the first waking the stream's producer. Later polls push `left`
+/// datagrams of `len` bytes, as many as the allowance takes, and the first reports the allowance
+/// it found.
+struct DatagramsAfterStream {
+    reports: mpsc::Sender<Report>,
+    left: usize,
+    len: usize,
+    deadline: Option<Instant>,
+    /// The stream's waker, until the first datagram poll wakes it.
+    stream: Option<Waker>,
+    sent: bool,
+    reported: bool,
+}
+
+impl DatagramsAfterStream {
+    fn new(reports: mpsc::Sender<Report>, left: usize, len: usize) -> Self {
+        Self {
+            reports,
+            left,
+            len,
+            deadline: None,
+            stream: None,
+            sent: false,
+            reported: false,
+        }
+    }
+}
+
+impl QuicSession for DatagramsAfterStream {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event == ConnEvent::Connected {
+            let id = conn.open_stream(Dir::Bi, ORDER).expect("a stream opens");
+            self.stream = Some(conn.stream_waker(id));
+            // Late enough that the handshake's last packets are out.
+            self.deadline = Some(conn.now() + Duration::from_millis(100));
+        }
+    }
+
+    fn on_stream(&mut self, _: &mut Conn<'_>, _: StreamId, _: StreamReady) {}
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, sink: &mut SendSink<'_>) -> Poll<()> {
+        if !mem::replace(&mut self.sent, true) {
+            sink.push(Bytes::from_static(b"hello"))
+                .expect("within the allowance");
+            sink.finish().expect("the stream is open");
+        }
+        Poll::Pending
+    }
+
+    fn poll_datagrams(&mut self, _: &mut Context<'_>, sink: &mut DatagramSink<'_>) -> Poll<()> {
+        if !self.sent {
+            if let Some(stream) = self.stream.take() {
+                stream.wake();
+            }
+            return Poll::Ready(());
+        }
+        if !mem::replace(&mut self.reported, true) {
+            let _ = self
+                .reports
+                .send(Report::DatagramAllowance(sink.allowance()));
+        }
+        while self.left > 0 && sink.allowance() >= datagram_frame_len(self.len) {
+            sink.push_parts(&[payload(self.len)], ORDER, None)
+                .expect("within the allowance");
+            self.left -= 1;
+        }
+        if self.left == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, conn: &mut Conn<'_>) -> Poll<()> {
+        if self.deadline.is_some_and(|at| conn.now() >= at) {
+            self.deadline = None;
+            conn.datagram_waker().wake();
+        }
+        Poll::Pending
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
+/// A client session whose datagram producer, woken a while after the handshake, returns `Ready`
+/// on every poll. With `keep` set, its first poll pushes datagrams until about `keep` bytes of the
+/// allowance are left; otherwise, and on later polls, it pushes nothing. A further while after
+/// the wake, the session reports the allowance of each poll.
+struct StalledProducer {
+    reports: mpsc::Sender<Report>,
+    keep: Option<usize>,
+    deadline: Option<Instant>,
+    woken: bool,
+    allowances: Vec<usize>,
+}
+
+impl StalledProducer {
+    fn new(reports: mpsc::Sender<Report>, keep: Option<usize>) -> Self {
+        Self {
+            reports,
+            keep,
+            deadline: None,
+            woken: false,
+            allowances: Vec::new(),
+        }
+    }
+}
+
+impl QuicSession for StalledProducer {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event == ConnEvent::Connected {
+            // Late enough that the handshake's last packets are out.
+            self.deadline = Some(conn.now() + Duration::from_millis(100));
+        }
+    }
+
+    fn on_stream(&mut self, _: &mut Conn<'_>, _: StreamId, _: StreamReady) {}
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, _: &mut SendSink<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+
+    fn poll_datagrams(&mut self, _: &mut Context<'_>, sink: &mut DatagramSink<'_>) -> Poll<()> {
+        self.allowances.push(sink.allowance());
+        if let Some(keep) = self.keep.take() {
+            const LEN: usize = 1000;
+            let mut fill = sink.allowance().saturating_sub(keep);
+            while fill >= datagram_frame_len(LEN) {
+                sink.push_parts(&[payload(LEN)], ORDER, None)
+                    .expect("within the allowance");
+                fill -= datagram_frame_len(LEN);
+            }
+            if let Some(len) = (0..fill)
+                .rev()
+                .take(3)
+                .find(|&len| datagram_frame_len(len) == fill)
+            {
+                sink.push_parts(&[payload(len)], ORDER, None)
+                    .expect("within the allowance");
+            }
+        }
+        Poll::Ready(())
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, conn: &mut Conn<'_>) -> Poll<()> {
+        if !self.deadline.is_some_and(|at| conn.now() >= at) {
+            return Poll::Pending;
+        }
+        if mem::replace(&mut self.woken, true) {
+            self.deadline = None;
+            let _ = self
+                .reports
+                .send(Report::DatagramPolls(mem::take(&mut self.allowances)));
+        } else {
+            self.deadline = Some(conn.now() + Duration::from_millis(200));
+            conn.datagram_waker().wake();
+        }
+        Poll::Pending
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
+/// A place in the wire order ahead of [`ORDER`].
+const URGENT: SendOrder = SendOrder {
+    urgency: 0,
+    ..ORDER
+};
+
+/// A client session whose datagram producer pushes `left` datagrams of `len` bytes at [`ORDER`], as
+/// many as its allowance takes on each poll up to `per_poll`. Its first poll pushes nothing and
+/// wakes the producer of a stream opened at [`URGENT`]. When first polled, that producer reports
+/// how many datagrams are left and how many turns have passed since the first was pushed, and
+/// sends `hello` and the FIN; the session checks the echo.
+struct DatagramsAndStream {
+    reports: mpsc::Sender<Report>,
+    left: usize,
+    len: usize,
+    per_poll: usize,
+    /// The stream's waker, until the first datagram poll wakes it.
+    stream: Option<Waker>,
+    /// The turn in which the first datagram was pushed.
+    first_push: Option<u64>,
+    sent: bool,
+    received: Vec<u8>,
+}
+
+impl DatagramsAndStream {
+    fn new(reports: mpsc::Sender<Report>, left: usize, len: usize, per_poll: usize) -> Self {
+        Self {
+            reports,
+            left,
+            len,
+            per_poll,
+            stream: None,
+            first_push: None,
+            sent: false,
+            received: Vec::new(),
+        }
+    }
+}
+
+impl QuicSession for DatagramsAndStream {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event == ConnEvent::Connected {
+            let id = conn.open_stream(Dir::Bi, URGENT).expect("a stream opens");
+            self.stream = Some(conn.stream_waker(id));
+            conn.datagram_waker().wake();
+        }
+    }
+
+    fn on_stream(&mut self, conn: &mut Conn<'_>, id: StreamId, ready: StreamReady) {
+        if !matches!(ready, StreamReady::Readable | StreamReady::Finished) {
+            return;
+        }
+        for segment in read_all(conn, id) {
+            self.received.extend_from_slice(&segment);
+        }
+        if ready == StreamReady::Finished {
+            let _ = self
+                .reports
+                .send(Report::LastEchoed(self.received == b"hello"));
+        }
+    }
+
+    fn poll_send(&mut self, _: &mut Context<'_>, _: StreamId, sink: &mut SendSink<'_>) -> Poll<()> {
+        if mem::replace(&mut self.sent, true) {
+            return Poll::Pending;
+        }
+        let turn = current_turn::<Self>();
+        let since = self.first_push.map(|first| turn - first);
+        let _ = self
+            .reports
+            .send(Report::StreamFirstPolled(self.left, since));
+        sink.push(Bytes::from_static(b"hello"))
+            .expect("within the allowance");
+        sink.finish().expect("the stream is open");
+        Poll::Ready(())
+    }
+
+    fn poll_datagrams(&mut self, _: &mut Context<'_>, sink: &mut DatagramSink<'_>) -> Poll<()> {
+        if let Some(stream) = self.stream.take() {
+            stream.wake();
+            return Poll::Ready(());
+        }
+        let mut pushed = 0;
+        while self.left > 0
+            && pushed < self.per_poll
+            && sink.allowance() >= datagram_frame_len(self.len)
+        {
+            sink.push_parts(&[payload(self.len)], ORDER, None)
+                .expect("within the allowance");
+            self.left -= 1;
+            pushed += 1;
+        }
+        if pushed > 0 && self.first_push.is_none() {
+            self.first_push = Some(current_turn::<Self>());
+        }
+        if self.left == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, _: &mut Conn<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
 /// A server session that reports its events and, when `panics` is set, panics when dropped.
 struct Fragile {
     recorder: Recorder,
@@ -3058,6 +3516,319 @@ fn a_deadline_a_producer_sets_runs_poll_session() {
     let _conn = harness.connect(addr, move || TimedPull::new(tx));
     await_reports(&rx, vec![Report::DeadlineMet(true)]);
     harness.shutdown();
+}
+
+#[test]
+fn a_datagram_producer_is_pulled_as_the_window_opens_and_its_expired_datagram_is_refused() {
+    // Thirty 1,000-byte datagrams take more than the initial congestion window of 12,000 bytes,
+    // so the producer is pulled again as acknowledgments open it.
+    const COUNT: usize = 30;
+    let harness = Harness::new();
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| {
+            Ok(DatagramReader {
+                reports: server_reports.clone(),
+                read: 0,
+                stale: false,
+            })
+        });
+        app.transport = Some(datagram_transport());
+        app
+    });
+    let _conn = harness.connect_with(
+        addr,
+        ConnOptions {
+            transport: Some(datagram_transport()),
+        },
+        move || DatagramProducer::new(tx, COUNT, 1000, usize::MAX),
+    );
+    let others = await_reports(
+        &rx,
+        vec![
+            Report::DatagramPushed(Err(DatagramError::Expired)),
+            Report::DatagramsRead(COUNT, false),
+        ],
+    );
+    assert!(
+        others
+            .iter()
+            .all(|report| matches!(report, Report::DatagramsRead(read, false) if *read < COUNT)),
+        "{others:?}"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn a_datagram_producer_cut_short_by_the_turns_work_is_polled_again_in_the_next_turn() {
+    // Each poll pushes one datagram and uses up the connection's work for the turn. The peers
+    // acknowledge nothing within the test, so only the driver's own requeue polls it again.
+    const COUNT: usize = 8;
+    let mut harness = Harness::new();
+    harness.limits.turn_staging = POLL_CHARGE;
+    let transport = TransportConfig::builder()
+        .ack_policy(sluggish().ack_policy())
+        .max_datagram_frame_size(65535)
+        .build()
+        .expect("a transport config");
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let server_transport = transport.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| {
+            Ok(DatagramReader {
+                reports: server_reports.clone(),
+                read: 0,
+                stale: false,
+            })
+        });
+        app.transport = Some(server_transport);
+        app
+    });
+    let _conn = harness.connect_with(
+        addr,
+        ConnOptions {
+            transport: Some(transport),
+        },
+        move || DatagramProducer::new(tx, COUNT, 10, 1),
+    );
+    await_reports_within(&rx, vec![Report::DatagramsRead(COUNT, false)], STALL);
+    harness.shutdown();
+}
+
+#[test]
+fn a_datagram_producer_whose_datagrams_expire_unsent_is_polled_again_without_input() {
+    // The peers acknowledge nothing within the test, so the attempt that drops the expired
+    // datagrams, sending nothing, is all that can get the producer polled again.
+    const COUNT: usize = 4;
+    let harness = Harness::new();
+    let transport = |pacing| {
+        TransportConfig::builder()
+            .ack_policy(sluggish().ack_policy())
+            .max_datagram_frame_size(65535)
+            .pacing(pacing)
+            .build()
+            .expect("a transport config")
+    };
+    let (tx, rx) = mpsc::channel();
+    let server_transport = transport(false);
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| {
+            Ok(DatagramReader {
+                reports: tx.clone(),
+                read: 0,
+                stale: false,
+            })
+        });
+        app.transport = Some(server_transport);
+        app
+    });
+    let _conn = harness.connect_with(
+        addr,
+        ConnOptions {
+            transport: Some(transport(true)),
+        },
+        move || ExpiringProducer {
+            count: COUNT,
+            deadline: None,
+            first: None,
+        },
+    );
+    await_reports_within(&rx, vec![Report::DatagramsRead(COUNT, false)], STALL);
+    harness.shutdown();
+}
+
+/// Runs a [`StalledProducer`] client that keeps `keep` with `harness`'s limits against a server
+/// that takes datagrams, with peers that acknowledge nothing within the test, and returns the
+/// allowance of each of the producer's polls.
+fn polls_of_a_stalled_producer(harness: Harness, keep: Option<usize>) -> Vec<usize> {
+    let transport = TransportConfig::builder()
+        .ack_policy(sluggish().ack_policy())
+        .max_datagram_frame_size(65535)
+        .build()
+        .expect("a transport config");
+    let (tx, rx) = mpsc::channel();
+    // The server's reports go nowhere.
+    let (server_reports, _) = mpsc::channel();
+    let server_transport = transport.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| {
+            Ok(DatagramReader {
+                reports: server_reports.clone(),
+                read: 0,
+                stale: false,
+            })
+        });
+        app.transport = Some(server_transport);
+        app
+    });
+    let _conn = harness.connect_with(
+        addr,
+        ConnOptions {
+            transport: Some(transport),
+        },
+        move || StalledProducer::new(tx, keep),
+    );
+    let report = rx.recv_timeout(WAIT).expect("the producer's watch ends");
+    harness.shutdown();
+    let Report::DatagramPolls(allowances) = report else {
+        panic!("unexpected {report:?}");
+    };
+    allowances
+}
+
+#[test]
+fn a_datagram_producer_that_pushes_nothing_with_room_for_any_datagram_is_not_polled_every_turn() {
+    // The turn's work is less than the window, so it cuts the sink, but leaves room for the
+    // longest datagram.
+    let mut harness = Harness::new();
+    harness.limits.turn_staging = 4000;
+    let allowances = polls_of_a_stalled_producer(harness, None);
+    assert!(
+        allowances == [4000],
+        "polled {} times; first allowances {:?}",
+        allowances.len(),
+        &allowances[..allowances.len().min(10)]
+    );
+}
+
+#[test]
+fn a_datagram_producer_the_window_leaves_less_than_a_frame_is_not_polled_every_turn() {
+    // The first poll fills the window but for 900 bytes, less than the longest datagram's frame,
+    // and the packets that carry its datagrams take a little more of it.
+    let allowances = polls_of_a_stalled_producer(Harness::new(), Some(900));
+    assert!(
+        allowances.len() < 10,
+        "polled {} times; first allowances {:?}",
+        allowances.len(),
+        &allowances[..allowances.len().min(10)]
+    );
+    assert!(
+        allowances
+            .last()
+            .is_some_and(|&last| last > 0 && last < 900),
+        "{allowances:?}"
+    );
+}
+
+#[test]
+fn a_datagram_producer_the_turns_work_leaves_less_than_a_frame_is_polled_again_in_the_next_turn() {
+    // The producer's poll that pushes nothing and the stream's poll after it each count the least
+    // a poll counts, so in the application phase after the stream's packet is sent the turn's work
+    // leaves the producer `SHORT` bytes, less than the frame of its next datagram. The peers
+    // acknowledge nothing within the test, so only the driver's own requeue polls it again.
+    const COUNT: usize = 4;
+    const LEN: usize = 1000;
+    const SHORT: usize = 500;
+    let mut harness = Harness::new();
+    harness.limits.turn_staging = 2 * POLL_CHARGE + SHORT as u64;
+    let transport = TransportConfig::builder()
+        .ack_policy(sluggish().ack_policy())
+        .max_datagram_frame_size(65535)
+        .build()
+        .expect("a transport config");
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let server_transport = transport.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| {
+            Ok(DatagramReader {
+                reports: server_reports.clone(),
+                read: 0,
+                stale: false,
+            })
+        });
+        app.transport = Some(server_transport);
+        app
+    });
+    let _conn = harness.connect_with(
+        addr,
+        ConnOptions {
+            transport: Some(transport),
+        },
+        move || DatagramsAfterStream::new(tx, COUNT, LEN),
+    );
+    assert!(SHORT < datagram_frame_len(LEN));
+    await_reports_within(
+        &rx,
+        vec![
+            Report::DatagramAllowance(SHORT),
+            Report::DatagramsRead(COUNT, false),
+        ],
+        STALL,
+    );
+    harness.shutdown();
+}
+
+/// Runs a [`DatagramsAndStream`] client with `transport` against an echo server that takes
+/// datagrams, and returns what its stream's producer reported when first polled.
+fn first_poll_beside_datagrams(
+    harness: Harness,
+    transport: Arc<TransportConfig>,
+    session: impl FnOnce(mpsc::Sender<Report>) -> DatagramsAndStream + Send + 'static,
+) -> (usize, Option<u64>) {
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| Ok(Echo::new(server_reports.clone())));
+        app.transport = Some(datagram_transport());
+        app
+    });
+    let _conn = harness.connect_with(
+        addr,
+        ConnOptions {
+            transport: Some(transport),
+        },
+        move || session(tx),
+    );
+    let reports = await_reports(&rx, vec![Report::LastEchoed(true)]);
+    harness.shutdown();
+    reports
+        .iter()
+        .find_map(|report| match report {
+            Report::StreamFirstPolled(left, since) => Some((*left, *since)),
+            _ => None,
+        })
+        .expect("the stream's producer was polled")
+}
+
+#[test]
+fn a_stream_woken_beside_a_datagram_producer_pushing_one_per_poll_is_polled_in_the_same_turn() {
+    // Each poll pushes one datagram and counts the least a poll counts, and the producer has four
+    // turns' worth of polls to push. The initial window takes them all, so only the turn's work
+    // limits how often the producer is polled.
+    const COUNT: usize = 4 * (TURN_STAGING / POLL_CHARGE) as usize;
+    let (left, since) = first_poll_beside_datagrams(Harness::new(), datagram_transport(), |tx| {
+        DatagramsAndStream::new(tx, COUNT, 10, 1)
+    });
+    assert!(
+        left > 0 && since == Some(0),
+        "the stream was first polled {since:?} turns after the first datagram, with {left} of \
+         {COUNT} left"
+    );
+}
+
+#[test]
+fn a_stream_woken_beside_a_datagram_producer_pushing_in_bulk_is_polled_in_the_same_turn() {
+    // Each poll pushes as many datagrams as the allowance takes, and one poll could push the
+    // initial window of 32 datagrams, more than the turn's work of two polls' least counts.
+    const COUNT: usize = 200;
+    let mut harness = Harness::new();
+    harness.limits.turn_staging = 2 * POLL_CHARGE;
+    let transport = TransportConfig::builder()
+        .max_datagram_frame_size(65535)
+        .initial_window(32)
+        .build()
+        .expect("a transport config");
+    let (left, since) = first_poll_beside_datagrams(harness, transport, |tx| {
+        DatagramsAndStream::new(tx, COUNT, 1000, usize::MAX)
+    });
+    assert!(
+        left > 0 && since == Some(0),
+        "the stream was first polled {since:?} turns after the first datagram, with {left} of \
+         {COUNT} left"
+    );
 }
 
 #[test]

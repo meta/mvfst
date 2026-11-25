@@ -15,8 +15,8 @@
 //! contents that [`Frames`] would reject; [`PacketWriter`](crate::PacketWriter) adds the encoders
 //! that split or fit frames to a packet.
 //!
-//! DATAGRAM frames (RFC 9221, types 0x30 and 0x31) are not implemented. mvfstr never advertises
-//! `max_datagram_frame_size`, so receiving one is a PROTOCOL_VIOLATION.
+//! DATAGRAM frames (RFC 9221, types 0x30 and 0x31) decode and encode here too; whether a
+//! connection takes them is its max_datagram_frame_size transport parameter's business.
 
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -78,11 +78,13 @@ pub enum FrameKind {
     ApplicationClose,
     /// HANDSHAKE_DONE (0x1e).
     HandshakeDone,
+    /// DATAGRAM (0x30) and DATAGRAM with a Length field (0x31), RFC 9221.
+    Datagram,
 }
 
 impl FrameKind {
     /// Every frame kind, in frame type order.
-    pub const ALL: [FrameKind; 21] = [
+    pub const ALL: [FrameKind; 22] = [
         FrameKind::Padding,
         FrameKind::Ping,
         FrameKind::Ack,
@@ -104,6 +106,7 @@ impl FrameKind {
         FrameKind::ConnectionClose,
         FrameKind::ApplicationClose,
         FrameKind::HandshakeDone,
+        FrameKind::Datagram,
     ];
 
     /// Returns whether a frame of this kind may appear in a packet of type `ty`. As RFC 9000
@@ -274,6 +277,14 @@ pub enum Frame<'a> {
     },
     /// HANDSHAKE_DONE.
     HandshakeDone,
+    /// DATAGRAM (RFC 9221).
+    Datagram {
+        /// The application data.
+        data: &'a [u8],
+        /// Whether the frame carries a Length field (type 0x31); without one (type 0x30) the data
+        /// runs to the end of the packet.
+        with_length: bool,
+    },
 }
 
 impl Frame<'_> {
@@ -286,7 +297,7 @@ impl Frame<'_> {
             varint_len_of(bytes.len()) + bytes.len()
         }
         let id_len = |id: &StreamId| vlen(VarInt::from(*id));
-        // Every frame type defined by RFC 9000 encodes on one byte.
+        // Every frame type defined here encodes on one byte.
         1 + match self {
             Frame::Padding { len } => return *len,
             Frame::Ping | Frame::HandshakeDone => 0,
@@ -337,13 +348,21 @@ impl Frame<'_> {
                 reason,
             } => vlen(error_code.to_varint()) + vlen(*frame_type) + bytes_len(reason),
             Frame::ApplicationClose { error_code, reason } => vlen(*error_code) + bytes_len(reason),
+            Frame::Datagram { data, with_length } => {
+                if *with_length {
+                    bytes_len(data)
+                } else {
+                    data.len()
+                }
+            }
         }
     }
 
     /// Writes the whole frame at the start of `out` and returns its length. STREAM frames always
-    /// carry a Length field and carry an Offset field only when the offset is not zero. A frame
-    /// that [`Frames`] would reject is refused whatever room `out` has (see [`InvalidFrame`]). On
-    /// error `out` is unchanged.
+    /// carry a Length field and carry an Offset field only when the offset is not zero. A DATAGRAM
+    /// frame without a Length field takes the rest of the packet, so nothing, padding included,
+    /// may follow it. A frame that [`Frames`] would reject is refused whatever room `out` has (see
+    /// [`InvalidFrame`]). On error `out` is unchanged.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, FrameEncodeError> {
         self.check().map_err(FrameEncodeError::Invalid)?;
         let len = self.encoded_len();
@@ -483,6 +502,15 @@ impl Frame<'_> {
                 put_bytes(&mut w, reason);
             }
             Frame::HandshakeDone => w.put_varint(type_varint(HANDSHAKE_DONE)),
+            Frame::Datagram { data, with_length } => {
+                if *with_length {
+                    w.put_varint(type_varint(DATAGRAM_LEN));
+                    put_bytes(&mut w, data);
+                } else {
+                    w.put_varint(type_varint(DATAGRAM));
+                    w.put_slice(data);
+                }
+            }
         }
         debug_assert_eq!(w.pos(), len);
         Ok(len)
@@ -538,6 +566,7 @@ impl Frame<'_> {
             Frame::ConnectionClose { .. } => FrameKind::ConnectionClose,
             Frame::ApplicationClose { .. } => FrameKind::ApplicationClose,
             Frame::HandshakeDone => FrameKind::HandshakeDone,
+            Frame::Datagram { .. } => FrameKind::Datagram,
         }
     }
 }
@@ -727,8 +756,7 @@ impl std::error::Error for InvalidFrame {}
 ///
 /// Consecutive PADDING frames are decoded as one [`Frame::Padding`]. The first malformed frame
 /// yields its error and ends the iteration. An empty payload does not yield a frame; RFC 9000
-/// makes a packet without frames a PROTOCOL_VIOLATION, which the caller checks. DATAGRAM frames
-/// (RFC 9221) are not supported and yield a PROTOCOL_VIOLATION error.
+/// makes a packet without frames a PROTOCOL_VIOLATION, which the caller checks.
 #[derive(Clone, Debug)]
 pub struct Frames<'a> {
     r: Reader<'a>,
@@ -742,6 +770,11 @@ impl<'a> Frames<'a> {
             r: Reader::new(payload),
             failed: false,
         }
+    }
+
+    /// Returns how many bytes of the payload the frames decoded so far took.
+    pub fn offset(&self) -> usize {
+        self.r.pos()
     }
 }
 
@@ -923,15 +956,25 @@ fn decode<'a>(r: &mut Reader<'a>) -> Result<Frame<'a>, FrameError> {
                 ecn,
             })
         }
-        DATAGRAM | DATAGRAM_LEN => {
-            return Err(FrameError::new(
-                TransportErrorCode::PROTOCOL_VIOLATION,
-                ty,
-                "DATAGRAM frames are not supported",
-            ));
+        DATAGRAM => Frame::Datagram {
+            data: f.r.rest(),
+            with_length: false,
+        },
+        DATAGRAM_LEN => {
+            let len = f.varint()?;
+            Frame::Datagram {
+                data: f.bytes_varint_len(len)?,
+                with_length: true,
+            }
         }
         _ => return Err(FrameError::encoding(ty, "unknown frame type")),
     })
+}
+
+/// Returns the length of a DATAGRAM frame with a Length field that carries `data_len` bytes, as
+/// [`PacketWriter::datagram`](crate::PacketWriter::datagram) writes it.
+pub fn datagram_frame_len(data_len: usize) -> usize {
+    1 + varint_len_of(data_len) + data_len
 }
 
 /// Writes a length-prefixed byte string.
@@ -981,9 +1024,9 @@ const PATH_RESPONSE: u64 = 0x1b;
 const CONNECTION_CLOSE: u64 = 0x1c;
 const APPLICATION_CLOSE: u64 = 0x1d;
 const HANDSHAKE_DONE: u64 = 0x1e;
-/// DATAGRAM (RFC 9221), reserved here and not implemented.
+/// DATAGRAM (RFC 9221), without and with a Length field.
 const DATAGRAM: u64 = 0x30;
-const DATAGRAM_LEN: u64 = 0x31;
+pub(crate) const DATAGRAM_LEN: u64 = 0x31;
 /// The flag bits of a STREAM frame type.
 pub(crate) const STREAM_OFF: u64 = 0x04;
 pub(crate) const STREAM_LEN: u64 = 0x02;

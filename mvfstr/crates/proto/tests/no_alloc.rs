@@ -6,8 +6,9 @@
  */
 
 //! Buffering packets until their keys arrive does not allocate once the endpoint's pool holds
-//! buffers, on a server or a client. A global allocator counts every allocation on each test's
-//! thread, and the binary holds only these tests.
+//! buffers, on a server or a client, and neither does queuing and sealing a datagram from shared
+//! parts. A global allocator counts every allocation on each test's thread, and the binary holds
+//! only these tests.
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -17,12 +18,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use mvfstr_proto::Bytes;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::Ecn;
 use mvfstr_proto::EndpointConfig;
+use mvfstr_proto::InlineSealer;
 use mvfstr_proto::RxDatagram;
 use mvfstr_proto::RxMeta;
+use mvfstr_proto::SegmentSink;
+use mvfstr_proto::SendOrder;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::SlotId;
+use mvfstr_proto::TransportConfig;
+use mvfstr_proto::TxClass;
+use mvfstr_proto::TxMeta;
 use mvfstr_proto::testing::Loss;
 use mvfstr_proto::testing::Pair;
 use mvfstr_proto::testing::PairConfig;
@@ -85,6 +94,19 @@ fn client_config() -> PairConfig {
 }
 
 fn lossless() -> PairConfig {
+    lossless_with(Arc::new(TransportConfig::default()))
+}
+
+/// Returns a lossless pair config whose two sides take DATAGRAM frames.
+fn datagram_config() -> PairConfig {
+    let transport = TransportConfig::builder()
+        .max_datagram_frame_size(65535)
+        .build()
+        .expect("a transport config");
+    lossless_with(transport)
+}
+
+fn lossless_with(transport: Arc<TransportConfig>) -> PairConfig {
     // RFC 8410: a PKCS #8 v1 document with the id-Ed25519 algorithm around the seed.
     const PREFIX: [u8; 16] = [
         0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
@@ -118,9 +140,11 @@ fn lossless() -> PairConfig {
     )
     .expect("a client TLS config");
     let server = ServerConfig::builder(Arc::new(server_tls))
+        .transport(transport.clone())
         .build()
         .expect("a server config");
     let client = ClientConfig::builder(Arc::new(client_tls))
+        .transport(transport)
         .build()
         .expect("a client config");
     let endpoint = EndpointConfig::builder([7; 32])
@@ -237,5 +261,81 @@ fn a_clients_buffered_packets_allocate_nothing_once_its_endpoints_pool_holds_buf
         buffer_client_copies(&mut pair),
         0,
         "a second connection reuses it"
+    );
+}
+
+/// A sink over one reused slot that keeps only the length of each datagram, so it does not
+/// allocate.
+struct FixedSink {
+    slot: [u8; 1500],
+    lens: Vec<u16>,
+}
+
+impl SegmentSink for FixedSink {
+    fn next_segment(&mut self, max_len: u16, _class: TxClass) -> Option<(SlotId, &mut [u8])> {
+        let len = usize::from(max_len).min(self.slot.len());
+        Some((SlotId(0), &mut self.slot[..len]))
+    }
+
+    fn end_segment(&mut self, len: u16) {
+        if len > 0 {
+            self.lens.push(len);
+        }
+    }
+
+    fn end_run(&mut self, _meta: TxMeta) {}
+}
+
+#[test]
+fn a_datagram_from_shared_parts_is_queued_and_sealed_without_allocating() {
+    let mut pair = Pair::new(epoch(), unix_now(), datagram_config());
+    let limit = pair.now + LIMIT;
+    assert!(pair.handshake(limit));
+    pair.run(pair.now + Duration::from_millis(200));
+    let order = SendOrder {
+        class: 1,
+        urgency: 3,
+        incremental: false,
+        order: 0,
+    };
+    let header = Bytes::from(vec![0x48; 40]);
+    let payload = Bytes::from(vec![0x50; 1000]);
+    let parts = [
+        Bytes::from_static(&[0x01, 0x2a]),
+        header,
+        payload.slice(..300),
+        payload.slice(500..800),
+    ];
+    let limits = pair.limits();
+    let mut sink = FixedSink {
+        slot: [0; 1500],
+        lens: Vec::with_capacity(16),
+    };
+    let client = pair.client.conn_mut();
+    // A first datagram warms up the queue and the sent-packet records.
+    client.send_datagram(&parts, order, None).unwrap();
+    client.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+    // An attempt that seals a PING allocates only what checking the attempt takes in a debug
+    // build, nothing in a release build.
+    client.ping();
+    let before = ALLOCATIONS.with(Cell::get);
+    client.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+    let ping = ALLOCATIONS.with(Cell::get) - before;
+    sink.lens.clear();
+    let before = ALLOCATIONS.with(Cell::get);
+    client.send_datagram(&parts, order, None).unwrap();
+    assert_eq!(
+        ALLOCATIONS.with(Cell::get) - before,
+        0,
+        "queuing keeps the parts"
+    );
+    let before = ALLOCATIONS.with(Cell::get);
+    let outcome = client.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+    let datagram = ALLOCATIONS.with(Cell::get) - before;
+    assert_eq!(outcome.datagrams, 1);
+    assert!(usize::from(sink.lens[0]) > 2 + 40 + 600, "{:?}", sink.lens);
+    assert_eq!(
+        datagram, ping,
+        "sealing writes the parts straight into the slot"
     );
 }

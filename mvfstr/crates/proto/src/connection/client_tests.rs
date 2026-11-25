@@ -1042,3 +1042,42 @@ fn a_server_lowering_its_idle_timeout_under_0rtt_is_fine() {
     assert_eq!(closed(&pair.client.events), None);
     assert_eq!(read_all(pair.server.conn_mut(), id), (1_000, true));
 }
+
+/// Returns a transport config that advertises a max_datagram_frame_size of 65535.
+fn datagrams() -> Arc<TransportConfig> {
+    transport(|c| c.max_datagram_frame_size(65535))
+}
+
+#[test]
+fn a_ticket_from_a_connection_that_advertises_datagrams_does_not_allow_0rtt() {
+    // RFC 9221: a server that accepts 0-RTT must advertise at least the max_datagram_frame_size of
+    // the connection that issued the ticket, and this server does not advertise one.
+    let config = resumable(&early_setup().transport(datagrams()));
+    let without_datagrams = with_server(&config, Arc::new(TransportConfig::default()), true);
+    let (epoch, mut pair) = start(without_datagrams);
+    assert!(pair.handshake(epoch + LIMIT));
+    assert!(!pair.client.has_event(&ConnEvent::EarlyDataWritable));
+    assert!(
+        !pair
+            .client
+            .events
+            .iter()
+            .any(|event| matches!(event, ConnEvent::EarlyData { .. }))
+    );
+    let client = pair.client.conn_mut();
+    assert_eq!(client.tls_info().map(|info| info.resumed), Some(true));
+    assert_eq!(client.peer_max_datagram_frame_size(), 0);
+}
+
+#[test]
+fn a_connection_that_advertises_datagrams_does_not_accept_0rtt() {
+    let config = resumable(&early_setup());
+    let (epoch, mut pair) = start(with_server(&config, datagrams(), true));
+    assert!(pair.handshake(epoch + LIMIT));
+    assert!(
+        early_events_in_order(&pair.client.events, false),
+        "{:?}",
+        pair.client.events
+    );
+    assert_eq!(pair.client.conn_mut().peer_max_datagram_frame_size(), 65535);
+}

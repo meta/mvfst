@@ -9,6 +9,7 @@
 //! events and app-limited marking, over the pair harness of [`crate::testing`].
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -32,6 +33,9 @@ use super::tests::server_addr;
 use super::tests::start;
 use crate::CongestionControl;
 use crate::InlineSealer;
+use crate::SendOrder;
+use crate::Stop;
+use crate::TxLimits;
 use crate::TxOutcome;
 use crate::cc::Cc;
 use crate::cc::SentEvent;
@@ -426,6 +430,90 @@ fn a_datagram_of_staged_bytes_keeps_the_mark_off_even_behind_flow_control() {
         assert_eq!(outcome.stop, crate::Stop::ConnFlowControl);
         assert_eq!(client.sources.streams.backlog().staged, mtu - short);
         assert_eq!(client.recovery.is_app_limited(), short == 1, "{short}");
+    }
+}
+
+/// Returns a pair whose two sides take DATAGRAM frames, after the handshake and a quiet round
+/// trip, whose client then gets a recording controller.
+fn recorded_with_datagrams() -> Pair {
+    let datagrams = config(|c| c.max_datagram_frame_size(65535));
+    let setup = crate::testing::fixtures::Setup {
+        client_transport: Arc::clone(&datagrams),
+        server_transport: datagrams,
+        ..crate::testing::fixtures::Setup::default()
+    };
+    let (_, mut pair) = handshake(setup.pair());
+    pair.run(pair.now + RTT);
+    record(pair.client.conn_mut());
+    pair
+}
+
+#[test]
+fn a_datagram_of_queued_datagram_frames_keeps_the_mark_off() {
+    // Queued DATAGRAM frames of a datagram's worth of bytes, then one byte less, in two frames.
+    for short in [0, 1] {
+        let mut pair = recorded_with_datagrams();
+        let t0 = pair.now;
+        let client = pair.client.conn_mut();
+        assert!(client.limited_by_app());
+        let mtu = usize::from(client.mtu);
+        // Each frame takes a type byte and a 2-byte Length besides its data.
+        for len in [600 - 3, mtu - 600 - 3 - short] {
+            let data = Bytes::from(vec![7; len]);
+            client.send_datagram(&[data], ORDER, None).unwrap();
+        }
+        assert_eq!(client.limited_by_app(), short == 1, "{short}");
+        // An attempt the socket refuses leaves them queued.
+        let mut sink = VecSink::new(1500);
+        sink.set_refuse(true);
+        client.poll_transmit(&limits(t0), &mut sink, &mut InlineSealer);
+        assert_eq!(client.recovery.is_app_limited(), short == 1, "{short}");
+    }
+}
+
+#[test]
+fn datagrams_that_cannot_be_sent_behind_a_sent_one_do_not_keep_the_mark_off() {
+    // Behind a datagram the attempt sends wait two less urgent ones, more than a datagram's worth
+    // of bytes together, that it cannot send: they expire before it, or their frames are longer
+    // than its datagrams hold.
+    for expire in [true, false] {
+        let mut pair = recorded_with_datagrams();
+        let t0 = pair.now;
+        let client = pair.client.conn_mut();
+        client
+            .send_datagram(&[Bytes::from_static(b"live")], ORDER, None)
+            .unwrap();
+        let later = SendOrder {
+            order: ORDER.order + 1,
+            ..ORDER
+        };
+        let (len, expiry) = if expire {
+            (600, Some(t0 + Duration::from_millis(1)))
+        } else {
+            (client.max_datagram_size(), None)
+        };
+        for _ in 0..2 {
+            let data = Bytes::from(vec![7; len]);
+            client.send_datagram(&[data], later, expiry).unwrap();
+        }
+        let lim = TxLimits {
+            max_datagram: 1100,
+            ..limits(t0 + Duration::from_millis(1))
+        };
+        let outcome = client.poll_transmit(&lim, &mut VecSink::new(1500), &mut InlineSealer);
+        assert_eq!(
+            (outcome.datagrams, outcome.stop),
+            (1, Stop::Idle),
+            "{expire}"
+        );
+        assert!(client.app_limited, "{expire}");
+        assert!(client.recovery.is_app_limited(), "{expire}");
+        let stats = client.datagram_stats();
+        let dropped = if expire { (2, 0) } else { (0, 2) };
+        assert_eq!((stats.expired, stats.send_dropped), dropped, "{expire}");
+        let stats = client.stats();
+        let window = usize::try_from(stats.cwnd - stats.bytes_in_flight).unwrap();
+        assert_eq!(client.datagram_allowance(), window, "{expire}");
     }
 }
 

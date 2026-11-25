@@ -87,6 +87,7 @@ use rustls::pki_types::UnixTime;
 use crate::Conn;
 use crate::ConnHandle;
 use crate::ConnInfo;
+use crate::DatagramSink;
 use crate::DriverConnectError;
 use crate::PollOutcome;
 use crate::QuicApplication;
@@ -146,7 +147,7 @@ pub(crate) const POLL_CHARGE: u64 = 16 * 1024;
 /// Connections the intake takes from the timers and the ready queue per turn.
 const INTAKE_PER_TURN: usize = 256;
 
-/// `poll_send` calls per turn across all connections.
+/// `poll_send` and `poll_datagrams` calls per turn across all connections.
 const POLLS_PER_TURN: usize = 1024;
 
 /// Connection attempts handled per turn; later Initials wait for the next turn. It also caps,
@@ -166,7 +167,7 @@ pub(crate) struct Limits {
     pub(crate) requeues: u64,
     /// Connections the intake takes from the timers and the ready queue per turn.
     pub(crate) intake: usize,
-    /// `poll_send` calls per turn across all connections.
+    /// `poll_send` and `poll_datagrams` calls per turn across all connections.
     pub(crate) polls: usize,
     /// Bytes one connection's pull steps may stage per turn, each poll counted at least
     /// [`POLL_CHARGE`].
@@ -254,7 +255,7 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     sched: RefCell<Sched>,
     /// Turns run so far.
     turns: Cell<u64>,
-    /// `poll_send` calls in this turn.
+    /// `poll_send` and `poll_datagrams` calls in this turn.
     turn_polls: Cell<usize>,
     /// Connection attempts handled in this turn.
     turn_handshakes: Cell<usize>,
@@ -496,6 +497,10 @@ struct Entry<S, B> {
     pull_turn: u64,
     /// What the pull steps of turn `pull_turn` counted against `Limits::turn_staging`.
     pull_work: u64,
+    /// The waker handed to the datagram producer, made for its first poll.
+    datagram_waker: Option<Waker>,
+    /// The datagram producer's waker has fired and the producer has not returned `Pending` since.
+    datagrams_ready: bool,
 }
 
 /// The queues of the turn.
@@ -1666,6 +1671,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             if bits & wake::STREAM != 0 {
                 self.queue_app(key, entry);
             }
+            if bits & wake::DATAGRAM != 0 {
+                entry.datagrams_ready = true;
+                self.queue_app(key, entry);
+            }
         });
     }
 
@@ -1709,6 +1718,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             quiesce_due,
             stream_wakers,
             pull_work,
+            datagram_waker,
+            datagrams_ready,
             ..
         } = entry;
         if deliver(conn, session, wake, stream_wakers, now, &mut dirty) {
@@ -1735,6 +1746,53 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         for &id in &ids {
             if let Ok(mut stream) = conn.stream(id) {
                 stream.wake_producer();
+            }
+        }
+        // The datagram pull step: poll the ready producer while it pushes and the connection has a
+        // datagram allowance. While streams are pull-ready, the step does at most half of the
+        // connection's turn work, and its sink takes no more than that work has left, so that the
+        // pull steps below poll them in this phase too. A producer still ready is polled in the
+        // next turn when the turn's work or polls stopped it, or when that work left its sink
+        // short of the longest datagram's frame and it pushed nothing. One that the connection's
+        // allowance stopped waits for an application phase that finds an allowance, as the one
+        // after the next receive or after a transmit attempt that sends a packet or drops expired
+        // datagrams. One that pushed nothing with room for any datagram waits for the connection's
+        // next application phase.
+        let mut datagrams_capped = false;
+        if *datagrams_ready {
+            let waker = datagram_waker.get_or_insert_with(|| wake.waker(wake::DATAGRAM));
+            let limit = if conn.pull_ready().next().is_some() {
+                self.limits.turn_staging / 2
+            } else {
+                self.limits.turn_staging
+            };
+            let mut sink = DatagramSink::new(conn, now);
+            let cut =
+                sink.limit(usize::try_from(limit.saturating_sub(*pull_work)).unwrap_or(usize::MAX));
+            loop {
+                if sink.allowance() == 0 {
+                    // The connection's allowance is not used up if the step's work cut it.
+                    datagrams_capped = cut;
+                    break;
+                }
+                if *pull_work >= limit || self.turn_polls.get() >= self.limits.polls {
+                    datagrams_capped = true;
+                    break;
+                }
+                self.turn_polls.set(self.turn_polls.get() + 1);
+                let staged = sink.staged();
+                let poll = session.poll_datagrams(&mut Context::from_waker(waker), &mut sink);
+                let progressed = sink.take_progressed();
+                *pull_work += (sink.staged() - staged).max(POLL_CHARGE);
+                dirty |= progressed;
+                if poll.is_pending() {
+                    *datagrams_ready = false;
+                    break;
+                }
+                if !progressed {
+                    datagrams_capped = cut && !sink.fits_longest();
+                    break;
+                }
             }
         }
         // Pull steps: poll the pull-ready streams in wire order, then list them again, since
@@ -1790,9 +1848,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         };
         *self.pull_ids.borrow_mut() = ids;
         // Streams still pull-ready, because the turn's work or polls ran out or because they were
-        // polled in this application phase already, are polled in the next turn. A connection the
-        // turn's poll cap left without a single poll goes first then.
-        if waiting {
+        // polled in this application phase already, are polled in the next turn, as is a datagram
+        // producer the turn's work or polls cut short. A connection the turn's poll cap left
+        // without a single poll goes first then.
+        if waiting || datagrams_capped {
             let mut sched = self.sched.borrow_mut();
             if *pull_work == 0 {
                 *app_queued = true;
@@ -1991,6 +2050,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 #[cfg(test)]
                 self.record.borrow_mut().attempt(key, at);
                 let sent_before = entry.conn.stats().sent_packets;
+                let allowance = entry
+                    .datagrams_ready
+                    .then(|| entry.conn.datagram_allowance());
                 let outcome = match entry.socket.as_deref_mut() {
                     Some(socket) => {
                         attempt(&mut entry.conn, socket, key, at, self.limits.max_segments)
@@ -2052,7 +2114,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     }
                 }
                 self.set_pacing(key, entry, outcome.pacing_at);
-                if outcome.datagrams > 0 {
+                // A ready datagram producer is polled again once the attempt frees allowance,
+                // which it does without sending when it drops expired or oversize datagrams.
+                if outcome.datagrams > 0
+                    || allowance.is_some_and(|before| entry.conn.datagram_allowance() > before)
+                {
                     self.queue_app(key, entry);
                 }
                 self.after_transport(key, entry);
@@ -3114,6 +3180,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             stream_wakers: HashMap::new(),
             pull_turn: 0,
             pull_work: 0,
+            datagram_waker: None,
+            datagrams_ready: false,
         };
         self.slab.borrow_mut().insert(key, entry);
         wake

@@ -29,6 +29,7 @@
 //! | [`config`] | immutable configs and per-connection options |
 //! | [`endpoint`] | routing, Initial acceptance, stateless replies |
 //! | [`connection`] | the connection and its public operations |
+//! | [`datagram`] | DATAGRAM frames (RFC 9221): the send and receive queues |
 //! | [`transmit`] | the transmit attempt, its stops and limits, I/O-neutral transmit types |
 //! | [`receive`] | received datagrams and their metadata |
 //! | `sources` | the frame sources, tried in a fixed order for each frame to write |
@@ -46,6 +47,7 @@
 pub mod cc;
 pub mod config;
 pub mod connection;
+pub mod datagram;
 pub mod endpoint;
 pub mod events;
 pub mod flow_control;
@@ -88,6 +90,8 @@ pub use connection::RawTransportParamsIter;
 pub use connection::Readiness;
 pub use connection::TlsDeliverError;
 pub use connection::TlsInfo;
+pub use datagram::DatagramError;
+pub use datagram::DatagramStats;
 pub use endpoint::AcceptError;
 pub use endpoint::ConnKey;
 pub use endpoint::ConnectError;

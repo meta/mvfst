@@ -6,8 +6,9 @@
  */
 
 //! The Scheduled source: STREAM frames in the wire scheduler's order, each stream's lost bytes
-//! before its new ones. A PTO probe takes every stream's lost bytes before any new ones, because
-//! the PTO queues the oldest data in flight as lost bytes for it.
+//! before its new ones, and DATAGRAM frames (RFC 9221). A PTO probe takes every stream's lost
+//! bytes before any new ones, because the PTO queues the oldest data in flight as lost bytes for
+//! it.
 //!
 //! Connection credit gates new bytes at emit and never takes a stream out of the scheduler: the
 //! walk offers the first stream with something it may send now, so lost bytes and FINs go out
@@ -26,6 +27,7 @@ use mvfstr_wire::VarInt;
 use super::Adapter;
 use super::FrameSource;
 use super::SendCx;
+use crate::datagram::wire_key;
 use crate::recovery::Space;
 use crate::recovery::sent::SentFrame;
 use crate::streams::conn::StreamState;
@@ -35,11 +37,17 @@ use crate::streams::send_buf::FrameKind;
 use crate::streams::send_buf::Pending;
 use crate::transmit::admission::Class;
 
-/// The Scheduled source's candidate: a stream's slab slot.
+/// The Scheduled source's candidate: a stream's slab slot, or [`DATAGRAM`].
 pub(crate) type ScheduledCand = u32;
 
-/// Returns the stream to send from next and its class: lost bytes and a lone FIN do not take
-/// connection credit, new bytes do. A probe takes lost bytes first, whichever stream holds them.
+/// The candidate that stands for the first datagram in wire order. The scheduler marks a missing
+/// slot with this value, so no stream's slot takes it.
+pub(crate) const DATAGRAM: ScheduledCand = u32::MAX;
+
+/// Returns the candidate to send next and its class: the first datagram in wire order when it
+/// comes before the first stream with something to send, or ties with it, and that stream
+/// otherwise. Lost bytes and a lone FIN do not take connection credit, new bytes do. A probe takes
+/// lost bytes first, whichever stream holds them.
 pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, ScheduledCand)> {
     if cx.space != Space::Data {
         return None;
@@ -49,6 +57,43 @@ pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, Sched
     {
         return Some((Class::Lost, slot));
     }
+    let stream = next_stream(state);
+    if state.datagrams.is_empty() {
+        return stream;
+    }
+    datagram_or(state, cx, stream)
+}
+
+/// Returns the first datagram in wire order when it comes before `stream`, the first stream with
+/// something to send, or ties with it, and that stream otherwise.
+// Out of line, so the code that sends streams alone stays as small as without datagrams.
+#[inline(never)]
+fn datagram_or(
+    state: &StreamState,
+    cx: &SendCx<'_>,
+    stream: Option<(Class, ScheduledCand)>,
+) -> Option<(Class, ScheduledCand)> {
+    let Some(datagram) = state.datagrams.head_key(cx.now) else {
+        return stream;
+    };
+    let goes_first = match stream {
+        None => true,
+        // Connection flow control does not hold back datagrams (RFC 9221).
+        Some((Class::NewStream, _)) if state.conn_send.available() == 0 => true,
+        Some((_, slot)) => state
+            .streams
+            .scheduler()
+            .order(slot)
+            .is_none_or(|order| datagram <= wire_key(order)),
+    };
+    match stream {
+        Some(stream) if !goes_first => Some(stream),
+        _ => Some((Class::Datagram, DATAGRAM)),
+    }
+}
+
+/// Returns the class and slot of the stream to send from next.
+fn next_stream(state: &StreamState) -> Option<(Class, ScheduledCand)> {
     let conn_credit = state.conn_send.available();
     let scheduler = state.streams.scheduler();
     let mut cursor = Cursor::default();
@@ -88,10 +133,14 @@ fn retransmission(state: &StreamState) -> Option<ScheduledCand> {
     })
 }
 
-/// Returns the room the smallest STREAM frame of the stream in `slot` takes: one byte at its
-/// first unsent offset (lost bytes start below it, so their offset does not take more room).
-pub(crate) fn min_len(state: &StreamState, slot: ScheduledCand) -> usize {
-    let Some(stream) = state.streams.get_slot(slot) else {
+/// Returns the room the candidate takes: the oldest datagram's whole frame, or the smallest STREAM
+/// frame of the stream, one byte at its first unsent offset (lost bytes start below it, so their
+/// offset does not take more room).
+pub(crate) fn min_len(state: &StreamState, cand: ScheduledCand, cx: &SendCx<'_>) -> usize {
+    if cand == DATAGRAM {
+        return state.datagrams.head_frame_len(cx.now).unwrap_or(0);
+    }
+    let Some(stream) = state.streams.get_slot(cand) else {
         return 0;
     };
     let offset = stream
@@ -118,8 +167,8 @@ impl FrameSource for ScheduledSource<'_> {
         next(self.0, cx)
     }
 
-    fn min_len(&self, cand: ScheduledCand, _cx: &SendCx<'_>) -> usize {
-        min_len(self.0, cand)
+    fn min_len(&self, cand: ScheduledCand, cx: &SendCx<'_>) -> usize {
+        min_len(self.0, cand, cx)
     }
 
     fn write(
@@ -129,6 +178,10 @@ impl FrameSource for ScheduledSource<'_> {
         cx: &mut SendCx<'_>,
     ) -> Result<(), Full> {
         let state = &mut *self.0;
+        if cand == DATAGRAM {
+            // A DATAGRAM frame is not retransmitted, so it leaves no sent-frame record.
+            return state.datagrams.write_head(w, cx.now);
+        }
         let Some(mut stream) = state.streams.by_slot(cand) else {
             return Err(Full);
         };

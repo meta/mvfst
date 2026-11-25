@@ -469,7 +469,8 @@ impl Connection {
 
     /// Returns whether an attempt that ended at `stop` leaves the window underused for want of
     /// data: it ran out of candidates with a datagram of the window unused and did not have a
-    /// producer to poll, or connection flow control stopped it, which RFC 9002 treats the same way.
+    /// producer to poll or DATAGRAM frames queued, or connection flow control stopped it, which
+    /// RFC 9002 treats the same way.
     fn is_app_limited(&self, stop: Stop) -> bool {
         match stop {
             Stop::Idle => {
@@ -477,7 +478,9 @@ impl Connection {
                     .cc
                     .cwnd()
                     .saturating_sub(self.recovery.bytes_in_flight());
-                !self.sources.streams.has_pull_ready() && left >= u64::from(self.mtu)
+                !self.sources.streams.has_pull_ready()
+                    && self.sources.streams.datagrams.is_empty()
+                    && left >= u64::from(self.mtu)
             }
             Stop::ConnFlowControl => true,
             _ => false,
@@ -486,12 +489,14 @@ impl Connection {
 
     /// Returns whether the connection is application-limited at the end of an attempt, whatever
     /// its stop, by the rules of mvfst's BBR3: less than a datagram of stream bytes is staged,
-    /// those connection flow control holds back included; push senders are not waiting for
-    /// `Writable` and producers are not pull-ready; lost stream and CRYPTO data are not waiting
-    /// for retransmission; and the window has room, even less than a datagram.
+    /// those connection flow control holds back included, and DATAGRAM frames queued; push
+    /// senders are not waiting for `Writable` and producers are not pull-ready; lost stream and
+    /// CRYPTO data are not waiting for retransmission; and the window has room, even less than a
+    /// datagram.
     pub(super) fn limited_by_app(&self) -> bool {
         let backlog = self.sources.streams.backlog();
-        backlog.staged < u64::from(self.mtu)
+        let datagrams = self.sources.streams.datagrams.bytes() as u64;
+        backlog.staged + datagrams < u64::from(self.mtu)
             && !backlog.push_blocked
             && !backlog.pull_ready
             && !backlog.lost

@@ -397,10 +397,16 @@ pub struct TransportConfig {
     extra_params: Vec<(VarInt, Bytes)>,
     keep_alive: Option<KeepAlive>,
     max_ptos: Option<u32>,
+    max_datagram_frame_size: u64,
+    datagram_send_queue: usize,
+    datagram_recv_queue: usize,
 }
 
 /// The largest transport parameter id RFC 9000 defines, retry_source_connection_id.
 const LAST_RFC9000_PARAM: u64 = 0x10;
+
+/// The id of max_datagram_frame_size (RFC 9221).
+const MAX_DATAGRAM_FRAME_SIZE_PARAM: u64 = 0x20;
 
 /// mvfst's default stream window, 65 KiB.
 const DEFAULT_STREAM_WINDOW: u64 = 65 * 1024;
@@ -437,6 +443,9 @@ impl Default for TransportConfig {
             extra_params: Vec::new(),
             keep_alive: None,
             max_ptos: None,
+            max_datagram_frame_size: 0,
+            datagram_send_queue: 1024,
+            datagram_recv_queue: 1024,
         }
     }
 }
@@ -608,6 +617,22 @@ impl TransportConfig {
     /// Returns how many consecutive PTO expirations close the connection silently, if set.
     pub fn max_ptos(&self) -> Option<u32> {
         self.max_ptos
+    }
+
+    /// Returns max_datagram_frame_size (RFC 9221), the largest DATAGRAM frame this endpoint takes;
+    /// 0, which is not advertised, means that it does not take DATAGRAM frames.
+    pub fn max_datagram_frame_size(&self) -> u64 {
+        self.max_datagram_frame_size
+    }
+
+    /// Returns how many datagrams wait to be sent before the oldest is dropped.
+    pub fn datagram_send_queue(&self) -> usize {
+        self.datagram_send_queue
+    }
+
+    /// Returns how many received datagrams wait for the application before the oldest is dropped.
+    pub fn datagram_recv_queue(&self) -> usize {
+        self.datagram_recv_queue
     }
 }
 
@@ -817,6 +842,28 @@ impl TransportConfigBuilder {
         self
     }
 
+    /// Sets max_datagram_frame_size (RFC 9221), below 2^62: the largest DATAGRAM frame, type and
+    /// Length field included, this endpoint takes. A value above 0 is advertised and lets the peer
+    /// send DATAGRAM frames; RFC 9221 recommends 65535. Default 0: DATAGRAM frames are refused.
+    pub fn max_datagram_frame_size(mut self, bytes: u64) -> Self {
+        self.config.max_datagram_frame_size = bytes;
+        self
+    }
+
+    /// Sets how many datagrams wait to be sent, at least 1; queuing one more drops the oldest.
+    /// Default 1024.
+    pub fn datagram_send_queue(mut self, datagrams: usize) -> Self {
+        self.config.datagram_send_queue = datagrams;
+        self
+    }
+
+    /// Sets how many received datagrams wait for the application, at least 1; receiving one more
+    /// drops the oldest. Default 1024.
+    pub fn datagram_recv_queue(mut self, datagrams: usize) -> Self {
+        self.config.datagram_recv_queue = datagrams;
+        self
+    }
+
     /// Validates the settings.
     pub fn build(self) -> Result<Arc<TransportConfig>, ConfigError> {
         let c = &self.config;
@@ -893,9 +940,12 @@ impl TransportConfigBuilder {
         )?;
         check(c.pacing_min_burst >= 1, "pacing_min_burst")?;
         check(c.pacing_max_burst >= c.pacing_min_burst, "pacing_max_burst")?;
-        // The encoder fails on an id that RFC 9000 defines or that repeats, which decoders reject.
+        // The encoder fails on an id that RFC 9000 defines or that repeats, which decoders reject,
+        // and max_datagram_frame_size comes from its own setting.
         let extra_ids_ok = c.extra_params.iter().enumerate().all(|(i, (id, _))| {
-            id.into_inner() > LAST_RFC9000_PARAM && c.extra_params[..i].iter().all(|(e, _)| e != id)
+            id.into_inner() > LAST_RFC9000_PARAM
+                && id.into_inner() != MAX_DATAGRAM_FRAME_SIZE_PARAM
+                && c.extra_params[..i].iter().all(|(e, _)| e != id)
         });
         check(extra_ids_ok, "extra_params")?;
         // The idle timeout's range, so that the keepalive deadline is as representable as the
@@ -908,6 +958,9 @@ impl TransportConfigBuilder {
         };
         check(keep_alive_ok, "keep_alive")?;
         check(c.max_ptos != Some(0), "max_ptos")?;
+        varint_field(c.max_datagram_frame_size, "max_datagram_frame_size")?;
+        check(c.datagram_send_queue >= 1, "datagram_send_queue")?;
+        check(c.datagram_recv_queue >= 1, "datagram_recv_queue")?;
         Ok(Arc::new(self.config))
     }
 }
@@ -930,7 +983,10 @@ pub enum ServerTls {
     /// On a [`TlsHost`](mvfstr_tls::TlsHost) outside the connection, which the caller drives
     /// through [`Connection::tls_input`](crate::Connection::tls_input) and
     /// [`Connection::tls_deliver`](crate::Connection::tls_deliver). The host chooses the
-    /// certificates, cipher suites, key exchange groups and ALPN protocol.
+    /// certificates, cipher suites, key exchange groups and ALPN protocol. A host that accepts
+    /// 0-RTT applies RFC 9221's rule itself: it accepts early data only when the transport
+    /// parameters of [`TlsInput::Start`](mvfstr_tls::TlsInput::Start) advertise at least the
+    /// max_datagram_frame_size of the connection that issued the ticket.
     External,
 }
 
@@ -970,6 +1026,8 @@ fn default_secure_random() -> &'static dyn SecureRandom {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     tls: ServerTls,
+    /// The main rustls config without early data, kept when the server accepts 0-RTT.
+    tls_without_early_data: Option<ServerTls>,
     transport: Arc<TransportConfig>,
     versions: Vec<Version>,
     alpn: AlpnPolicy,
@@ -984,6 +1042,7 @@ impl ServerConfig {
         ServerConfigBuilder {
             config: ServerConfig {
                 tls: tls.into(),
+                tls_without_early_data: None,
                 transport: Arc::new(TransportConfig::default()),
                 versions: vec![Version::V1],
                 alpn: AlpnPolicy::Required,
@@ -993,9 +1052,21 @@ impl ServerConfig {
         }
     }
 
-    /// Returns where the handshakes of accepted connections run.
+    /// Returns where the handshakes of accepted connections run. On a server that accepts 0-RTT,
+    /// a connection that advertises max_datagram_frame_size runs on the main rustls config
+    /// without early data instead.
     pub fn tls(&self) -> &ServerTls {
         &self.tls
+    }
+
+    /// Returns where the handshake of a connection with `transport` runs: [`tls`](Self::tls),
+    /// except that on a server that accepts 0-RTT, a connection that advertises
+    /// max_datagram_frame_size runs on the main rustls config without early data.
+    pub(crate) fn tls_for(&self, transport: &TransportConfig) -> &ServerTls {
+        match &self.tls_without_early_data {
+            Some(tls) if transport.max_datagram_frame_size() > 0 => tls,
+            _ => &self.tls,
+        }
     }
 
     /// Returns the rustls config that takes a ClientHello without ALPN on a connection of
@@ -1077,9 +1148,12 @@ impl ServerConfigBuilder {
 
     /// Sets whether connections on the main rustls config accept 0-RTT: the server then issues
     /// session tickets allowing early data and reads 0-RTT packets that follow the client's
-    /// Initial. Test grade, for exercising clients: it does not guard against replay beyond
-    /// rustls's single-use stateful tickets and does not limit early data. Default false, and
-    /// the rustls config itself must not enable early data either way.
+    /// Initial. A connection that advertises max_datagram_frame_size does neither, because
+    /// RFC 9221 requires a server that accepts 0-RTT to advertise at least the value of the
+    /// connection that issued the ticket, and the tickets do not carry it. Test grade, for
+    /// exercising clients: it does not guard against replay beyond rustls's single-use stateful
+    /// tickets and does not limit early data. Default false, and the rustls config itself must not
+    /// enable early data either way.
     pub fn accept_early_data(mut self, accept: bool) -> Self {
         self.accept_early_data = accept;
         self
@@ -1113,6 +1187,7 @@ impl ServerConfigBuilder {
             let mut tls = rustls::ServerConfig::clone(tls);
             tls.max_early_data_size = u32::MAX;
             tls.send_tls13_tickets = tls.send_tls13_tickets.max(1);
+            config.tls_without_early_data = Some(config.tls.clone());
             config.tls = ServerTls::Rustls(Arc::new(tls));
         }
         Ok(Arc::new(config))
@@ -1594,6 +1669,50 @@ mod tests {
                     ..ack
                 }),
                 "ack_policy",
+            ),
+        ];
+        for (builder, field) in cases {
+            assert_eq!(
+                builder.clone().build(),
+                Err(out_of_range(field)),
+                "{builder:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn datagram_settings_are_off_by_default_and_checked() {
+        let config = TransportConfig::default();
+        assert_eq!(config.max_datagram_frame_size(), 0);
+        assert_eq!(config.datagram_send_queue(), 1024);
+        assert_eq!(config.datagram_recv_queue(), 1024);
+        let config = TransportConfig::builder()
+            .max_datagram_frame_size(65535)
+            .datagram_send_queue(1)
+            .datagram_recv_queue(2)
+            .build()
+            .unwrap();
+        assert_eq!(config.max_datagram_frame_size(), 65535);
+        assert_eq!(config.datagram_send_queue(), 1);
+        assert_eq!(config.datagram_recv_queue(), 2);
+        let max_datagram_frame_size = (VarInt::from_u32(0x20), Bytes::from_static(&[0x40, 0x64]));
+        let cases = [
+            (
+                TransportConfig::builder().max_datagram_frame_size(1 << 62),
+                "max_datagram_frame_size",
+            ),
+            (
+                TransportConfig::builder().datagram_send_queue(0),
+                "datagram_send_queue",
+            ),
+            (
+                TransportConfig::builder().datagram_recv_queue(0),
+                "datagram_recv_queue",
+            ),
+            // The parameter is advertised from max_datagram_frame_size alone.
+            (
+                TransportConfig::builder().extra_params(vec![max_datagram_frame_size]),
+                "extra_params",
             ),
         ];
         for (builder, field) in cases {

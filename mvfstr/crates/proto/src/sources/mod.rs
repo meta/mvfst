@@ -77,7 +77,7 @@ pub(crate) enum SourceId {
     Control,
     /// PTO probes: a PING when the packet is not otherwise ack-eliciting; per space.
     Probe,
-    /// STREAM frames through the scheduler's cursor.
+    /// STREAM and DATAGRAM frames through the scheduler's cursor.
     Scheduled,
     /// Keepalive and application PING.
     Ping,
@@ -152,7 +152,7 @@ pub(crate) const fn frame_owner(kind: FrameKind) -> Owner {
         | FrameKind::StreamsBlocked
         | FrameKind::NewConnectionId
         | FrameKind::RetireConnectionId => Owner::Source(SourceId::Control),
-        FrameKind::Stream => Owner::Source(SourceId::Scheduled),
+        FrameKind::Stream | FrameKind::Datagram => Owner::Source(SourceId::Scheduled),
         FrameKind::ConnectionClose | FrameKind::ApplicationClose => Owner::Source(SourceId::Close),
     }
 }
@@ -309,7 +309,7 @@ impl Sources {
             SourceId::Scheduled => {
                 scheduled::next(&self.streams, cx).map(|(class, slot)| Candidate {
                     class,
-                    min_len: scheduled::min_len(&self.streams, slot),
+                    min_len: scheduled::min_len(&self.streams, slot, cx),
                 })
             }
             SourceId::Ping => candidate_of(&self.ping, cx),
@@ -898,7 +898,7 @@ mod tests {
         };
         let (_, cand) = ScheduledSource(&mut s).next(&cx).expect("new bytes");
         // A payload one byte smaller than the candidate's `min_len`, then a full-size packet.
-        for payload in [scheduled::min_len(&s, cand) - 1, 1_200 - overhead] {
+        for payload in [scheduled::min_len(&s, cand, &cx) - 1, 1_200 - overhead] {
             let mut buf = vec![0; overhead + payload];
             let mut w = PacketWriter::new(&mut buf, header, 0, 4, TAG_LEN).unwrap();
             cx.sent.clear();

@@ -239,6 +239,8 @@ pub(super) struct Forge<'a> {
     /// The ACK Delay field of that frame.
     pub(super) ack_delay: VarInt,
     frames: &'a [Frame<'a>],
+    /// Bytes written as they are after the frames, for frames encoded as `frames` would not be.
+    pub(super) raw: &'a [u8],
     /// PADDING up to this packet length.
     len: usize,
     /// Bits set in the first byte under header protection.
@@ -275,6 +277,7 @@ impl<'a> Forge<'a> {
             ack: None,
             ack_delay: VarInt::ZERO,
             frames,
+            raw: &[],
             len: 0,
             first_bits: 0,
             empty: false,
@@ -292,6 +295,7 @@ impl<'a> Forge<'a> {
         for frame in self.frames {
             w.frame(frame).unwrap();
         }
+        w.put_ack_eliciting_bytes(self.raw).unwrap();
         w.pad_to(self.len).unwrap();
         let layout = w.finish();
         let len = if self.empty {

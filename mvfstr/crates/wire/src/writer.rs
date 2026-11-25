@@ -28,10 +28,12 @@ use crate::codec::varint_len_of;
 use crate::frame::ACK;
 use crate::frame::ACK_ECN;
 use crate::frame::CRYPTO;
+use crate::frame::DATAGRAM_LEN;
 use crate::frame::STREAM;
 use crate::frame::STREAM_FIN;
 use crate::frame::STREAM_LEN;
 use crate::frame::STREAM_OFF;
+use crate::frame::datagram_frame_len;
 use crate::frame::type_varint;
 use crate::header::FIXED_BIT;
 use crate::header::HANDSHAKE_TYPE;
@@ -484,6 +486,28 @@ impl<'a> PacketWriter<'a> {
         }
         self.buf[self.pos..end].copy_from_slice(bytes);
         self.pos = end;
+        self.has_frames = true;
+        self.ack_eliciting = true;
+        Ok(())
+    }
+
+    /// Writes a DATAGRAM frame (RFC 9221) with a Length field whose data is `parts` in order, each
+    /// copied once into the packet. Fails with [`Full`], leaving the packet unchanged, if the whole
+    /// frame does not fit.
+    pub fn datagram<B: AsRef<[u8]>>(&mut self, parts: &[B]) -> Result<(), Full> {
+        let len: usize = parts.iter().map(|part| part.as_ref().len()).sum();
+        let frame_len = datagram_frame_len(len);
+        if frame_len > self.remaining() {
+            return Err(Full);
+        }
+        let limit = self.limit();
+        let mut w = Writer::new(&mut self.buf[self.pos..limit]);
+        w.put_varint(type_varint(DATAGRAM_LEN));
+        w.put_varint(varint_from_len(len));
+        for part in parts {
+            w.put_slice(part.as_ref());
+        }
+        self.pos += frame_len;
         self.has_frames = true;
         self.ack_eliciting = true;
         Ok(())

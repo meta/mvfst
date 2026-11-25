@@ -5,9 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! What a session works through: the lent connection, the send sink and the cross-thread handle.
+//! What a session works through: the lent connection, the send and datagram sinks and the
+//! cross-thread handle.
 
 use std::fmt;
+use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
@@ -17,9 +19,12 @@ use std::time::Instant;
 use bytes::Bytes;
 use mvfstr_proto::AppCode;
 use mvfstr_proto::Connection;
+use mvfstr_proto::DatagramError;
 use mvfstr_proto::SendError;
+use mvfstr_proto::SendOrder;
 use mvfstr_proto::StreamId;
 use mvfstr_proto::StreamMut;
+use mvfstr_proto::datagram::datagram_frame_len;
 use roxygen_runtime::worker::SubmitError;
 
 use crate::wake;
@@ -64,6 +69,14 @@ impl Conn<'_> {
     /// stream has room. A new stream, or one whose `poll_send` returned `Pending`, waits for it.
     pub fn stream_waker(&self, id: StreamId) -> Waker {
         self.wake.stream_waker(id)
+    }
+
+    /// Returns a waker that marks the session's datagram producer ready, so the driver polls
+    /// [`QuicSession::poll_datagrams`](crate::QuicSession::poll_datagrams) while the connection
+    /// has a datagram allowance. The producer waits for it at first and after it returns
+    /// `Pending`.
+    pub fn datagram_waker(&self) -> Waker {
+        self.wake.waker(wake::DATAGRAM)
     }
 
     /// Returns a handle for reaching this connection from other tasks or threads.
@@ -197,6 +210,111 @@ impl From<SendError> for SinkError {
     }
 }
 
+/// Where [`QuicSession::poll_datagrams`](crate::QuicSession::poll_datagrams) pushes datagrams.
+///
+/// A datagram's parts are queued as given, not copied, and copied once, into the packet that
+/// carries it. A push stores the whole datagram or nothing.
+pub struct DatagramSink<'a> {
+    conn: &'a mut Connection,
+    now: Instant,
+    progressed: bool,
+    /// Bytes stored through this sink.
+    staged: u64,
+    /// What is left of the connection's datagram allowance as the pull step began.
+    left: usize,
+}
+
+impl<'a> DatagramSink<'a> {
+    /// Creates a sink over `conn` for the polls of one pull step at `now`.
+    pub(crate) fn new(conn: &'a mut Connection, now: Instant) -> Self {
+        let left = conn.datagram_allowance();
+        Self {
+            conn,
+            now,
+            progressed: false,
+            staged: 0,
+            left,
+        }
+    }
+
+    /// Returns whether a datagram was stored since the last call.
+    pub(crate) fn take_progressed(&mut self) -> bool {
+        mem::take(&mut self.progressed)
+    }
+
+    /// Returns the bytes stored through this sink.
+    pub(crate) fn staged(&self) -> u64 {
+        self.staged
+    }
+
+    /// Lowers what the sink takes to at most `most` bytes. Returns whether the connection's
+    /// allowance left it more.
+    pub(crate) fn limit(&mut self, most: usize) -> bool {
+        let cut = self.left > most;
+        self.left = self.left.min(most);
+        cut
+    }
+
+    /// Returns whether the sink takes the frame of the longest datagram the connection takes.
+    pub(crate) fn fits_longest(&self) -> bool {
+        self.left >= datagram_frame_len(self.max_size())
+    }
+}
+
+impl DatagramSink<'_> {
+    /// Returns the time the driver read when the current phase began.
+    pub fn now(&self) -> Instant {
+        self.now
+    }
+
+    /// Returns how many bytes of datagrams the sink takes now, each counted with its frame's type
+    /// and Length ([`datagram_frame_len`](mvfstr_proto::datagram::datagram_frame_len)): what the
+    /// congestion window had left after the queued datagrams as the pull step began, at most what
+    /// the driver lets the step stage of the connection's work for the turn, less what the sink
+    /// has stored since. A datagram a full send queue drops does not give its bytes back.
+    pub fn allowance(&self) -> usize {
+        self.left
+    }
+
+    /// Returns the longest datagram the connection takes, or 0 while the peer does not take
+    /// DATAGRAM frames with data.
+    pub fn max_size(&self) -> usize {
+        self.conn.max_datagram_size()
+    }
+
+    /// Queues a datagram whose data is `parts` in order, at most
+    /// [`MAX_PARTS`](mvfstr_proto::datagram::MAX_PARTS), to be sent at `order` in the wire order
+    /// and dropped unsent once `expiry` passes. It stores the whole datagram or fails without
+    /// storing any of it.
+    pub fn push_parts(
+        &mut self,
+        parts: &[Bytes],
+        order: SendOrder,
+        expiry: Option<Instant>,
+    ) -> Result<(), DatagramError> {
+        // The connection's clock may lag the driver's, which the producer reads.
+        if expiry.is_some_and(|expiry| expiry <= self.now) {
+            return Err(DatagramError::Expired);
+        }
+        let len: usize = parts.iter().map(Bytes::len).sum();
+        let frame = datagram_frame_len(len);
+        if frame > self.left {
+            return Err(DatagramError::OverAllowance);
+        }
+        self.conn.send_datagram(parts, order, expiry)?;
+        self.progressed = true;
+        self.staged += len as u64;
+        self.left -= frame;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DatagramSink<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatagramSink").finish_non_exhaustive()
+    }
+}
+
 /// A handle to a connection usable from any thread. Commands go through a bounded queue to the
 /// connection's worker, and fail with [`SubmitError::Overloaded`] when it is full.
 #[derive(Clone, Debug)]
@@ -237,6 +355,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::ORDER;
+    use crate::test_support::handshaken_datagram_pair;
+    use crate::test_support::handshaken_datagram_pair_with;
     use crate::test_support::handshaken_pair;
     use crate::wake::Shared;
 
@@ -326,6 +446,118 @@ mod tests {
         let mut sink = SendSink::new(conn.stream(id).expect("the stream is open"));
         sink.finish().expect("the stream finishes");
         assert!(sink.progressed(), "a finish alone is progress");
+    }
+
+    #[test]
+    fn a_datagram_sink_stores_whole_datagrams_within_its_allowance() {
+        let mut pair = handshaken_datagram_pair();
+        let now = pair.now;
+        let mut sink = DatagramSink::new(pair.client.conn_mut(), now);
+        assert_eq!(sink.now(), now);
+        let max = sink.max_size();
+        let allowance = sink.allowance();
+        assert!(
+            max > 1000 && allowance > 2 * max,
+            "the window holds a few datagrams"
+        );
+
+        let part = Bytes::from(vec![7; 100]);
+        sink.push_parts(&[part.clone(), part], ORDER, None)
+            .expect("within the allowance");
+        assert!(sink.take_progressed());
+        assert!(!sink.take_progressed(), "taking clears the progress");
+        // The frame's type byte and 2-byte Length count too.
+        assert_eq!(sink.allowance(), allowance - 203);
+        assert_eq!(sink.staged(), 200);
+
+        let full = Bytes::from(vec![1; max]);
+        while sink.allowance() >= datagram_frame_len(max) {
+            sink.push_parts(std::slice::from_ref(&full), ORDER, None)
+                .expect("within the allowance");
+        }
+        let left = sink.allowance();
+        let staged = sink.staged();
+        sink.take_progressed();
+        assert_eq!(
+            sink.push_parts(&[Bytes::from(vec![2; left + 1])], ORDER, None),
+            Err(DatagramError::OverAllowance)
+        );
+        assert_eq!(sink.allowance(), left, "a refused push stores nothing");
+        assert_eq!(sink.staged(), staged);
+        assert!(!sink.take_progressed());
+    }
+
+    #[test]
+    fn a_datagram_sink_charges_each_push_its_frames_type_and_length() {
+        let mut pair = handshaken_datagram_pair();
+        let now = pair.now;
+        let mut sink = DatagramSink::new(pair.client.conn_mut(), now);
+        let max = sink.max_size();
+        let full = Bytes::from(vec![1; max]);
+        while sink.allowance() >= datagram_frame_len(max) {
+            sink.push_parts(std::slice::from_ref(&full), ORDER, None)
+                .expect("within the allowance");
+        }
+        // What is left takes a datagram whose frame fits it, not one whose data alone does.
+        let left = sink.allowance();
+        assert!(left > 3, "{left}");
+        assert_eq!(
+            sink.push_parts(&[Bytes::from(vec![2; left])], ORDER, None),
+            Err(DatagramError::OverAllowance)
+        );
+        let fits = (0..left)
+            .rev()
+            .find(|&len| datagram_frame_len(len) <= left)
+            .expect("a short datagram fits");
+        sink.push_parts(&[Bytes::from(vec![2; fits])], ORDER, None)
+            .expect("its frame fits the allowance");
+        assert_eq!(sink.allowance(), left - datagram_frame_len(fits));
+    }
+
+    #[test]
+    fn a_datagram_sinks_allowance_runs_out_though_a_short_send_queue_drops_its_oldest() {
+        // A send queue of two drops its oldest datagram on each push past the second, so the
+        // queued frames stay at two; the sink still takes no more than the allowance it began
+        // with.
+        let mut pair = handshaken_datagram_pair_with(|transport| transport.datagram_send_queue(2));
+        let now = pair.now;
+        let mut sink = DatagramSink::new(pair.client.conn_mut(), now);
+        let allowance = sink.allowance();
+        let data = Bytes::from(vec![7; 1000]);
+        let frame = datagram_frame_len(1000);
+        let mut pushed = 0;
+        while sink.allowance() >= frame && pushed < 100 {
+            sink.push_parts(std::slice::from_ref(&data), ORDER, None)
+                .expect("within the allowance");
+            pushed += 1;
+        }
+        assert_eq!(pushed, allowance / frame);
+        assert_eq!(sink.allowance(), allowance % frame);
+        assert_eq!(
+            pair.client.conn().datagram_stats().send_dropped,
+            pushed as u64 - 2
+        );
+    }
+
+    #[test]
+    fn a_datagram_sink_refuses_a_datagram_expired_by_the_drivers_clock() {
+        let mut pair = handshaken_datagram_pair();
+        // The driver read its clock after the connection's last operation.
+        let now = pair.now + Duration::from_millis(10);
+        let mut sink = DatagramSink::new(pair.client.conn_mut(), now);
+        let allowance = sink.allowance();
+        let data = [Bytes::from_static(b"stale")];
+        for expiry in [now - Duration::from_millis(5), now] {
+            assert_eq!(
+                sink.push_parts(&data, ORDER, Some(expiry)),
+                Err(DatagramError::Expired)
+            );
+        }
+        assert_eq!(sink.allowance(), allowance, "nothing is queued");
+        assert!(!sink.take_progressed());
+        sink.push_parts(&data, ORDER, Some(now + Duration::from_millis(1)))
+            .expect("a live datagram is queued");
+        assert!(sink.take_progressed());
     }
 
     #[test]

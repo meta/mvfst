@@ -54,6 +54,7 @@ pub use budget::UnitKind;
 pub use budget::WorkBudget;
 pub use conn::Conn;
 pub use conn::ConnHandle;
+pub use conn::DatagramSink;
 pub use conn::SendSink;
 pub use conn::SinkError;
 pub use endpoint::DriverConnectError;

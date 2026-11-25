@@ -32,7 +32,6 @@ pub(crate) enum Class {
     /// Control frames and new CRYPTO data.
     Control,
     /// A DATAGRAM frame.
-    #[expect(dead_code, reason = "DATAGRAM frames are not built")]
     Datagram,
     /// New stream bytes, which also need connection credit.
     NewStream,

@@ -19,6 +19,8 @@ use mvfstr_proto::ClientConfig;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::SendOrder;
 use mvfstr_proto::ServerConfig;
+use mvfstr_proto::TransportConfig;
+use mvfstr_proto::config::TransportConfigBuilder;
 use mvfstr_proto::testing::Pair;
 use mvfstr_proto::testing::PairConfig;
 use mvfstr_tls::ManualTimeProvider;
@@ -39,10 +41,17 @@ pub(crate) const ORDER: SendOrder = SendOrder {
 /// Returns a client config and a server config for a self-signed `localhost` certificate, both
 /// with ALPN `h3`, and an endpoint config.
 pub(crate) fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
+    configs_carrying(None)
+}
+
+/// Like [`configs`], with `transport`, if any, for both sides.
+fn configs_carrying(
+    transport: Option<Arc<TransportConfig>>,
+) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
     let key = rcgen::KeyPair::generate().expect("rcgen makes a key");
     let params =
         rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("rcgen takes the name");
-    configs_with(params, &key)
+    configs_of(params, &key, transport)
 }
 
 /// Returns the configs of [`configs`] for the certificate that `params` describes, signed by
@@ -50,6 +59,15 @@ pub(crate) fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointCo
 pub(crate) fn configs_with(
     params: rcgen::CertificateParams,
     key: &rcgen::KeyPair,
+) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
+    configs_of(params, key, None)
+}
+
+/// Like [`configs_with`], with `transport`, if any, for both sides.
+fn configs_of(
+    params: rcgen::CertificateParams,
+    key: &rcgen::KeyPair,
+    transport: Option<Arc<TransportConfig>>,
 ) -> (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>) {
     let cert = params.self_signed(key).expect("rcgen makes a certificate");
     let time = Arc::new(ManualTimeProvider::new(UnixTime::now()));
@@ -69,12 +87,14 @@ pub(crate) fn configs_with(
         alpn,
     )
     .expect("a client TLS config");
-    let server = ServerConfig::builder(Arc::new(server_tls))
-        .build()
-        .expect("a server config");
-    let client = ClientConfig::builder(Arc::new(client_tls))
-        .build()
-        .expect("a client config");
+    let mut server = ServerConfig::builder(Arc::new(server_tls));
+    let mut client = ClientConfig::builder(Arc::new(client_tls));
+    if let Some(transport) = transport {
+        server = server.transport(transport.clone());
+        client = client.transport(transport);
+    }
+    let server = server.build().expect("a server config");
+    let client = client.build().expect("a client config");
     let endpoint = EndpointConfig::builder(reset_key())
         .build()
         .expect("an endpoint config");
@@ -134,7 +154,28 @@ fn provider() -> CryptoProvider {
 
 /// Returns a pair harness whose handshake has completed.
 pub(crate) fn handshaken_pair() -> Pair {
-    let (client, server, endpoint) = configs();
+    handshake(configs())
+}
+
+/// Returns a pair harness whose two sides take DATAGRAM frames, with its handshake completed.
+pub(crate) fn handshaken_datagram_pair() -> Pair {
+    handshaken_datagram_pair_with(|transport| transport)
+}
+
+/// Like [`handshaken_datagram_pair`], with the transport settings `f` makes of those.
+pub(crate) fn handshaken_datagram_pair_with(
+    f: impl FnOnce(TransportConfigBuilder) -> TransportConfigBuilder,
+) -> Pair {
+    let transport = f(TransportConfig::builder().max_datagram_frame_size(65535))
+        .build()
+        .expect("a transport config");
+    handshake(configs_carrying(Some(transport)))
+}
+
+/// Returns a pair harness of `configs` whose handshake has completed.
+fn handshake(
+    (client, server, endpoint): (Arc<ClientConfig>, Arc<ServerConfig>, Arc<EndpointConfig>),
+) -> Pair {
     let epoch = Instant::now();
     let mut pair = Pair::new(
         epoch,

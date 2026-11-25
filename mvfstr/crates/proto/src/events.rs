@@ -44,8 +44,6 @@ impl fmt::Display for AppCode {
 }
 
 /// A rare fact about a connection, from [`Connection::poll_event`](crate::Connection::poll_event).
-///
-/// The QUIC DATAGRAM extension is not supported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnEvent {
     /// The 1-RTT write keys are installed, so 1-RTT packets can be sent: for a server once it
@@ -76,6 +74,10 @@ pub enum ConnEvent {
     },
     /// A path changed.
     Path(PathEvent),
+    /// Received datagrams (RFC 9221) wait in
+    /// [`Connection::read_datagram`](crate::Connection::read_datagram), which the application
+    /// drains until it returns `None`.
+    DatagramsReadable,
     /// The connection does not have an open stream or a packet in flight.
     Quiet,
     /// The connection closed and does not carry streams or data any more. `Drained` follows once

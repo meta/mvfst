@@ -57,6 +57,7 @@ use crate::StreamError;
 use crate::StreamReady;
 use crate::TransportConfig;
 use crate::connection::ConnError;
+use crate::datagram::SendQueue;
 use crate::flow_control::RecvWindow;
 use crate::flow_control::SendCredit;
 use crate::flow_control::StreamRecvFlow;
@@ -319,9 +320,11 @@ pub(crate) fn dir_index(dir: Dir) -> usize {
     }
 }
 
-/// A connection's streams and flow control.
+/// A connection's streams and flow control, and the datagrams it sends in the streams' wire order.
 pub(crate) struct StreamState {
     pub(crate) streams: Streams<StreamParts>,
+    /// The DATAGRAM frames (RFC 9221) waiting to be sent.
+    pub(crate) datagrams: SendQueue,
     config: PartsConfig,
     /// Connection send credit from the peer's MAX_DATA.
     pub(crate) conn_send: SendCredit,
@@ -399,6 +402,7 @@ impl StreamState {
                 config.max_streams_uni(),
                 QUANTUM,
             ),
+            datagrams: SendQueue::new(config.datagram_send_queue()),
             config: PartsConfig {
                 side,
                 local: Windows {

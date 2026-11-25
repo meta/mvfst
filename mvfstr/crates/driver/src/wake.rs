@@ -38,6 +38,8 @@ pub(crate) const RX: u8 = 1 << 2;
 pub(crate) const TX: u8 = 1 << 3;
 /// A stream waker fired.
 pub(crate) const STREAM: u8 = 1 << 4;
+/// The session's datagram waker fired.
+pub(crate) const DATAGRAM: u8 = 1 << 5;
 
 /// The most commands queued per connection; [`ConnWake::submit`] fails with `Overloaded` past it.
 pub(crate) const COMMAND_CAPACITY: usize = 64;

@@ -677,12 +677,14 @@ impl Endpoint {
         let mut rng_seed = [0; 32];
         cx.rng.fill(&mut rng_seed);
         let (without_alpn, alpn) = config.tls_without_alpn(incoming.version);
+        let transport = options
+            .transport
+            .unwrap_or_else(|| config.transport().clone());
+        let tls = config.tls_for(&transport);
         let setup = ConnSetup {
             now: cx.now,
             version: incoming.version,
-            transport: options
-                .transport
-                .unwrap_or_else(|| config.transport().clone()),
+            transport,
             alpn,
             remote: incoming.meta.src,
             local_ip: incoming.meta.dst_ip,
@@ -695,7 +697,7 @@ impl Endpoint {
             src_ports: Some(Arc::clone(&self.shared_src_ports)),
             pool: self.pool.clone(),
         };
-        let mut conn = Connection::server(setup, config.tls(), without_alpn.cloned())
+        let mut conn = Connection::server(setup, tls, without_alpn.cloned())
             .map_err(|e| AcceptError::Tls(rustls_error(e)))?;
         let meta = incoming.meta;
         let mut datagram = incoming.datagram;

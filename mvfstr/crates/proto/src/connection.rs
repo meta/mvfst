@@ -28,6 +28,8 @@ mod cc_tests;
 #[cfg(test)]
 mod client_tests;
 #[cfg(test)]
+mod datagram_tests;
+#[cfg(test)]
 mod horizon_tests;
 mod key_update;
 #[cfg(test)]
@@ -90,6 +92,8 @@ use crate::ClientTls;
 use crate::CloseReason;
 use crate::CongestionControl;
 use crate::ConnEvent;
+use crate::DatagramError;
+use crate::DatagramStats;
 use crate::EndpointEvent;
 use crate::Initiator;
 use crate::KeepAlive;
@@ -121,6 +125,7 @@ use crate::cid::ConnRng;
 use crate::cid::LocalCids;
 use crate::cid::MAX_LOCAL_CIDS;
 use crate::cid::PeerCids;
+use crate::datagram;
 use crate::endpoint::SrcPortState;
 use crate::pacer::Bursts;
 use crate::pacer::Pacer;
@@ -408,6 +413,8 @@ pub struct Connection {
     sent_frames: [Vec<crate::recovery::SentFrame>; 3],
     /// The sequence number of the next datagram built.
     tx_seq: u64,
+    /// The DATAGRAM frames (RFC 9221) received and not yet read.
+    datagrams_received: datagram::RecvQueue,
     stats: ConnStats,
     /// The rustls error behind a local TLS failure.
     local_tls_error: Option<Box<rustls::Error>>,
@@ -584,6 +591,7 @@ impl Connection {
             tls_out: Vec::new(),
             sent_frames: Default::default(),
             tx_seq: 0,
+            datagrams_received: datagram::RecvQueue::new(config.datagram_recv_queue()),
             stats: ConnStats::default(),
             local_tls_error: None,
             retry: None,
@@ -697,6 +705,11 @@ impl Connection {
             "a connection with a build horizon was given no clock epoch"
         );
         self.now = self.now.max(limits.now);
+        if !self.sources.streams.datagrams.is_empty() {
+            let max_frame = usize::from(self.mtu.min(limits.max_datagram))
+                .saturating_sub(self.one_rtt_overhead());
+            self.sources.streams.datagrams.prune(limits.now, max_frame);
+        }
         let outcome = self.transmit(limits, sink, sealer);
         self.wake_writable();
         outcome
@@ -1049,6 +1062,84 @@ impl Connection {
             .map_or(0, |peer| {
                 params::max_datagram_frame_size(&peer.decoded).unwrap_or(0)
             })
+    }
+
+    /// Returns the longest datagram [`send_datagram`](Self::send_datagram) takes now, or 0 while
+    /// the peer does not take DATAGRAM frames with data (see [`DatagramError::Unsupported`]).
+    pub fn max_datagram_size(&self) -> usize {
+        let peer = self.peer_max_datagram_frame_size();
+        if peer == 0 {
+            return 0;
+        }
+        let room = usize::from(self.mtu).saturating_sub(self.one_rtt_overhead());
+        datagram::max_data(room.min(usize::try_from(peer).unwrap_or(usize::MAX)))
+    }
+
+    /// Returns the bytes of datagrams worth producing now: what the congestion window has left
+    /// after the queued DATAGRAM frames, or 0 while the connection is not open or the peer does
+    /// not take DATAGRAM frames with data.
+    pub fn datagram_allowance(&self) -> usize {
+        if self.state != State::Open || self.max_datagram_size() == 0 {
+            return 0;
+        }
+        let room = self
+            .cc
+            .cwnd()
+            .saturating_sub(self.recovery.bytes_in_flight());
+        usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.sources.streams.datagrams.bytes())
+    }
+
+    /// Returns the bytes of a 1-RTT packet on the current path besides its frames, at the largest
+    /// packet number.
+    fn one_rtt_overhead(&self) -> usize {
+        self.packet_room(Space::Data, crate::PathId(0), 1) - 1
+    }
+
+    /// Queues a datagram whose data is `parts` in order, to be sent at `order` in the wire order
+    /// and dropped unsent once `expiry` passes.
+    pub fn send_datagram(
+        &mut self,
+        parts: &[Bytes],
+        order: SendOrder,
+        expiry: Option<Instant>,
+    ) -> Result<(), DatagramError> {
+        if self.state != State::Open {
+            return Err(DatagramError::Closed);
+        }
+        if expiry.is_some_and(|expiry| expiry <= self.now) {
+            return Err(DatagramError::Expired);
+        }
+        if parts.len() > datagram::MAX_PARTS {
+            return Err(DatagramError::TooManyParts);
+        }
+        let max = self.max_datagram_size();
+        if max == 0 {
+            return Err(DatagramError::Unsupported);
+        }
+        let len: usize = parts.iter().map(Bytes::len).sum();
+        if len > max {
+            return Err(DatagramError::TooLarge);
+        }
+        self.sources
+            .streams
+            .datagrams
+            .push(parts, len, order, expiry);
+        Ok(())
+    }
+
+    /// Takes the oldest received datagram not yet read, if any.
+    pub fn read_datagram(&mut self) -> Option<Bytes> {
+        self.datagrams_received.pop()
+    }
+
+    /// Returns the connection's datagram counters.
+    pub fn datagram_stats(&self) -> DatagramStats {
+        let mut stats = DatagramStats::default();
+        self.sources.streams.datagrams.add_stats(&mut stats);
+        self.datagrams_received.add_stats(&mut stats);
+        stats
     }
 
     /// Returns counters and current values for logs and benchmarks.

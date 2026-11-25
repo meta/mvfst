@@ -441,13 +441,32 @@ fn non_minimal_frame_types_are_protocol_violations() {
 }
 
 #[test]
-fn datagram_frames_are_protocol_violations() {
-    // mvfstr never advertises max_datagram_frame_size (RFC 9221).
-    for payload in [&[0x30, b'x'][..], &[0x31, 0x01, b'x']] {
-        let err = decode_all(payload).unwrap_err();
-        assert_eq!(err.code(), TransportErrorCode::PROTOCOL_VIOLATION);
-        assert_eq!(err.frame_type(), v(u64::from(payload[0])));
-    }
+fn decodes_datagram_frames_with_and_without_a_length() {
+    // RFC 9221: type 0x30 carries data to the end of the packet, 0x31 a Length field first.
+    assert_eq!(
+        decode_all(&[0x30, b'x', b'y', 0x01]).unwrap(),
+        [Frame::Datagram {
+            data: &[b'x', b'y', 0x01],
+            with_length: false,
+        }]
+    );
+    assert_eq!(
+        decode_all(&[0x31, 0x02, b'x', b'y', 0x01]).unwrap(),
+        [
+            Frame::Datagram {
+                data: b"xy",
+                with_length: true,
+            },
+            Frame::Ping,
+        ]
+    );
+    assert_eq!(
+        decode_all(&[0x30]).unwrap(),
+        [Frame::Datagram {
+            data: b"",
+            with_length: false,
+        }]
+    );
 }
 
 /// Returns one complete encoding of every frame type with fields, all with a length-delimited end.
@@ -476,6 +495,7 @@ fn frames_with_fields() -> Vec<Vec<u8>> {
         vec![0x1b, 1, 2, 3, 4, 5, 6, 7, 8],
         vec![0x1c, 0x07, 0x06, 0x02, b'n', b'o'],
         vec![0x1d, 0x07, 0x02, b'n', b'o'],
+        vec![0x31, 0x02, 0xaa, 0xbb],
     ]
 }
 
@@ -513,7 +533,7 @@ fn iteration_ends_at_the_first_error() {
 }
 
 /// RFC 9000 Table 3, "Pkts" and "Spec" columns, per kind.
-const TABLE_3: [(FrameKind, &str, &str); 21] = [
+const TABLE_3: [(FrameKind, &str, &str); 22] = [
     (FrameKind::Padding, "IH01", "NP"),
     (FrameKind::Ping, "IH01", ""),
     (FrameKind::Ack, "IH_1", "NC"),
@@ -536,6 +556,8 @@ const TABLE_3: [(FrameKind, &str, &str); 21] = [
     (FrameKind::ConnectionClose, "IH01", "N"),
     (FrameKind::ApplicationClose, "__01", "N"),
     (FrameKind::HandshakeDone, "___1", ""),
+    // RFC 9221: DATAGRAM goes in 0-RTT and 1-RTT packets and is ack-eliciting.
+    (FrameKind::Datagram, "__01", ""),
 ];
 
 #[test]
@@ -652,6 +674,14 @@ fn one_of_each<'a>(ack_payload: &'a [u8]) -> Vec<Frame<'a>> {
             reason: b"",
         },
         Frame::HandshakeDone,
+        Frame::Datagram {
+            data: &[0xd0; 70],
+            with_length: true,
+        },
+        Frame::Datagram {
+            data: b"to the end of the packet",
+            with_length: false,
+        },
     ]
 }
 

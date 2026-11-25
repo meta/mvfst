@@ -713,6 +713,40 @@ fn frames_encoded_by_the_caller_are_appended_in_pieces() {
 }
 
 #[test]
+fn a_datagram_is_written_from_its_parts_whole_or_not_at_all() {
+    // A quarter stream ID, a MoQ prefix, a shared header and two segments of a shared payload.
+    let payload = Bytes::from(vec![0x50_u8; 100]);
+    let parts = [
+        Bytes::from_static(&[0x01]),
+        Bytes::from_static(&[0x00, 0x2a]),
+        Bytes::from_static(b"HDR"),
+        payload.slice(..20),
+        payload.slice(60..70),
+    ];
+    // 36 bytes of data take a 38-byte frame: the type, a 1-byte Length and the data.
+    let mut slot = [0xaa_u8; 64];
+    let mut w = short_writer(&mut slot);
+    assert_eq!(w.remaining(), 37);
+    assert_eq!(w.datagram(&parts), Err(Full));
+    assert_eq!(w.remaining(), 37);
+    assert!(w.is_empty());
+    let mut slot = [0xaa_u8; 65];
+    let mut w = short_writer(&mut slot);
+    assert_eq!(w.datagram(&parts), Ok(()));
+    assert_eq!(w.remaining(), 0);
+    assert!(w.is_ack_eliciting());
+    let layout = w.finish();
+    let expected = [&[0x01, 0x00, 0x2a][..], b"HDR", &[0x50; 30]].concat();
+    assert_eq!(
+        frames_of(&slot, layout),
+        [Frame::Datagram {
+            data: &expected,
+            with_length: true,
+        }]
+    );
+}
+
+#[test]
 fn no_encoded_bytes_leave_the_packet_empty() {
     let mut slot = [0u8; 60];
     let mut w = short_writer(&mut slot);

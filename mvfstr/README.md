@@ -47,6 +47,8 @@ mvfstr is under active development, and its APIs will change before 1.0.
   mvfst's do.
 - Streams scheduled by urgency, with incremental streams taking turns, as in
   RFC 9218.
+- The QUIC DATAGRAM extension (RFC 9221), off unless max_datagram_frame_size
+  is configured.
 - Passive migration: once the handshake is confirmed, a server follows a
   client that moves to a new address, for example after a NAT rebinding, and
   validates the new path.
@@ -57,7 +59,6 @@ mvfstr is under active development, and its APIs will change before 1.0.
 - 0-RTT is not supported. A client does not keep the tokens that a server
   sends in NEW_TOKEN frames.
 - A server does not send Retry packets, and a client discards them.
-- The QUIC DATAGRAM extension (RFC 9221) is not supported.
 - Path MTU discovery is not supported. A connection sends datagrams of 1,200
   bytes, or, if configured to, the smaller of the two endpoints'
   max_udp_payload_size once the peer's transport parameters arrive.
