@@ -12,6 +12,7 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -43,6 +44,7 @@ use super::stream_tests::ORDER;
 use crate::AlpnPolicy;
 use crate::AppCode;
 use crate::CloseReason;
+use crate::CongestionControl;
 use crate::ConnEvent;
 use crate::ConnKey;
 use crate::ConnOptions;
@@ -2772,4 +2774,38 @@ fn a_client_releases_the_crypto_page_of_its_tickets() {
         0,
         "the client releases the page of the tickets that it read"
     );
+}
+
+#[test]
+fn discarded_spaces_free_their_ack_ranges_and_sent_packet_rings() {
+    let cubic = Arc::new(TransportConfig::default());
+    // A controller that takes rate samples also keeps send snapshots in the handshake spaces.
+    let bbr3 = TransportConfig::builder()
+        .congestion_control(CongestionControl::Bbr3)
+        .pacing(true)
+        .build()
+        .expect("a valid transport config");
+    let mut held = Vec::new();
+    for transport in [cubic, bbr3] {
+        let cc = transport.congestion_control();
+        let (_, mut pair) = handshake(Setup::default().transport(transport).pair());
+        pair.run(pair.now + Duration::from_millis(200));
+        for (side, peer) in [(Side::Server, &pair.server), (Side::Client, &pair.client)] {
+            let conn = peer.conn();
+            for space in [Space::Initial, Space::Handshake] {
+                assert!(
+                    conn.spaces[space.index()].discarded,
+                    "{cc:?} {side:?} {space:?}"
+                );
+                held.push((
+                    (cc, side, space),
+                    conn.sources.ack[space.index()].received().capacity(),
+                    conn.recovery.space(space).capacities(),
+                ));
+            }
+        }
+    }
+    // The capacity of the ACK ranges, then those of the record, frame, hole and snapshot rings.
+    let none: Vec<_> = held.iter().map(|&(case, ..)| (case, 0, [0; 4])).collect();
+    assert_eq!(held, none, "the memory of the discarded spaces");
 }

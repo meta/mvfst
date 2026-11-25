@@ -873,13 +873,14 @@ impl SentPackets {
         forgotten_lost
     }
 
-    /// Forgets every packet because the space's keys were discarded (RFC 9002). Returns the
-    /// in-flight bytes removed, which no longer count toward bytes in flight.
+    /// Forgets every packet and frees the rings, because the space's keys were discarded
+    /// (RFC 9002). Returns the in-flight bytes removed, which no longer count toward bytes in
+    /// flight.
     pub fn discard(&mut self) -> u64 {
         let removed = self.bytes_in_flight;
-        self.pkts.clear();
-        self.snapshots.clear();
-        self.frames.clear();
+        self.pkts = VecDeque::new();
+        self.snapshots = VecDeque::new();
+        self.frames = VecDeque::new();
         self.frames_front = 0;
         self.frames_end = 0;
         self.bytes_in_flight = 0;
@@ -888,7 +889,7 @@ impl SentPackets {
         self.last_ack_eliciting = None;
         self.loss_time = None;
         self.declared_lost = 0;
-        self.holes.clear();
+        self.holes = VecDeque::new();
         removed
     }
 
@@ -896,6 +897,18 @@ impl SentPackets {
     #[cfg(test)]
     pub(crate) fn snapshot_capacity(&self) -> usize {
         self.snapshots.capacity()
+    }
+
+    /// Returns the capacities of the record, frame, hole and snapshot rings, for tests of the
+    /// memory they hold.
+    #[cfg(test)]
+    pub(crate) fn capacities(&self) -> [usize; 4] {
+        [
+            self.pkts.capacity(),
+            self.frames.capacity(),
+            self.holes.capacity(),
+            self.snapshots.capacity(),
+        ]
     }
 
     /// Returns how many records the ring holds, resolved or not.
@@ -1644,6 +1657,40 @@ mod tests {
         // Late acknowledgments of discarded packets are ignored.
         let (summary, events) = ack(&mut s, &[0..=5], t0 + 11 * MS).unwrap();
         assert_eq!((summary.newly_acked, events.len()), (0, 0));
+    }
+
+    #[test]
+    fn discarding_the_space_frees_its_rings() {
+        let t0 = crate::recovery::test_epoch();
+        let mut s = ring(t0, 6);
+        s.set_last_snapshot(SendSnapshot {
+            delivered: 0,
+            first_send_time: t0,
+            delivered_time: t0,
+            from_send: true,
+            app_limited: false,
+            tx_in_flight: 7200,
+            lost: 0,
+            total_sent: 7200,
+        });
+        // Acknowledging 5 leaves holes at 0-4.
+        ack(&mut s, &[5..=5], t0 + 10 * MS).unwrap();
+        let held = s.capacities();
+        assert!(
+            held.iter().all(|&c| c > 0),
+            "every ring holds memory: {held:?}"
+        );
+        assert_eq!(s.discard(), 6000);
+        assert_eq!(
+            s.capacities(),
+            [0; 4],
+            "the record, frame, hole and snapshot rings of a discarded space"
+        );
+        // Packet numbers go on after a discard, as they do when a client's 0-RTT is rejected.
+        s.push_frame(stream_frame(6000));
+        s.on_sent(6, t0 + 20 * MS, 1200, ELICITING, 6).unwrap();
+        assert_eq!(frames(&s.get(6).unwrap()), vec![stream_frame(6000)]);
+        assert_eq!(s.bytes_in_flight(), 1200);
     }
 
     #[test]

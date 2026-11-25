@@ -76,12 +76,12 @@ pub struct ReceivedPackets {
 
 impl ReceivedPackets {
     /// Creates the tracking for `space`, which keeps at most `max_ranges` ranges (at least 1) and
-    /// drops the oldest first.
+    /// drops the oldest first. The ranges take no memory until a packet arrives.
     pub fn new(space: Space, max_ranges: usize) -> Self {
         let max_ranges = max_ranges.max(1);
         Self {
             space,
-            ranges: VecDeque::with_capacity(max_ranges + 1),
+            ranges: VecDeque::new(),
             max_ranges,
             floor: 0,
             report_floor: 0,
@@ -182,10 +182,12 @@ impl ReceivedPackets {
                 return true;
             }
             Some(last) if pn > last.1 + 1 => {
+                self.reserve_range();
                 self.ranges.push_back((pn, pn));
                 return true;
             }
             None => {
+                self.reserve_range();
                 self.ranges.push_back((pn, pn));
                 return true;
             }
@@ -204,9 +206,23 @@ impl ReceivedPackets {
             }
             (true, false) => self.ranges[i - 1].1 = pn,
             (false, true) => self.ranges[i].0 = pn,
-            (false, false) => self.ranges.insert(i, (pn, pn)),
+            (false, false) => {
+                self.reserve_range();
+                self.ranges.insert(i, (pn, pn));
+            }
         }
         true
+    }
+
+    /// Makes room for one more range: the room doubles from 4 up to `max_ranges + 1`, the most
+    /// ranges held at once, because `on_packet` adds a range before it drops the oldest.
+    fn reserve_range(&mut self) {
+        let len = self.ranges.len();
+        if len == self.ranges.capacity() {
+            // `on_packet` leaves at most `max_ranges` ranges, so `room > len`.
+            let room = (len * 2).max(4).min(self.max_ranges + 1);
+            self.ranges.reserve_exact(room - len);
+        }
     }
 
     /// Returns whether an ACK frame is due at `now`, for a policy that acknowledges once
@@ -263,6 +279,12 @@ impl ReceivedPackets {
     #[cfg(test)]
     pub(crate) fn searches(&self) -> u64 {
         self.searches.get()
+    }
+
+    /// Returns how many ranges fit in the memory the ranges hold.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.ranges.capacity()
     }
 
     /// Returns the ranges to acknowledge, largest first, as the ACK encoder takes them. The
@@ -553,6 +575,53 @@ mod tests {
             r.ack_due(t0 + 50 * MS, 10, 25 * MS),
             AckDue::At(t0 + 75 * MS)
         );
+    }
+
+    #[test]
+    fn the_ranges_start_empty_and_grow_by_doubling_to_one_past_the_maximum() {
+        let t0 = crate::recovery::test_epoch();
+        // 1,000 packets with a gap after each one: the even numbers below 2,000, in blocks whose
+        // largest packet arrives first. Blocks of two make every growth happen at the back. Blocks
+        // of three add the other two ranges of a block in the middle, and from the second growth
+        // on, the ranges grow there.
+        let evens: Vec<u64> = (0..1000).map(|i| 2 * i).collect();
+        for (max_ranges, growth) in [(32, &[0, 4, 8, 16, 32, 33][..]), (3, &[0, 4]), (1, &[0, 2])] {
+            for block in [2, 3] {
+                let case = format!("{max_ranges} ranges, blocks of {block}");
+                let mut r = ReceivedPackets::new(Space::Data, max_ranges);
+                let mut capacities = vec![r.capacity()];
+                for chunk in evens.chunks(block) {
+                    let (largest, earlier) = chunk.split_last().expect("a block holds a packet");
+                    for pn in std::iter::once(largest).chain(earlier) {
+                        assert!(
+                            r.on_packet(*pn, true, Ecn::NotEct, t0),
+                            "{case}: {pn} reported duplicate"
+                        );
+                        let capacity = r.capacity();
+                        assert!(
+                            capacity <= max_ranges + 1,
+                            "{case}: room for {capacity} ranges after {pn}"
+                        );
+                        if capacities.last() != Some(&capacity) {
+                            capacities.push(capacity);
+                        }
+                    }
+                }
+                assert_eq!(capacities, growth, "{case}: the capacities in turn");
+                // The newest ranges are reported, and the packets of dropped ranges count as
+                // duplicates.
+                let oldest = 2000 - 2 * max_ranges as u64;
+                let kept: Vec<_> = (0..max_ranges as u64)
+                    .map(|i| 1998 - 2 * i)
+                    .map(|pn| pn..=pn)
+                    .collect();
+                assert_eq!(ranges(&r), kept, "{case}");
+                assert!(r.is_duplicate(oldest - 2), "{case}");
+                assert!(!r.on_packet(oldest - 2, true, Ecn::NotEct, t0), "{case}");
+                assert!(!r.is_duplicate(oldest - 1), "{case}");
+                assert!(!r.is_duplicate(1999), "{case}");
+            }
+        }
     }
 
     #[test]

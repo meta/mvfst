@@ -111,19 +111,19 @@ fn pages() -> u64 {
 }
 
 /// The most heap that an idle server holds after a handshake without session tickets.
-const IDLE_SERVER: usize = 6_115;
+const IDLE_SERVER: usize = 4_147;
 /// The most heap that an idle client holds after a handshake without session tickets.
-const IDLE_CLIENT: usize = 9_300;
+const IDLE_CLIENT: usize = 7_332;
 /// The most heap that a server holds after one request and response.
-const REQUEST_SERVER: usize = 26_827;
+const REQUEST_SERVER: usize = 24_859;
 /// The most heap that a client holds after one request and response.
-const REQUEST_CLIENT: usize = 30_012;
+const REQUEST_CLIENT: usize = 28_044;
 /// The most heap that a server holds after an HTTP/3-shaped flight.
-const H3_SERVER: usize = 79_875;
+const H3_SERVER: usize = 77_907;
 /// The most heap that a client holds after an HTTP/3-shaped flight.
-const H3_CLIENT: usize = 66_636;
+const H3_CLIENT: usize = 64_668;
 /// The most heap that an idle client holds after its session tickets arrive.
-const TICKETS_CLIENT: usize = 9_460;
+const TICKETS_CLIENT: usize = 7_492;
 
 /// Returns what ring adds to the heap of a connection on `side` when it is the only crypto
 /// backend: ring keeps its keys in Rust allocations, where aws-lc-rs keeps them in C.
