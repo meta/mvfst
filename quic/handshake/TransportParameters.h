@@ -14,6 +14,8 @@
 #include <quic/common/Expected.h>
 #include <quic/common/MvfstLogging.h>
 
+#include <algorithm>
+
 namespace quic {
 
 // macro for repetitive static_cast<uint64_t>(TransportParameterId)
@@ -142,9 +144,8 @@ struct TicketTransportParameters {
 inline auto findParameter(
     const std::vector<TransportParameter>& parameters,
     TransportParameterId id) {
-  return std::find_if(parameters.begin(), parameters.end(), [id](auto& param) {
-    return param.parameter == id;
-  });
+  return std::ranges::find_if(
+      parameters, [id](auto& param) { return param.parameter == id; });
 }
 
 quic::Expected<Optional<uint64_t>, QuicError> getIntegerParameter(
