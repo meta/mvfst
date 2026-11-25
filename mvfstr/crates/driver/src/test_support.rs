@@ -7,10 +7,14 @@
 
 //! Configs and connections for the driver's tests.
 
+use std::fs::File;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use mvfstr_io::MmsgOptions;
+use mvfstr_io::SocketOptions;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::SendOrder;
@@ -71,10 +75,33 @@ pub(crate) fn configs_with(
     let client = ClientConfig::builder(Arc::new(client_tls))
         .build()
         .expect("a client config");
-    let endpoint = EndpointConfig::builder([7; 32])
+    let endpoint = EndpointConfig::builder(reset_key())
         .build()
         .expect("an endpoint config");
     (client, server, endpoint)
+}
+
+/// Returns a stateless reset key read from the OS's random source, so that a reset from another
+/// test's endpoint does not carry a token that this test's endpoints accept.
+pub(crate) fn reset_key() -> [u8; 32] {
+    let mut key = [0; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut key))
+        .expect("the OS's random source reads");
+    key
+}
+
+/// Returns the backend's default settings without SO_REUSEPORT. If two sockets of one user both
+/// set it, Linux may bind the second to the first one's port when asked for port 0 and then spread
+/// datagrams over both, so one test's server could receive another test's connections.
+pub(crate) fn mmsg_options() -> MmsgOptions {
+    MmsgOptions {
+        socket: SocketOptions {
+            reuse_port: false,
+            ..SocketOptions::default()
+        },
+        ..MmsgOptions::default()
+    }
 }
 
 /// Returns a client config like the one [`configs`] returns that also offers the protocols `more`

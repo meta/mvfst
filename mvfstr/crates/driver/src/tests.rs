@@ -9,6 +9,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -105,6 +106,8 @@ use crate::steer::INBOX_CAPACITY;
 use crate::steer::handoff_lifetime;
 use crate::test_support::ORDER;
 use crate::test_support::configs;
+use crate::test_support::mmsg_options;
+use crate::test_support::reset_key;
 use crate::timers::Kind;
 use crate::turn::Limits;
 use crate::turn::POLL_CHARGE;
@@ -259,7 +262,7 @@ struct Harness<B: Backend = MmsgBackend> {
 
 impl Harness {
     fn new() -> Self {
-        Self::with_options(MmsgOptions::default())
+        Self::with_options(mmsg_options())
     }
 
     /// Blocks `worker`'s thread in a command until the returned sender is dropped.
@@ -1235,6 +1238,27 @@ fn gather(
         }
     }
     others
+}
+
+#[test]
+fn two_harnesses_get_different_reset_keys() {
+    // Otherwise a client accepts a stateless reset from another test's server.
+    let (first, second) = (Harness::new(), Harness::new());
+    assert_ne!(first.endpoint.reset_key(), second.endpoint.reset_key());
+    first.shutdown();
+    second.shutdown();
+}
+
+#[test]
+fn endpoint_configs_that_tests_set_in_place_of_the_harness_ones_get_their_own_reset_keys() {
+    let configs = [
+        zero_length_cids(),
+        zero_length_cids(),
+        building_ahead(Duration::ZERO),
+        building_ahead(Duration::ZERO),
+    ];
+    let keys: BTreeSet<[u8; 32]> = configs.iter().map(|config| *config.reset_key()).collect();
+    assert_eq!(keys.len(), configs.len(), "{keys:?}");
 }
 
 #[test]
@@ -3565,7 +3589,7 @@ impl GatedPing {
     fn new() -> Self {
         let valves = Arc::new(Valves::default());
         let harness = Harness::<Gated>::with_options(GatedOptions {
-            mmsg: MmsgOptions::default(),
+            mmsg: mmsg_options(),
             valves: Arc::clone(&valves),
         });
         let transport = sluggish();
@@ -3803,7 +3827,7 @@ fn connections_refused_by_a_full_socket_resume_once_it_flushes() {
     let harness = Harness::<Gated>::with_options(GatedOptions {
         mmsg: MmsgOptions {
             max_unsent: 1500,
-            ..MmsgOptions::default()
+            ..mmsg_options()
         },
         valves: Arc::clone(&valves),
     });
@@ -3963,6 +3987,7 @@ fn a_worker_that_drains_quiesces_its_driver_and_waits_for_it() {
             app.quiesced = Some(quiesced);
             let handle = EndpointDriver::<_, MmsgBackend>::builder(endpoint, app)
                 .bind_server(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), config)
+                .backend_options(mmsg_options())
                 .spawn(worker)
                 .expect("the server driver starts");
             let _ = addr_tx.send(handle.local_addr().expect("the server is bound"));
@@ -4274,14 +4299,10 @@ fn a_session_deadline_left_in_place_once_served_is_not_served_again() {
 
 /// Returns socket settings that read one datagram per receive batch.
 fn one_datagram_per_batch() -> MmsgOptions {
-    MmsgOptions {
-        rx_batch: 1,
-        socket: SocketOptions {
-            gro: false,
-            ..SocketOptions::default()
-        },
-        ..MmsgOptions::default()
-    }
+    let mut options = mmsg_options();
+    options.rx_batch = 1;
+    options.socket.gro = false;
+    options
 }
 
 #[test]
@@ -4355,7 +4376,7 @@ fn a_full_batch_goes_back_to_the_tail_of_its_phase_and_the_phase_flushes_once() 
     const LEN: usize = 8_000;
     let valves = Arc::new(Valves::default());
     let mut harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     // Every attempt fills its batch with one datagram.
@@ -4765,7 +4786,7 @@ where
 fn a_stateless_reply_the_server_socket_holds_back_leaves_once_it_is_writable() {
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     let (tx, _rx) = mpsc::channel();
@@ -4801,7 +4822,7 @@ fn a_stateless_reply_the_server_socket_holds_back_leaves_once_it_is_writable() {
 fn a_receive_error_on_the_server_socket_leaves_the_rest_of_the_receive_to_run() {
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     let (tx, _rx) = mpsc::channel();
@@ -4850,6 +4871,14 @@ fn a_connection_refused_while_its_socket_waits_to_be_writable_waits_with_it() {
     ping.harness.shutdown();
 }
 
+/// Returns an endpoint config whose connections use zero-length connection IDs.
+fn zero_length_cids() -> Arc<EndpointConfig> {
+    EndpointConfig::builder(reset_key())
+        .local_cid_len(0)
+        .build()
+        .expect("an endpoint config")
+}
+
 #[test]
 fn a_drained_connection_gives_up_its_routes() {
     let mut harness = Harness::new();
@@ -4860,10 +4889,7 @@ fn a_drained_connection_gives_up_its_routes() {
     });
     // The client's connections take the one zero-length connection ID, so a second can open
     // only once the first has given up its route.
-    harness.endpoint = EndpointConfig::builder([7; 32])
-        .local_cid_len(0)
-        .build()
-        .expect("an endpoint config");
+    harness.endpoint = zero_length_cids();
     for code in [1, 2] {
         let reports = tx.clone();
         let conn = harness.connect(addr, move || Recorder {
@@ -5292,7 +5318,7 @@ fn a_send_that_frees_staging_room_gets_its_producer_polled_again() {
 fn a_connection_attempt_the_application_ignores_draws_no_answer() {
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     let (tx, rx) = mpsc::channel();
@@ -5400,10 +5426,7 @@ fn connections_that_fail_to_open_give_their_slots_back() {
 
     // The client's connections take the one zero-length connection ID, so every connect after
     // the first fails in the endpoint.
-    harness.endpoint = EndpointConfig::builder([7; 32])
-        .local_cid_len(0)
-        .build()
-        .expect("an endpoint config");
+    harness.endpoint = zero_length_cids();
     let (endpoint, config) = (harness.endpoint.clone(), harness.client_config.clone());
     let (limits, options) = (harness.limits, harness.options.clone());
     let (failed_tx, failed_rx) = mpsc::channel();
@@ -5835,7 +5858,7 @@ fn a_paced_sender_resumes_at_each_release_without_other_input() {
     const LEN: usize = 9_000;
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     let mut relay = None;
@@ -6106,11 +6129,9 @@ fn a_server_driver_accepts_on_a_socket_opened_before_it() {
         .server
         .handle()
         .submit(move |worker| {
-            let backend = MmsgBackend::bind(
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-                &MmsgOptions::default(),
-            )
-            .expect("a server socket");
+            let backend =
+                MmsgBackend::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &mmsg_options())
+                    .expect("a server socket");
             let addr = Backend::local_addr(&backend).expect("the socket is bound");
             let handle = EndpointDriver::<_, MmsgBackend>::builder(
                 endpoint,
@@ -6221,6 +6242,7 @@ impl Steered {
         count: u16,
         make: impl Fn(u16) -> App<S> + Clone + Send + 'static,
     ) -> Self {
+        // The workers' sockets share one address, so they keep the default SO_REUSEPORT.
         let options = MmsgOptions::default();
         let open = |addr| mvfstr_io::socket::open(addr, None, &options.socket).expect("a socket");
         let first = open(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
@@ -6299,6 +6321,49 @@ fn steered_app(index: u16, reports: mpsc::Sender<Report>) -> App<Recorder> {
             reports: reports.clone(),
         })
     })
+}
+
+/// Returns whether a socket that sets SO_REUSEPORT can bind `addr` too, which Linux allows only
+/// when the socket that holds `addr` set it as well.
+fn shares_its_port(addr: SocketAddr) -> bool {
+    let options = SocketOptions {
+        reuse_port: true,
+        ..SocketOptions::default()
+    };
+    match mvfstr_io::socket::open(addr, None, &options) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => false,
+        Err(error) => panic!("binding {addr} failed: {error}"),
+    }
+}
+
+#[test]
+fn only_test_servers_that_ask_for_so_reuseport_share_their_port() {
+    let harness = Harness::new();
+    let (tx, _rx) = mpsc::channel();
+    let addr = harness.serve({
+        let tx = tx.clone();
+        move || recording_server(tx)
+    });
+    assert!(!shares_its_port(addr), "a harness server shares its port");
+
+    let servers = Steered::start(&harness, 2, move |index| steered_app(index, tx.clone()));
+    assert!(
+        shares_its_port(servers.addr),
+        "a steered group does not share its port"
+    );
+    servers.shutdown();
+    harness.shutdown();
+}
+
+#[test]
+fn socket_settings_that_tests_build_leave_so_reuseport_off() {
+    for (what, options) in [
+        ("one datagram per batch", one_datagram_per_batch()),
+        ("kernel release", kernel_release(Duration::from_millis(5))),
+    ] {
+        assert!(!options.socket.reuse_port, "{what}");
+    }
 }
 
 #[test]
@@ -6666,7 +6731,7 @@ fn a_steered_driver_that_is_not_a_server_worker_of_its_group_does_not_start() {
                 )
             };
             let server = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-            let socket = || MmsgBackend::bind(server, &MmsgOptions::default()).expect("a socket");
+            let socket = || MmsgBackend::bind(server, &mmsg_options()).expect("a socket");
             let refused = [
                 // Worker 0 of 2 in a group of 3.
                 builder()
@@ -6744,7 +6809,7 @@ impl QuicSession for Counted {
 fn the_driver_counts_the_packets_and_datagrams_its_connections_send() {
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     let (tx, rx) = mpsc::channel();
@@ -7242,7 +7307,7 @@ fn a_turn_counts_each_poll_by_the_bytes_it_staged() {
 
 /// Returns an endpoint config whose accepted connections may build up to `horizon` ahead.
 fn building_ahead(horizon: Duration) -> Arc<EndpointConfig> {
-    EndpointConfig::builder([7; 32])
+    EndpointConfig::builder(reset_key())
         .build_horizon(horizon)
         .build()
         .expect("an endpoint config")
@@ -7253,7 +7318,7 @@ fn kernel_release(horizon: Duration) -> MmsgOptions {
     MmsgOptions {
         txtime: true,
         txtime_horizon: horizon,
-        ..MmsgOptions::default()
+        ..mmsg_options()
     }
 }
 
@@ -7304,7 +7369,7 @@ fn accepted_connections_build_within_the_server_sockets_horizon_and_client_conne
         "the socket's horizon, under the endpoint's"
     );
     assert_eq!(
-        horizons(MmsgOptions::default(), default_ack_delay).0,
+        horizons(mmsg_options(), default_ack_delay).0,
         vec![(Duration::ZERO, Kind::Pacing)],
         "nothing ahead without release support"
     );
@@ -7499,7 +7564,7 @@ fn with_kernel_release_the_server_socket_is_flushed_after_each_attempt_and_for_a
 
     // The bulk connection is unpaced, and without kernel release it keeps the phase's reading
     // and its one flush.
-    let (events, _, record) = stalled_bulk(MmsgOptions::default(), None);
+    let (events, _, record) = stalled_bulk(mmsg_options(), None);
     assert!(
         most_attempts_per_flush(&events) >= 2,
         "without kernel release, each attempt had its own flush: {events:?}"
@@ -7633,7 +7698,7 @@ fn stalled_paced(setup: PacedSetup) -> Paced {
     } = setup;
     let valves = Arc::new(Valves::default());
     let harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     let (tx, rx) = mpsc::channel();
@@ -7771,7 +7836,7 @@ fn a_paced_attempt_requeued_on_a_full_batch_is_flushed_on_its_own_socket_before_
     const LEN: usize = 9_000;
     let valves = Arc::new(Valves::default());
     let mut harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     harness.limits.max_segments = 1;
@@ -7949,7 +8014,7 @@ fn stalled_clients(
     const LEN: usize = 9_000;
     let valves = Arc::new(Valves::default());
     let mut harness = Harness::<Gated>::with_options(GatedOptions {
-        mmsg: MmsgOptions::default(),
+        mmsg: mmsg_options(),
         valves: Arc::clone(&valves),
     });
     harness.limits = limits;
