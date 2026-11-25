@@ -830,6 +830,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_gso_send_refused_with_eio_goes_again_as_single_datagrams() {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -880,6 +881,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn every_gso_send_cut_from_a_stamped_run_carries_its_release() {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let fd = socket.as_fd();

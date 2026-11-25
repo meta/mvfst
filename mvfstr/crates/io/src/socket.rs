@@ -407,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_short_header_goes_to_the_worker_its_connection_id_names() {
         let (group, addr) = steered_group();
         for first in (0..=255u8).step_by(7) {
@@ -421,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_long_header_goes_to_the_worker_its_destination_connection_id_names() {
         let (group, addr) = steered_group();
         for (first, dcid_len) in (0..=255u8)
@@ -441,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_datagram_without_a_connection_id_to_read_is_left_to_the_kernels_hash() {
         let (group, addr) = steered_group();
         let unreadable: [(&str, &[u8]); 4] = [

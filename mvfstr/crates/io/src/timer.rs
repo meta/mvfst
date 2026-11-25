@@ -195,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn creating_one_fails_in_a_tokio_runtime_without_io() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -207,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn fires_no_earlier_than_its_deadline() {
         runtime().block_on(async {
             let mut timer = TimerFd::new().unwrap();
@@ -224,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_disarmed_timer_does_not_fire_and_a_rearmed_one_keeps_only_its_new_deadline() {
         runtime().block_on(async {
             let mut timer = TimerFd::new().unwrap();

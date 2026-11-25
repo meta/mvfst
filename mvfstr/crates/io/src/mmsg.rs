@@ -438,6 +438,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_short_batch_clears_readiness_so_the_next_poll_is_pending_without_a_receive() {
         let rt = runtime();
         let _guard = rt.enter();
@@ -453,6 +454,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn datagrams_that_arrive_after_a_short_batch_wake_the_task_and_are_delivered() {
         let rt = runtime();
         let _guard = rt.enter();
@@ -486,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_full_batch_reads_on_without_a_wake_and_the_short_batch_after_it_ends_the_reads() {
         let rt = runtime();
         let _guard = rt.enter();
@@ -504,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_full_batch_of_only_discarded_datagrams_reads_on_and_a_short_one_ends_the_reads() {
         let rt = runtime();
         let _guard = rt.enter();

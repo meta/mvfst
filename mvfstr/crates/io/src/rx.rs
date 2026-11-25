@@ -290,6 +290,7 @@ mod tests {
     use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
     use std::ptr;
+    use std::slice;
 
     use socket2::Domain;
     use socket2::Protocol;
@@ -372,6 +373,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn headers_built_once_by_new_give_every_batch_its_own_metadata() {
         let loop4 = IpAddr::from(Ipv4Addr::LOCALHOST);
         let loop6 = IpAddr::from(Ipv6Addr::LOCALHOST);
@@ -572,7 +574,115 @@ mod tests {
         }
     }
 
+    /// Reads every header of `rx` and, through its pointers, the whole name, control space, iovec
+    /// and buffer it reaches. Checks that every length is whole, that each header reaches its own
+    /// buffer, and that it holds the source and ECN codepoint of the last datagram written into it,
+    /// as `last` records.
+    fn read_every_header(rx: &Rx, last: &[Option<(SocketAddr, Ecn)>], at: &str) {
+        for (i, hdr) in rx.hdrs.iter().enumerate() {
+            let msg = &hdr.msg_hdr;
+            assert_eq!(
+                (msg.msg_namelen, msg.msg_controllen, msg.msg_iovlen),
+                (
+                    size_of::<libc::sockaddr_storage>() as _,
+                    cmsg::SPACE as _,
+                    1
+                ),
+                "{at}, header {i}"
+            );
+            // SAFETY: the name and control pointers reach a whole, aligned `sockaddr_storage` and
+            // `CmsgSpace`, and the iovec pointer one iovec, all owned by `rx`, which outlives the
+            // reads.
+            let (name, control, iov) = unsafe {
+                (
+                    msg.msg_name.cast::<libc::sockaddr_storage>().read(),
+                    msg.msg_control.cast::<CmsgSpace>().read(),
+                    msg.msg_iov.read(),
+                )
+            };
+            assert_eq!(
+                iov.iov_len, rx.size,
+                "{at}, header {i}: iov_len stays whole"
+            );
+            // SAFETY: the iovec reaches its whole buffer in `rx.buf`, which outlives the slice.
+            let data = unsafe { slice::from_raw_parts(iov.iov_base.cast::<u8>(), iov.iov_len) };
+            assert_eq!(data, &rx.buf[i * rx.size..][..rx.size], "{at}, header {i}");
+            let (src, ecn) = last[i].unzip();
+            assert_eq!(
+                (
+                    sys::to_socket_addr(&name, msg.msg_namelen),
+                    Cmsgs::parse(&control.0).ecn
+                ),
+                (src, ecn.unwrap_or(Ecn::NotEct)),
+                "{at}, header {i}"
+            );
+        }
+    }
+
     #[test]
+    fn every_header_reaches_its_storage_with_whole_lengths_after_short_and_full_batches() {
+        // Without a socket, so that it also runs under Miri, which checks each pointer the headers
+        // hold whenever the test writes or reads through it. The kernel shortens the name and
+        // control lengths of the headers that each batch fills; `rearm` must restore them, and
+        // every header, filled or not, must still reach its own storage after `Rx` has moved.
+        const BATCH: usize = 4;
+        let v4 = (
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 4433)),
+            0b10,
+            Ecn::Ect0,
+        );
+        let v6 = (
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443)),
+            0b01,
+            Ecn::Ect1,
+        );
+        // The source, traffic class and ECN codepoint of each datagram one call fills.
+        let batches: [&[(SocketAddr, u8, Ecn)]; 4] =
+            [&[v4, v6], &[v6, v4, v6, v4], &[v6], &[v4, v4, v6, v6]];
+        let mut rx = moved(Rx::new(BATCH, 64));
+        let mut last = [None; BATCH];
+        read_every_header(&rx, &last, "before the first call");
+        for (round, batch) in batches.iter().enumerate() {
+            rx.rearm();
+            read_every_header(&rx, &last, &format!("round {round}, after rearm"));
+            let seed = round as u8;
+            for (i, &(src, tos, ecn)) in batch.iter().enumerate() {
+                kernel_fill(&mut rx, i, src, tos, &bytes(seed, 10 + i));
+                last[i] = Some((src, ecn));
+            }
+            assert_eq!(rx.parse(batch.len()), batch.len(), "round {round}");
+            assert_eq!(rx.drained(), batch.len() < BATCH, "round {round}");
+            let whole = (size_of::<libc::sockaddr_storage>() as _, cmsg::SPACE as _);
+            for (i, hdr) in rx.hdrs.iter().enumerate() {
+                let lengths = (hdr.msg_hdr.msg_namelen, hdr.msg_hdr.msg_controllen);
+                assert_eq!(
+                    lengths != whole,
+                    i < batch.len(),
+                    "round {round}, header {i}: the kernel shortens only the headers it fills"
+                );
+            }
+            let got: Vec<_> = rx
+                .buffers()
+                .map(|(meta, data)| {
+                    let got = (meta.src, meta.ecn, data.to_vec());
+                    data.fill(0xff);
+                    got
+                })
+                .collect();
+            let want: Vec<_> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, &(src, _, ecn))| (src, ecn, bytes(seed, 10 + i)))
+                .collect();
+            assert_eq!(got, want, "round {round}");
+            rx = moved(rx);
+        }
+        rx.rearm();
+        read_every_header(&rx, &last, "after the last rearm");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_datagram_whose_control_data_was_cut_short_is_discarded() {
         let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
         let socket = crate::socket::open(local, None, &SocketOptions::default()).unwrap();

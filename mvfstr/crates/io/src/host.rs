@@ -658,6 +658,7 @@ mod tests {
     const HANG_GUARD: Duration = Duration::from_secs(20);
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_poll_sets_read_readiness_while_a_registered_socket_has_a_datagram() {
         let host = ManualHost::new().unwrap();
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -771,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_short_batch_clears_read_readiness_and_the_next_poll_waits_without_a_receive() {
         let host = ManualHost::new().unwrap();
         let mut backend = bind(&host, 32);
@@ -797,6 +799,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn datagrams_that_arrive_after_a_short_batch_wake_the_task_and_are_delivered() {
         let host = ManualHost::new().unwrap();
         let mut backend = bind(&host, 32);
@@ -831,6 +834,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_full_batch_reads_on_without_a_wake_and_the_short_batch_after_it_clears_readiness() {
         let host = ManualHost::new().unwrap();
         let mut backend = bind(&host, 4);
@@ -857,6 +861,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_full_batch_of_only_discarded_datagrams_reads_on_and_a_short_one_clears_readiness() {
         let host = ManualHost::new().unwrap();
         let mut backend = bind(&host, 4);
