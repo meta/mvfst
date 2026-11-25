@@ -11,10 +11,11 @@
 //! allocates on a steady path after a warm-up: bulk send with ACK processing, bulk receive with
 //! consume, DATAGRAM receive, and a loss and retransmit cycle, plus a forged Initial through route
 //! and accept. Stream censuses count what a receive buffer allocates for in-order read cycles and
-//! for a short request, and what a send buffer allocates for in-order ACKs. The census of a path
-//! that is already clean asserts 0, and the other censuses assert their count as an upper bound. A
-//! global allocator counts every allocation on each test's thread, and the binary holds only these
-//! tests.
+//! for a short request, and what a send buffer allocates for in-order ACKs. Key censuses count what
+//! one level's key set and one key update built from raw traffic secrets allocate. The census of a
+//! path that is already clean asserts 0, and the other censuses assert their count as an upper
+//! bound. A global allocator counts every allocation on each test's thread, and the binary holds
+//! only these tests.
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -25,6 +26,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use mvfstr_crypto::AES_128_GCM;
+use mvfstr_crypto::KeySet;
+use mvfstr_crypto::KeyUpdater;
+use mvfstr_crypto::TrafficSecret;
 use mvfstr_proto::AcceptError;
 use mvfstr_proto::Bytes;
 use mvfstr_proto::ClientConfig;
@@ -995,5 +1000,43 @@ fn census_a_forged_initial_through_route_and_accept() {
     assert!(
         allocations <= 15,
         "a forged Initial through route and accept: {allocations}"
+    );
+}
+
+/// Returns the raw traffic secrets of a SHA-256 suite for the two directions of one level.
+fn traffic_secrets() -> (TrafficSecret, TrafficSecret) {
+    let secret = |byte| TrafficSecret::new(&[byte; 32]).expect("a 32-byte secret");
+    (secret(0x11), secret(0x22))
+}
+
+#[test]
+fn census_a_key_set_from_raw_secrets_allocates_a_packet_key_and_a_header_key_per_direction() {
+    let (local, remote) = traffic_secrets();
+    // The first key set warms up what the crypto library sets up once.
+    drop(KeySet::from_secrets(&AES_128_GCM, &local, &remote));
+    let before = ALLOCATIONS.with(Cell::get);
+    let keys = KeySet::from_secrets(&AES_128_GCM, &local, &remote);
+    let allocations = ALLOCATIONS.with(Cell::get) - before;
+    drop(keys);
+    assert!(
+        allocations <= 4,
+        "a key set from raw secrets: {allocations}"
+    );
+}
+
+#[test]
+fn census_a_key_update_from_raw_secrets_allocates_only_its_two_packet_keys() {
+    let (local, remote) = traffic_secrets();
+    let current = KeySet::from_secrets(&AES_128_GCM, &local, &remote);
+    let mut updater = KeyUpdater::from_secrets(&AES_128_GCM, local, remote, &current);
+    drop(updater.next_keys());
+    let before = ALLOCATIONS.with(Cell::get);
+    let next = updater.next_keys();
+    let allocations = ALLOCATIONS.with(Cell::get) - before;
+    drop(next);
+    // The header-protection keys stay those of the first key set.
+    assert!(
+        allocations <= 2,
+        "a key update from raw secrets: {allocations}"
     );
 }

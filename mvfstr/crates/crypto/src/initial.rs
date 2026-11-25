@@ -12,7 +12,6 @@
 //! version.
 
 use std::fmt;
-use std::sync::Arc;
 
 use mvfstr_wire::Side;
 use mvfstr_wire::Version;
@@ -108,7 +107,7 @@ pub fn initial_keys(
         Side::Server => (&secrets.server, &secrets.client),
     };
     Ok(KeySet {
-        local: Arc::new(PacketKeys::from_secret(&AES_128_GCM, local)),
+        local: PacketKeys::from_secret(&AES_128_GCM, local),
         remote: PacketKeys::from_secret(&AES_128_GCM, remote),
     })
 }

@@ -320,6 +320,9 @@ pub struct RustlsSession {
     write_level: Level,
     /// The alert for a failure that rustls reported without one.
     alert: Option<AlertDescription>,
+    /// Keys rustls installed that mvfstr cannot use. rustls has moved past them while
+    /// `write_level` has not, so every later write fails.
+    refused_keys: Option<UnsupportedKeyError>,
     /// A server's config for a ClientHello without ALPN, until the ClientHello has arrived.
     alpn_choice: Option<Box<AlpnChoice>>,
     /// The start of the ClientHello a server is receiving, not yet given to rustls.
@@ -551,8 +554,8 @@ impl TlsSession {
     /// installed after them. Returns `Ok(None)` once TLS has written everything it has ready; call
     /// it until then after every [`read_crypto`](Self::read_crypto).
     ///
-    /// Fails with [`TlsError::UnsupportedKeys`] when rustls installs keys that mvfstr cannot use;
-    /// the connection must then close.
+    /// Fails with [`TlsError::UnsupportedKeys`] when rustls installs keys that mvfstr cannot use,
+    /// and on every call after that; the connection must then close.
     pub fn write_crypto(&mut self, buf: &mut Vec<u8>) -> Result<Option<CryptoOutput>, TlsError> {
         match self {
             Self::Rustls(session) => session.write_crypto(buf),
@@ -658,6 +661,7 @@ impl RustlsSession {
             version,
             write_level: Level::Initial,
             alert: None,
+            refused_keys: None,
             alpn_choice: None,
             partial_hello: Vec::new(),
             hello_unanswered: false,
@@ -801,6 +805,9 @@ impl RustlsSession {
     }
 
     fn write_crypto(&mut self, buf: &mut Vec<u8>) -> Result<Option<CryptoOutput>, TlsError> {
+        if let Some(error) = self.refused_keys {
+            return Err(TlsError::UnsupportedKeys(error));
+        }
         let start = buf.len();
         let level = self.write_level;
         let Some(conn) = self.conn_mut() else {
@@ -812,12 +819,12 @@ impl RustlsSession {
         let keys = match change {
             None => None,
             Some(quic::KeyChange::Handshake { keys }) => {
-                let keys = KeySet::from_rustls(keys).map_err(TlsError::UnsupportedKeys)?;
+                let keys = KeySet::from_rustls(keys).map_err(|error| self.refuse_keys(error))?;
                 self.write_level = Level::Handshake;
                 Some(KeyChange::Handshake(keys))
             }
             Some(quic::KeyChange::OneRtt { keys, next }) => {
-                let keys = KeySet::from_rustls(keys).map_err(TlsError::UnsupportedKeys)?;
+                let keys = KeySet::from_rustls(keys).map_err(|error| self.refuse_keys(error))?;
                 self.write_level = Level::OneRtt;
                 let update = KeyUpdater::new(next, &keys);
                 Some(KeyChange::OneRtt { keys, update })
@@ -828,6 +835,11 @@ impl RustlsSession {
         }
         self.hello_unanswered = false;
         Ok(Some(CryptoOutput { level, len, keys }))
+    }
+
+    fn refuse_keys(&mut self, error: UnsupportedKeyError) -> TlsError {
+        self.refused_keys = Some(error);
+        TlsError::UnsupportedKeys(error)
     }
 
     fn peer_transport_params(&self) -> Option<&[u8]> {

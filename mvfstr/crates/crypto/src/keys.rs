@@ -144,7 +144,10 @@ impl PacketKeys {
         // `KeyMaterial` holds keys of exactly `alg`'s length.
         let header =
             AeadHeaderKey::new(alg, material.hp()).expect("derived key has the algorithm's length");
-        let keys = PacketKeys::new(Box::new(aead_packet_key(alg, material)), Box::new(header));
+        let keys = PacketKeys::with_shared_header(
+            Box::new(aead_packet_key(alg, material)),
+            Arc::new(header),
+        );
         debug_assert!(
             keys.has_quic_lengths(),
             "derived keys use 16-byte tags and samples"
@@ -213,13 +216,10 @@ impl fmt::Debug for PacketKeys {
 }
 
 /// The keys of one encryption level in both directions.
-///
-/// The local keys are behind an `Arc` because a [`SealJob`](crate::SealJob) borrows them and a
-/// deferring sealer may hold them until it seals.
 #[derive(Debug)]
 pub struct KeySet {
     /// The keys protecting packets this endpoint sends.
-    pub local: Arc<PacketKeys>,
+    pub local: PacketKeys,
     /// The keys protecting packets the peer sends.
     pub remote: PacketKeys,
 }
@@ -229,7 +229,7 @@ impl KeySet {
     /// [`PacketKeys::from_rustls`] does for either direction.
     pub fn from_rustls(keys: rustls::quic::Keys) -> Result<KeySet, UnsupportedKeyError> {
         Ok(KeySet {
-            local: Arc::new(PacketKeys::from_rustls(keys.local)?),
+            local: PacketKeys::from_rustls(keys.local)?,
             remote: PacketKeys::from_rustls(keys.remote)?,
         })
     }
@@ -243,7 +243,7 @@ impl KeySet {
         remote: &TrafficSecret,
     ) -> KeySet {
         KeySet {
-            local: Arc::new(PacketKeys::from_traffic_secret(alg, local)),
+            local: PacketKeys::from_traffic_secret(alg, local),
             remote: PacketKeys::from_traffic_secret(alg, remote),
         }
     }
@@ -320,10 +320,7 @@ impl KeyUpdater {
             }
         };
         let next = KeySet {
-            local: Arc::new(PacketKeys::with_shared_header(
-                local,
-                self.local_header.clone(),
-            )),
+            local: PacketKeys::with_shared_header(local, self.local_header.clone()),
             remote: PacketKeys::with_shared_header(remote, self.remote_header.clone()),
         };
         debug_assert!(

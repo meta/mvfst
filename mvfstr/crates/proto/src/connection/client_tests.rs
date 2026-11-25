@@ -1313,14 +1313,14 @@ fn a_retry_after_0rtt_sends_the_early_data_again() {
         .collect();
     assert_eq!(packets[0].ty, PacketType::Initial);
     assert_eq!(packets[0].token, token);
-    let keys = client.early.as_ref().unwrap().keys.clone().unwrap();
+    let keys = client.early.as_ref().unwrap().keys.as_ref().unwrap();
     let mut streams = Vec::new();
     for packet in packets
         .iter()
         .filter(|packet| packet.ty == PacketType::ZeroRtt)
     {
         assert_eq!(packet.dcid, &cid(0xab)[..]);
-        let (_, plaintext) = open_long(&keys, packet);
+        let (_, plaintext) = open_long(keys, packet);
         for frame in Frames::new(&plaintext) {
             if let Frame::Stream {
                 id: frame_id,

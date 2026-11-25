@@ -300,7 +300,7 @@ struct RetryState {
 struct EarlyState {
     /// A client's 0-RTT write keys, until the handshake completes; a server's 0-RTT read keys,
     /// until it opens a 1-RTT packet.
-    keys: Option<Arc<PacketKeys>>,
+    keys: Option<PacketKeys>,
     /// A client's view of the parameters the server remembered (RFC 9000), in force until the
     /// server's own arrive.
     params: Option<TransportParameters>,
@@ -1350,14 +1350,14 @@ impl Connection {
             return;
         }
         self.early = Some(Box::new(EarlyState {
-            keys: Some(Arc::new(keys)),
+            keys: Some(keys),
             params: Some(view),
         }));
         self.push_event(ConnEvent::EarlyDataWritable);
     }
 
     /// Returns the keys that seal 0-RTT packets while a client sends them, before its 1-RTT keys.
-    fn zero_rtt_write_keys(&self) -> Option<&Arc<PacketKeys>> {
+    fn zero_rtt_write_keys(&self) -> Option<&PacketKeys> {
         if self.side != Side::Client || self.has_keys(Space::Data) {
             return None;
         }

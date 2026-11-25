@@ -7,10 +7,15 @@
 
 //! In-memory handshakes between client and server `TlsSession`s.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use mvfstr_crypto::AES_128_GCM;
 use mvfstr_crypto::CHACHA20_POLY1305;
 use mvfstr_crypto::InlineSealer;
 use mvfstr_crypto::KeySet;
@@ -30,12 +35,20 @@ use mvfstr_tls::TlsError;
 use mvfstr_tls::TlsSession;
 use mvfstr_wire::Side;
 use mvfstr_wire::Version;
+use rustls::CipherSuiteCommon;
+use rustls::SupportedCipherSuite;
+use rustls::Tls13CipherSuite;
+use rustls::crypto::cipher::AeadKey;
+use rustls::crypto::cipher::Iv;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
+use rustls::quic::Algorithm;
+use rustls::quic::HeaderProtectionKey;
 use rustls::quic::PacketKey;
+use rustls::quic::Tag;
 
 /// 2026-09-21, the Unix time the tests run at.
 const NOW: u64 = 1_790_000_000;
@@ -405,7 +418,7 @@ fn a_resuming_client_reports_only_the_parameters_of_the_current_connection() {
 
 /// Seals a packet at one level with `tx` and checks `rx` opens it. `header` is the unprotected
 /// header, ending with a packet number whose length is in its first byte.
-fn seal_and_open(tx: &Arc<PacketKeys>, rx: &PacketKeys, header: &[u8], pn: u64) {
+fn seal_and_open(tx: &PacketKeys, rx: &PacketKeys, header: &[u8], pn: u64) {
     let payload: Vec<u8> = (0..64u8).collect();
     let mut packet = [header, &payload, &[0; 16]].concat();
     let job = SealJob {
@@ -878,6 +891,174 @@ fn a_handshake_message_too_long_to_buffer_fails_with_decode_error() {
     assert_eq!(
         server.tls.alert().map(|code| code.into_inner()),
         Some(0x0132)
+    );
+}
+
+/// A packet key that reports a 12-byte AEAD tag and otherwise seals and opens as the key it wraps.
+struct TwelveByteTag(Box<dyn PacketKey>);
+
+impl PacketKey for TwelveByteTag {
+    fn encrypt_in_place(
+        &self,
+        packet_number: u64,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<Tag, rustls::Error> {
+        self.0.encrypt_in_place(packet_number, header, payload)
+    }
+
+    fn decrypt_in_place<'a>(
+        &self,
+        packet_number: u64,
+        header: &[u8],
+        payload: &'a mut [u8],
+    ) -> Result<&'a [u8], rustls::Error> {
+        self.0.decrypt_in_place(packet_number, header, payload)
+    }
+
+    fn tag_len(&self) -> usize {
+        12
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        self.0.confidentiality_limit()
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        self.0.integrity_limit()
+    }
+}
+
+/// mvfstr's AES-128-GCM, except that the packet keys it builds at the positions in `twelve_byte`,
+/// counting from 0, report a 12-byte tag. An endpoint builds its two Handshake keys first, then
+/// its two 1-RTT keys. It holds the TLS_AES_128_GCM_SHA256 suite that carries it, because rustls
+/// takes both as statics; each test has its own.
+struct TwelveByteTags {
+    built: AtomicUsize,
+    twelve_byte: Range<usize>,
+    suite: OnceLock<Tls13CipherSuite>,
+}
+
+impl TwelveByteTags {
+    const fn new(twelve_byte: Range<usize>) -> TwelveByteTags {
+        TwelveByteTags {
+            built: AtomicUsize::new(0),
+            twelve_byte,
+            suite: OnceLock::new(),
+        }
+    }
+}
+
+impl Algorithm for TwelveByteTags {
+    fn packet_key(&self, key: AeadKey, iv: Iv) -> Box<dyn PacketKey> {
+        let packet = AES_128_GCM.packet_key(key, iv);
+        if self
+            .twelve_byte
+            .contains(&self.built.fetch_add(1, Ordering::Relaxed))
+        {
+            return Box::new(TwelveByteTag(packet));
+        }
+        packet
+    }
+
+    fn header_protection_key(&self, key: AeadKey) -> Box<dyn HeaderProtectionKey> {
+        AES_128_GCM.header_protection_key(key)
+    }
+
+    fn aead_key_len(&self) -> usize {
+        AES_128_GCM.aead_key_len()
+    }
+}
+
+/// Returns a server rustls config, built without mvfstr_tls's suite rewrite, that offers only
+/// TLS_AES_128_GCM_SHA256 with `quic` as the QUIC algorithm.
+fn twelve_byte_tag_server(quic: &'static TwelveByteTags) -> Arc<rustls::ServerConfig> {
+    let base = &mvfstr_crypto::cipher_suite::TLS13_AES_128_GCM_SHA256;
+    let suite = quic.suite.get_or_init(|| Tls13CipherSuite {
+        common: CipherSuiteCommon {
+            suite: base.common.suite,
+            hash_provider: base.common.hash_provider,
+            confidentiality_limit: base.common.confidentiality_limit,
+        },
+        hkdf_provider: base.hkdf_provider,
+        aead_alg: base.aead_alg,
+        quic: Some(quic),
+    });
+    let mut provider = mvfstr_crypto::default_provider();
+    provider.cipher_suites = vec![SupportedCipherSuite::Tls13(suite)];
+    let (chain, key) = self_signed("localhost");
+    let time = Arc::new(ManualTimeProvider::new(unix(NOW)));
+    let mut config = rustls::ServerConfig::builder_with_details(Arc::new(provider), time)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    Arc::new(config)
+}
+
+/// Returns a server whose QUIC algorithm is `quic` and which has read a client's ClientHello.
+fn twelve_byte_tag_server_after_hello(quic: &'static TwelveByteTags) -> Peer {
+    let client = TlsSession::client(
+        client_config(&[b"h3"]),
+        Version::V1,
+        localhost(),
+        b"client transport parameters".to_vec(),
+    );
+    let server = TlsSession::server(
+        twelve_byte_tag_server(quic),
+        Version::V1,
+        b"server transport parameters".to_vec(),
+    );
+    let (mut client, mut server) = (Peer::new(client.unwrap()), Peer::new(server.unwrap()));
+    client.write(&mut server);
+    assert!(server.read().unwrap());
+    server
+}
+
+#[test]
+fn write_crypto_keeps_failing_once_tls_installs_unusable_keys() {
+    static HANDSHAKE_KEYS: TwelveByteTags = TwelveByteTags::new(0..2);
+    let mut server = twelve_byte_tag_server_after_hello(&HANDSHAKE_KEYS);
+    let mut buf = Vec::new();
+    // The ServerHello comes with the Handshake keys, which the session refuses.
+    let first = server.tls.write_crypto(&mut buf);
+    assert!(
+        matches!(first, Err(TlsError::UnsupportedKeys(_))),
+        "{first:?}"
+    );
+    // rustls has moved on to the Handshake flight and its usable 1-RTT keys. The session must not
+    // hand them out, under the level it had before the refusal or under any other.
+    let second = server.tls.write_crypto(&mut buf);
+    assert!(
+        matches!(second, Err(TlsError::UnsupportedKeys(_))),
+        "a session that refused keys stays failed: {second:?}"
+    );
+}
+
+#[test]
+fn write_crypto_keeps_failing_once_tls_installs_unusable_one_rtt_keys() {
+    static ONE_RTT_KEYS: TwelveByteTags = TwelveByteTags::new(2..4);
+    let mut server = twelve_byte_tag_server_after_hello(&ONE_RTT_KEYS);
+    let mut buf = Vec::new();
+    let hello = server.tls.write_crypto(&mut buf);
+    assert!(
+        matches!(&hello, Ok(Some(out)) if matches!(out.keys, Some(KeyChange::Handshake(_)))),
+        "{hello:?}"
+    );
+    // The Handshake flight comes with the 1-RTT keys, which the session refuses.
+    let flight = server.tls.write_crypto(&mut buf);
+    assert!(
+        matches!(flight, Err(TlsError::UnsupportedKeys(_))),
+        "{flight:?}"
+    );
+    // rustls has nothing more to write until the client's Finished arrives, and the session still
+    // reports the refusal.
+    let later = server.tls.write_crypto(&mut buf);
+    assert!(
+        matches!(later, Err(TlsError::UnsupportedKeys(_))),
+        "a session that refused keys stays failed: {later:?}"
     );
 }
 

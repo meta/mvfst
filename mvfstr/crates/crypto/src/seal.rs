@@ -9,13 +9,10 @@
 //!
 //! A packet is planned and written into a backend slot by the connection, then sealed: the
 //! payload is encrypted in place and header protection applied. The connection hands each built
-//! packet to a [`Sealer`]. [`InlineSealer`] seals at once; another sealer may record the job and
-//! seal a batch across connections in [`Sealer::finish`], before the backend flushes. Slot IDs
-//! stay valid in the backend until the run is flushed or abandoned, which is what lets a sealer
-//! defer.
+//! packet to a [`Sealer`], such as [`InlineSealer`], and the backend may send the slot as soon as
+//! the sealer returns.
 
 use std::fmt;
-use std::sync::Arc;
 
 use crate::header::SAMPLE_LEN;
 use crate::header::protect_header;
@@ -38,7 +35,7 @@ pub struct SealJob<'a> {
     /// The backend slot holding the packet.
     pub slot: SlotId,
     /// The keys of the packet's encryption level.
-    pub keys: &'a Arc<PacketKeys>,
+    pub keys: &'a PacketKeys,
     /// The full packet number, which forms the AEAD nonce.
     pub pn: u64,
     /// The header length, packet number included.
@@ -71,42 +68,19 @@ impl fmt::Display for SealError {
 
 impl std::error::Error for SealError {}
 
-/// Access to backend slots by ID, for a sealer that seals recorded jobs in
-/// [`Sealer::finish`].
-pub trait SlotAccess {
-    /// Returns the bytes of a slot that has not been flushed or abandoned.
-    fn slot_mut(&mut self, slot: SlotId) -> Option<&mut [u8]>;
-}
-
-/// The result of [`Sealer::finish`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SealOutcome {
-    /// Every recorded job is sealed. It is the only variant, so a deferred job that fails to seal
-    /// is not reported.
-    Done,
-}
-
-/// A sealer of built packets, which seals each one at once or before the next flush.
+/// A sealer of built packets, which seals each one before [`seal`](Self::seal) returns.
 pub trait Sealer {
-    /// Seals the packet in `pkt` (its slot's bytes, at least `job.len` long) or records the job
-    /// to seal it in [`finish`](Self::finish).
+    /// Seals the packet in `pkt`, its slot's bytes, at least `job.len` long.
     fn seal(&mut self, job: SealJob<'_>, pkt: &mut [u8]) -> Result<(), SealError>;
-
-    /// Seals every recorded job. Called before the backend flushes.
-    fn finish(&mut self, slots: &mut dyn SlotAccess) -> SealOutcome {
-        let _ = slots;
-        SealOutcome::Done
-    }
 }
 
-/// A sealer that seals each packet inside [`Sealer::seal`], encrypting the payload in place and
-/// then applying header protection (RFC 9001). Its [`Sealer::finish`] returns at once.
+/// A sealer that encrypts the payload in place and then applies header protection (RFC 9001).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InlineSealer;
 
 impl Sealer for InlineSealer {
     fn seal(&mut self, job: SealJob<'_>, pkt: &mut [u8]) -> Result<(), SealError> {
-        let keys = &**job.keys;
+        let keys = job.keys;
         let (len, hdr_len) = (usize::from(job.len), usize::from(job.hdr_len));
         if len == 0 || len > pkt.len() {
             return Err(SealError::BadLayout);
@@ -149,30 +123,6 @@ mod tests {
     use crate::testdata::hex;
     use crate::testdata::unhex;
 
-    struct Recorder(Vec<(SlotId, u64)>);
-
-    impl Sealer for Recorder {
-        fn seal(&mut self, job: SealJob<'_>, _pkt: &mut [u8]) -> Result<(), SealError> {
-            self.0.push((job.slot, job.pn));
-            Ok(())
-        }
-    }
-
-    struct NoSlots;
-
-    impl SlotAccess for NoSlots {
-        fn slot_mut(&mut self, _slot: SlotId) -> Option<&mut [u8]> {
-            None
-        }
-    }
-
-    #[test]
-    fn a_sealer_that_seals_inline_needs_no_finish() {
-        let mut sealer = Recorder(Vec::new());
-        assert_eq!(sealer.finish(&mut NoSlots), SealOutcome::Done);
-        assert!(sealer.0.is_empty());
-    }
-
     #[test]
     fn inline_sealer_reproduces_rfc9001_a2_and_a3() {
         let secrets = [
@@ -187,7 +137,7 @@ mod tests {
         ];
         for (secret, pn, header, payload, protected) in cases {
             let secret = unhex(secret).try_into().unwrap();
-            let keys = Arc::new(PacketKeys::from_secret(&AES_128_GCM, &secret));
+            let keys = PacketKeys::from_secret(&AES_128_GCM, &secret);
             let header = unhex(header);
             let mut slot = header.clone();
             slot.extend_from_slice(&payload);
@@ -217,7 +167,7 @@ mod tests {
 
     #[test]
     fn jobs_that_do_not_fit_their_slot_are_refused_unchanged() {
-        let keys = Arc::new(PacketKeys::from_secret(&AES_128_GCM, &[9; 32]));
+        let keys = PacketKeys::from_secret(&AES_128_GCM, &[9; 32]);
         let fits = short_packet(3);
         let job = |hdr_len: u16, len: u16| SealJob {
             slot: SlotId(0),
@@ -317,10 +267,10 @@ mod tests {
         let material = KeyMaterial::derive(&AES_128_GCM, &unhex(secret).try_into().unwrap());
         let packet = AeadPacketKey::new(&AES_128_GCM, material.key(), *material.iv()).unwrap();
         let header = AeadHeaderKey::new(&AES_128_GCM, material.hp()).unwrap();
-        let keys = Arc::new(PacketKeys::new(
+        let keys = PacketKeys::new(
             Box::new(NoLengthCalls(packet)),
             Box::new(NoLengthCalls(header)),
-        ));
+        );
         let header = unhex(A3_HEADER);
         let mut slot = [header.clone(), unhex(A3_PAYLOAD), vec![0; TAG_LEN]].concat();
         let job = SealJob {
@@ -342,9 +292,8 @@ mod tests {
 
     #[test]
     fn keys_can_be_shared_across_threads() {
-        // A `Connection` is `Send` and holds `Arc<PacketKeys>`; a batch sealer may share them.
+        // A `Connection` is `Send` and holds `PacketKeys`.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PacketKeys>();
-        assert_send_sync::<Arc<PacketKeys>>();
     }
 }

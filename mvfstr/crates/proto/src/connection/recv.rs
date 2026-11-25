@@ -571,7 +571,7 @@ impl Connection {
         if self.side != Side::Server {
             return None;
         }
-        self.early.as_ref()?.keys.as_deref()
+        self.early.as_ref()?.keys.as_ref()
     }
 
     /// Counts a packet that failed authentication; past the integrity limit, the connection
@@ -1085,7 +1085,7 @@ impl Connection {
                 .and_then(|keys| mvfstr_crypto::PacketKeys::from_rustls(keys).ok())
         {
             self.early = Some(Box::new(super::EarlyState {
-                keys: Some(std::sync::Arc::new(keys)),
+                keys: Some(keys),
                 params: None,
             }));
         }
