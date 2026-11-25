@@ -35,6 +35,7 @@ use mvfstr_wire::TransportErrorCode;
 use mvfstr_wire::Version;
 use mvfstr_wire::decode_packet_number;
 use mvfstr_wire::encode_retry;
+use mvfstr_wire::encode_version_negotiation;
 use rustls::CipherSuiteCommon;
 use rustls::SupportedCipherSuite;
 use rustls::Tls13CipherSuite;
@@ -43,10 +44,12 @@ use rustls::crypto::cipher::Iv;
 use rustls::quic;
 
 use super::Connection;
+use super::State;
 use super::stream_tests::App;
 use super::stream_tests::ORDER;
 use super::stream_tests::RTT;
 use super::stream_tests::run_apps;
+use super::tests::Forge;
 use super::tests::LIMIT;
 use super::tests::deliver;
 use super::tests::handshake;
@@ -990,6 +993,143 @@ fn a_client_follows_only_the_first_retry_and_none_after_a_server_packet() {
     assert_eq!(deliver(client, pair.now, server_addr(), late).dropped, 1);
     assert!(client.retry.is_none());
     assert_eq!(client.remote_cid(), peer);
+}
+
+/// Returns a pair after the handshake and a quiet half second.
+fn established() -> Pair {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let quiet = pair.now + Duration::from_millis(500);
+    pair.run(quiet);
+    pair
+}
+
+/// Returns a pair stopped at the step in which its client processed its first packet from the
+/// server.
+fn past_the_first_server_packet() -> Pair {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    assert!(pair.run_until(epoch + LIMIT, |pair| {
+        pair.client.conn().stats().recv_packets > 0
+    }));
+    pair
+}
+
+#[test]
+fn an_established_client_parses_no_short_header_datagram_for_a_retry() {
+    let mut pair = established();
+    let now = pair.now;
+    let server = pair.server.conn();
+    let datagrams: Vec<_> = (0..10)
+        .map(|i| Forge::of(server, Space::Data, 1_000 + i, &[Frame::Ping]).seal(server))
+        .collect();
+    let client = pair.client.conn_mut();
+    let probes = client.retry_probes;
+    for datagram in datagrams {
+        assert_eq!(deliver(client, now, server_addr(), datagram).packets, 1);
+    }
+    assert_eq!(
+        client.retry_probes - probes,
+        0,
+        "a Retry cannot be followed once a packet from the server was processed"
+    );
+}
+
+#[test]
+fn a_client_parses_datagrams_for_a_retry_only_until_it_follows_one() {
+    let (epoch, mut pair, _) = first_flight();
+    let client = pair.client.conn_mut();
+    let odcid = client.original_dcid;
+    let now = epoch + Duration::from_millis(20);
+    let first = retry_packet(client, cid(0xab), b"retry token", odcid);
+    assert_eq!(deliver(client, now, server_addr(), first).dropped, 0);
+    assert_eq!(
+        client.retry_probes, 1,
+        "the first Retry is parsed and followed"
+    );
+    while client.poll_event().is_some() {}
+
+    let second = retry_packet(client, cid(0xcd), b"another", odcid);
+    let summary = deliver(client, now, server_addr(), second);
+    assert_eq!((summary.packets, summary.dropped), (0, 1));
+    assert_eq!(
+        client.retry.as_ref().map(|retry| retry.scid),
+        Some(cid(0xab))
+    );
+    assert_eq!(client.remote_cid(), cid(0xab));
+    assert_eq!(client.poll_event(), None);
+    assert_eq!(client.state, State::Open);
+    assert_eq!(client.retry_probes, 1, "a second Retry cannot be followed");
+}
+
+#[test]
+fn a_retry_after_the_first_server_packet_is_dropped_without_a_retry_parse() {
+    let mut pair = past_the_first_server_packet();
+    let now = pair.now;
+    let client = pair.client.conn_mut();
+    let peer = client.remote_cid();
+    let received = client.stats().recv_packets;
+    let probes = client.retry_probes;
+    let late = retry_packet(client, cid(0xab), b"retry token", client.original_dcid);
+    let summary = deliver(client, now, server_addr(), late);
+    assert_eq!((summary.packets, summary.dropped), (0, 1));
+    assert!(client.retry.is_none());
+    assert_eq!(client.remote_cid(), peer);
+    assert_eq!(client.stats().recv_packets, received);
+    assert_eq!(client.poll_event(), None);
+    assert_eq!(client.state, State::Open);
+    // A long header with the Retry type is not parsed for a Retry either: the gate is the
+    // connection's state, not the first byte.
+    assert_eq!(
+        client.retry_probes - probes,
+        0,
+        "a Retry cannot be followed once a packet from the server was processed"
+    );
+}
+
+#[test]
+fn a_version_negotiation_after_the_first_server_packet_is_ignored_without_a_retry_parse() {
+    let mut pair = past_the_first_server_packet();
+    let now = pair.now;
+    let client = pair.client.conn_mut();
+    let probes = client.retry_probes;
+    let mut vn = vec![0; 100];
+    let versions = [Version(0x1a2a_3a4a)];
+    let len = encode_version_negotiation(
+        &mut vn,
+        0x2a,
+        &client.local_cid,
+        &client.original_dcid,
+        &versions,
+    )
+    .unwrap();
+    vn.truncate(len);
+    let summary = deliver(client, now, server_addr(), vn);
+    assert_eq!((summary.packets, summary.dropped), (0, 1));
+    assert_eq!(client.poll_event(), None);
+    assert_eq!(client.state, State::Open);
+    assert_eq!(
+        client.retry_probes - probes,
+        0,
+        "a Retry cannot be followed once a packet from the server was processed"
+    );
+}
+
+#[test]
+fn a_retry_shaped_datagram_ending_in_the_peer_token_resets_an_established_client() {
+    let mut pair = established();
+    let now = pair.now;
+    let client = pair.client.conn_mut();
+    let token = client.sources.cids.peer.current().unwrap().1.unwrap();
+    let mut datagram = retry_packet(client, cid(0xab), b"retry token", client.original_dcid);
+    datagram.extend_from_slice(&token.0);
+    let summary = deliver(client, now, server_addr(), datagram);
+    assert_eq!((summary.packets, summary.dropped), (0, 1));
+    let events: Vec<_> = std::iter::from_fn(|| client.poll_event()).collect();
+    assert_eq!(
+        closed(&events),
+        Some((CloseReason::Silent, Initiator::StatelessReset)),
+        "a datagram that cannot be processed and ends in the token is a stateless reset: \
+         {events:?}"
+    );
 }
 
 /// Returns a pair config whose client holds a session ticket from a finished connection.

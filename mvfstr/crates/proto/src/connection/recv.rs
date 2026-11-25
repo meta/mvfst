@@ -176,8 +176,15 @@ impl Connection {
         data: &mut [u8],
         summary: &mut RecvSummary,
     ) {
-        // A Retry is the whole datagram (RFC 9000); only a client takes one.
-        if self.side == Side::Client
+        // A Retry is the whole datagram (RFC 9000). A client can follow only one, and only before
+        // it processes a packet from the server, so only then is the header read for one.
+        let retry_followable =
+            self.side == Side::Client && self.stats.recv_packets == 0 && self.retry.is_none();
+        #[cfg(test)]
+        if retry_followable {
+            self.retry_probes += 1;
+        }
+        if retry_followable
             && let Ok(Header::Retry(retry)) = Header::parse(data, self.local_cid.len())
         {
             if !self.recv_retry(now, &retry, &data[..retry.packet_len()]) {
@@ -317,7 +324,7 @@ impl Connection {
     /// or a packet type that does not carry frames.
     fn parse(&self, data: &[u8]) -> Option<PacketInfo> {
         let Ok(Header::Protected(header)) = Header::parse(data, self.local_cid.len()) else {
-            // Retry and Version Negotiation are read before the packets.
+            // A Retry or Version Negotiation that can still matter is read before the packets.
             return None;
         };
         let long = header.version().is_some();

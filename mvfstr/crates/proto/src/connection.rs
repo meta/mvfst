@@ -423,6 +423,9 @@ pub struct Connection {
     local_tls_error: Option<Box<rustls::Error>>,
     /// The Retry a client followed.
     retry: Option<Box<RetryState>>,
+    /// The received datagrams whose header a client parsed to look for a Retry.
+    #[cfg(test)]
+    retry_probes: u64,
     /// 0-RTT keys and parameters while they are in use.
     early: Option<Box<EarlyState>>,
     /// When an ack-eliciting packet last went out or the keepalive last fired: the keepalive
@@ -598,6 +601,8 @@ impl Connection {
             stats: ConnStats::default(),
             local_tls_error: None,
             retry: None,
+            #[cfg(test)]
+            retry_probes: 0,
             early: None,
             keepalive_base: setup.now,
             now: setup.now,
