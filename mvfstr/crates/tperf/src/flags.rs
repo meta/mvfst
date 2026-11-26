@@ -13,6 +13,8 @@ use std::str::FromStr;
 
 use mvfstr_proto::CongestionControl;
 
+use crate::object::HEADER_LEN;
+
 /// Which side of the benchmark to run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -80,6 +82,7 @@ pub struct Flags {
     pub(crate) pacing: bool,
     pub(crate) gso: bool,
     pub(crate) max_cwnd_mss: u32,
+    /// The data streams of each connection, which the server opens and the client reports.
     pub(crate) num_streams: u32,
     pub(crate) bytes_per_stream: u64,
     pub(crate) max_receive_packet_size: u16,
@@ -102,6 +105,16 @@ pub struct Flags {
     /// The layout of the connection IDs this side issues.
     pub(crate) cid_format: CidFormat,
     pub(crate) tls_backend: TlsBackend,
+    /// The connections a client opens to the server.
+    pub(crate) num_conns: u32,
+    /// Objects per second that the server writes to each stream; 0 writes as fast as it can.
+    /// A client given the server's value reads the objects and measures each one's latency
+    /// against the send time in its header, which is valid only when client and server run on
+    /// the same host.
+    pub(crate) object_rate: u32,
+    /// The length of each object when `object_rate` is set, its 16-byte header included. The
+    /// client counts an object of another length as bad.
+    pub(crate) object_size: u32,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -109,6 +122,9 @@ pub(crate) const PACING_TICK_US: u32 = 200;
 
 /// mvfst's default minimum pacing burst.
 pub(crate) const MIN_BURST: u16 = 5;
+
+/// The default `--object_size`, about one datagram's payload.
+const OBJECT_SIZE: u32 = 1200;
 
 impl Default for Flags {
     /// The defaults of mvfst's tperf.
@@ -142,6 +158,9 @@ impl Default for Flags {
             work_budget_us: 0,
             cid_format: CidFormat::Random,
             tls_backend: TlsBackend::Inline,
+            num_conns: 1,
+            object_rate: 0,
+            object_size: OBJECT_SIZE,
         }
     }
 }
@@ -175,11 +194,10 @@ impl Flags {
                 return Err(FlagError::Unknown(body.to_owned()));
             }
         }
-        // Only the server opens streams, as in mvfst tperf, and only it takes `--tls_backend`.
+        // Only the server opens and ends streams, as in mvfst tperf, and only it takes
+        // `--tls_backend`. The client takes `--num_streams`, `--object_rate` and `--object_size`
+        // too, with the server's values, to read what it receives and label its summary line.
         if flags.mode == Mode::Client {
-            if flags.num_streams != 1 {
-                return Err(FlagError::ServerOnly("num_streams"));
-            }
             if flags.bytes_per_stream != 0 {
                 return Err(FlagError::ServerOnly("bytes_per_stream"));
             }
@@ -189,6 +207,8 @@ impl Flags {
             if flags.tls_backend != TlsBackend::Inline {
                 return Err(FlagError::ServerOnly("tls_backend"));
             }
+        } else if flags.num_conns != 1 {
+            return Err(FlagError::ClientOnly("num_conns"));
         }
         if flags.congestion == CongestionControl::Bbr3 && !flags.pacing {
             return Err(FlagError::Bbr3NeedsPacing);
@@ -295,6 +315,16 @@ impl Flags {
                     _ => return Err(bad()),
                 }
             }
+            "num_conns" => self.num_conns = positive(value).ok_or_else(bad)?,
+            "object_rate" => self.object_rate = value.parse().map_err(|_| bad())?,
+            // An object holds at least its header.
+            "object_size" => {
+                self.object_size = value
+                    .parse()
+                    .ok()
+                    .filter(|&size| size >= HEADER_LEN as u32)
+                    .ok_or_else(bad)?
+            }
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -320,7 +350,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 22] = [
+const VALUE_FLAGS: [&str; 25] = [
     "mode",
     "host",
     "port",
@@ -341,6 +371,9 @@ const VALUE_FLAGS: [&str; 22] = [
     "work_budget_us",
     "cid_format",
     "tls_backend",
+    "num_conns",
+    "object_rate",
+    "object_size",
     "minloglevel",
     "v",
 ];
@@ -368,6 +401,8 @@ pub enum FlagError {
     MissingValue(String),
     /// A server-only flag was set in client mode.
     ServerOnly(&'static str),
+    /// A client-only flag was set in server mode.
+    ClientOnly(&'static str),
     /// BBR3 was chosen without pacing, which it needs.
     Bbr3NeedsPacing,
     /// BBR3 was chosen for the client, which never paces.
@@ -400,6 +435,7 @@ impl fmt::Display for FlagError {
             Self::Unknown(flag) => write!(f, "unknown command line flag '{flag}'"),
             Self::MissingValue(flag) => write!(f, "flag '{flag}' is missing its argument"),
             Self::ServerOnly(flag) => write!(f, "{flag} option is server only"),
+            Self::ClientOnly(flag) => write!(f, "{flag} option is client only"),
             Self::Bbr3NeedsPacing => write!(
                 f,
                 "--congestion=bbr3 needs --pacing; mvfstr-tperf does not fall back to another controller"
@@ -474,6 +510,9 @@ mod tests {
             work_budget_us: 0,
             cid_format: CidFormat::Random,
             tls_backend: TlsBackend::Inline,
+            num_conns: 1,
+            object_rate: 0,
+            object_size: 1200,
         };
         assert_eq!(flags, expected);
     }
@@ -536,6 +575,9 @@ mod tests {
                 work_budget_us: 0,
                 cid_format: CidFormat::Random,
                 tls_backend: TlsBackend::Inline,
+                num_conns: 1,
+                object_rate: 0,
+                object_size: 1200,
             }
         );
         let server = parse(&[
@@ -692,10 +734,6 @@ mod tests {
     #[test]
     fn a_client_refuses_the_server_only_stream_flags() {
         assert_eq!(
-            parse(&["--mode=client", "--num_streams=2"]),
-            Err(FlagError::ServerOnly("num_streams"))
-        );
-        assert_eq!(
             parse(&["--bytes_per_stream=10", "--mode=client"]),
             Err(FlagError::ServerOnly("bytes_per_stream")),
             "checked once every flag is read"
@@ -847,5 +885,110 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(flags, Flags::default());
+    }
+
+    #[test]
+    fn the_object_and_connection_flags_default_to_todays_run_and_take_both_forms() {
+        let defaults = Flags::default();
+        assert_eq!(
+            (
+                defaults.num_conns,
+                defaults.object_rate,
+                defaults.object_size
+            ),
+            (1, 0, 1200),
+            "one connection, writing as fast as it can"
+        );
+        let client = parse(&["--mode=client", "--num_conns=8"]).unwrap();
+        assert_eq!(
+            client,
+            Flags {
+                mode: Mode::Client,
+                num_conns: 8,
+                ..Flags::default()
+            }
+        );
+        assert_eq!(
+            parse(&["--mode", "client", "--num_conns", "4"]).map(|flags| flags.num_conns),
+            Ok(4)
+        );
+        let server = parse(&["--num_streams=2", "--object_rate=50", "--object_size=4096"]).unwrap();
+        assert_eq!(
+            server,
+            Flags {
+                num_streams: 2,
+                object_rate: 50,
+                object_size: 4096,
+                ..Flags::default()
+            }
+        );
+        let server = parse(&["--object_rate", "30", "--object_size", "16"]).unwrap();
+        assert_eq!((server.object_rate, server.object_size), (30, 16));
+        assert_eq!(
+            parse(&["--object_rate=50", "--object_rate=0"]).map(|flags| flags.object_rate),
+            Ok(0),
+            "0 writes as fast as it can"
+        );
+    }
+
+    #[test]
+    fn num_conns_is_client_only_and_both_sides_take_the_stream_and_object_flags() {
+        assert_eq!(
+            parse(&["--num_conns=4"]),
+            Err(FlagError::ClientOnly("num_conns")),
+            "a server by default"
+        );
+        assert_eq!(
+            parse(&["--num_conns=2", "--mode=server"]),
+            Err(FlagError::ClientOnly("num_conns"))
+        );
+        assert!(parse(&["--mode=server", "--num_conns=1"]).is_ok());
+        // The client reads what the server writes with the server's values.
+        for mode in ["--mode=client", "--mode=server"] {
+            let flags = parse(&[
+                mode,
+                "--num_streams=2",
+                "--object_rate=50",
+                "--object_size=4096",
+            ]);
+            assert_eq!(
+                flags.map(|flags| (flags.num_streams, flags.object_rate, flags.object_size)),
+                Ok((2, 50, 4096)),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            FlagError::ClientOnly("num_conns").to_string(),
+            "num_conns option is client only"
+        );
+    }
+
+    #[test]
+    fn values_outside_the_object_and_connection_flags_ranges_are_refused() {
+        // An object holds at least its 16-byte header, and its length fits the header's 4 bytes.
+        for arg in [
+            "--num_conns=0",
+            "--num_conns=-1",
+            "--num_conns=many",
+            "--object_rate=-1",
+            "--object_rate=fast",
+            "--object_size=0",
+            "--object_size=15",
+            "--object_size=4294967296",
+        ] {
+            let (flag, value) = arg[2..].split_once('=').unwrap();
+            assert_eq!(
+                parse(&["--mode=client", arg]),
+                Err(FlagError::BadValue {
+                    flag: flag.to_owned(),
+                    value: value.to_owned(),
+                }),
+                "{arg}"
+            );
+        }
+        assert_eq!(
+            parse(&["--object_size=16", "--object_size=4294967295"]).map(|flags| flags.object_size),
+            Ok(u32::MAX)
+        );
     }
 }

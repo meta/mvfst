@@ -11,6 +11,7 @@
 use std::fmt;
 use std::io;
 use std::io::Write;
+use std::mem;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::rc::Rc;
@@ -35,7 +36,6 @@ use mvfstr_io::TxCaps;
 use mvfstr_proto::ClientConfig;
 use mvfstr_proto::CloseReason;
 use mvfstr_proto::ConnOptions;
-use mvfstr_proto::ConnStats;
 use mvfstr_proto::EndpointConfig;
 use mvfstr_proto::ServerConfig;
 use mvfstr_proto::TransportConfig;
@@ -46,6 +46,7 @@ use rustls::pki_types::ServerName;
 
 use crate::client::ClientApp;
 use crate::client::ClientSession;
+use crate::client::ConnReport;
 use crate::client::Outcome;
 use crate::config;
 use crate::config::SERVER_NAME;
@@ -55,13 +56,18 @@ use crate::flags::HostLoop;
 use crate::flags::Mode;
 use crate::manual::ManualWorker;
 use crate::manual::io_host;
+use crate::report::ConnTally;
 use crate::report::Measurement;
+use crate::report::WriteMode;
 use crate::report::closed_line;
+use crate::report::server_summary_line;
 use crate::report::startup_line;
 use crate::report::stats_line;
+use crate::report::summary_line;
 use crate::server::Closed;
 use crate::server::Driver;
 use crate::server::ServerApp;
+use crate::server::ServerCounters;
 use crate::server::Settings;
 
 /// The capacity of a worker's command queue; each side submits one command.
@@ -124,6 +130,21 @@ pub(crate) struct RunningServer {
     addr: SocketAddr,
     startup: String,
     closed: mpsc::Receiver<Closed>,
+    summary: ServerSummary,
+}
+
+/// What a server's summary line reads, from any thread.
+#[derive(Clone, Debug)]
+pub(crate) struct ServerSummary {
+    mode: WriteMode,
+    counters: Arc<ServerCounters>,
+}
+
+impl ServerSummary {
+    /// Returns the server's summary line for what it has done so far.
+    pub(crate) fn line(&self) -> String {
+        server_summary_line(self.mode, &self.counters.tally())
+    }
 }
 
 impl RunningServer {
@@ -141,6 +162,17 @@ impl RunningServer {
     /// channel ends when the server's worker stops.
     pub(crate) fn closed_connections(&self) -> &mpsc::Receiver<Closed> {
         &self.closed
+    }
+
+    /// Returns the server's summary line for what it has done so far.
+    #[cfg(test)]
+    pub(crate) fn summary_line(&self) -> String {
+        self.summary.line()
+    }
+
+    /// Returns what reads the server's summary line, which may move to another thread.
+    pub(crate) fn summary(&self) -> ServerSummary {
+        self.summary.clone()
     }
 }
 
@@ -267,6 +299,7 @@ struct ServerSetup {
     settings: Settings,
     segments: u16,
     closed: mpsc::Receiver<Closed>,
+    summary: ServerSummary,
 }
 
 impl ServerSetup {
@@ -277,15 +310,21 @@ impl ServerSetup {
         let (server, host_tls) = config::server_config(flags)?;
         let transport = Arc::clone(server.transport());
         let (closed_tx, closed) = mpsc::channel();
+        let settings = Settings::new(flags, closed_tx, host_tls);
+        let summary = ServerSummary {
+            mode: write_mode(flags),
+            counters: settings.counters(),
+        };
         Ok(Self {
             addr,
             endpoint,
             build_horizon,
             server,
             transport,
-            settings: Settings::new(flags, closed_tx, host_tls),
+            settings,
             segments: max_segments(flags),
             closed,
+            summary,
         })
     }
 }
@@ -306,6 +345,7 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
         settings,
         segments,
         closed,
+        summary,
     } = ServerSetup::new(flags)?;
     let worker = Worker::new(flags.host_loop)?;
     let (started_tx, started) = mpsc::channel();
@@ -328,26 +368,30 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
         addr,
         startup: startup_line(&transport, build_horizon, &caps),
         closed,
+        summary,
     })
 }
 
 /// Runs a client configured by `flags` and writes its result lines to `out`.
 pub(crate) fn run_client(flags: &Flags, out: &mut impl Write) -> Result<(), RunError> {
-    run_client_with(flags, config::client_config(flags)?, out)
+    run_client_with(flags, config::client_config(flags)?, out).map(drop)
 }
 
-/// Runs a client with the config `client` and every other setting from `flags`.
+/// Runs a client with the config `client` and every other setting from `flags`, and returns what
+/// each of its connections received.
 fn run_client_with(
     flags: &Flags,
     client: Arc<ClientConfig>,
     out: &mut impl Write,
-) -> Result<(), RunError> {
+) -> Result<Vec<ConnTally>, RunError> {
     let remote = resolve(flags)?;
     let endpoint = config::endpoint_config(flags)?;
     let options = backend_options(flags);
     let name =
         ServerName::try_from(SERVER_NAME).map_err(|error| RunError::Start(error.to_string()))?;
     let duration_secs = flags.duration_secs;
+    let conns = usize::try_from(flags.num_conns).unwrap_or(usize::MAX);
+    let object_size = (write_mode(flags) == WriteMode::Paced).then_some(flags.object_size);
     let worker = Worker::new(flags.host_loop)?;
     let (outcomes_tx, outcomes) = mpsc::channel();
     let (started_tx, started) = mpsc::channel();
@@ -357,26 +401,36 @@ fn run_client_with(
             HostLoop::Tokio => connect::<MmsgBackend>,
             HostLoop::Manual => connect::<HostBackend<ManualHost>>,
         };
-        let session = ClientSession::new(duration_secs, outcomes_tx);
+        let sessions = (0..conns)
+            .map(|index| ClientSession::new(index, duration_secs, object_size, outcomes_tx.clone()))
+            .collect();
         let _ = started_tx.send(connect(
-            worker, endpoint, options, remote, name, client, session,
+            worker, endpoint, options, remote, name, client, sessions,
         ));
     })?;
     started
         .recv()
         .map_err(|_| RunError::WorkerGone)?
         .map_err(RunError::Start)?;
-    let result = match outcomes.recv() {
-        Ok(Outcome::Measured { measurement, stats }) => {
-            write_results(out, &measurement, flags.stats.then_some(&stats))
-                .map_err(RunError::Output)
+    // A connection drains after it reports, possibly before another one reports.
+    let mut drained = 0;
+    let mut measured = Vec::with_capacity(conns);
+    let result = loop {
+        if measured.len() == conns {
+            break write_results(out, flags, &mut measured).map_err(RunError::Output);
         }
-        Ok(Outcome::Closed(reason)) => Err(RunError::Closed(reason)),
-        Ok(Outcome::Drained) | Err(_) => Err(RunError::WorkerGone),
+        match outcomes.recv() {
+            Ok(Outcome::Measured(report)) => measured.push(report),
+            Ok(Outcome::Drained) => drained += 1,
+            Ok(Outcome::Closed(reason)) => break Err(RunError::Closed(reason)),
+            Err(_) => break Err(RunError::WorkerGone),
+        }
     };
-    while let Ok(outcome) = outcomes.recv_timeout(DRAIN_WAIT) {
+    while drained < conns
+        && let Ok(outcome) = outcomes.recv_timeout(DRAIN_WAIT)
+    {
         if matches!(outcome, Outcome::Drained) {
-            break;
+            drained += 1;
         }
     }
     worker.shutdown()?;
@@ -450,7 +504,8 @@ fn spawn_server<B: Backend>(
     started
 }
 
-/// Starts a client driver on `worker`, on backend `B`, and opens its connection to `remote`.
+/// Starts a client driver on `worker`, on backend `B`, and opens a connection to `remote` for
+/// each of `sessions`.
 fn connect<B: TperfBackend>(
     worker: &WorkerContext,
     endpoint: Arc<EndpointConfig>,
@@ -458,31 +513,66 @@ fn connect<B: TperfBackend>(
     remote: SocketAddr,
     name: ServerName<'static>,
     client: Arc<ClientConfig>,
-    session: ClientSession,
+    sessions: Vec<ClientSession>,
 ) -> Result<(), String> {
     let driver = EndpointDriver::<_, B>::builder(endpoint, ClientApp)
         .backend_options(B::options(options))
         .spawn(worker)
         .map_err(|error| error.to_string())?;
-    driver
-        .connect(remote, name, client, ConnOptions::default(), session)
-        .map(drop)
-        .map_err(|error| error.to_string())
+    sessions.into_iter().try_for_each(|session| {
+        driver
+            .connect(
+                remote,
+                name.clone(),
+                Arc::clone(&client),
+                ConnOptions::default(),
+                session,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string())
+    })
 }
 
-/// Writes the result lines, then the stats line if `stats` is given.
+/// Writes the result lines for what the connections in `reports` received, which tperf's lines
+/// total, then each connection's stats line under `--stats`, then the summary line. Returns what
+/// each connection received, in the order the connections opened.
 fn write_results(
     out: &mut impl Write,
-    measurement: &Measurement,
-    stats: Option<&ConnStats>,
-) -> io::Result<()> {
-    for line in measurement.lines() {
+    flags: &Flags,
+    reports: &mut [ConnReport],
+) -> io::Result<Vec<ConnTally>> {
+    reports.sort_unstable_by_key(|report| report.index);
+    let total = Measurement {
+        bytes: reports.iter().map(|report| report.measurement.bytes).sum(),
+        duration_secs: flags.duration_secs,
+        streams: reports
+            .iter()
+            .map(|report| report.measurement.streams)
+            .sum(),
+    };
+    for line in total.lines() {
         writeln!(out, "{line}")?;
     }
-    if let Some(stats) = stats {
-        writeln!(out, "{}", stats_line(stats))?;
+    if flags.stats {
+        for report in reports.iter() {
+            writeln!(out, "{}", stats_line(&report.stats))?;
+        }
     }
-    Ok(())
+    let tallies: Vec<ConnTally> = reports
+        .iter_mut()
+        .map(|report| mem::take(&mut report.received))
+        .collect();
+    writeln!(
+        out,
+        "{}",
+        summary_line(
+            write_mode(flags),
+            flags.duration_secs,
+            flags.num_streams,
+            &tallies
+        )
+    )?;
+    Ok(tallies)
 }
 
 /// Resolves `--host` and `--port` to the first address they name.
@@ -496,6 +586,16 @@ fn resolve(flags: &Flags) -> Result<SocketAddr, RunError> {
         .map_err(unresolved)?
         .next()
         .ok_or_else(|| unresolved(io::Error::new(io::ErrorKind::NotFound, "no address")))
+}
+
+/// Returns what a server writes, and a client reads, with `flags`: objects on a clock under
+/// `--object_rate`.
+fn write_mode(flags: &Flags) -> WriteMode {
+    if flags.object_rate > 0 {
+        WriteMode::Paced
+    } else {
+        WriteMode::Saturate
+    }
 }
 
 /// Returns the most datagrams one transmit attempt builds: `--writes_per_loop` with GSO, else one.
@@ -568,6 +668,8 @@ pub enum RunError {
     WorkerGone,
     /// Writing the result lines failed.
     Output(io::Error),
+    /// The server could not block the signals that end it.
+    Signals(io::Error),
 }
 
 impl fmt::Display for RunError {
@@ -581,6 +683,7 @@ impl fmt::Display for RunError {
             Self::Closed(reason) => write!(f, "the connection closed early: {reason:?}"),
             Self::WorkerGone => f.write_str("the worker stopped without a result"),
             Self::Output(error) => write!(f, "cannot write the results: {error}"),
+            Self::Signals(error) => write!(f, "cannot block SIGINT and SIGTERM: {error}"),
         }
     }
 }
@@ -588,7 +691,10 @@ impl fmt::Display for RunError {
 impl std::error::Error for RunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Resolve { error, .. } | Self::Loop(error) | Self::Output(error) => Some(error),
+            Self::Resolve { error, .. }
+            | Self::Loop(error)
+            | Self::Output(error)
+            | Self::Signals(error) => Some(error),
             Self::Setup(error) => Some(error),
             Self::Worker(error) => Some(error),
             Self::Start(_) | Self::Closed(_) | Self::WorkerGone => None,
@@ -613,6 +719,7 @@ mod tests {
     use super::*;
     use crate::flags::QuicVersion;
     use crate::flags::TlsBackend;
+    use crate::object::HEADER_LEN;
     use crate::report;
     use crate::report::format_g;
 
@@ -1116,8 +1223,565 @@ mod tests {
                 ..loopback(Mode::Client, 0)
             },
         );
-        let last = output.lines().last().unwrap_or_default();
-        assert!(last.starts_with("Stats: sent_packets="), "{output}");
-        assert!(!last.contains("recv_packets=0 "), "{output}");
+        let stats = output
+            .lines()
+            .find(|line| line.starts_with("Stats: "))
+            .unwrap_or_default();
+        assert!(stats.starts_with("Stats: sent_packets="), "{output}");
+        assert!(!stats.contains("recv_packets=0 "), "{output}");
+    }
+
+    /// The keys of the client's summary line, in order.
+    const SUMMARY_KEYS: [&str; 13] = [
+        "stack",
+        "mode",
+        "conns",
+        "streams_per_conn",
+        "duration_s",
+        "bytes",
+        "mbps",
+        "conn_mbps_min",
+        "conn_mbps_p50",
+        "conn_mbps_max",
+        "stream_bytes_min",
+        "stream_bytes_max",
+        "streams_opened",
+    ];
+
+    /// The keys that a paced run adds to the client's summary line, in order.
+    const PACED_KEYS: [&str; 7] = [
+        "objects",
+        "bad_objects",
+        "lat_us_p50",
+        "lat_us_p90",
+        "lat_us_p99",
+        "lat_us_p999",
+        "lat_us_max",
+    ];
+
+    /// The keys of the server's summary line, in order, and those that paced mode adds.
+    const SERVER_KEYS: [&str; 3] = ["stack", "mode", "conns"];
+    const SERVER_PACED_KEYS: [&str; 3] = ["objects_sent", "objects_dropped", "late_ticks"];
+
+    /// The fields of a summary line, as a harness reads them.
+    struct Summary<'a> {
+        line: &'a str,
+        fields: Vec<(&'a str, &'a str)>,
+    }
+
+    impl Summary<'_> {
+        fn get(&self, key: &str) -> &str {
+            self.fields
+                .iter()
+                .find_map(|&(name, value)| (name == key).then_some(value))
+                .unwrap_or_else(|| panic!("no {key} in {}", self.line))
+        }
+
+        fn int(&self, key: &str) -> u64 {
+            let value = self.get(key);
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{key}={value} is not an integer in {}", self.line))
+        }
+
+        fn float(&self, key: &str) -> f64 {
+            let value = self.get(key);
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{key}={value} is not a number in {}", self.line))
+        }
+    }
+
+    /// Returns the one line of `output` whose first word is `tag`, after checking that its
+    /// fields are `key=value` pairs with the keys `keys`, in order.
+    fn read_summary<'a>(output: &'a str, tag: &str, keys: &[&str]) -> Summary<'a> {
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.split(' ').next() == Some(tag))
+            .collect();
+        let &[line] = lines.as_slice() else {
+            panic!("{} {tag} lines in {output:?}", lines.len());
+        };
+        let fields: Vec<(&str, &str)> = line
+            .split(' ')
+            .skip(1)
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("{field:?} is not key=value in {line}"))
+            })
+            .collect();
+        let names: Vec<&str> = fields.iter().map(|&(name, _)| name).collect();
+        assert_eq!(names, keys, "{line}");
+        Summary { line, fields }
+    }
+
+    /// Returns the keys of a paced client summary line.
+    fn paced_keys() -> Vec<&'static str> {
+        SUMMARY_KEYS.iter().chain(&PACED_KEYS).copied().collect()
+    }
+
+    /// Returns megabits of 10^6 bits per second as the summary lines print them.
+    fn mbps(bytes: u64, duration_secs: u32) -> String {
+        format!("{:.3}", bytes as f64 * 8.0 / 1e6 / f64::from(duration_secs))
+    }
+
+    #[test]
+    fn a_default_run_prints_tperfs_three_lines_and_then_one_saturate_summary_line() {
+        let server = start_server(&loopback(Mode::Server, 0)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 4, "{output}");
+        let parsed = report::parse(&lines[..3].join("\n"))
+            .unwrap_or_else(|| panic!("no result lines first in {output:?}"));
+        assert!(parsed.bytes > 0, "{output}");
+        let summary = read_summary(lines[3], "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(
+            [summary.get("stack"), summary.get("mode")],
+            ["mvfstr", "saturate"],
+            "{output}"
+        );
+        assert_eq!(
+            ["conns", "streams_per_conn", "duration_s", "streams_opened"]
+                .map(|key| summary.int(key)),
+            [1, 1, 1, 1],
+            "{output}"
+        );
+        assert_eq!(
+            ["bytes", "stream_bytes_min", "stream_bytes_max"].map(|key| summary.int(key)),
+            [parsed.bytes; 3],
+            "the one stream carries what the first line counts: {output}"
+        );
+        let expected = mbps(parsed.bytes, 1);
+        for key in ["mbps", "conn_mbps_min", "conn_mbps_p50", "conn_mbps_max"] {
+            assert_eq!(summary.get(key), expected, "{key}: {output}");
+        }
+    }
+
+    #[test]
+    fn under_stats_the_summary_line_comes_last_after_the_stats_line() {
+        let server = start_server(&loopback(Mode::Server, 0)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                stats: true,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 5, "{output}");
+        assert!(lines[3].starts_with("Stats: sent_packets="), "{output}");
+        read_summary(lines[4], "tperf_summary", &SUMMARY_KEYS);
+    }
+
+    #[test]
+    fn under_stats_each_connection_prints_its_stats_line_before_the_summary_line() {
+        let server = start_server(&loopback(Mode::Server, 0)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                num_conns: 2,
+                stats: true,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 6, "{output}");
+        for line in &lines[3..5] {
+            assert!(line.starts_with("Stats: sent_packets="), "{output}");
+            assert!(!line.contains("recv_packets=0 "), "{output}");
+        }
+        let summary = read_summary(lines[5], "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(summary.int("conns"), 2, "{output}");
+    }
+
+    #[test]
+    fn a_paced_server_that_cannot_keep_up_drops_its_oldest_objects_and_counts_late_ticks() {
+        // A 64 KiB object every 20 µs is 3.3 GB/s on one stream, more than the loopback carries,
+        // so ticks start late and, once 64 objects wait, each tick drops the oldest. The first
+        // object fits the transport's 64 KiB per-stream staging cap. The next needs 64 KiB to
+        // leave and a `Writable` edge to resume the stream, about 65 ms even at 1 MB/s.
+        let paced = |mode| Flags {
+            object_rate: 50_000,
+            object_size: 64 << 10,
+            ..loopback(mode, 0)
+        };
+        let server = start_server(&paced(Mode::Server)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..paced(Mode::Client)
+            },
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(summary.get("mode"), "paced", "{output}");
+        let line = server.summary_line();
+        let keys: Vec<&str> = SERVER_KEYS
+            .iter()
+            .chain(&SERVER_PACED_KEYS)
+            .copied()
+            .collect();
+        let served = read_summary(&line, "tperf_server_summary", &keys);
+        assert!(
+            served.int("objects_sent") > 1,
+            "the server writes a blocked stream again after its `Writable` edge: {line}"
+        );
+        assert!(served.int("objects_dropped") > 0, "{line}");
+        assert!(served.int("late_ticks") > 0, "{line}");
+    }
+
+    #[test]
+    fn ticks_that_one_timer_wake_runs_together_are_late_only_if_objects_wait() {
+        // At 10,000 ticks a second the driver's millisecond timer runs about ten ticks per wake.
+        // Header-only objects keep the byte rate low enough that the stream can drain each tick.
+        let paced = |mode| Flags {
+            object_rate: 10_000,
+            object_size: HEADER_LEN as u32,
+            ..loopback(mode, 0)
+        };
+        let server = start_server(&paced(Mode::Server)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..paced(Mode::Client)
+            },
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert!(
+            summary.int("objects") >= 8_000,
+            "a wake runs every tick it missed, so most of the 10,000 arrive: {output}"
+        );
+        let line = server.summary_line();
+        let keys: Vec<&str> = SERVER_KEYS
+            .iter()
+            .chain(&SERVER_PACED_KEYS)
+            .copied()
+            .collect();
+        let served = read_summary(&line, "tperf_server_summary", &keys);
+        assert!(
+            served.int("late_ticks") * 10 < served.int("objects_sent"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn four_connections_of_sixteen_streams_feed_every_stream_within_twice_the_smallest() {
+        let server = start_server(&Flags {
+            num_streams: 16,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let flags = Flags {
+            duration_secs: 2,
+            num_conns: 4,
+            num_streams: 16,
+            port: server.addr().port(),
+            ..loopback(Mode::Client, 0)
+        };
+        let mut out = Vec::new();
+        let conns =
+            run_client_with(&flags, config::client_config(&flags).unwrap(), &mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        let parsed =
+            report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
+        assert_eq!(
+            parsed.streams, 64,
+            "tperf's lines count the streams of every connection: {output}"
+        );
+        let summary = read_summary(&output, "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(summary.get("mode"), "saturate", "{output}");
+        assert_eq!(
+            ["conns", "streams_per_conn", "duration_s", "streams_opened"]
+                .map(|key| summary.int(key)),
+            [4, 16, 2, 64],
+            "{output}"
+        );
+        assert!(summary.int("stream_bytes_min") > 0, "{output}");
+
+        assert_eq!(conns.len(), 4, "{output}");
+        let mut total = 0;
+        for (index, conn) in conns.iter().enumerate() {
+            let smallest = conn.stream_bytes.iter().copied().min().unwrap_or(0);
+            let largest = conn.stream_bytes.iter().copied().max().unwrap_or(0);
+            eprintln!(
+                "connection {index}: {} streams, {smallest} to {largest} bytes per stream",
+                conn.stream_bytes.len()
+            );
+            assert_eq!(conn.stream_bytes.len(), 16, "connection {index}: {conn:?}");
+            assert!(smallest > 0, "connection {index}: {conn:?}");
+            assert!(
+                largest <= 2 * smallest,
+                "connection {index}: the largest stream got more than twice the smallest: \
+                 {conn:?}"
+            );
+            total += conn.stream_bytes.iter().sum::<u64>();
+        }
+        assert_eq!(summary.int("bytes"), total, "{output}");
+        assert_eq!(
+            parsed.bytes, total,
+            "tperf's lines count the bytes of every connection: {output}"
+        );
+        assert_eq!(
+            server.summary_line(),
+            "tperf_server_summary stack=mvfstr mode=saturate conns=4"
+        );
+    }
+
+    #[test]
+    fn paced_objects_reach_eight_connections_of_two_streams_at_the_rate_with_low_latency() {
+        const OBJECT_SIZE: u64 = 1200;
+        let paced = |mode| Flags {
+            num_streams: 2,
+            object_rate: 50,
+            object_size: OBJECT_SIZE as u32,
+            ..loopback(mode, 0)
+        };
+        let server = start_server(&paced(Mode::Server)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 2,
+                num_conns: 8,
+                ..paced(Mode::Client)
+            },
+        );
+        let parsed =
+            report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
+        assert!(
+            parsed.bytes < (1760 + 16) * OBJECT_SIZE,
+            "the server paces rather than saturates: {output}"
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(summary.get("mode"), "paced", "{output}");
+        assert_eq!(
+            ["conns", "streams_per_conn", "duration_s", "streams_opened"]
+                .map(|key| summary.int(key)),
+            [8, 2, 2, 16],
+            "{output}"
+        );
+        // 8 connections × 2 streams × 50 objects per second × 2 s, within 10 %.
+        let objects = summary.int("objects");
+        assert!((1440..=1760).contains(&objects), "{output}");
+        assert_eq!(summary.int("bad_objects"), 0, "{output}");
+        // Objects count in the window that bytes count in; each stream may end inside one.
+        let bytes = summary.int("bytes");
+        assert!(
+            objects * OBJECT_SIZE <= bytes && bytes < (objects + 16) * OBJECT_SIZE,
+            "{output}"
+        );
+        let latencies = [
+            "lat_us_p50",
+            "lat_us_p90",
+            "lat_us_p99",
+            "lat_us_p999",
+            "lat_us_max",
+        ]
+        .map(|key| summary.int(key));
+        assert!(latencies[0] > 0, "{output}");
+        assert!(latencies.is_sorted(), "{output}");
+        assert!(
+            latencies[3] < 50_000,
+            "p99.9 under 50 ms on idle loopback: {output}"
+        );
+
+        let line = server.summary_line();
+        let keys: Vec<&str> = SERVER_KEYS
+            .iter()
+            .chain(&SERVER_PACED_KEYS)
+            .copied()
+            .collect();
+        let served = read_summary(&line, "tperf_server_summary", &keys);
+        assert_eq!(
+            [served.get("stack"), served.get("mode"), served.get("conns")],
+            ["mvfstr", "paced", "8"]
+        );
+        let sent = served.int("objects_sent");
+        assert!(
+            objects <= sent && sent <= 2 * objects,
+            "the server sent what the client received and what the closes cut off: {line}"
+        );
+        assert_eq!(
+            served.int("objects_dropped"),
+            0,
+            "streams on idle loopback take every object: {line}"
+        );
+        served.int("late_ticks");
+    }
+
+    #[test]
+    fn streams_per_conn_is_the_clients_num_streams_when_each_stream_carries_one_object() {
+        // Each stream ends with its first object, often before the client hears of the others.
+        let paced = |mode| Flags {
+            num_streams: 16,
+            object_rate: 50,
+            ..loopback(mode, 0)
+        };
+        let server = start_server(&Flags {
+            bytes_per_stream: 1200,
+            ..paced(Mode::Server)
+        })
+        .unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..paced(Mode::Client)
+            },
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(summary.int("streams_per_conn"), 16, "{output}");
+        assert!(
+            summary.int("streams_opened") > 16,
+            "streams were replaced: {output}"
+        );
+        assert_eq!(
+            summary.int("stream_bytes_max"),
+            1200,
+            "one object per stream: {output}"
+        );
+        assert_eq!(summary.int("bad_objects"), 0, "{output}");
+    }
+
+    #[test]
+    fn the_clients_object_rate_and_not_what_the_server_writes_sets_its_mode() {
+        let server = |object_rate| {
+            start_server(&Flags {
+                num_streams: 2,
+                object_rate,
+                ..loopback(Mode::Server, 0)
+            })
+            .unwrap()
+        };
+        let client = |object_rate| Flags {
+            duration_secs: 1,
+            num_streams: 2,
+            object_rate,
+            ..loopback(Mode::Client, 0)
+        };
+        let output = client_output(&server(50), client(0));
+        let summary = read_summary(&output, "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(summary.get("mode"), "saturate", "{output}");
+
+        let output = client_output(&server(0), client(50));
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(summary.get("mode"), "paced", "{output}");
+        assert_eq!(
+            ["objects", "bad_objects"].map(|key| summary.int(key)),
+            [0, 2],
+            "each stream of zeros starts with a length of 0: {output}"
+        );
+    }
+
+    #[test]
+    fn a_client_whose_object_size_differs_from_the_servers_counts_bad_objects_and_no_latency() {
+        let server = start_server(&Flags {
+            num_streams: 2,
+            object_rate: 50,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                num_streams: 2,
+                object_rate: 50,
+                object_size: 1000,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(
+            ["objects", "bad_objects", "lat_us_max"].map(|key| summary.int(key)),
+            [0, 2, 0],
+            "each stream's first object is 1,200 bytes long: {output}"
+        );
+    }
+
+    #[test]
+    fn streams_per_conn_is_the_clients_num_streams_when_saturated_streams_roll_over() {
+        // A stream's last bytes and its FIN go out in one push, and its replacement opens at once.
+        let server = start_server(&Flags {
+            num_streams: 2,
+            bytes_per_stream: 100_000,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                num_conns: 2,
+                num_streams: 2,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let summary = read_summary(&output, "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(summary.get("mode"), "saturate", "{output}");
+        assert_eq!(summary.int("streams_per_conn"), 2, "{output}");
+        assert!(
+            summary.int("streams_opened") > 2 * 2,
+            "streams were replaced: {output}"
+        );
+    }
+
+    #[test]
+    fn paced_streams_roll_over_on_an_object_boundary_once_they_reach_bytes_per_stream() {
+        // Each stream ends after the object that takes it to 3,000 bytes: its third, at 3,600.
+        let paced = |mode| Flags {
+            num_streams: 2,
+            object_rate: 50,
+            object_size: 1200,
+            ..loopback(mode, 0)
+        };
+        let server = start_server(&Flags {
+            bytes_per_stream: 3000,
+            ..paced(Mode::Server)
+        })
+        .unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 2,
+                num_conns: 2,
+                ..paced(Mode::Client)
+            },
+        );
+        let parsed =
+            report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
+        assert!(
+            parsed.bytes < (440 + 4) * 1200,
+            "the server paces rather than saturates: {output}"
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(summary.get("mode"), "paced", "{output}");
+        assert_eq!(summary.int("conns"), 2, "{output}");
+        assert_eq!(summary.int("streams_per_conn"), 2, "{output}");
+        let opened = summary.int("streams_opened");
+        assert!(opened > 2 * 2, "streams were replaced: {output}");
+        // Each of the 4 streams rolls over every 3 objects, 60 ms, so about 33 times in 2 s.
+        assert!(opened > 40, "{output}");
+        assert_eq!(summary.int("stream_bytes_max"), 3600, "{output}");
+        assert_eq!(
+            summary.int("bad_objects"),
+            0,
+            "a stream ends on an object boundary: {output}"
+        );
+        // 2 connections × 2 streams × 50 objects per second × 2 s, within 10 %.
+        assert!(
+            (360..=440).contains(&summary.int("objects")),
+            "rolling over loses no object: {output}"
+        );
+        assert!(summary.float("mbps") > 0.0, "{output}");
     }
 }

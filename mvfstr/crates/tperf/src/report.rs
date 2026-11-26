@@ -98,6 +98,139 @@ pub(crate) fn parse(output: &str) -> Option<Parsed> {
     })
 }
 
+/// The stack name both summary lines carry, so one harness tells the two tperfs apart.
+const STACK: &str = "mvfstr";
+
+/// What the server writes: as much as each stream takes, or objects on a clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteMode {
+    /// As much as each stream takes, with `--object_rate` 0.
+    Saturate,
+    /// One object per stream on each tick of `--object_rate`.
+    Paced,
+}
+
+impl WriteMode {
+    /// Returns the mode's name in the summary lines.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Saturate => "saturate",
+            Self::Paced => "paced",
+        }
+    }
+}
+
+/// What one client connection received in its measured window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConnTally {
+    /// The bytes of each stream that arrived, in the order the server opened them.
+    pub(crate) stream_bytes: Vec<u64>,
+    /// The latency of each object received, in µs, in any order.
+    pub(crate) latencies_us: Vec<u64>,
+    /// Objects whose length was not the object size, or that their stream ended inside.
+    pub(crate) bad_objects: u64,
+}
+
+/// What a server has done since it started, for its summary line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ServerTally {
+    /// Connections accepted.
+    pub(crate) conns: u64,
+    /// Objects written to streams.
+    pub(crate) objects_sent: u64,
+    /// Objects dropped from full stream queues.
+    pub(crate) objects_dropped: u64,
+    /// Ticks that started while an object of the tick before was still queued.
+    pub(crate) late_ticks: u64,
+}
+
+/// Returns the value at `per_mille` thousandths of `sorted`, by nearest rank: the smallest value
+/// that at least that share of the values do not exceed. `None` if `sorted` is empty.
+pub(crate) fn percentile<T: Copy>(sorted: &[T], per_mille: u32) -> Option<T> {
+    let count = sorted.len() as u64;
+    let rank = (u64::from(per_mille) * count)
+        .div_ceil(1000)
+        .clamp(1, count.max(1));
+    sorted.get(usize::try_from(rank - 1).ok()?).copied()
+}
+
+/// Returns the client's summary line for a run in `mode` of `duration_secs` seconds, with
+/// `streams_per_conn` streams on each of the connections that `conns` describes. Rates are in
+/// megabits of 10^6 bits per second over the whole window.
+pub(crate) fn summary_line(
+    mode: WriteMode,
+    duration_secs: u32,
+    streams_per_conn: u32,
+    conns: &[ConnTally],
+) -> String {
+    let seconds = f64::from(duration_secs);
+    let mbps = |bytes: u64| bytes as f64 * 8.0 / 1e6 / seconds;
+    let conn_bytes: Vec<u64> = conns
+        .iter()
+        .map(|conn| conn.stream_bytes.iter().sum())
+        .collect();
+    let bytes: u64 = conn_bytes.iter().sum();
+    let mut conn_mbps: Vec<f64> = conn_bytes.iter().map(|&bytes| mbps(bytes)).collect();
+    conn_mbps.sort_by(f64::total_cmp);
+    let conn_at = |per_mille| percentile(&conn_mbps, per_mille).unwrap_or(0.0);
+    let streams = || {
+        conns
+            .iter()
+            .flat_map(|conn| conn.stream_bytes.iter().copied())
+    };
+    let opened: usize = conns.iter().map(|conn| conn.stream_bytes.len()).sum();
+    let mut line = format!(
+        "tperf_summary stack={STACK} mode={} conns={} streams_per_conn={streams_per_conn} \
+         duration_s={duration_secs} bytes={bytes} mbps={:.3} conn_mbps_min={:.3} \
+         conn_mbps_p50={:.3} conn_mbps_max={:.3} stream_bytes_min={} stream_bytes_max={} \
+         streams_opened={opened}",
+        mode.name(),
+        conns.len(),
+        mbps(bytes),
+        conn_at(0),
+        conn_at(500),
+        conn_at(1000),
+        streams().min().unwrap_or(0),
+        streams().max().unwrap_or(0),
+    );
+    if mode == WriteMode::Paced {
+        let mut latencies: Vec<u64> = conns
+            .iter()
+            .flat_map(|conn| conn.latencies_us.iter().copied())
+            .collect();
+        latencies.sort_unstable();
+        let at = |per_mille| percentile(&latencies, per_mille).unwrap_or(0);
+        let bad_objects: u64 = conns.iter().map(|conn| conn.bad_objects).sum();
+        line.push_str(&format!(
+            " objects={} bad_objects={bad_objects} lat_us_p50={} lat_us_p90={} lat_us_p99={} \
+             lat_us_p999={} lat_us_max={}",
+            latencies.len(),
+            at(500),
+            at(900),
+            at(990),
+            at(999),
+            at(1000),
+        ));
+    }
+    line
+}
+
+/// Returns the server's summary line, for a server in `mode` that has done what `tally` counts.
+pub(crate) fn server_summary_line(mode: WriteMode, tally: &ServerTally) -> String {
+    let mut line = format!(
+        "tperf_server_summary stack={STACK} mode={} conns={}",
+        mode.name(),
+        tally.conns
+    );
+    if mode == WriteMode::Paced {
+        line.push_str(&format!(
+            " objects_sent={} objects_dropped={} late_ticks={}",
+            tally.objects_sent, tally.objects_dropped, tally.late_ticks
+        ));
+    }
+    line
+}
+
 /// Returns the `--stats` line for a connection's counters.
 pub(crate) fn stats_line(stats: &ConnStats) -> String {
     format!(
@@ -420,6 +553,159 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             startup_line(&cubic, Duration::ZERO, &caps(ReleaseSupport::None)),
             "Server: congestion=cubic pacing=false pacing_granularity_us=1000 pacing_min_burst=5 \
              pacing_max_burst=44 txtime=false endpoint_horizon_us=0 so_sndbuf=14544416"
+        );
+    }
+
+    #[test]
+    fn percentiles_take_the_nearest_rank() {
+        let thousand: Vec<u64> = (1..=1000).collect();
+        let at = |per_mille| percentile(&thousand, per_mille);
+        assert_eq!(
+            [at(500), at(900), at(990), at(999), at(1000)],
+            [Some(500), Some(900), Some(990), Some(999), Some(1000)]
+        );
+        assert_eq!(at(1), Some(1));
+        assert_eq!(at(0), Some(1), "the smallest value");
+        // Ranks round up: 0.5 * 4 is rank 2, 0.9 * 4 = 3.6 is rank 4 and 0.5 * 3 = 1.5 rank 2.
+        let four = [10, 20, 30, 40];
+        assert_eq!(percentile(&four, 500), Some(20));
+        assert_eq!(percentile(&four, 900), Some(40));
+        assert_eq!(percentile(&four, 250), Some(10));
+        assert_eq!(percentile(&four, 251), Some(20));
+        assert_eq!(percentile(&[1, 2, 3], 500), Some(2));
+        assert_eq!(percentile(&[7], 999), Some(7));
+        assert_eq!(percentile(&[1.5, 2.5], 500), Some(1.5));
+        assert_eq!(percentile::<u64>(&[], 500), None);
+    }
+
+    #[test]
+    fn the_summary_line_names_its_fields_in_order_with_megabits_of_a_million_bits() {
+        let conns = [
+            ConnTally {
+                stream_bytes: vec![1_000_000, 2_000_000],
+                latencies_us: Vec::new(),
+                bad_objects: 0,
+            },
+            ConnTally {
+                stream_bytes: vec![400_000, 600_000],
+                latencies_us: Vec::new(),
+                bad_objects: 0,
+            },
+            ConnTally {
+                stream_bytes: vec![1_500_000, 500_000],
+                latencies_us: Vec::new(),
+                bad_objects: 0,
+            },
+        ];
+        // 6 MB in 2 s is 24 Mb/s; the connections carry 12, 4 and 8 Mb/s, so the median is 8.
+        assert_eq!(
+            summary_line(WriteMode::Saturate, 2, 2, &conns),
+            "tperf_summary stack=mvfstr mode=saturate conns=3 streams_per_conn=2 duration_s=2 \
+             bytes=6000000 mbps=24.000 conn_mbps_min=4.000 conn_mbps_p50=8.000 \
+             conn_mbps_max=12.000 stream_bytes_min=400000 stream_bytes_max=2000000 \
+             streams_opened=6"
+        );
+        // A stream that received nothing counts as opened, with 0 bytes.
+        let one = [ConnTally {
+            stream_bytes: vec![1_234_567, 0, 89],
+            latencies_us: Vec::new(),
+            bad_objects: 0,
+        }];
+        assert_eq!(
+            summary_line(WriteMode::Saturate, 3, 1, &one),
+            "tperf_summary stack=mvfstr mode=saturate conns=1 streams_per_conn=1 duration_s=3 \
+             bytes=1234656 mbps=3.292 conn_mbps_min=3.292 conn_mbps_p50=3.292 \
+             conn_mbps_max=3.292 stream_bytes_min=0 stream_bytes_max=1234567 streams_opened=3"
+        );
+    }
+
+    #[test]
+    fn a_paced_summary_line_adds_the_objects_and_their_latency_percentiles() {
+        // 1,000 latencies of 1 to 1,000 µs, unsorted and split over two connections.
+        let conns = [
+            ConnTally {
+                stream_bytes: vec![600_000],
+                latencies_us: (1..=1000).rev().step_by(2).collect(),
+                bad_objects: 0,
+            },
+            ConnTally {
+                stream_bytes: vec![600_000],
+                latencies_us: (1..=1000).step_by(2).collect(),
+                bad_objects: 0,
+            },
+        ];
+        assert_eq!(
+            summary_line(WriteMode::Paced, 1, 1, &conns),
+            "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=1 duration_s=1 \
+             bytes=1200000 mbps=9.600 conn_mbps_min=4.800 conn_mbps_p50=4.800 \
+             conn_mbps_max=4.800 stream_bytes_min=600000 stream_bytes_max=600000 \
+             streams_opened=2 objects=1000 bad_objects=0 lat_us_p50=500 lat_us_p90=900 \
+             lat_us_p99=990 lat_us_p999=999 lat_us_max=1000"
+        );
+        let none = [ConnTally {
+            stream_bytes: vec![0],
+            latencies_us: Vec::new(),
+            bad_objects: 0,
+        }];
+        assert!(
+            summary_line(WriteMode::Paced, 1, 1, &none).ends_with(
+                " streams_opened=1 objects=0 bad_objects=0 lat_us_p50=0 lat_us_p90=0 \
+                 lat_us_p99=0 lat_us_p999=0 lat_us_max=0"
+            ),
+            "a paced line keeps its fields without objects"
+        );
+    }
+
+    #[test]
+    fn a_paced_summary_line_counts_the_bad_objects_of_every_connection() {
+        let conns = [
+            ConnTally {
+                stream_bytes: vec![2400],
+                latencies_us: vec![100, 200],
+                bad_objects: 1,
+            },
+            ConnTally {
+                stream_bytes: vec![1200],
+                latencies_us: vec![300],
+                bad_objects: 2,
+            },
+        ];
+        assert_eq!(
+            summary_line(WriteMode::Paced, 1, 1, &conns),
+            "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=1 duration_s=1 \
+             bytes=3600 mbps=0.029 conn_mbps_min=0.010 conn_mbps_p50=0.010 \
+             conn_mbps_max=0.019 stream_bytes_min=1200 stream_bytes_max=2400 streams_opened=2 \
+             objects=3 bad_objects=3 lat_us_p50=200 lat_us_p90=300 lat_us_p99=300 \
+             lat_us_p999=300 lat_us_max=300"
+        );
+        assert!(
+            !summary_line(WriteMode::Saturate, 1, 1, &conns).contains("objects"),
+            "a saturate line has no object fields"
+        );
+    }
+
+    #[test]
+    fn the_server_summary_line_adds_its_object_counts_in_paced_mode() {
+        let tally = ServerTally {
+            conns: 8,
+            objects_sent: 1600,
+            objects_dropped: 3,
+            late_ticks: 2,
+        };
+        assert_eq!(
+            server_summary_line(WriteMode::Paced, &tally),
+            "tperf_server_summary stack=mvfstr mode=paced conns=8 objects_sent=1600 \
+             objects_dropped=3 late_ticks=2"
+        );
+        assert_eq!(
+            server_summary_line(
+                WriteMode::Saturate,
+                &ServerTally {
+                    conns: 4,
+                    ..ServerTally::default()
+                }
+            ),
+            "tperf_server_summary stack=mvfstr mode=saturate conns=4"
         );
     }
 }
