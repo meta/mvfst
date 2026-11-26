@@ -101,14 +101,16 @@ struct Slot {
     inbox: Mutex<Inbox>,
 }
 
-/// The datagrams other workers handed to one worker's driver.
+/// The datagrams other workers handed to one worker's driver, each charged as a [`WaitingQueue`]
+/// charges it: its length, but at least
+/// [`MIN_INITIAL_DATAGRAM`](crate::turn::MIN_INITIAL_DATAGRAM) bytes.
 #[derive(Default)]
 struct Inbox {
     /// The driver's task while it runs; without one, other workers keep what they would hand over.
     task: Option<Arc<Shared>>,
     datagrams: WaitingQueue,
-    /// The most bytes that `datagrams` may hold, set when the driver joins; a datagram that does
-    /// not fit is dropped, and its client sends it again.
+    /// The most bytes that `datagrams` may be charged, set when the driver joins; a datagram that
+    /// does not fit is dropped, and its client sends it again.
     bound: usize,
 }
 
@@ -128,8 +130,8 @@ impl Steering {
     }
 
     /// Makes the driver whose task is `task` worker `index` of the group until the returned
-    /// member drops. A worker index has one driver at a time. Its inbox holds datagrams of at most
-    /// `inbox_bytes` bytes in all. The member remembers where it sent each client's first
+    /// member drops. A worker index has one driver at a time. Its inbox holds datagrams charged at
+    /// most `inbox_bytes` bytes in all. The member remembers where it sent each client's first
     /// destination connection ID until a lifetime passes without a datagram that carries it: at
     /// least `lifetime`, which is `None` to remember IDs for as long as room allows, and at least
     /// what [`Member::accepted`] reports.
@@ -448,6 +450,15 @@ mod tests {
         datagram
     }
 
+    /// Returns a long-header datagram of `len` bytes, at least 14, whose eight-byte destination
+    /// connection ID repeats `byte`.
+    fn long_header(byte: u8, len: usize) -> Vec<u8> {
+        let mut datagram = vec![0xc0, 0, 0, 0, 1, 8];
+        datagram.extend([byte; 8]);
+        datagram.resize(len, 0);
+        datagram
+    }
+
     fn task() -> Arc<Shared> {
         Arc::new(Shared::default())
     }
@@ -456,6 +467,10 @@ mod tests {
 
     /// An inbox bound that the tests of other things do not reach.
     const ROOM: usize = 1 << 20;
+
+    /// The least an inbox charges a datagram: 1,200 bytes, the smallest datagram that may carry a
+    /// client's Initial.
+    const FLOOR: usize = 1200;
 
     #[test]
     fn a_connection_its_receiving_worker_kept_stays_there_when_its_initial_comes_again() {
@@ -717,30 +732,83 @@ mod tests {
     }
 
     #[test]
-    fn each_datagram_in_an_inbox_takes_its_own_bytes() {
+    fn each_datagram_in_an_inbox_takes_its_own_bytes_but_no_less_than_an_initial() {
         let group = Steering::new(2);
         let full = initial(2);
         let half = &full[..full.len() / 2];
+        let (larger, just_larger) = (long_header(2, 1500), long_header(2, 1201));
+        // A full datagram, a larger one and the floor of a smaller one fill the bound.
+        let bound = full.len() + larger.len() + FLOOR;
         let (zero, one) = (
             group.join(0, task(), Some(LIFETIME), ROOM),
-            group.join(1, task(), Some(LIFETIME), 2 * full.len() + half.len()),
+            group.join(1, task(), Some(LIFETIME), bound),
         );
         assert_eq!(zero.hand_off(1, &meta(), &full), Steer::HandedOff);
-        assert_eq!(zero.hand_off(1, &meta(), &full), Steer::HandedOff);
+        assert_eq!(zero.hand_off(1, &meta(), &larger), Steer::HandedOff);
         assert_eq!(
-            zero.hand_off(1, &meta(), &full),
+            zero.hand_off(1, &meta(), &larger),
             Steer::Dropped,
-            "a third full datagram would pass the bound"
+            "a second larger datagram takes its own 1,500 bytes and would pass the bound"
         );
         assert_eq!(
             zero.hand_off(1, &meta(), half),
             Steer::HandedOff,
-            "a half datagram fills the bound exactly"
+            "a half datagram is charged 1,200 bytes and fills the bound exactly"
         );
-        assert_eq!(zero.hand_off(1, &meta(), &half[..1]), Steer::Dropped);
+        assert_eq!(
+            zero.hand_off(1, &meta(), &half[..1]),
+            Steer::Dropped,
+            "a datagram of one byte is charged 1,200 bytes as well"
+        );
         let mut taken = Vec::new();
         one.take(|waiting| taken.push(waiting.datagram.len()));
-        assert_eq!(taken, [full.len(), full.len(), half.len()]);
+        assert_eq!(taken, [full.len(), larger.len(), half.len()]);
+
+        // Datagrams of 1,201 and 1,500 bytes leave 1,199 bytes of the bound.
+        assert_eq!(zero.hand_off(1, &meta(), &just_larger), Steer::HandedOff);
+        assert_eq!(zero.hand_off(1, &meta(), &larger), Steer::HandedOff);
+        assert_eq!(
+            zero.hand_off(1, &meta(), half),
+            Steer::Dropped,
+            "a half datagram does not fit in 1,199 bytes"
+        );
+        let mut taken = Vec::new();
+        one.take(|waiting| taken.push(waiting.datagram.len()));
+        assert_eq!(taken, [just_larger.len(), larger.len()]);
+    }
+
+    #[test]
+    fn an_inbox_charges_a_tiny_long_header_datagram_as_much_as_an_initial() {
+        const KEPT: usize = 3;
+        let group = Steering::new(2);
+        let (zero, one) = (
+            group.join(0, task(), Some(LIFETIME), KEPT * FLOOR),
+            group.join(1, task(), Some(LIFETIME), ROOM),
+        );
+        let now = Instant::now();
+        // The group's first new connection goes to worker 0, so worker 1 hands its Initial over
+        // and remembers where the client's destination connection ID went.
+        assert_eq!(one.steer_new(now, &meta(), &initial(3)), Steer::HandedOff);
+        let mut taken = Vec::new();
+        zero.take(|waiting| taken.push(waiting.datagram.len()));
+        assert_eq!(taken, [1200], "the Initial");
+        // Long-header datagrams of 14 to 16 bytes that carry the remembered ID follow it.
+        let tiny = |n: usize| long_header(3, 14 + n);
+        for n in 0..KEPT {
+            assert_eq!(
+                one.steer_known(now, &meta(), &tiny(n)),
+                Steer::HandedOff,
+                "tiny datagram {n}"
+            );
+        }
+        assert_eq!(
+            one.steer_known(now, &meta(), &tiny(0)),
+            Steer::Dropped,
+            "each tiny datagram is charged 1,200 bytes, so {KEPT} fill the bound"
+        );
+        let mut taken = Vec::new();
+        zero.take(|waiting| taken.push(waiting.datagram.len()));
+        assert_eq!(taken, [14, 15, 16], "in order, with their own lengths");
     }
 
     /// Counts its wakes.

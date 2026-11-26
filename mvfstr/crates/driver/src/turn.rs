@@ -155,8 +155,8 @@ const POLLS_PER_TURN: usize = 1024;
 /// apart from the attempts, the handshakes the driver starts on its TLS host per turn.
 const HANDSHAKES_PER_TURN: usize = 8;
 
-/// The bytes of the Initials kept for a later turn once a turn's connection attempts run out,
-/// counted by datagram length; an Initial past them is dropped, and its client sends it again.
+/// The bytes of the Initials kept for a later turn once a turn's connection attempts run out, as
+/// a [`WaitingQueue`] charges them; an Initial past them is dropped, and its client sends it again.
 /// 4 MiB holds the first flights of about 1,700 clients whose ClientHello takes two datagrams.
 const WAITING_INITIAL_BYTES: usize = 4 * 1024 * 1024;
 
@@ -177,8 +177,8 @@ pub(crate) struct Limits {
     /// Connection attempts handled per turn, and apart from them, handshakes started on the TLS
     /// host per turn.
     pub(crate) handshakes: usize,
-    /// The most bytes of the Initials kept for a later turn once a turn's connection attempts
-    /// run out, and of the datagrams other workers may hand to this one's inbox.
+    /// The most bytes charged for the Initials kept for a later turn once a turn's connection
+    /// attempts run out, and for the datagrams other workers may hand to this one's inbox.
     pub(crate) waiting_initial_bytes: usize,
 }
 
@@ -451,8 +451,13 @@ pub(crate) struct Waiting {
     pub(crate) datagram: Vec<u8>,
 }
 
-/// Datagrams kept to be routed again later, oldest first, and the bytes they hold, counted by
-/// datagram length.
+/// The least bytes a [`WaitingQueue`] charges a datagram: 1,200, the smallest datagram that may
+/// carry a client's Initial (RFC 9000).
+pub(crate) const MIN_INITIAL_DATAGRAM: usize = 1200;
+
+/// Datagrams kept to be routed again later, oldest first, and the bytes charged for them: each
+/// datagram is charged its length, but at least [`MIN_INITIAL_DATAGRAM`], so tiny datagrams do not
+/// fill a bound with more entries than Initials do.
 #[derive(Default)]
 pub(crate) struct WaitingQueue {
     datagrams: VecDeque<Waiting>,
@@ -460,25 +465,30 @@ pub(crate) struct WaitingQueue {
 }
 
 impl WaitingQueue {
+    /// Returns the bytes charged for a datagram of `len` bytes.
+    fn charge(len: usize) -> usize {
+        len.max(MIN_INITIAL_DATAGRAM)
+    }
+
     /// Returns whether a datagram of `len` bytes fits beside those queued within `bound` bytes.
     pub(crate) fn fits(&self, len: usize, bound: usize) -> bool {
-        len <= bound.saturating_sub(self.bytes)
+        Self::charge(len) <= bound.saturating_sub(self.bytes)
     }
 
     pub(crate) fn push_back(&mut self, waiting: Waiting) {
-        self.bytes += waiting.datagram.len();
+        self.bytes += Self::charge(waiting.datagram.len());
         self.datagrams.push_back(waiting);
     }
 
     fn pop_front(&mut self) -> Option<Waiting> {
         let waiting = self.datagrams.pop_front()?;
-        self.bytes -= waiting.datagram.len();
+        self.bytes -= Self::charge(waiting.datagram.len());
         Some(waiting)
     }
 
     /// Puts back first a datagram that [`pop_front`](Self::pop_front) took.
     fn push_front(&mut self, waiting: Waiting) {
-        self.bytes += waiting.datagram.len();
+        self.bytes += Self::charge(waiting.datagram.len());
         self.datagrams.push_front(waiting);
     }
 
@@ -1076,7 +1086,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         (sched.waiting.datagrams.len(), sched.kept_accept.is_some())
     }
 
-    /// Returns the bytes of the Initials that wait for a later turn.
+    /// Returns the bytes charged for the Initials that wait for a later turn.
     #[cfg(test)]
     pub(crate) fn waiting_bytes(&self) -> usize {
         self.sched.borrow().waiting.bytes
@@ -3943,5 +3953,70 @@ mod tests {
             order, expected,
             "each connection's datagrams in arrival order"
         );
+    }
+
+    #[test]
+    fn a_waiting_queue_charges_each_datagram_its_length_but_no_less_than_an_initial() {
+        let meta = RxMeta {
+            src: SocketAddr::from(([127, 0, 0, 1], 1)),
+            dst_ip: None,
+            ecn: Ecn::NotEct,
+            stride: 1200,
+            rx_time: Instant::now(),
+        };
+        let waiting = |len| Waiting {
+            meta,
+            datagram: vec![0; len],
+        };
+        let mut queue = WaitingQueue::default();
+        queue.push_back(waiting(20));
+        assert_eq!(queue.bytes, 1200, "a tiny datagram is charged 1,200 bytes");
+        queue.push_back(waiting(1200));
+        assert_eq!(
+            queue.bytes, 2400,
+            "a full-size Initial is charged its own bytes"
+        );
+        queue.push_back(waiting(1500));
+        assert_eq!(
+            queue.bytes, 3900,
+            "a larger datagram is charged its own bytes"
+        );
+        queue.push_back(waiting(1));
+        assert_eq!(queue.bytes, 5100);
+
+        // Whatever its length, a datagram fits only where 1,200 bytes are left.
+        let held = queue.bytes;
+        assert!(queue.fits(1, held + 1200));
+        assert!(!queue.fits(1, held + 1199));
+        assert!(queue.fits(1200, held + 1200));
+        assert!(!queue.fits(1200, held + 1199));
+        assert!(queue.fits(1201, held + 1201));
+        assert!(!queue.fits(1201, held + 1200));
+
+        let tiny = queue.pop_front().expect("four datagrams wait");
+        assert_eq!((tiny.datagram.len(), queue.bytes), (20, 3900));
+        let full = queue.pop_front().expect("three datagrams wait");
+        assert_eq!((full.datagram.len(), queue.bytes), (1200, 2700));
+        queue.push_front(full);
+        assert_eq!(queue.bytes, 3900);
+        queue.push_front(tiny);
+        assert_eq!(
+            queue.bytes, 5100,
+            "datagrams put back are charged as before"
+        );
+
+        let lens: Vec<usize> = queue
+            .drain()
+            .map(|waiting| waiting.datagram.len())
+            .collect();
+        assert_eq!(
+            lens,
+            [20, 1200, 1500, 1],
+            "oldest first, with their own lengths"
+        );
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.is_empty());
+        assert!(queue.fits(1, 1200));
+        assert!(!queue.fits(1, 1199));
     }
 }
