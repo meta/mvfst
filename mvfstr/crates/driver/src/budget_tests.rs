@@ -550,7 +550,7 @@ fn scripted_run() -> String {
 }
 
 /// The reference hash of [`scripted_run`]'s summary, which a driver without a budget must produce.
-const SCRIPTED_RUN: u64 = 0x60b1_31dc_9d94_deb3;
+const SCRIPTED_RUN: u64 = 0x0529_0fb9_7e95_965d;
 
 #[test]
 fn without_a_budget_a_scripted_runs_record_matches_the_drivers_before_the_budget() {

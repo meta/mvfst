@@ -131,7 +131,8 @@ fn packets_per_datagram(peer: &Peer) -> Vec<usize> {
 fn the_latest_rtt_is_the_newest_sample_rather_than_the_smoothed_rtt() {
     // The server acknowledges each ack-eliciting packet at once, so a sample is the round trip.
     let immediate = AckPolicy {
-        eliciting_threshold: 1,
+        before_init: 1,
+        after_init: 1,
         ..AckPolicy::default()
     };
     let setup = Setup {

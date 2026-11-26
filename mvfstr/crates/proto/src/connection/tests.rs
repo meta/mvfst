@@ -41,6 +41,7 @@ use super::Handshake;
 use super::PacketSpace;
 use super::PeerParams;
 use super::stream_tests::ORDER;
+use crate::AckPolicy;
 use crate::AlpnPolicy;
 use crate::AppCode;
 use crate::CloseReason;
@@ -92,6 +93,17 @@ use crate::testing::fixtures::unix_now;
 
 /// Every handshake here completes well within this, losses included.
 pub(super) const LIMIT: Duration = Duration::from_secs(10);
+
+/// Returns an ACK policy that acknowledges two ack-eliciting packets at once, and a lone one
+/// max_ack_delay less 1 ms after it arrived, whatever the RTT.
+pub(super) fn every_other_packet() -> AckPolicy {
+    AckPolicy {
+        before_init: 2,
+        after_init: 2,
+        rtt_timer: false,
+        ..AckPolicy::default()
+    }
+}
 
 pub(super) fn start(config: PairConfig) -> (Instant, Pair) {
     let epoch = test_epoch();

@@ -1092,7 +1092,7 @@ fn an_ack_only_datagram_takes_no_pacing_tokens() {
     let Stop::Pacing(release) = attempt_runs(&mut pair, now).0.stop else {
         panic!("not paced");
     };
-    // Two ack-eliciting packets make an ACK due at once.
+    // The packets follow a gap in the packet numbers, which makes an ACK due at once.
     from_server(&mut pair, now, &[&[Frame::Ping], &[Frame::Ping]]);
     let (ack, runs) = attempt_runs(&mut pair, now);
     assert_eq!((ack.datagrams, runs.len()), (1, 1), "{ack:?}");

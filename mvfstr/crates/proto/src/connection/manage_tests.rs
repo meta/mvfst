@@ -39,6 +39,7 @@ use super::tests::Forge;
 use super::tests::LIMIT;
 use super::tests::client_addr;
 use super::tests::deliver;
+use super::tests::every_other_packet;
 use super::tests::handshake;
 use super::tests::open_own_one_rtt;
 use super::tests::server_addr;
@@ -2366,7 +2367,14 @@ fn an_unanswered_challenge_goes_again_after_a_pto_even_once_acknowledged_three_a
 
 #[test]
 fn eight_chances_to_challenge_send_three_distinct_challenges_within_one_deadline_any_one_answers() {
-    let mut pair = settled(&Setup::default());
+    let setup = Setup {
+        server_transport: TransportConfig::builder()
+            .ack_policy(every_other_packet())
+            .build()
+            .expect("a transport config"),
+        ..Setup::default()
+    };
+    let mut pair = settled(&setup);
     let now = pair.now;
     let moved = from_client(&pair, 10, &[Frame::Ping, Frame::Padding { len: 1200 }]);
     let server = pair.server.conn_mut();

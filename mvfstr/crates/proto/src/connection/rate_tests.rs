@@ -27,6 +27,7 @@ use super::stream_tests::config;
 use super::stream_tests::pattern;
 use super::tests::Forge;
 use super::tests::deliver;
+use super::tests::every_other_packet;
 use super::tests::handshake;
 use super::tests::limits;
 use super::tests::server_addr;
@@ -588,7 +589,14 @@ fn samples_over_a_bottleneck_measure_its_rate_once_the_window_exceeds_the_bdp() 
     // 10 Mbit/s with a 20 ms round trip: a BDP of 25,000 bytes.
     const RATE: u64 = 1_250_000;
     const BDP: u64 = RATE / 50;
-    let mut config = setup(config(|c| c)).pair();
+    // The server acknowledges every other packet, and each ACK makes a sample.
+    let mut sides = setup(config(|c| c));
+    sides.server_transport = config(|c| {
+        c.max_data(1 << 40)
+            .max_stream_data_uni(1 << 30)
+            .ack_policy(every_other_packet())
+    });
+    let mut config = sides.pair();
     config.to_server.rate = Some(RATE);
     let (_, mut pair) = handshake(config);
     pair.run(pair.now + RTT);

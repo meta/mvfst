@@ -16,6 +16,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::Space;
+use crate::AckPolicy;
 use crate::receive::Ecn;
 
 /// The ECN counts of one space, reported in ACK_ECN frames (RFC 9000).
@@ -225,11 +226,20 @@ impl ReceivedPackets {
         }
     }
 
-    /// Returns whether an ACK frame is due at `now`, for a policy that acknowledges once
-    /// `threshold` ack-eliciting packets wait and at most `delay` after the first of them arrived.
-    /// The caller evaluates it once per receive batch, after recording every packet in it.
-    pub fn ack_due(&self, now: Instant, threshold: u8, delay: Duration) -> AckDue {
+    /// Returns whether an ACK frame is due at `now`, acknowledging once as many ack-eliciting
+    /// packets wait as `policy` sets for the largest packet number received, and at most `delay`
+    /// after the first of them arrived. The caller evaluates it once per receive batch, after
+    /// recording every packet in it.
+    pub fn ack_due(&self, now: Instant, policy: &AckPolicy, delay: Duration) -> AckDue {
         if let Some(first) = self.first_unacked_eliciting {
+            let past_init = self
+                .largest
+                .is_some_and(|(largest, _)| largest > policy.init_threshold);
+            let threshold = if past_init {
+                policy.after_init
+            } else {
+                policy.before_init
+            };
             let deadline = first + delay;
             if self.immediate || self.unacked_eliciting >= u32::from(threshold) || now >= deadline {
                 return AckDue::Now;
@@ -423,15 +433,71 @@ mod tests {
 
     const MS: Duration = Duration::from_millis(1);
 
+    /// Returns a policy that acknowledges once `threshold` ack-eliciting packets wait, whatever
+    /// the largest packet number received.
+    fn threshold(threshold: u16) -> AckPolicy {
+        AckPolicy {
+            before_init: threshold,
+            after_init: threshold,
+            ..AckPolicy::default()
+        }
+    }
+
+    #[test]
+    fn the_threshold_switches_once_the_largest_packet_number_passes_the_init_threshold() {
+        let t0 = crate::recovery::test_epoch();
+        let policy = AckPolicy {
+            init_threshold: 20,
+            before_init: 3,
+            after_init: 6,
+            ..AckPolicy::default()
+        };
+        // Records the in-order ack-eliciting packets `pns` as one batch and decides once.
+        let batch = |r: &mut ReceivedPackets, pns: RangeInclusive<u64>| {
+            for pn in pns {
+                assert!(
+                    r.on_packet(pn, true, Ecn::NotEct, t0),
+                    "{pn} reported duplicate"
+                );
+            }
+            r.ack_due(t0, &policy, 25 * MS)
+        };
+        let waits = AckDue::At(t0 + 25 * MS);
+
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert_eq!(batch(&mut r, 0..=17), AckDue::Now);
+        r.on_ack_sent();
+        assert_eq!(batch(&mut r, 18..=19), waits);
+        // Three wait and the largest packet number is the init threshold, not above it.
+        assert_eq!(batch(&mut r, 20..=20), AckDue::Now);
+        r.on_ack_sent();
+        // Above the init threshold, three to five waiting packets are not enough; six are.
+        assert_eq!(batch(&mut r, 21..=23), waits);
+        assert_eq!(batch(&mut r, 24..=25), waits);
+        assert_eq!(batch(&mut r, 26..=26), AckDue::Now);
+
+        // The threshold follows the largest packet number when the batch is decided, so packets
+        // that arrived at or below the init threshold count toward the larger one.
+        let mut r = ReceivedPackets::new(Space::Data, 32);
+        assert_eq!(batch(&mut r, 0..=18), AckDue::Now);
+        r.on_ack_sent();
+        assert_eq!(batch(&mut r, 19..=20), waits);
+        assert_eq!(batch(&mut r, 21..=21), waits);
+        assert_eq!(batch(&mut r, 22..=24), AckDue::Now);
+    }
+
     #[test]
     fn no_ack_is_due_without_packets_and_none_starts_for_non_eliciting_ones() {
         let t0 = crate::recovery::test_epoch();
         let mut r = ReceivedPackets::new(Space::Data, 32);
-        assert_eq!(r.ack_due(t0, 2, 25 * MS), AckDue::None);
+        assert_eq!(r.ack_due(t0, &threshold(2), 25 * MS), AckDue::None);
         for pn in 1..=5 {
             assert!(r.on_packet(pn, false, Ecn::NotEct, t0));
         }
-        assert_eq!(r.ack_due(t0 + 100 * MS, 2, 25 * MS), AckDue::Piggyback);
+        assert_eq!(
+            r.ack_due(t0 + 100 * MS, &threshold(2), 25 * MS),
+            AckDue::Piggyback
+        );
     }
 
     #[test]
@@ -442,12 +508,18 @@ mod tests {
         assert!(r.on_packet(2, true, Ecn::NotEct, t0 + MS));
         assert!(r.on_packet(3, false, Ecn::NotEct, t0 + 2 * MS));
         // One ack-eliciting packet: due max_ack_delay after it arrived.
-        assert_eq!(r.ack_due(t0 + 2 * MS, 2, 25 * MS), AckDue::At(t0 + 26 * MS));
-        assert_eq!(r.ack_due(t0 + 26 * MS, 2, 25 * MS), AckDue::Now);
+        assert_eq!(
+            r.ack_due(t0 + 2 * MS, &threshold(2), 25 * MS),
+            AckDue::At(t0 + 26 * MS)
+        );
+        assert_eq!(r.ack_due(t0 + 26 * MS, &threshold(2), 25 * MS), AckDue::Now);
         // A second one reaches the threshold.
         assert!(r.on_packet(4, true, Ecn::NotEct, t0 + 3 * MS));
-        assert_eq!(r.ack_due(t0 + 3 * MS, 2, 25 * MS), AckDue::Now);
-        assert_eq!(r.ack_due(t0 + 3 * MS, 3, 25 * MS), AckDue::At(t0 + 26 * MS));
+        assert_eq!(r.ack_due(t0 + 3 * MS, &threshold(2), 25 * MS), AckDue::Now);
+        assert_eq!(
+            r.ack_due(t0 + 3 * MS, &threshold(3), 25 * MS),
+            AckDue::At(t0 + 26 * MS)
+        );
     }
 
     #[test]
@@ -456,9 +528,17 @@ mod tests {
         for space in [Space::Initial, Space::Handshake] {
             let mut r = ReceivedPackets::new(space, 32);
             assert!(r.on_packet(0, false, Ecn::NotEct, t0));
-            assert_eq!(r.ack_due(t0, 2, 25 * MS), AckDue::Piggyback, "{space:?}");
+            assert_eq!(
+                r.ack_due(t0, &threshold(2), 25 * MS),
+                AckDue::Piggyback,
+                "{space:?}"
+            );
             assert!(r.on_packet(1, true, Ecn::NotEct, t0));
-            assert_eq!(r.ack_due(t0, 2, 25 * MS), AckDue::Now, "{space:?}");
+            assert_eq!(
+                r.ack_due(t0, &threshold(2), 25 * MS),
+                AckDue::Now,
+                "{space:?}"
+            );
         }
     }
 
@@ -470,7 +550,7 @@ mod tests {
         for &(pn, eliciting) in packets {
             assert!(r.on_packet(pn, eliciting, Ecn::NotEct, t0));
         }
-        r.ack_due(t0, 10, 25 * MS) == AckDue::Now
+        r.ack_due(t0, &threshold(10), 25 * MS) == AckDue::Now
     }
 
     #[test]
@@ -501,7 +581,7 @@ mod tests {
         }
         assert_eq!(ranges(&r), vec![0..=100]);
         assert_eq!(
-            r.ack_due(t0, u8::MAX, 25 * MS),
+            r.ack_due(t0, &threshold(u16::MAX), 25 * MS),
             AckDue::At(t0 + 25 * MS),
             "an in-order packet made an ACK due at once"
         );
@@ -522,7 +602,7 @@ mod tests {
         assert!(!r.is_duplicate(last), "{last} reported duplicate");
         assert!(r.on_packet(last, eliciting, Ecn::NotEct, t0));
         (
-            r.ack_due(t0, 10, 25 * MS) == AckDue::Now,
+            r.ack_due(t0, &threshold(10), 25 * MS) == AckDue::Now,
             r.searches() - before,
         )
     }
@@ -552,9 +632,9 @@ mod tests {
         let mut r = ReceivedPackets::new(Space::Data, 32);
         // Not for a non-eliciting packet: that would answer it with an ACK-only packet.
         assert!(r.on_packet(1, false, Ecn::Ce, t0));
-        assert_eq!(r.ack_due(t0, 10, 25 * MS), AckDue::Piggyback);
+        assert_eq!(r.ack_due(t0, &threshold(10), 25 * MS), AckDue::Piggyback);
         assert!(r.on_packet(2, true, Ecn::Ce, t0));
-        assert_eq!(r.ack_due(t0, 10, 25 * MS), AckDue::Now);
+        assert_eq!(r.ack_due(t0, &threshold(10), 25 * MS), AckDue::Now);
     }
 
     #[test]
@@ -563,16 +643,22 @@ mod tests {
         let mut r = ReceivedPackets::new(Space::Data, 32);
         assert!(r.on_packet(1, true, Ecn::NotEct, t0));
         assert!(r.on_packet(3, true, Ecn::NotEct, t0));
-        assert_eq!(r.ack_due(t0, 10, 25 * MS), AckDue::Now);
+        assert_eq!(r.ack_due(t0, &threshold(10), 25 * MS), AckDue::Now);
         r.on_ack_sent();
-        assert_eq!(r.ack_due(t0 + 30 * MS, 10, 25 * MS), AckDue::None);
+        assert_eq!(
+            r.ack_due(t0 + 30 * MS, &threshold(10), 25 * MS),
+            AckDue::None
+        );
         assert_eq!(ranges(&r), vec![3..=3, 1..=1]);
         assert!(r.on_packet(4, false, Ecn::NotEct, t0 + 40 * MS));
-        assert_eq!(r.ack_due(t0 + 40 * MS, 10, 25 * MS), AckDue::Piggyback);
+        assert_eq!(
+            r.ack_due(t0 + 40 * MS, &threshold(10), 25 * MS),
+            AckDue::Piggyback
+        );
         // The delay runs from the first ack-eliciting packet after the ACK.
         assert!(r.on_packet(5, true, Ecn::NotEct, t0 + 50 * MS));
         assert_eq!(
-            r.ack_due(t0 + 50 * MS, 10, 25 * MS),
+            r.ack_due(t0 + 50 * MS, &threshold(10), 25 * MS),
             AckDue::At(t0 + 75 * MS)
         );
     }

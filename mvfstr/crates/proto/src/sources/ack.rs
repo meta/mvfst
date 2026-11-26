@@ -22,6 +22,7 @@ use mvfstr_wire::VarInt;
 
 use super::FrameSource;
 use super::SendCx;
+use crate::AckPolicy;
 use crate::receive::Ecn;
 use crate::recovery::AckDue;
 use crate::recovery::ReceivedPackets;
@@ -84,8 +85,8 @@ impl AckSource {
     }
 
     /// Makes the ACK decision at the end of a receive batch.
-    pub(crate) fn decide(&mut self, now: Instant, threshold: u8, delay: Duration) {
-        self.due = self.received.ack_due(now, threshold, delay);
+    pub(crate) fn decide(&mut self, now: Instant, policy: &AckPolicy, delay: Duration) {
+        self.due = self.received.ack_due(now, policy, delay);
     }
 
     /// Returns when a delayed ACK becomes due, if one is waiting.

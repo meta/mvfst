@@ -18,6 +18,7 @@ use mvfstr_wire::StreamId;
 use super::Connection;
 use super::State;
 use super::stream_tests::config;
+use super::tests::every_other_packet;
 use super::tests::handshake;
 use crate::AppCode;
 use crate::SendOrder;
@@ -551,11 +552,15 @@ fn check(pair: &mut Pair, m: &Model, seen: &mut Seen, at: &str) {
 /// Runs `steps` random operations from `seed` on streams opened at the orders of `mix`, with
 /// stream windows of `window` bytes.
 fn run(seed: u64, mix: Mix, window: u64, steps: usize) -> Seen {
+    // The seeds reach the states the tests count with both sides acknowledging every other
+    // packet.
     let setup = Setup {
+        client_transport: config(|c| c.ack_policy(every_other_packet())),
         server_transport: config(|c| {
             c.max_data(4 * window)
                 .max_stream_data_uni(window)
                 .max_stream_data_bidi_remote(window)
+                .ack_policy(every_other_packet())
         }),
         ..Setup::default()
     };

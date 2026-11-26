@@ -4270,8 +4270,10 @@ fn a_quiesce_whose_grace_runs_past_the_clock_never_forces_a_close() {
 fn sluggish() -> Arc<TransportConfig> {
     TransportConfig::builder()
         .ack_policy(AckPolicy {
-            eliciting_threshold: u8::MAX,
+            before_init: 255,
+            after_init: 255,
             max_ack_delay: Duration::from_secs(16),
+            rtt_timer: false,
             ..AckPolicy::default()
         })
         .build()
@@ -6669,8 +6671,10 @@ fn relay_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn sluggish_and_paced() -> Arc<TransportConfig> {
     TransportConfig::builder()
         .ack_policy(AckPolicy {
-            eliciting_threshold: u8::MAX,
+            before_init: 255,
+            after_init: 255,
             max_ack_delay: Duration::from_secs(16),
+            rtt_timer: false,
             ..AckPolicy::default()
         })
         .pacing(true)

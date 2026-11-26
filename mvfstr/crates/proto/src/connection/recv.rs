@@ -160,10 +160,17 @@ impl Connection {
         let policy = self.config.ack_policy();
         // The timer fires up to one granularity late, which the advertised max_ack_delay,
         // rounded up to whole milliseconds, absorbs.
-        let delay = policy.max_ack_delay.saturating_sub(super::GRANULARITY);
+        let longest = policy.max_ack_delay.saturating_sub(super::GRANULARITY);
+        let delay = if policy.rtt_timer {
+            (self.recovery.rtt().smoothed() / 4)
+                .max(super::GRANULARITY)
+                .min(longest)
+        } else {
+            longest
+        };
         for (space, ack) in self.sources.ack.iter_mut().enumerate() {
             if !self.spaces[space].discarded {
-                ack.decide(now, policy.eliciting_threshold, delay);
+                ack.decide(now, &policy, delay);
             }
         }
     }

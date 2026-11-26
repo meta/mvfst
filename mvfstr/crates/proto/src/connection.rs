@@ -22,6 +22,8 @@
 
 #[cfg(test)]
 mod accessor_tests;
+#[cfg(test)]
+mod ack_tests;
 mod buffered;
 #[cfg(test)]
 mod cc_tests;

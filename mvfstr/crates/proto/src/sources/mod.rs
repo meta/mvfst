@@ -654,6 +654,7 @@ mod tests {
 
     use super::control::ControlCand;
     use super::*;
+    use crate::AckPolicy;
     use crate::AppCode;
     use crate::CreditDue;
     use crate::OpenError;
@@ -737,7 +738,11 @@ mod tests {
         for pn in (0..=3).chain(70..=90) {
             ack.on_packet(pn, true, Ecn::Ect0, test_epoch());
         }
-        ack.decide(test_epoch(), 2, Duration::from_millis(24));
+        ack.decide(
+            test_epoch(),
+            &AckPolicy::default(),
+            Duration::from_millis(24),
+        );
         fits_the_room_it_asks_for(&mut ack, Space::Data, true);
 
         // New CRYPTO bytes at an offset past 63, whose varint takes two bytes.

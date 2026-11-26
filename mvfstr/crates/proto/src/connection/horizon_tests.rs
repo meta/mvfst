@@ -283,7 +283,8 @@ fn an_ack_only_datagram_leaves_after_the_last_release_and_measures_its_delay_fro
     let t0 = pair.now;
     let last = built_ahead(&mut pair).last().unwrap().1;
     assert_eq!(last, t0 + 9 * 209 * US);
-    // Two ack-eliciting packets make an ACK due at once, while data waits for the pacer.
+    // The packets follow a gap in the packet numbers, which makes an ACK due at once, while data
+    // waits for the pacer.
     from_client(&mut pair, t0, &[&[Frame::Ping], &[Frame::Ping]]);
     let (ack, runs) = server_attempt(&mut pair, t0);
     assert_eq!((ack.datagrams, runs.len()), (1, 1), "{ack:?}");

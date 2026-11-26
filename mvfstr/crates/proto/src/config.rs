@@ -278,15 +278,24 @@ pub enum CongestionControl {
     Bbr3,
 }
 
-/// When to acknowledge (RFC 9000).
+/// When to acknowledge (RFC 9000). The thresholds and the timer follow mvfst's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AckPolicy {
-    /// The number of unacknowledged ack-eliciting packets that triggers an acknowledgment; at
-    /// least 1. Default 2, as RFC 9000 recommends.
-    pub eliciting_threshold: u8,
+    /// The largest packet number received up to which `before_init` applies; above it,
+    /// `after_init` does. Default 100.
+    pub init_threshold: u64,
+    /// The number of unacknowledged ack-eliciting packets that triggers an acknowledgment while
+    /// the largest packet number received is at most `init_threshold`; at least 1. Default 10.
+    pub before_init: u16,
+    /// The number of unacknowledged ack-eliciting packets that triggers an acknowledgment once
+    /// the largest packet number received is above `init_threshold`; at least 1. Default 10.
+    pub after_init: u16,
     /// The longest we delay an acknowledgment, advertised as max_ack_delay in whole
     /// milliseconds rounded up; at most 2^14 - 1 ms. Default 25 ms.
     pub max_ack_delay: Duration,
+    /// Whether the ACK timer is a quarter of the smoothed RTT, but at least 1 ms. It is at most
+    /// max_ack_delay less 1 ms, which is its length when this is false. Default true.
+    pub rtt_timer: bool,
     /// The ack_delay_exponent we advertise, at most 20. Default 3.
     pub ack_delay_exponent: u8,
 }
@@ -294,8 +303,11 @@ pub struct AckPolicy {
 impl Default for AckPolicy {
     fn default() -> Self {
         Self {
-            eliciting_threshold: 2,
+            init_threshold: 100,
+            before_init: 10,
+            after_init: 10,
             max_ack_delay: Duration::from_millis(25),
+            rtt_timer: true,
             ack_delay_exponent: 3,
         }
     }
@@ -926,7 +938,8 @@ impl TransportConfigBuilder {
         check(
             // RFC 9000 allows a max_ack_delay below 2^14 ms. It is advertised in whole
             // milliseconds rounded up, so the ACK timer never runs past the advertised value.
-            ack.eliciting_threshold >= 1
+            ack.before_init >= 1
+                && ack.after_init >= 1
                 && ack.max_ack_delay <= Duration::from_millis((1 << 14) - 1)
                 && ack.ack_delay_exponent <= 20,
             "ack_policy",
@@ -1465,7 +1478,11 @@ mod tests {
         assert_eq!(config.idle_timeout(), Some(Duration::from_secs(30)));
         assert_eq!(config.max_udp_payload_size(), 1452);
         assert_eq!(config.ack_policy(), AckPolicy::default());
-        assert_eq!(config.ack_policy().eliciting_threshold, 2);
+        // mvfst's ACK cadence.
+        assert_eq!(config.ack_policy().init_threshold, 100);
+        assert_eq!(config.ack_policy().before_init, 10);
+        assert_eq!(config.ack_policy().after_init, 10);
+        assert!(config.ack_policy().rtt_timer);
         assert_eq!(config.ack_policy().max_ack_delay, Duration::from_millis(25));
         assert_eq!(config.ack_policy().ack_delay_exponent, 3);
         assert_eq!(config.congestion_control(), CongestionControl::Cubic);
@@ -1486,8 +1503,11 @@ mod tests {
     #[test]
     fn transport_builder_sets_every_field() {
         let ack = AckPolicy {
-            eliciting_threshold: 10,
+            init_threshold: 1000,
+            before_init: 2,
+            after_init: 20,
             max_ack_delay: Duration::from_millis(5),
+            rtt_timer: false,
             ack_delay_exponent: 8,
         };
         let config = TransportConfig::builder()
@@ -1544,8 +1564,11 @@ mod tests {
     #[test]
     fn transport_builder_accepts_range_limits() {
         let ack = AckPolicy {
-            eliciting_threshold: 1,
+            init_threshold: u64::MAX,
+            before_init: 1,
+            after_init: 1,
             max_ack_delay: Duration::from_millis((1 << 14) - 1),
+            rtt_timer: true,
             ack_delay_exponent: 20,
         };
         let limits = [
@@ -1661,7 +1684,14 @@ mod tests {
             ),
             (
                 TransportConfig::builder().ack_policy(AckPolicy {
-                    eliciting_threshold: 0,
+                    before_init: 0,
+                    ..ack
+                }),
+                "ack_policy",
+            ),
+            (
+                TransportConfig::builder().ack_policy(AckPolicy {
+                    after_init: 0,
                     ..ack
                 }),
                 "ack_policy",
