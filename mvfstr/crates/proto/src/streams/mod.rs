@@ -14,6 +14,8 @@
 //! per-stream mutation goes.
 
 mod api;
+#[cfg(test)]
+mod conformance;
 pub(crate) mod conn;
 mod fair_share;
 pub(crate) mod guard;
