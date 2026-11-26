@@ -32,6 +32,7 @@ use mvfstr_driver::Conn;
 use mvfstr_driver::ConnHandle;
 use mvfstr_driver::ConnInfo;
 use mvfstr_driver::EndpointHandle;
+use mvfstr_driver::EndpointStats;
 use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
 use mvfstr_driver::Refusal;
@@ -75,6 +76,8 @@ pub(crate) struct Closed {
     pub(crate) socket_stops: u64,
     /// The pacing wakes the server's transmit phases have taken so far, over every connection.
     pub(crate) phase_pacing_wakes: u64,
+    /// The Initials of new connections the server has dropped so far.
+    pub(crate) dropped_initials: u64,
 }
 
 /// The ID of a session's connection to its own TLS host.
@@ -184,6 +187,9 @@ impl<B: Backend> QuicApplication for ServerApp<B> {
         _options: &mut ConnOptions,
     ) -> Result<ServerSession<B>, Refusal> {
         self.settings.counters.conns.fetch_add(1, Ordering::Relaxed);
+        if let Some(driver) = self.driver.get() {
+            self.settings.counters.copy_driver(&driver.stats());
+        }
         Ok(ServerSession {
             tls_host: self.settings.host_tls.clone().map(|tls| Hosted {
                 host: RustlsHost::server(tls),
@@ -296,12 +302,18 @@ impl<B: Backend> QuicSession for ServerSession<B> {
                 }
                 self.run_tls(conn);
                 self.tls_host = None;
+                let endpoint = self.driver.get().map(|driver| driver.stats());
+                if let Some(stats) = &endpoint {
+                    self.settings.counters.copy_driver(stats);
+                }
                 if self.settings.stats {
-                    let endpoint = self.driver.get().map(|driver| driver.stats());
                     let _ = self.settings.closed.send(Closed {
                         stats: conn.stats(),
                         socket_stops: endpoint.as_ref().map_or(0, |stats| stats.socket_stops),
-                        phase_pacing_wakes: endpoint.map_or(0, |stats| stats.phase_pacing_wakes),
+                        phase_pacing_wakes: endpoint
+                            .as_ref()
+                            .map_or(0, |stats| stats.phase_pacing_wakes),
+                        dropped_initials: endpoint.map_or(0, |stats| stats.dropped_initials),
                     });
                 }
             }
@@ -742,9 +754,19 @@ pub(crate) struct ServerCounters {
     objects_sent: AtomicU64,
     objects_dropped: AtomicU64,
     late_ticks: AtomicU64,
+    /// The driver's counters, copied on each accept and close.
+    dropped_initials: AtomicU64,
+    turns: AtomicU64,
 }
 
 impl ServerCounters {
+    /// Copies the driver's counters that the summary line reports.
+    fn copy_driver(&self, stats: &EndpointStats) {
+        self.dropped_initials
+            .store(stats.dropped_initials, Ordering::Relaxed);
+        self.turns.store(stats.turns, Ordering::Relaxed);
+    }
+
     /// Returns the counts so far.
     pub(crate) fn tally(&self) -> ServerTally {
         ServerTally {
@@ -752,6 +774,8 @@ impl ServerCounters {
             objects_sent: self.objects_sent.load(Ordering::Relaxed),
             objects_dropped: self.objects_dropped.load(Ordering::Relaxed),
             late_ticks: self.late_ticks.load(Ordering::Relaxed),
+            dropped_initials: self.dropped_initials.load(Ordering::Relaxed),
+            turns: self.turns.load(Ordering::Relaxed),
         }
     }
 }
@@ -918,6 +942,27 @@ mod tests {
                 objects_sent: 2,
                 objects_dropped: 1,
                 late_ticks: 4,
+                ..ServerTally::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_summary_reads_the_drivers_dropped_initials_and_turns_as_last_copied() {
+        let counters = ServerCounters::default();
+        let mut stats = EndpointStats::default();
+        stats.dropped_initials = 389;
+        stats.turns = 52_377;
+        counters.copy_driver(&stats);
+        stats.dropped_initials = 811;
+        stats.turns = 60_001;
+        counters.copy_driver(&stats);
+        assert_eq!(
+            counters.tally(),
+            ServerTally {
+                dropped_initials: 811,
+                turns: 60_001,
+                ..ServerTally::default()
             }
         );
     }

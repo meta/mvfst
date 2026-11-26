@@ -116,7 +116,6 @@ use crate::lab::MemOptions;
 use crate::lab::SERVER;
 use crate::lab::lab_configs;
 use crate::lab::transport as lab_transport;
-use crate::steer::INBOX_CAPACITY;
 use crate::steer::handoff_lifetime;
 use crate::test_support::ORDER;
 use crate::test_support::configs;
@@ -4188,7 +4187,7 @@ fn initials_beyond_those_a_turn_can_keep_are_dropped() {
     const FORGED: usize = 4;
     let mut harness = Harness::new();
     harness.limits.handshakes = 1;
-    harness.limits.waiting_initials = 1;
+    harness.limits.waiting_initial_bytes = forged_initial().len();
     let (tx, rx) = mpsc::channel();
     let addr = harness.serve(move || {
         App::new(move |_| {
@@ -7378,19 +7377,27 @@ fn a_retransmitted_first_initial_reaches_the_worker_that_accepted_the_connection
     servers.shutdown();
 }
 
+/// The length of a client's first Initial in these tests, which fills the smallest datagram that
+/// may carry it.
+const FIRST_INITIAL: usize = 1200;
+
 #[test]
 fn a_datagram_handed_to_a_full_inbox_is_dropped_and_counted() {
-    let harness = Harness::new();
+    const KEPT: usize = 3;
+    let mut harness = Harness::new();
+    harness.limits.waiting_initial_bytes = KEPT * FIRST_INITIAL;
     let (tx, rx) = mpsc::channel();
     let servers = Steered::start(&harness, 2, move |index| steered_app(index, tx.clone()));
     // Worker 0 does not run a turn while blocked, so what it is handed stays in its inbox.
     let blocked = Harness::block(&servers.workers[0]);
     let (_client, first) = client_initial(&harness, servers.addr, |byte| byte % 2 == 1);
+    assert_eq!(first.len(), FIRST_INITIAL);
     let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
     let from = peer.local_addr().expect("a bound socket");
     // The kernel delivers every copy to worker 1, which hands the first to worker 0, the group's
-    // first new connection, and every copy after it to the same worker.
-    let capacity = INBOX_CAPACITY as u64;
+    // first new connection, and every copy after it to the same worker, whose inbox holds the
+    // bytes of three.
+    let capacity = KEPT as u64;
     for sent in 1..=capacity {
         peer.send_to(&first, servers.addr)
             .expect("the datagram goes out");
@@ -7431,35 +7438,46 @@ fn a_datagram_handed_to_a_full_inbox_is_dropped_and_counted() {
 
 #[test]
 fn datagrams_handed_to_a_worker_beyond_those_it_can_keep_waiting_are_dropped_and_counted() {
-    const KEPT: usize = 4;
+    const KEPT: u64 = 4;
     const HANDED: u64 = 6;
     let mut harness = Harness::new();
-    harness.limits.waiting_initials = KEPT;
+    harness.limits.waiting_initial_bytes = KEPT as usize * FIRST_INITIAL;
     let (tx, _rx) = mpsc::channel();
     let servers = Steered::start(&harness, 2, move |index| steered_app(index, tx.clone()));
     let blocked = Harness::block(&servers.workers[0]);
     let (_client, first) = client_initial(&harness, servers.addr, |byte| byte % 2 == 1);
+    assert_eq!(first.len(), FIRST_INITIAL);
     let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
-    // Worker 1 hands every copy to worker 0, as above, whose inbox holds them all.
+    // Worker 1 hands every copy to worker 0, as above. Worker 0's inbox has the bound of its
+    // waiting queue, so it takes the bytes of four copies, and worker 1 drops the rest.
     for sent in 1..=HANDED {
         peer.send_to(&first, servers.addr)
             .expect("the datagram goes out");
         let deadline = Instant::now() + WAIT;
-        while servers.stats::<Recorder>(1).steered_out < sent {
+        while {
+            let stats = servers.stats::<Recorder>(1);
+            stats.steered_out + stats.dropped_initials < sent
+        } {
             assert!(
                 Instant::now() < deadline,
-                "worker 1 never handed off copy {sent}"
+                "worker 1 never dealt with copy {sent}"
             );
             std::thread::yield_now();
         }
     }
-    // Worker 0's next turn takes its whole inbox, and keeps only as many for later as its queue
-    // of waiting Initials holds.
+    let stats = servers.stats::<Recorder>(1);
+    assert_eq!(
+        (stats.steered_out, stats.dropped_initials),
+        (KEPT, HANDED - KEPT),
+        "the copies past the inbox's bytes are dropped and counted by the worker that hands off"
+    );
+    // Worker 0's next turn takes its whole inbox into its empty waiting queue, which has room for
+    // all of it.
     drop(blocked);
     let deadline = Instant::now() + WAIT;
     let stats = loop {
         let stats = servers.stats::<Recorder>(0);
-        if stats.steered_in >= HANDED {
+        if stats.steered_in >= KEPT {
             break stats;
         }
         assert!(Instant::now() < deadline, "worker 0 never took its inbox");
@@ -7467,8 +7485,8 @@ fn datagrams_handed_to_a_worker_beyond_those_it_can_keep_waiting_are_dropped_and
     };
     assert_eq!(
         (stats.steered_in, stats.dropped_initials),
-        (HANDED, HANDED - KEPT as u64),
-        "the datagrams past the waiting queue's room are dropped and counted"
+        (KEPT, 0),
+        "what fits the inbox fits the waiting queue"
     );
     harness.shutdown();
     servers.shutdown();

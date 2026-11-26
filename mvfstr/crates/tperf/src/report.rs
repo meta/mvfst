@@ -142,6 +142,12 @@ pub(crate) struct ServerTally {
     pub(crate) objects_dropped: u64,
     /// Ticks that started while an object of the tick before was still queued.
     pub(crate) late_ticks: u64,
+    /// The driver's [`EndpointStats::dropped_initials`](mvfstr_driver::EndpointStats), as of the
+    /// last accept or close.
+    pub(crate) dropped_initials: u64,
+    /// The driver's [`EndpointStats::turns`](mvfstr_driver::EndpointStats), as of the last accept
+    /// or close.
+    pub(crate) turns: u64,
 }
 
 /// Returns the value at `per_mille` thousandths of `sorted`, by nearest rank: the smallest value
@@ -228,6 +234,10 @@ pub(crate) fn server_summary_line(mode: WriteMode, tally: &ServerTally) -> Strin
             tally.objects_sent, tally.objects_dropped, tally.late_ticks
         ));
     }
+    line.push_str(&format!(
+        " dropped_initials={} turns={}",
+        tally.dropped_initials, tally.turns
+    ));
     line
 }
 
@@ -244,10 +254,17 @@ pub(crate) fn stats_line(stats: &ConnStats) -> String {
 }
 
 /// Returns the server's `--stats` line for a closed connection: its counters, and the
-/// endpoint's cumulative socket stops and pacing wakes taken inside transmit phases.
-pub(crate) fn closed_line(stats: &ConnStats, socket_stops: u64, phase_pacing_wakes: u64) -> String {
+/// endpoint's cumulative socket stops, pacing wakes taken inside transmit phases and dropped
+/// Initials.
+pub(crate) fn closed_line(
+    stats: &ConnStats,
+    socket_stops: u64,
+    phase_pacing_wakes: u64,
+    dropped_initials: u64,
+) -> String {
     format!(
-        "{} socket_stops={socket_stops} phase_pacing_wakes={phase_pacing_wakes}",
+        "{} socket_stops={socket_stops} phase_pacing_wakes={phase_pacing_wakes} \
+         dropped_initials={dropped_initials}",
         stats_line(stats)
     )
 }
@@ -484,9 +501,9 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             acks_received: 0,
         };
         assert_eq!(
-            closed_line(&stats, 7, 0),
+            closed_line(&stats, 7, 0, 0),
             "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
-             srtt_us=150 socket_stops=7 phase_pacing_wakes=0"
+             srtt_us=150 socket_stops=7 phase_pacing_wakes=0 dropped_initials=0"
         );
     }
 
@@ -507,9 +524,32 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             acks_received: 0,
         };
         assert_eq!(
-            closed_line(&stats, 7, 4_211),
+            closed_line(&stats, 7, 4_211, 0),
             "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
-             srtt_us=150 socket_stops=7 phase_pacing_wakes=4211"
+             srtt_us=150 socket_stops=7 phase_pacing_wakes=4211 dropped_initials=0"
+        );
+    }
+
+    #[test]
+    fn the_servers_closed_connection_line_ends_with_the_endpoints_dropped_initials() {
+        let stats = ConnStats {
+            sent_packets: 81_000,
+            sent_bytes: 117_000_000,
+            lost_packets: 12,
+            recv_packets: 1_900,
+            recv_bytes: 95_000,
+            cwnd: 1_452_000,
+            bytes_in_flight: 63_888,
+            smoothed_rtt: Duration::from_micros(150),
+            latest_rtt: Duration::from_micros(160),
+            rtt_var: Duration::from_micros(20),
+            tx_inconsistent: 0,
+            acks_received: 0,
+        };
+        assert_eq!(
+            closed_line(&stats, 7, 4_211, 389),
+            "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
+             srtt_us=150 socket_stops=7 phase_pacing_wakes=4211 dropped_initials=389"
         );
     }
 
@@ -691,11 +731,12 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             objects_sent: 1600,
             objects_dropped: 3,
             late_ticks: 2,
+            ..ServerTally::default()
         };
         assert_eq!(
             server_summary_line(WriteMode::Paced, &tally),
             "tperf_server_summary stack=mvfstr mode=paced conns=8 objects_sent=1600 \
-             objects_dropped=3 late_ticks=2"
+             objects_dropped=3 late_ticks=2 dropped_initials=0 turns=0"
         );
         assert_eq!(
             server_summary_line(
@@ -705,7 +746,29 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
                     ..ServerTally::default()
                 }
             ),
-            "tperf_server_summary stack=mvfstr mode=saturate conns=4"
+            "tperf_server_summary stack=mvfstr mode=saturate conns=4 dropped_initials=0 turns=0"
+        );
+    }
+
+    #[test]
+    fn the_server_summary_line_ends_with_the_drivers_dropped_initials_and_turns() {
+        let tally = ServerTally {
+            conns: 1000,
+            objects_sent: 1600,
+            objects_dropped: 3,
+            late_ticks: 2,
+            dropped_initials: 811,
+            turns: 52_377,
+        };
+        assert_eq!(
+            server_summary_line(WriteMode::Saturate, &tally),
+            "tperf_server_summary stack=mvfstr mode=saturate conns=1000 dropped_initials=811 \
+             turns=52377"
+        );
+        assert_eq!(
+            server_summary_line(WriteMode::Paced, &tally),
+            "tperf_server_summary stack=mvfstr mode=paced conns=1000 objects_sent=1600 \
+             objects_dropped=3 late_ticks=2 dropped_initials=811 turns=52377"
         );
     }
 }

@@ -40,11 +40,8 @@ use mvfstr_proto::RxMeta;
 use mvfstr_proto::TransportConfig;
 
 use crate::turn::Waiting;
+use crate::turn::WaitingQueue;
 use crate::wake::Shared;
-
-/// Datagrams a worker's inbox holds. A datagram handed to a full inbox is dropped, and its client
-/// sends it again.
-pub(crate) const INBOX_CAPACITY: usize = 256;
 
 /// The most IDs a worker remembers; past it the one remembered first is forgotten first, even if
 /// later datagrams carried it. A worker that receives more new connections than this within a
@@ -109,7 +106,10 @@ struct Slot {
 struct Inbox {
     /// The driver's task while it runs; without one, other workers keep what they would hand over.
     task: Option<Arc<Shared>>,
-    datagrams: VecDeque<Waiting>,
+    datagrams: WaitingQueue,
+    /// The most bytes that `datagrams` may hold, set when the driver joins; a datagram that does
+    /// not fit is dropped, and its client sends it again.
+    bound: usize,
 }
 
 impl Steering {
@@ -128,19 +128,23 @@ impl Steering {
     }
 
     /// Makes the driver whose task is `task` worker `index` of the group until the returned
-    /// member drops. A worker index has one driver at a time. The member remembers where it sent
-    /// each client's first destination connection ID until a lifetime passes without a datagram
-    /// that carries it: at least `lifetime`, which is `None` to remember IDs for as long as room
-    /// allows, and at least what [`Member::accepted`] reports.
+    /// member drops. A worker index has one driver at a time. Its inbox holds datagrams of at most
+    /// `inbox_bytes` bytes in all. The member remembers where it sent each client's first
+    /// destination connection ID until a lifetime passes without a datagram that carries it: at
+    /// least `lifetime`, which is `None` to remember IDs for as long as room allows, and at least
+    /// what [`Member::accepted`] reports.
     pub(crate) fn join(
         self: &Arc<Self>,
         index: u16,
         task: Arc<Shared>,
         lifetime: Option<Duration>,
+        inbox_bytes: usize,
     ) -> Member {
         self.outlast(lifetime);
         if let Some(Padded(slot)) = self.inboxes.get(usize::from(index)) {
-            lock(&slot.inbox).task = Some(task);
+            let mut inbox = lock(&slot.inbox);
+            inbox.task = Some(task);
+            inbox.bound = inbox_bytes;
         }
         Member {
             group: Arc::clone(self),
@@ -184,7 +188,7 @@ impl Steering {
         let Some(task) = &inbox.task else {
             return Err(Refused::Gone);
         };
-        if inbox.datagrams.len() >= INBOX_CAPACITY {
+        if !inbox.datagrams.fits(datagram.datagram.len(), inbox.bound) {
             return Err(Refused::Full);
         }
         // A driver takes its whole inbox at once, so a non-empty inbox has a wake pending.
@@ -214,7 +218,7 @@ pub(crate) enum Steer {
     Keep,
     /// Another worker's driver has it.
     HandedOff,
-    /// It was for another worker, whose inbox was full.
+    /// It was for another worker, whose inbox did not have room for it.
     Dropped,
 }
 
@@ -222,7 +226,7 @@ pub(crate) enum Steer {
 enum Refused {
     /// The target's driver does not run.
     Gone,
-    /// The target's inbox is full.
+    /// The datagram does not fit the bytes left in the target's inbox.
     Full,
 }
 
@@ -238,7 +242,7 @@ pub(crate) struct Member {
     index: u16,
     handoffs: RefCell<Handoffs>,
     /// An empty queue whose allocation the next take swaps into the inbox.
-    spare: RefCell<VecDeque<Waiting>>,
+    spare: RefCell<WaitingQueue>,
 }
 
 impl Member {
@@ -319,7 +323,7 @@ impl Member {
             mem::swap(&mut inbox.datagrams, &mut taken);
             slot.filled.store(false, Ordering::Relaxed);
         }
-        taken.drain(..).for_each(&mut f);
+        taken.drain().for_each(&mut f);
         *self.spare.borrow_mut() = taken;
     }
 }
@@ -329,7 +333,7 @@ impl Drop for Member {
         if let Some(Padded(slot)) = self.group.inboxes.get(usize::from(self.index)) {
             let mut inbox = lock(&slot.inbox);
             inbox.task = None;
-            inbox.datagrams.clear();
+            inbox.datagrams = WaitingQueue::default();
             slot.filled.store(false, Ordering::Relaxed);
         }
     }
@@ -450,12 +454,15 @@ mod tests {
 
     const LIFETIME: Duration = Duration::from_secs(60);
 
+    /// An inbox bound that the tests of other things do not reach.
+    const ROOM: usize = 1 << 20;
+
     #[test]
     fn a_connection_its_receiving_worker_kept_stays_there_when_its_initial_comes_again() {
         let group = Steering::new(2);
         let (zero, _one) = (
-            group.join(0, task(), Some(LIFETIME)),
-            group.join(1, task(), Some(LIFETIME)),
+            group.join(0, task(), Some(LIFETIME), ROOM),
+            group.join(1, task(), Some(LIFETIME), ROOM),
         );
         // The group's first new connection goes to worker 0, the next to worker 1.
         assert_eq!(
@@ -477,7 +484,7 @@ mod tests {
     #[test]
     fn a_connection_kept_because_its_worker_did_not_run_stays_with_the_worker_that_kept_it() {
         let group = Steering::new(2);
-        let zero = group.join(0, task(), Some(LIFETIME));
+        let zero = group.join(0, task(), Some(LIFETIME), ROOM);
         assert_eq!(
             zero.steer_new(Instant::now(), &meta(), &initial(2)),
             Steer::Keep
@@ -487,7 +494,7 @@ mod tests {
             zero.steer_new(Instant::now(), &meta(), &initial(4)),
             Steer::Keep
         );
-        let _one = group.join(1, task(), Some(LIFETIME));
+        let _one = group.join(1, task(), Some(LIFETIME), ROOM);
         assert_eq!(
             zero.steer_new(Instant::now(), &meta(), &initial(4)),
             Steer::Keep,
@@ -515,8 +522,8 @@ mod tests {
     fn an_id_is_remembered_for_a_lifetime_after_the_last_datagram_that_carried_it() {
         let group = Steering::new(2);
         let (_zero, one) = (
-            group.join(0, task(), Some(LIFETIME)),
-            group.join(1, task(), Some(LIFETIME)),
+            group.join(0, task(), Some(LIFETIME), ROOM),
+            group.join(1, task(), Some(LIFETIME), ROOM),
         );
         let start = Instant::now();
         // The group's first new connection goes to worker 0; while the server does not answer,
@@ -542,8 +549,8 @@ mod tests {
     fn an_id_is_remembered_as_long_as_connections_accepted_with_their_own_transport_can_wait() {
         let group = Steering::new(2);
         let (zero, one) = (
-            group.join(0, task(), Some(LIFETIME)),
-            group.join(1, task(), Some(LIFETIME)),
+            group.join(0, task(), Some(LIFETIME), ROOM),
+            group.join(1, task(), Some(LIFETIME), ROOM),
         );
         let start = Instant::now();
         assert_eq!(one.steer_new(start, &meta(), &initial(3)), Steer::HandedOff);
@@ -575,7 +582,10 @@ mod tests {
     #[test]
     fn without_an_idle_timeout_an_id_is_not_forgotten_for_its_age() {
         let group = Steering::new(2);
-        let (_zero, one) = (group.join(0, task(), None), group.join(1, task(), None));
+        let (_zero, one) = (
+            group.join(0, task(), None, ROOM),
+            group.join(1, task(), None, ROOM),
+        );
         let start = Instant::now();
         assert_eq!(one.steer_new(start, &meta(), &initial(3)), Steer::HandedOff);
         let a_year_later = start + Duration::from_secs(365 * 24 * 3600);
@@ -628,7 +638,7 @@ mod tests {
     #[test]
     fn a_worker_whose_driver_does_not_run_is_handed_nothing() {
         let group = Steering::new(2);
-        let zero = group.join(0, task(), Some(LIFETIME));
+        let zero = group.join(0, task(), Some(LIFETIME), ROOM);
         let now = Instant::now();
         // New connections go to workers 0, 1, 0, 1 and so on.
         assert_eq!(zero.steer_new(now, &meta(), &initial(2)), Steer::Keep);
@@ -637,7 +647,7 @@ mod tests {
             Steer::Keep,
             "worker 1's driver has not started"
         );
-        let one = group.join(1, task(), Some(LIFETIME));
+        let one = group.join(1, task(), Some(LIFETIME), ROOM);
         assert_eq!(zero.steer_new(now, &meta(), &initial(4)), Steer::Keep);
         assert_eq!(zero.steer_new(now, &meta(), &initial(5)), Steer::HandedOff);
         drop(one);
@@ -648,29 +658,89 @@ mod tests {
             "worker 1's driver has ended"
         );
         let mut taken = 0;
-        group.join(1, task(), Some(LIFETIME)).take(|_| taken += 1);
+        group
+            .join(1, task(), Some(LIFETIME), ROOM)
+            .take(|_| taken += 1);
         assert_eq!(taken, 0, "what an ended driver was handed went with it");
     }
 
     #[test]
     fn a_full_inbox_drops_what_is_handed_to_it() {
+        const KEPT: usize = 3;
         let group = Steering::new(2);
+        // The target's own bound decides, not the bound of the worker that hands off.
         let (zero, one) = (
-            group.join(0, task(), Some(LIFETIME)),
-            group.join(1, task(), Some(LIFETIME)),
+            group.join(0, task(), Some(LIFETIME), 0),
+            group.join(1, task(), Some(LIFETIME), KEPT * initial(2).len()),
         );
-        for _ in 0..INBOX_CAPACITY {
+        for _ in 0..KEPT {
             assert_eq!(zero.hand_off(1, &meta(), &initial(2)), Steer::HandedOff);
         }
         assert_eq!(zero.hand_off(1, &meta(), &initial(2)), Steer::Dropped);
         let mut taken = 0;
         one.take(|_| taken += 1);
-        assert_eq!(taken, INBOX_CAPACITY);
+        assert_eq!(taken, KEPT);
         assert_eq!(
             zero.hand_off(1, &meta(), &initial(2)),
             Steer::HandedOff,
             "an inbox taken has room again"
         );
+    }
+
+    #[test]
+    fn an_inbox_has_its_whole_bound_again_after_every_take() {
+        const KEPT: usize = 3;
+        let group = Steering::new(2);
+        let (zero, one) = (
+            group.join(0, task(), Some(LIFETIME), ROOM),
+            group.join(1, task(), Some(LIFETIME), KEPT * initial(2).len()),
+        );
+        // A take swaps the inbox with the queue that the take before it emptied, so the third
+        // fill reuses the first fill's queue.
+        for round in 1..=4 {
+            for _ in 0..KEPT {
+                assert_eq!(
+                    zero.hand_off(1, &meta(), &initial(2)),
+                    Steer::HandedOff,
+                    "fill {round}"
+                );
+            }
+            assert_eq!(
+                zero.hand_off(1, &meta(), &initial(2)),
+                Steer::Dropped,
+                "fill {round}"
+            );
+            let mut taken = 0;
+            one.take(|_| taken += 1);
+            assert_eq!(taken, KEPT, "fill {round}");
+        }
+    }
+
+    #[test]
+    fn each_datagram_in_an_inbox_takes_its_own_bytes() {
+        let group = Steering::new(2);
+        let full = initial(2);
+        let half = &full[..full.len() / 2];
+        let (zero, one) = (
+            group.join(0, task(), Some(LIFETIME), ROOM),
+            group.join(1, task(), Some(LIFETIME), 2 * full.len() + half.len()),
+        );
+        assert_eq!(zero.hand_off(1, &meta(), &full), Steer::HandedOff);
+        assert_eq!(zero.hand_off(1, &meta(), &full), Steer::HandedOff);
+        assert_eq!(
+            zero.hand_off(1, &meta(), &full),
+            Steer::Dropped,
+            "a third full datagram would pass the bound"
+        );
+        assert_eq!(
+            zero.hand_off(1, &meta(), half),
+            Steer::HandedOff,
+            "a half datagram fills the bound exactly"
+        );
+        assert_eq!(zero.hand_off(1, &meta(), &half[..1]), Steer::Dropped);
+        let mut taken = Vec::new();
+        one.take(|waiting| taken.push(waiting.datagram.len()));
+        assert_eq!(taken, [full.len(), full.len(), half.len()]);
     }
 
     /// Counts its wakes.
@@ -689,8 +759,8 @@ mod tests {
         let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
         target.register(&Waker::from(Arc::clone(&wakes)));
         let (zero, one) = (
-            group.join(0, task(), Some(LIFETIME)),
-            group.join(1, target, Some(LIFETIME)),
+            group.join(0, task(), Some(LIFETIME), ROOM),
+            group.join(1, target, Some(LIFETIME), ROOM),
         );
         zero.hand_off(1, &meta(), &initial(2));
         zero.hand_off(1, &meta(), &initial(3));

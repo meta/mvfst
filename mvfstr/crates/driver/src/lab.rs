@@ -1012,6 +1012,8 @@ pub(crate) struct LabApp {
     /// empty.
     pub(crate) accept_costs: Vec<Duration>,
     pub(crate) accepted: Rc<Cell<usize>>,
+    /// How the application turns down every attempt instead of accepting it, if set.
+    pub(crate) refusal: Option<Refusal>,
 }
 
 impl LabApp {
@@ -1024,6 +1026,7 @@ impl LabApp {
             accept: Box::new(accept),
             accept_costs: Vec::new(),
             accepted: Rc::default(),
+            refusal: None,
         }
     }
 
@@ -1045,6 +1048,9 @@ impl QuicApplication for LabApp {
             .copied()
             .unwrap_or_default();
         self.net.charge(cost);
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
         self.accepted.set(n + 1);
         Ok((self.accept)(n, options))
     }

@@ -91,6 +91,9 @@ struct ServerPlan {
     build_horizon: Duration,
     /// The initial window, in packets, of the connections the server accepts, if not the lab's.
     window: Option<u32>,
+    /// The builder's bound on the bytes of the Initials the server keeps for a later turn, if
+    /// not the default.
+    waiting_initial_bytes: Option<usize>,
 }
 
 impl Default for ServerPlan {
@@ -110,6 +113,7 @@ impl Default for ServerPlan {
             socket_segments: None,
             build_horizon: Duration::ZERO,
             window: None,
+            waiting_initial_bytes: None,
         }
     }
 }
@@ -152,6 +156,7 @@ impl Scene {
             socket_segments,
             build_horizon,
             window,
+            waiting_initial_bytes,
         } = plan;
         let endpoint = if build_horizon.is_zero() {
             endpoint
@@ -189,6 +194,9 @@ impl Scene {
                 polls: polls.unwrap_or(limits.polls),
                 ..limits
             });
+        }
+        if let Some(bytes) = waiting_initial_bytes {
+            server = server.waiting_initial_bytes(bytes);
         }
         if let Some(budget) = budget {
             server = server.work_budget(budget);
@@ -1205,6 +1213,121 @@ fn a_slice_that_closes_in_an_accept_stops_right_after_it_in_serve_waiting() {
         scene.servers().len(),
         4,
         "the last waiting Initial is accepted next"
+    );
+}
+
+/// The length of a client's first Initial in the lab: the smallest datagram that may carry it.
+const FIRST_INITIAL: usize = 1200;
+
+#[test]
+fn a_waiting_initial_that_a_stop_pushes_back_counts_once() {
+    // As in the test above, the slice closes in the accept of the first Initial kept waiting and
+    // stops the poll before the second; the bound has room for exactly those two.
+    let budget = WorkBudget::per_poll(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        budget: Some(budget.clone()),
+        handshakes: Some(2),
+        accept_costs: vec![Duration::ZERO, Duration::ZERO, SLICE * 2, Duration::ZERO],
+        waiting_initial_bytes: Some(2 * FIRST_INITIAL),
+        ..ServerPlan::default()
+    });
+    for _ in 0..4 {
+        scene.connect(0, Some(0));
+    }
+    scene.lab.settle_except(Some(scene.server_task));
+    scene.lab.advance(DELAY);
+    let first = scene.poll_server();
+    assert_eq!(scene.servers().len(), 3, "{first:?}");
+    assert_eq!(scene.server.waiting(), (1, false), "{first:?}");
+    assert_eq!(
+        scene.server.waiting_bytes(),
+        FIRST_INITIAL,
+        "the Initial popped and put back counts once: {first:?}"
+    );
+    assert_eq!(scene.server.stats().dropped_initials, 0, "{first:?}");
+    scene.poll_server();
+    assert_eq!(scene.servers().len(), 4);
+    assert_eq!(scene.server.waiting(), (0, false));
+    assert_eq!(
+        scene.server.waiting_bytes(),
+        0,
+        "the accept took its bytes out"
+    );
+}
+
+#[test]
+fn an_inbox_taken_while_attempts_still_wait_keeps_only_what_fits_beside_them() {
+    const KEPT: usize = 3;
+    let other_addr = SocketAddr::from(([127, 0, 0, 1], 444));
+    let group = Steering::new(2);
+    let budget = WorkBudget::new(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        budget: Some(budget.clone()),
+        handshakes: Some(1),
+        steering: Some((Arc::clone(&group), 0)),
+        waiting_initial_bytes: Some(KEPT * FIRST_INITIAL),
+        ..ServerPlan::default()
+    });
+    let other = scene.spawn_worker(&group, 1, other_addr);
+    for _ in 0..4 * KEPT {
+        scene.connect_to(other_addr, 0, Some(0));
+    }
+    scene.lab.net.hold(other_addr);
+    scene.lab.settle_except(Some(scene.server_task));
+    let held = scene.lab.net.take_held();
+    assert_eq!(
+        held.iter()
+            .map(|arrival| (arrival.src, arrival.data.len()))
+            .collect::<Vec<_>>(),
+        (0..4 * KEPT as u16)
+            .map(|n| (nth_socket(n), FIRST_INITIAL))
+            .collect::<Vec<_>>(),
+        "each first flight is one datagram"
+    );
+    // The group's new connections go to this worker and the other in turn, starting with this
+    // one, so the other worker hands over the first, third and fifth of the six it receives,
+    // which fill this worker's inbox.
+    let deliver = |arrivals: &[Arrival]| {
+        for arrival in arrivals {
+            scene.lab.net.inject(other_addr, arrival.clone());
+        }
+        scene.lab.settle_except(Some(scene.server_task));
+    };
+    deliver(&held[..2 * KEPT]);
+    assert_eq!(other.stats().steered_out, KEPT as u64);
+    // On a grant, this worker takes its inbox into its waiting queue and routes the first of it
+    // again; the check before the accept stops the poll and keeps that attempt out of the queue.
+    budget.set_hold(true);
+    budget.grant();
+    let first = scene.poll_server();
+    assert_eq!(scene.server.waiting(), (KEPT - 1, true), "{first:?}");
+    // The next three handed over fill the inbox again. The queue still holds two when this worker
+    // takes the inbox, so only one more fits.
+    deliver(&held[2 * KEPT..]);
+    let stats = other.stats();
+    assert_eq!(
+        (stats.steered_out, stats.dropped_initials),
+        (2 * KEPT as u64, 0),
+        "every hand-off fits the inbox"
+    );
+    budget.set_hold(false);
+    budget.refill();
+    let mut marks = Vec::new();
+    while scene.lab.queued(scene.server_task) {
+        assert!(marks.len() < 2_000, "the server keeps waking: {marks:?}");
+        marks.extend(scene.poll_server());
+    }
+    let stats = scene.server.stats();
+    assert_eq!(
+        (stats.steered_in, stats.dropped_initials),
+        (2 * KEPT as u64, KEPT as u64 - 1),
+        "the inbox's datagrams past the queue's room are dropped and counted when taken: \
+         {marks:?}"
+    );
+    assert_eq!(
+        accepts_per_turn(&marks),
+        [0, 2, 4, 6].map(|n| [nth_socket(n)]),
+        "the kept attempt, then the queue in order: {marks:?}"
     );
 }
 

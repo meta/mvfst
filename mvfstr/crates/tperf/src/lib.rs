@@ -104,7 +104,8 @@ fn serve(flags: &Flags) -> Result<(), RunError> {
             closed_line(
                 &closed.stats,
                 closed.socket_stops,
-                closed.phase_pacing_wakes
+                closed.phase_pacing_wakes,
+                closed.dropped_initials,
             )
         );
     }

@@ -155,9 +155,10 @@ const POLLS_PER_TURN: usize = 1024;
 /// apart from the attempts, the handshakes the driver starts on its TLS host per turn.
 const HANDSHAKES_PER_TURN: usize = 8;
 
-/// Initials kept for a later turn once a turn's connection attempts run out; more are dropped,
-/// and their clients send them again.
-const WAITING_INITIALS: usize = 256;
+/// The bytes of the Initials kept for a later turn once a turn's connection attempts run out,
+/// counted by datagram length; an Initial past them is dropped, and its client sends it again.
+/// 4 MiB holds the first flights of about 1,700 clients whose ClientHello takes two datagrams.
+const WAITING_INITIAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// The per-turn caps and the transmit batch limit; tests lower them.
 #[derive(Clone, Copy, Debug)]
@@ -176,8 +177,9 @@ pub(crate) struct Limits {
     /// Connection attempts handled per turn, and apart from them, handshakes started on the TLS
     /// host per turn.
     pub(crate) handshakes: usize,
-    /// Initials kept for a later turn once a turn's connection attempts run out.
-    pub(crate) waiting_initials: usize,
+    /// The most bytes of the Initials kept for a later turn once a turn's connection attempts
+    /// run out, and of the datagrams other workers may hand to this one's inbox.
+    pub(crate) waiting_initial_bytes: usize,
 }
 
 impl Default for Limits {
@@ -189,7 +191,7 @@ impl Default for Limits {
             polls: POLLS_PER_TURN,
             turn_staging: TURN_STAGING,
             handshakes: HANDSHAKES_PER_TURN,
-            waiting_initials: WAITING_INITIALS,
+            waiting_initial_bytes: WAITING_INITIAL_BYTES,
         }
     }
 }
@@ -449,6 +451,48 @@ pub(crate) struct Waiting {
     pub(crate) datagram: Vec<u8>,
 }
 
+/// Datagrams kept to be routed again later, oldest first, and the bytes they hold, counted by
+/// datagram length.
+#[derive(Default)]
+pub(crate) struct WaitingQueue {
+    datagrams: VecDeque<Waiting>,
+    bytes: usize,
+}
+
+impl WaitingQueue {
+    /// Returns whether a datagram of `len` bytes fits beside those queued within `bound` bytes.
+    pub(crate) fn fits(&self, len: usize, bound: usize) -> bool {
+        len <= bound.saturating_sub(self.bytes)
+    }
+
+    pub(crate) fn push_back(&mut self, waiting: Waiting) {
+        self.bytes += waiting.datagram.len();
+        self.datagrams.push_back(waiting);
+    }
+
+    fn pop_front(&mut self) -> Option<Waiting> {
+        let waiting = self.datagrams.pop_front()?;
+        self.bytes -= waiting.datagram.len();
+        Some(waiting)
+    }
+
+    /// Puts back first a datagram that [`pop_front`](Self::pop_front) took.
+    fn push_front(&mut self, waiting: Waiting) {
+        self.bytes += waiting.datagram.len();
+        self.datagrams.push_front(waiting);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.datagrams.is_empty()
+    }
+
+    /// Empties the queue, yielding its datagrams oldest first.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = Waiting> + '_ {
+        self.bytes = 0;
+        self.datagrams.drain(..)
+    }
+}
+
 /// A connection's own connected socket, with the wakers for its receive and writable polls.
 struct OwnSocket<B> {
     socket: B,
@@ -532,7 +576,7 @@ struct Sched {
     rx_more: bool,
     /// Initials for new connections that came after their turn's connection attempts ran out,
     /// oldest first.
-    waiting: VecDeque<Waiting>,
+    waiting: WaitingQueue,
     /// Connections whose attempt the server socket refused, waiting for it to take runs again,
     /// oldest first.
     parked: VecDeque<ConnKey>,
@@ -599,8 +643,8 @@ pub struct EndpointStats {
     /// tore that connection down, and in the application's `accept` or `quiesce`, a session's
     /// `Drop`, or the creation of a connection.
     pub contained_panics: u64,
-    /// Initials for new connections dropped because the queue of those waiting for a later turn,
-    /// or the inbox of the worker they were steered to, was full.
+    /// Initials for new connections dropped because they did not fit the bytes left in the queue
+    /// of those waiting for a later turn, or in the inbox of the worker they were steered to.
     pub dropped_initials: u64,
     /// Datagrams of new connections handed to another worker's driver (worker steering).
     pub steered_out: u64,
@@ -770,8 +814,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let lifetime = server
             .as_ref()
             .and_then(|server| handoff_lifetime(server.config().transport()));
-        let steering =
-            steering.map(|(group, index)| group.join(index, Arc::clone(&shared), lifetime));
+        let steering = steering.map(|(group, index)| {
+            group.join(
+                index,
+                Arc::clone(&shared),
+                lifetime,
+                limits.waiting_initial_bytes,
+            )
+        });
         let src_port_drops = endpoint.src_port_drops();
         Self {
             worker: worker.clone(),
@@ -789,7 +839,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 app_first: Vec::new(),
                 rx: KeyQueue::default(),
                 rx_more: false,
-                waiting: VecDeque::new(),
+                waiting: WaitingQueue::default(),
                 parked: VecDeque::new(),
                 server_blocked: false,
                 reports: Vec::new(),
@@ -1023,7 +1073,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> (usize, bool) {
         let sched = self.sched.borrow();
-        (sched.waiting.len(), sched.kept_accept.is_some())
+        (sched.waiting.datagrams.len(), sched.kept_accept.is_some())
+    }
+
+    /// Returns the bytes of the Initials that wait for a later turn.
+    #[cfg(test)]
+    pub(crate) fn waiting_bytes(&self) -> usize {
+        self.sched.borrow().waiting.bytes
     }
 
     /// Returns the endpoint's counters.
@@ -2643,9 +2699,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     }
 
     /// Keeps for a later turn an Initial that came after this turn's connection attempts ran out,
-    /// or drops it when too many wait already; its client sends it again.
+    /// or drops it when it does not fit the bytes left for waiting Initials; its client sends it
+    /// again.
     fn keep_waiting(&self, meta: &RxMeta, datagram: &[u8]) {
-        if self.sched.borrow().waiting.len() >= self.limits.waiting_initials {
+        let bound = self.limits.waiting_initial_bytes;
+        if !self.sched.borrow().waiting.fits(datagram.len(), bound) {
             self.dropped_initials.set(self.dropped_initials.get() + 1);
             return;
         }
@@ -2655,11 +2713,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         });
     }
 
-    /// Queues `waiting` to be routed again in a later turn, or drops it when too many wait
-    /// already.
+    /// Queues `waiting` to be routed again in a later turn, or drops it when it does not fit the
+    /// bytes left for waiting Initials.
     fn queue_waiting(&self, waiting: Waiting) {
+        let bound = self.limits.waiting_initial_bytes;
         let mut sched = self.sched.borrow_mut();
-        if sched.waiting.len() >= self.limits.waiting_initials {
+        if !sched.waiting.fits(waiting.datagram.len(), bound) {
             self.dropped_initials.set(self.dropped_initials.get() + 1);
             return;
         }

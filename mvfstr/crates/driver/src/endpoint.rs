@@ -163,6 +163,16 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
         self
     }
 
+    /// Bounds at `bytes`, counted by datagram length, the Initials of new connections that the
+    /// server keeps for a later turn once a turn's connection attempts run out, and with the same
+    /// bound the datagrams that other workers of a [`steering`](Self::steering) group hand to this
+    /// one. A datagram that would pass a bound is dropped and counted in
+    /// [`EndpointStats::dropped_initials`], and its client sends it again. Default: 4 MiB.
+    pub fn waiting_initial_bytes(mut self, bytes: usize) -> Self {
+        self.limits.waiting_initial_bytes = bytes;
+        self
+    }
+
     /// Sets the timers that wake the driver. Default [`HostTimers::tokio`], the timers of a
     /// Roxygen worker on Tokio; a host without a Tokio reactor passes its own.
     pub fn host_timers(mut self, timers: HostTimers) -> Self {
@@ -417,6 +427,12 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
         self.core
             .upgrade()
             .map_or((0, false), |core| core.waiting())
+    }
+
+    /// Returns the bytes of the Initials that wait for a later turn.
+    #[cfg(test)]
+    pub(crate) fn waiting_bytes(&self) -> usize {
+        self.core.upgrade().map_or(0, |core| core.waiting_bytes())
     }
 
     /// Makes the driver's next turn panic outside every connection's guard.

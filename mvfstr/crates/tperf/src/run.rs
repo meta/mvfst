@@ -212,6 +212,7 @@ impl HostedServer {
                     &closed.stats,
                     closed.socket_stops,
                     closed.phase_pacing_wakes,
+                    closed.dropped_initials,
                 )
             })
             .collect()
@@ -716,6 +717,21 @@ impl From<ManagedWorkerError> for RunError {
 
 #[cfg(test)]
 mod tests {
+    use std::task::Context;
+    use std::task::Poll;
+
+    use mvfstr_driver::Conn;
+    use mvfstr_driver::ConnHandle;
+    use mvfstr_driver::ConnInfo;
+    use mvfstr_driver::QuicSession;
+    use mvfstr_driver::Refusal;
+    use mvfstr_driver::SendSink;
+    use mvfstr_proto::AppCode;
+    use mvfstr_proto::Bytes;
+    use mvfstr_proto::ConnEvent;
+    use mvfstr_proto::StreamId;
+    use mvfstr_proto::StreamReady;
+
     use super::*;
     use crate::flags::QuicVersion;
     use crate::flags::TlsBackend;
@@ -825,6 +841,7 @@ mod tests {
             &closed.stats,
             closed.socket_stops,
             closed.phase_pacing_wakes,
+            closed.dropped_initials,
         );
         assert!(line.contains(" socket_stops="), "{line}");
         assert_eq!(
@@ -1259,9 +1276,21 @@ mod tests {
         "lat_us_max",
     ];
 
-    /// The keys of the server's summary line, in order, and those that paced mode adds.
+    /// The keys of the server's summary line, in order: those of every mode, those that paced
+    /// mode adds, and the driver's counters, which end the line in every mode.
     const SERVER_KEYS: [&str; 3] = ["stack", "mode", "conns"];
     const SERVER_PACED_KEYS: [&str; 3] = ["objects_sent", "objects_dropped", "late_ticks"];
+    const SERVER_DRIVER_KEYS: [&str; 2] = ["dropped_initials", "turns"];
+
+    /// Returns the keys of a paced server summary line.
+    fn server_paced_keys() -> Vec<&'static str> {
+        SERVER_KEYS
+            .iter()
+            .chain(&SERVER_PACED_KEYS)
+            .chain(&SERVER_DRIVER_KEYS)
+            .copied()
+            .collect()
+    }
 
     /// The fields of a summary line, as a harness reads them.
     struct Summary<'a> {
@@ -1425,12 +1454,7 @@ mod tests {
         let summary = read_summary(&output, "tperf_summary", &paced_keys());
         assert_eq!(summary.get("mode"), "paced", "{output}");
         let line = server.summary_line();
-        let keys: Vec<&str> = SERVER_KEYS
-            .iter()
-            .chain(&SERVER_PACED_KEYS)
-            .copied()
-            .collect();
-        let served = read_summary(&line, "tperf_server_summary", &keys);
+        let served = read_summary(&line, "tperf_server_summary", &server_paced_keys());
         assert!(
             served.int("objects_sent") > 1,
             "the server writes a blocked stream again after its `Writable` edge: {line}"
@@ -1462,12 +1486,7 @@ mod tests {
             "a wake runs every tick it missed, so most of the 10,000 arrive: {output}"
         );
         let line = server.summary_line();
-        let keys: Vec<&str> = SERVER_KEYS
-            .iter()
-            .chain(&SERVER_PACED_KEYS)
-            .copied()
-            .collect();
-        let served = read_summary(&line, "tperf_server_summary", &keys);
+        let served = read_summary(&line, "tperf_server_summary", &server_paced_keys());
         assert!(
             served.int("late_ticks") * 10 < served.int("objects_sent"),
             "{line}"
@@ -1531,10 +1550,160 @@ mod tests {
             parsed.bytes, total,
             "tperf's lines count the bytes of every connection: {output}"
         );
+        let line = server.summary_line();
+        let keys: Vec<&str> = SERVER_KEYS
+            .iter()
+            .chain(&SERVER_DRIVER_KEYS)
+            .copied()
+            .collect();
+        let served = read_summary(&line, "tperf_server_summary", &keys);
         assert_eq!(
-            server.summary_line(),
-            "tperf_server_summary stack=mvfstr mode=saturate conns=4"
+            [served.get("stack"), served.get("mode"), served.get("conns")],
+            ["mvfstr", "saturate", "4"]
         );
+        assert_eq!(served.int("dropped_initials"), 0, "{line}");
+    }
+
+    #[test]
+    fn the_server_summary_line_ends_with_its_drivers_dropped_initials_and_turns() {
+        let server = start_server(&loopback(Mode::Server, 0)).unwrap();
+        client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                num_conns: 2,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let line = server.summary_line();
+        let keys: Vec<&str> = SERVER_KEYS
+            .iter()
+            .chain(&SERVER_DRIVER_KEYS)
+            .copied()
+            .collect();
+        let served = read_summary(&line, "tperf_server_summary", &keys);
+        assert_eq!(served.int("conns"), 2, "{line}");
+        assert_eq!(
+            served.int("dropped_initials"),
+            0,
+            "two connections fit the waiting queue: {line}"
+        );
+        assert!(
+            served.int("turns") > 0,
+            "the server's driver ran turns to accept them: {line}"
+        );
+    }
+
+    /// A client application whose session passes the connection's handle to the test once the
+    /// handshake completes; the connection stays open until the test closes it.
+    struct HandOver;
+
+    impl QuicApplication for HandOver {
+        type Session = Handed;
+
+        fn accept(
+            &mut self,
+            _info: &ConnInfo,
+            _options: &mut ConnOptions,
+        ) -> Result<Handed, Refusal> {
+            Err(Refusal::Refuse)
+        }
+    }
+
+    /// The session of a [`HandOver`] client's connection.
+    struct Handed(mpsc::Sender<ConnHandle>);
+
+    impl QuicSession for Handed {
+        fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+            if matches!(event, ConnEvent::Connected) {
+                let _ = self.0.send(conn.handle());
+            }
+        }
+
+        fn on_stream(&mut self, _conn: &mut Conn<'_>, _id: StreamId, _ready: StreamReady) {}
+
+        fn poll_send(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _id: StreamId,
+            _sink: &mut SendSink<'_>,
+        ) -> Poll<()> {
+            Poll::Pending
+        }
+
+        fn poll_session(&mut self, _cx: &mut Context<'_>, _conn: &mut Conn<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn the_server_summary_has_the_drivers_turns_as_of_its_last_accept_or_close() {
+        let server = start_server(&Flags {
+            stats: true,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let flags = loopback(Mode::Client, server.addr().port());
+        let endpoint = config::endpoint_config(&flags).unwrap();
+        let client = config::client_config(&flags).unwrap();
+        let options = backend_options(&flags);
+        let remote = server.addr();
+        let worker = ManagedWorker::new(WORKER_COMMANDS).unwrap();
+        let (handles_tx, handles) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |context| {
+                let driver = EndpointDriver::<_, MmsgBackend>::builder(endpoint, HandOver)
+                    .backend_options(options)
+                    .spawn(context)
+                    .expect("the client's driver starts");
+                let name = ServerName::try_from(SERVER_NAME).expect("a valid server name");
+                driver
+                    .connect(
+                        remote,
+                        name,
+                        client,
+                        ConnOptions::default(),
+                        Handed(handles_tx),
+                    )
+                    .expect("the client connects");
+            })
+            .unwrap();
+        let keys: Vec<&str> = SERVER_KEYS
+            .iter()
+            .chain(&SERVER_DRIVER_KEYS)
+            .copied()
+            .collect();
+
+        // The server accepted the connection before it sent the flight that completes the
+        // client's handshake, and it has not closed it.
+        let handle = handles
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the client's handshake completes");
+        let line = server.summary_line();
+        let accepted = read_summary(&line, "tperf_server_summary", &keys);
+        assert_eq!(accepted.int("conns"), 1, "{line}");
+        let turns = accepted.int("turns");
+        assert!(
+            turns > 0,
+            "the summary has the driver's turns as of the server's accept: {line}"
+        );
+
+        // The server reads the close in a later turn than the one in which it accepted the
+        // connection.
+        handle.close(AppCode::from_u32(0), Bytes::new()).unwrap();
+        server
+            .closed_connections()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server's connection closes");
+        let line = server.summary_line();
+        let closed = read_summary(&line, "tperf_server_summary", &keys);
+        assert_eq!(closed.int("conns"), 1, "{line}");
+        assert!(
+            closed.int("turns") > turns,
+            "the summary has the driver's turns as of the server's close: {line}"
+        );
+        worker.shutdown().unwrap();
     }
 
     #[test]
@@ -1595,12 +1764,7 @@ mod tests {
         );
 
         let line = server.summary_line();
-        let keys: Vec<&str> = SERVER_KEYS
-            .iter()
-            .chain(&SERVER_PACED_KEYS)
-            .copied()
-            .collect();
-        let served = read_summary(&line, "tperf_server_summary", &keys);
+        let served = read_summary(&line, "tperf_server_summary", &server_paced_keys());
         assert_eq!(
             [served.get("stack"), served.get("mode"), served.get("conns")],
             ["mvfstr", "paced", "8"]

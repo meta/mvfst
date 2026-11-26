@@ -46,6 +46,8 @@ mod timers;
 #[cfg(test)]
 mod tls_tests;
 mod turn;
+#[cfg(test)]
+mod waiting_tests;
 mod wake;
 
 pub use app::AlpnRouter;
