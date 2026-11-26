@@ -59,10 +59,10 @@ use crate::manual::io_host;
 use crate::report::ConnTally;
 use crate::report::Measurement;
 use crate::report::WriteMode;
+use crate::report::client_stats_line;
 use crate::report::closed_line;
 use crate::report::server_summary_line;
 use crate::report::startup_line;
-use crate::report::stats_line;
 use crate::report::summary_line;
 use crate::server::Closed;
 use crate::server::Driver;
@@ -556,7 +556,11 @@ fn write_results(
     }
     if flags.stats {
         for report in reports.iter() {
-            writeln!(out, "{}", stats_line(&report.stats))?;
+            writeln!(
+                out,
+                "{}",
+                client_stats_line(&report.stats, &report.received, flags.num_streams)
+            )?;
         }
     }
     let tallies: Vec<ConnTally> = reports
@@ -1249,7 +1253,7 @@ mod tests {
     }
 
     /// The keys of the client's summary line, in order.
-    const SUMMARY_KEYS: [&str; 13] = [
+    const SUMMARY_KEYS: [&str; 15] = [
         "stack",
         "mode",
         "conns",
@@ -1263,6 +1267,8 @@ mod tests {
         "stream_bytes_min",
         "stream_bytes_max",
         "streams_opened",
+        "stream_spread_p50",
+        "stream_spread_max",
     ];
 
     /// The keys that a paced run adds to the client's summary line, in order.
@@ -1391,6 +1397,14 @@ mod tests {
         for key in ["mbps", "conn_mbps_min", "conn_mbps_p50", "conn_mbps_max"] {
             assert_eq!(summary.get(key), expected, "{key}: {output}");
         }
+        assert_eq!(
+            [
+                summary.get("stream_spread_p50"),
+                summary.get("stream_spread_max")
+            ],
+            ["1.000"; 2],
+            "the one stream got bytes: {output}"
+        );
     }
 
     #[test]
@@ -1430,6 +1444,116 @@ mod tests {
         }
         let summary = read_summary(lines[5], "tperf_summary", &SUMMARY_KEYS);
         assert_eq!(summary.int("conns"), 2, "{output}");
+    }
+
+    #[test]
+    fn under_stats_each_connection_prints_its_stream_spread_and_the_summary_their_median_and_max() {
+        const STREAMS: u32 = 4;
+        let server = start_server(&Flags {
+            num_streams: STREAMS,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let flags = Flags {
+            duration_secs: 1,
+            num_conns: 2,
+            num_streams: STREAMS,
+            stats: true,
+            port: server.addr().port(),
+            ..loopback(Mode::Client, 0)
+        };
+        let mut out = Vec::new();
+        let conns =
+            run_client_with(&flags, config::client_config(&flags).unwrap(), &mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        // A saturating server feeds every stream on loopback, so each spread is finite.
+        let mut spreads: Vec<f64> = conns
+            .iter()
+            .map(|conn| {
+                let smallest = conn.stream_bytes.iter().copied().min().unwrap_or(0);
+                let largest = conn.stream_bytes.iter().copied().max().unwrap_or(0);
+                assert_eq!(
+                    conn.stream_bytes.len(),
+                    STREAMS as usize,
+                    "{conn:?}: {output}"
+                );
+                assert!(smallest > 0, "{conn:?}: {output}");
+                largest as f64 / smallest as f64
+            })
+            .collect();
+        let printed: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("Stats: "))
+            .map(|line| {
+                line.rsplit_once(" stream_spread=")
+                    .unwrap_or_else(|| panic!("no stream_spread in {line}"))
+                    .1
+            })
+            .collect();
+        let expected: Vec<String> = spreads
+            .iter()
+            .map(|spread| format!("{spread:.3}"))
+            .collect();
+        assert_eq!(printed, expected, "in connection order: {output}");
+
+        spreads.sort_by(f64::total_cmp);
+        let [lower, upper] = [spreads[0], spreads[1]].map(|spread| format!("{spread:.3}"));
+        let summary = read_summary(&output, "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(
+            summary.get("stream_spread_p50"),
+            lower,
+            "the median of two is the lower: {output}"
+        );
+        assert_eq!(summary.get("stream_spread_max"), upper, "{output}");
+    }
+
+    #[test]
+    fn a_stream_the_client_expects_but_never_receives_makes_its_connections_spread_infinite() {
+        let server = start_server(&Flags {
+            num_streams: 2,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let flags = Flags {
+            duration_secs: 1,
+            num_streams: 3,
+            stats: true,
+            port: server.addr().port(),
+            ..loopback(Mode::Client, 0)
+        };
+        let mut out = Vec::new();
+        let conns =
+            run_client_with(&flags, config::client_config(&flags).unwrap(), &mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(conns.len(), 1, "{output}");
+        assert_eq!(
+            conns[0].stream_bytes.len(),
+            2,
+            "the server opens two streams: {output}"
+        );
+        assert!(
+            conns[0].stream_bytes.iter().all(|&bytes| bytes > 0),
+            "{output}"
+        );
+        let stats: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("Stats: "))
+            .collect();
+        assert_eq!(stats.len(), 1, "{output}");
+        assert!(
+            stats[0].ends_with(" stream_spread=inf"),
+            "the third stream counts with 0 bytes: {output}"
+        );
+        let summary = read_summary(&output, "tperf_summary", &SUMMARY_KEYS);
+        assert_eq!(summary.int("streams_per_conn"), 3, "{output}");
+        assert_eq!(
+            [
+                summary.get("stream_spread_p50"),
+                summary.get("stream_spread_max")
+            ],
+            ["inf"; 2],
+            "{output}"
+        );
     }
 
     #[test]

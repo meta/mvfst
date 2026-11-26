@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The client's result lines, their parser, the `--stats` line and the line with the server's
+//! The client's result lines, their parser, the `--stats` lines and the line with the server's
 //! sending setup. The result lines keep the format and unit of mvfst's tperf, so the parser reads
 //! the output of either tool.
 
@@ -131,6 +131,25 @@ pub(crate) struct ConnTally {
     pub(crate) bad_objects: u64,
 }
 
+impl ConnTally {
+    /// Returns the largest bytes of the connection's streams over the smallest. Its streams are
+    /// the `streams_per_conn` it should have, each one that never arrived with 0 bytes, plus any
+    /// that arrived beyond them. NaN if every stream got 0 bytes, infinite if only some did.
+    pub(crate) fn stream_spread(&self, streams_per_conn: u32) -> f64 {
+        let largest = self.stream_bytes.iter().copied().max().unwrap_or(0);
+        if largest == 0 {
+            // Not 0.0 / 0.0, whose NaN has a sign that Rust leaves unspecified.
+            return f64::NAN;
+        }
+        let smallest = if (self.stream_bytes.len() as u64) < u64::from(streams_per_conn) {
+            0
+        } else {
+            self.stream_bytes.iter().copied().min().unwrap_or(0)
+        };
+        largest as f64 / smallest as f64
+    }
+}
+
 /// What a server has done since it started, for its summary line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ServerTally {
@@ -160,9 +179,20 @@ pub(crate) fn percentile<T: Copy>(sorted: &[T], per_mille: u32) -> Option<T> {
     sorted.get(usize::try_from(rank - 1).ok()?).copied()
 }
 
+/// Sorts `spreads`, the stream spreads of a client's connections, with infinity above every
+/// number and every NaN last, and returns their median and their max by rank; NaN for both if
+/// `spreads` is empty.
+pub(crate) fn stream_spread_p50_and_max(spreads: &mut [f64]) -> (f64, f64) {
+    // total_cmp alone would sort a NaN with its sign bit set below every number.
+    spreads.sort_by(|a, b| a.is_nan().cmp(&b.is_nan()).then_with(|| a.total_cmp(b)));
+    let at = |per_mille| percentile(spreads, per_mille).unwrap_or(f64::NAN);
+    (at(500), at(1000))
+}
+
 /// Returns the client's summary line for a run in `mode` of `duration_secs` seconds, with
 /// `streams_per_conn` streams on each of the connections that `conns` describes. Rates are in
-/// megabits of 10^6 bits per second over the whole window.
+/// megabits of 10^6 bits per second over the whole window, and the stream spreads are the median
+/// and the max of the connections' [`ConnTally::stream_spread`].
 pub(crate) fn summary_line(
     mode: WriteMode,
     duration_secs: u32,
@@ -185,11 +215,17 @@ pub(crate) fn summary_line(
             .flat_map(|conn| conn.stream_bytes.iter().copied())
     };
     let opened: usize = conns.iter().map(|conn| conn.stream_bytes.len()).sum();
+    let mut spreads: Vec<f64> = conns
+        .iter()
+        .map(|conn| conn.stream_spread(streams_per_conn))
+        .collect();
+    let (spread_p50, spread_max) = stream_spread_p50_and_max(&mut spreads);
     let mut line = format!(
         "tperf_summary stack={STACK} mode={} conns={} streams_per_conn={streams_per_conn} \
          duration_s={duration_secs} bytes={bytes} mbps={:.3} conn_mbps_min={:.3} \
          conn_mbps_p50={:.3} conn_mbps_max={:.3} stream_bytes_min={} stream_bytes_max={} \
-         streams_opened={opened}",
+         streams_opened={opened} stream_spread_p50={spread_p50:.3} \
+         stream_spread_max={spread_max:.3}",
         mode.name(),
         conns.len(),
         mbps(bytes),
@@ -241,8 +277,8 @@ pub(crate) fn server_summary_line(mode: WriteMode, tally: &ServerTally) -> Strin
     line
 }
 
-/// Returns the `--stats` line for a connection's counters.
-pub(crate) fn stats_line(stats: &ConnStats) -> String {
+/// Returns a connection's counters, which start the `--stats` lines of both sides.
+fn stats_line(stats: &ConnStats) -> String {
     format!(
         "Stats: sent_packets={} recv_packets={} lost_packets={} cwnd_bytes={} srtt_us={}",
         stats.sent_packets,
@@ -250,6 +286,20 @@ pub(crate) fn stats_line(stats: &ConnStats) -> String {
         stats.lost_packets,
         stats.cwnd,
         stats.smoothed_rtt.as_micros()
+    )
+}
+
+/// Returns the client's `--stats` line for a connection: its counters, and the stream spread of
+/// `conn`, which should have `streams_per_conn` streams.
+pub(crate) fn client_stats_line(
+    stats: &ConnStats,
+    conn: &ConnTally,
+    streams_per_conn: u32,
+) -> String {
+    format!(
+        "{} stream_spread={:.3}",
+        stats_line(stats),
+        conn.stream_spread(streams_per_conn)
     )
 }
 
@@ -484,6 +534,62 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         );
     }
 
+    /// Returns a tally of streams that received `stream_bytes`.
+    fn tally(stream_bytes: &[u64]) -> ConnTally {
+        ConnTally {
+            stream_bytes: stream_bytes.to_vec(),
+            ..ConnTally::default()
+        }
+    }
+
+    #[test]
+    fn the_clients_stats_line_ends_with_the_connections_stream_spread() {
+        let stats = ConnStats {
+            sent_packets: 81_000,
+            sent_bytes: 117_000_000,
+            lost_packets: 12,
+            recv_packets: 1_900,
+            recv_bytes: 95_000,
+            cwnd: 1_452_000,
+            bytes_in_flight: 63_888,
+            smoothed_rtt: Duration::from_micros(150),
+            latest_rtt: Duration::from_micros(160),
+            rtt_var: Duration::from_micros(20),
+            tx_inconsistent: 0,
+            acks_received: 0,
+        };
+        assert_eq!(
+            client_stats_line(&stats, &tally(&[5_000]), 1),
+            "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 cwnd_bytes=1452000 \
+             srtt_us=150 stream_spread=1.000",
+            "one stream that got bytes"
+        );
+        let counters = "Stats: sent_packets=81000 recv_packets=1900 lost_packets=12 \
+                        cwnd_bytes=1452000 srtt_us=150";
+        let line = |stream_bytes: &[u64], streams_per_conn| {
+            client_stats_line(&stats, &tally(stream_bytes), streams_per_conn)
+        };
+        assert_eq!(
+            line(&[700, 300], 2),
+            format!("{counters} stream_spread=2.333")
+        );
+        assert_eq!(
+            line(&[700, 300], 3),
+            format!("{counters} stream_spread=inf"),
+            "a stream that never arrived"
+        );
+        assert_eq!(
+            line(&[700, 0], 2),
+            format!("{counters} stream_spread=inf"),
+            "a stream that arrived without bytes"
+        );
+        assert_eq!(
+            line(&[], 2),
+            format!("{counters} stream_spread=NaN"),
+            "a connection that received nothing"
+        );
+    }
+
     #[test]
     fn the_servers_closed_connection_line_adds_the_endpoints_socket_stops() {
         let stats = ConnStats {
@@ -619,6 +725,94 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
     }
 
     #[test]
+    fn a_connections_stream_spread_is_its_largest_streams_bytes_over_its_smallest() {
+        assert_eq!(tally(&[300, 100, 200]).stream_spread(3), 3.0);
+        assert_eq!(tally(&[700, 300]).stream_spread(2), 700.0 / 300.0);
+        assert_eq!(
+            tally(&[5_000]).stream_spread(1),
+            1.0,
+            "one stream that got bytes"
+        );
+        assert_eq!(
+            tally(&[100, 400, 50]).stream_spread(2),
+            8.0,
+            "a stream that ended and its replacement count as two"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_never_arrived_counts_with_no_bytes_so_the_spread_is_infinite() {
+        // The tally holds only the streams that arrived.
+        assert_eq!(tally(&[100, 200]).stream_spread(3), f64::INFINITY);
+        assert_eq!(
+            tally(&[1_000_000]).stream_spread(64),
+            f64::INFINITY,
+            "64 streams with bytes on one"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_arrived_without_bytes_makes_the_spread_infinite() {
+        assert_eq!(tally(&[100, 0]).stream_spread(2), f64::INFINITY);
+        assert_eq!(
+            tally(&[0, 1]).stream_spread(1),
+            f64::INFINITY,
+            "a stream beyond streams_per_conn counts too"
+        );
+    }
+
+    #[test]
+    fn a_connection_whose_streams_got_no_bytes_has_a_spread_of_positive_nan() {
+        for (stream_bytes, streams_per_conn) in
+            [(&[][..], 4), (&[0, 0][..], 2), (&[0][..], 3), (&[][..], 0)]
+        {
+            let spread = tally(stream_bytes).stream_spread(streams_per_conn);
+            // A NaN that 0.0 / 0.0 computes at run time is negative on x86-64.
+            assert_eq!(
+                spread.to_bits(),
+                f64::NAN.to_bits(),
+                "{stream_bytes:?} of {streams_per_conn} streams: {spread}, sign negative: {}",
+                spread.is_sign_negative()
+            );
+        }
+    }
+
+    #[test]
+    fn stream_spreads_rank_infinity_above_every_number_and_any_nan_last() {
+        assert!(
+            (-f64::NAN).is_sign_negative(),
+            "negation flips the sign bit of a NaN"
+        );
+        let printed = |spreads: &[f64]| -> Vec<String> {
+            spreads
+                .iter()
+                .map(|spread| format!("{spread:.3}"))
+                .collect()
+        };
+        for nan in [f64::NAN, -f64::NAN] {
+            let mut spreads = [2.0, nan, f64::INFINITY, 1.0];
+            let (p50, max) = stream_spread_p50_and_max(&mut spreads);
+            let negative = nan.is_sign_negative();
+            assert_eq!(
+                printed(&spreads),
+                ["1.000", "2.000", "inf", "NaN"],
+                "sign negative: {negative}"
+            );
+            assert_eq!(p50, 2.0, "the lower middle; sign negative: {negative}");
+            assert!(max.is_nan(), "{max}; sign negative: {negative}");
+        }
+
+        let mut both = [f64::NAN, 3.0, -f64::NAN, f64::INFINITY, 1.0];
+        let (p50, max) = stream_spread_p50_and_max(&mut both);
+        assert_eq!(printed(&both), ["1.000", "3.000", "inf", "NaN", "NaN"]);
+        assert_eq!(p50, f64::INFINITY);
+        assert!(max.is_nan(), "{max}");
+
+        let (p50, max) = stream_spread_p50_and_max(&mut []);
+        assert!(p50.is_nan() && max.is_nan(), "{p50} and {max}");
+    }
+
+    #[test]
     fn the_summary_line_names_its_fields_in_order_with_megabits_of_a_million_bits() {
         let conns = [
             ConnTally {
@@ -638,14 +832,16 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             },
         ];
         // 6 MB in 2 s is 24 Mb/s; the connections carry 12, 4 and 8 Mb/s, so the median is 8.
+        // Their stream spreads are 2, 1.5 and 3.
         assert_eq!(
             summary_line(WriteMode::Saturate, 2, 2, &conns),
             "tperf_summary stack=mvfstr mode=saturate conns=3 streams_per_conn=2 duration_s=2 \
              bytes=6000000 mbps=24.000 conn_mbps_min=4.000 conn_mbps_p50=8.000 \
              conn_mbps_max=12.000 stream_bytes_min=400000 stream_bytes_max=2000000 \
-             streams_opened=6"
+             streams_opened=6 stream_spread_p50=2.000 stream_spread_max=3.000"
         );
-        // A stream that received nothing counts as opened, with 0 bytes.
+        // A stream that received nothing counts as opened, with 0 bytes, so the spread is
+        // infinite.
         let one = [ConnTally {
             stream_bytes: vec![1_234_567, 0, 89],
             latencies_us: Vec::new(),
@@ -655,7 +851,56 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             summary_line(WriteMode::Saturate, 3, 1, &one),
             "tperf_summary stack=mvfstr mode=saturate conns=1 streams_per_conn=1 duration_s=3 \
              bytes=1234656 mbps=3.292 conn_mbps_min=3.292 conn_mbps_p50=3.292 \
-             conn_mbps_max=3.292 stream_bytes_min=0 stream_bytes_max=1234567 streams_opened=3"
+             conn_mbps_max=3.292 stream_bytes_min=0 stream_bytes_max=1234567 streams_opened=3 \
+             stream_spread_p50=inf stream_spread_max=inf"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_takes_the_median_and_the_max_of_the_connections_stream_spreads() {
+        // Spreads NaN (an empty tally, which a connection that received nothing reports), 1, 3,
+        // infinite (a stream that never arrived) and 2.5; the connections carry 0, 2, 4, 1 and
+        // 3.5 Mb/s.
+        let conns = [
+            ConnTally::default(),
+            tally(&[125_000, 125_000]),
+            tally(&[375_000, 125_000]),
+            tally(&[125_000]),
+            tally(&[312_500, 125_000]),
+        ];
+        assert_eq!(
+            summary_line(WriteMode::Saturate, 1, 2, &conns),
+            "tperf_summary stack=mvfstr mode=saturate conns=5 streams_per_conn=2 duration_s=1 \
+             bytes=1312500 mbps=10.500 conn_mbps_min=0.000 conn_mbps_p50=2.000 \
+             conn_mbps_max=4.000 stream_bytes_min=125000 stream_bytes_max=375000 \
+             streams_opened=7 stream_spread_p50=3.000 stream_spread_max=NaN"
+        );
+        // Without the NaN, the median of four is the lower middle.
+        assert_eq!(
+            summary_line(WriteMode::Saturate, 1, 2, &conns[1..]),
+            "tperf_summary stack=mvfstr mode=saturate conns=4 streams_per_conn=2 duration_s=1 \
+             bytes=1312500 mbps=10.500 conn_mbps_min=1.000 conn_mbps_p50=2.000 \
+             conn_mbps_max=4.000 stream_bytes_min=125000 stream_bytes_max=375000 \
+             streams_opened=7 stream_spread_p50=2.500 stream_spread_max=inf"
+        );
+        let finite = [conns[1].clone(), conns[2].clone(), conns[4].clone()];
+        assert_eq!(
+            summary_line(WriteMode::Saturate, 1, 2, &finite),
+            "tperf_summary stack=mvfstr mode=saturate conns=3 streams_per_conn=2 duration_s=1 \
+             bytes=1187500 mbps=9.500 conn_mbps_min=2.000 conn_mbps_p50=3.500 \
+             conn_mbps_max=4.000 stream_bytes_min=125000 stream_bytes_max=375000 \
+             streams_opened=6 stream_spread_p50=2.500 stream_spread_max=3.000"
+        );
+    }
+
+    #[test]
+    fn a_summary_line_without_connections_prints_nan_for_both_stream_spreads() {
+        assert_eq!(
+            summary_line(WriteMode::Saturate, 1, 2, &[]),
+            "tperf_summary stack=mvfstr mode=saturate conns=0 streams_per_conn=2 duration_s=1 \
+             bytes=0 mbps=0.000 conn_mbps_min=0.000 conn_mbps_p50=0.000 conn_mbps_max=0.000 \
+             stream_bytes_min=0 stream_bytes_max=0 streams_opened=0 stream_spread_p50=NaN \
+             stream_spread_max=NaN"
         );
     }
 
@@ -679,8 +924,9 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=1 duration_s=1 \
              bytes=1200000 mbps=9.600 conn_mbps_min=4.800 conn_mbps_p50=4.800 \
              conn_mbps_max=4.800 stream_bytes_min=600000 stream_bytes_max=600000 \
-             streams_opened=2 objects=1000 bad_objects=0 lat_us_p50=500 lat_us_p90=900 \
-             lat_us_p99=990 lat_us_p999=999 lat_us_max=1000"
+             streams_opened=2 stream_spread_p50=1.000 stream_spread_max=1.000 objects=1000 \
+             bad_objects=0 lat_us_p50=500 lat_us_p90=900 lat_us_p99=990 lat_us_p999=999 \
+             lat_us_max=1000"
         );
         let none = [ConnTally {
             stream_bytes: vec![0],
@@ -689,8 +935,9 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         }];
         assert!(
             summary_line(WriteMode::Paced, 1, 1, &none).ends_with(
-                " streams_opened=1 objects=0 bad_objects=0 lat_us_p50=0 lat_us_p90=0 \
-                 lat_us_p99=0 lat_us_p999=0 lat_us_max=0"
+                " streams_opened=1 stream_spread_p50=NaN stream_spread_max=NaN objects=0 \
+                 bad_objects=0 lat_us_p50=0 lat_us_p90=0 lat_us_p99=0 lat_us_p999=0 \
+                 lat_us_max=0"
             ),
             "a paced line keeps its fields without objects"
         );
@@ -715,8 +962,8 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=1 duration_s=1 \
              bytes=3600 mbps=0.029 conn_mbps_min=0.010 conn_mbps_p50=0.010 \
              conn_mbps_max=0.019 stream_bytes_min=1200 stream_bytes_max=2400 streams_opened=2 \
-             objects=3 bad_objects=3 lat_us_p50=200 lat_us_p90=300 lat_us_p99=300 \
-             lat_us_p999=300 lat_us_max=300"
+             stream_spread_p50=1.000 stream_spread_max=1.000 objects=3 bad_objects=3 \
+             lat_us_p50=200 lat_us_p90=300 lat_us_p99=300 lat_us_p999=300 lat_us_max=300"
         );
         assert!(
             !summary_line(WriteMode::Saturate, 1, 1, &conns).contains("objects"),
