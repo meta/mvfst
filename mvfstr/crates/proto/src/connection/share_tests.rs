@@ -5,9 +5,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A seeded property test of the staging split: random operations on a client's streams through
-//! the pair harness and, after each one, a check of every stream's allowance and send capacity and
-//! the pull-ready list against a reference split computed from scratch over the demand list.
+//! A seeded property test of the default staging split: random operations on a client's streams
+//! through the pair harness and, after each one, a check of every stream's allowance and send
+//! capacity and the pull-ready list against a reference split computed from scratch over the
+//! demand list.
+//!
+//! The reference splits by bucket in wire order. A sequential bucket's streams take their rooms in
+//! turn. An incremental bucket's peers are each entitled to an equal part of what reaches the
+//! bucket and what they hold, and the buckets after it get what reaches it less the sum of the
+//! peers' rooms, however much the peers take. Within an incremental bucket the pull-ready list
+//! follows the rotation, and the peers outside it, which do not have bytes to send, come after it
+//! in an order the check does not pin.
 
 use std::time::Duration;
 
@@ -21,6 +29,7 @@ use super::stream_tests::config;
 use super::tests::every_other_packet;
 use super::tests::handshake;
 use crate::AppCode;
+use crate::Prioritizer;
 use crate::SendOrder;
 use crate::StreamReady;
 use crate::streams::conn::SendPart;
@@ -69,16 +78,20 @@ fn key(order: SendOrder) -> Key {
 #[derive(Clone, Copy, Debug)]
 struct Peer {
     key: Key,
-    /// `(order, id, 0)` for a sequential stream, `(turn, ticket, id)` for an incremental one.
-    place: (u128, u64, u64),
+    /// `(order, id)` for a sequential stream; for an incremental one, `(0, position)` in the wire
+    /// order if it is scheduled and `(1, id)` if not.
+    place: (u128, u64),
     id: StreamId,
     figures: Figures,
     pull: bool,
+    /// Whether the stream is incremental and not scheduled.
+    unscheduled: bool,
 }
 
 /// Returns the streams on the demand list, sorted into the wire order.
 fn peers(state: &StreamState) -> Vec<Peer> {
     let streams = &state.streams;
+    let walk: Vec<u32> = streams.prioritizer().iter().collect();
     let mut peers = Vec::new();
     let mut next = streams.first(List::Demand);
     while let Some(slot) = next {
@@ -90,11 +103,11 @@ fn peers(state: &StreamState) -> Vec<Peer> {
             continue;
         };
         let (order, id) = (stream.order(), stream.id());
-        let place = if order.incremental {
-            let (turn, ticket) = streams.scheduler().place(slot, id, order);
-            (u128::from(turn), ticket, id.into_inner())
-        } else {
-            (order.order, id.into_inner(), 0)
+        let position = walk.iter().position(|&scheduled| scheduled == slot);
+        let place = match (order.incremental, position) {
+            (false, _) => (order.order, id.into_inner()),
+            (true, Some(position)) => (0, position as u64),
+            (true, None) => (1, id.into_inner()),
         };
         peers.push(Peer {
             key: key(order),
@@ -102,6 +115,7 @@ fn peers(state: &StreamState) -> Vec<Peer> {
             id,
             figures: figures(send),
             pull: streams.is_on(List::PullReady, slot),
+            unscheduled: order.incremental && position.is_none(),
         });
     }
     peers.sort_by_key(|p| (p.key, p.place));
@@ -120,7 +134,8 @@ fn incremental(figures: Figures, entitled: u64, left: u64) -> u64 {
 }
 
 /// Returns the allowance of each of a bucket's peers, in wire order, when `left` bytes reach it,
-/// with the share that caps its low-water mark; and what the bucket leaves.
+/// with the share that caps its low-water mark; and what the bucket leaves: for an incremental
+/// bucket, `left` less the sum of its peers' rooms, which bounds what they take.
 fn split(bucket: &[Peer], mut left: u64) -> (Vec<(u64, u64)>, u64) {
     if bucket[0].key.2 {
         let held = bucket
@@ -131,8 +146,10 @@ fn split(bucket: &[Peer], mut left: u64) -> (Vec<(u64, u64)>, u64) {
             .iter()
             .map(|p| (incremental(p.figures, entitled, left), entitled))
             .collect();
-        let taken = out.iter().fold(0u64, |taken, a| taken.saturating_add(a.0));
-        (out, left.saturating_sub(taken))
+        let rooms = bucket
+            .iter()
+            .fold(0u64, |rooms, p| rooms.saturating_add(p.figures.room));
+        (out, left.saturating_sub(rooms))
     } else {
         let out = bucket
             .iter()
@@ -198,10 +215,35 @@ fn reference_allowance(state: &StreamState, id: StreamId, budget: u64) -> u64 {
         incremental(asker, entitlement(left, held, n), left)
     } else {
         let ahead = others
-            .filter(|p| (p.place.0, p.place.1) < (order.order, id.into_inner()))
+            .filter(|p| p.place < (order.order, id.into_inner()))
             .fold(0u64, |sum, p| sum.saturating_add(p.figures.room));
         asker.room.min(left.saturating_sub(ahead))
     }
+}
+
+/// Returns pull-ready list `listed` with each run of incremental peers outside the rotation of
+/// their bucket sorted by stream ID, as their order is not pinned.
+fn normalized(state: &StreamState, listed: &[(StreamId, u64)]) -> Vec<(StreamId, u64)> {
+    let peers = peers(state);
+    let outside = |id: StreamId| {
+        peers
+            .iter()
+            .find(|p| p.id == id)
+            .filter(|p| p.unscheduled)
+            .map(|p| p.key)
+    };
+    let mut out = listed.to_vec();
+    let mut start = 0;
+    while start < out.len() {
+        let key = outside(out[start].0);
+        let mut end = start + 1;
+        while key.is_some() && end < out.len() && outside(out[end].0) == key {
+            end += 1;
+        }
+        out[start..end].sort_by_key(|&(id, _)| id.into_inner());
+        start = end;
+    }
+    out
 }
 
 /// Bytes to stage, shared.
@@ -528,12 +570,13 @@ fn check(pair: &mut Pair, m: &Model, seen: &mut Seen, at: &str) {
             );
         }
     }
-    let wanted = budgets.map(|b| reference_pull_ready(state, b));
+    let wanted = budgets.map(|b| normalized(state, &reference_pull_ready(state, b)));
     for (b, want) in budgets.into_iter().zip(&wanted) {
         conn.sources.streams.collect_pull_ready(b);
         let got: Vec<_> = (0..)
             .map_while(|i| conn.sources.streams.pulled(i))
             .collect();
+        let got = normalized(&conn.sources.streams, &got);
         assert_eq!(&got, want, "{at}: pull-ready with a budget of {b}");
     }
     for &id in &ids {
@@ -546,6 +589,7 @@ fn check(pair: &mut Pair, m: &Model, seen: &mut Seen, at: &str) {
     }
     let got: Vec<_> = conn.pull_ready().map(|(id, a)| (id, a as u64)).collect();
     seen.listed = seen.listed.max(got.len());
+    let got = normalized(&conn.sources.streams, &got);
     assert_eq!(got, wanted[0], "{at}: pull_ready");
 }
 
@@ -621,9 +665,11 @@ fn incremental_peers_keep_their_allowances_after_earlier_peers_take_what_reaches
     for id in [y, z] {
         conn.stream(id).unwrap().wake_producer();
     }
-    // Three peers holding 64 KiB are entitled to 32 KiB each: Y takes all 32 KiB that reach
-    // the bucket, and Z, after it, is still entitled to its own 32 KiB.
-    let listed: Vec<_> = conn.pull_ready().collect();
+    // Three peers holding 64 KiB are entitled to 32 KiB each: either of Y and Z, outside the
+    // rotation in an order the split does not pin, may take all 32 KiB that reach the bucket, and
+    // the other is still entitled to its own 32 KiB.
+    let mut listed: Vec<_> = conn.pull_ready().collect();
+    listed.sort_by_key(|&(id, _)| id.into_inner());
     assert_eq!(listed, [(y, 32 * 1024), (z, 32 * 1024)]);
 }
 

@@ -22,7 +22,6 @@
 
 use mvfstr_wire::StreamId;
 
-use super::prioritizer::Figures;
 use super::prioritizer::Peer;
 use super::prioritizer::Peers;
 use super::prioritizer::PeersMut;
@@ -36,6 +35,9 @@ use super::share::Holding;
 use super::share::Place;
 use super::share::Shares;
 use super::share::Standing;
+use super::share::entitlement;
+use super::share::holding;
+use super::share::incremental_allowance;
 use super::share::share_key;
 
 /// The byte-fair plug: the [`Scheduler`]'s wire order, where incremental streams take turns by
@@ -44,30 +46,6 @@ pub struct FairShare {
     scheduler: Scheduler,
     /// The streams on the demand list, by bucket of the split.
     shares: Shares,
-}
-
-/// Returns what each of `peers` incremental peers of a bucket is entitled to stage: an equal
-/// part of what reaches the bucket (`left`) and what the peers already hold (`held`).
-fn entitlement(left: u64, held: u64, peers: u64) -> u64 {
-    left.saturating_add(held) / peers.max(1)
-}
-
-/// Returns an incremental peer's allowance: its room, up to what its `entitled` bytes leave
-/// above what it holds, and no more than what reaches its bucket (`left`). A peer holding its
-/// entitlement gets an allowance only once it drains.
-fn incremental_allowance(holding: Holding, entitled: u64, left: u64) -> u64 {
-    holding
-        .room
-        .min(entitled.saturating_sub(holding.staged))
-        .min(left)
-}
-
-/// Returns what a stream with `figures` holds of the split.
-fn holding(figures: Figures) -> Holding {
-    Holding {
-        room: figures.room,
-        staged: figures.staged,
-    }
 }
 
 impl FairShare {

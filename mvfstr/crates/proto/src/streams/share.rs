@@ -26,6 +26,7 @@
 //! update each time the guard reindexes that stream: readers take both from the stream, and the
 //! plug brings the peer's record up to date when another stream joins the bucket.
 
+use super::prioritizer::Figures;
 use super::scheduler::SendOrder;
 
 /// A bucket of the split: class, urgency, and whether its streams are incremental. Buckets go in
@@ -45,6 +46,30 @@ pub(crate) struct Holding {
     pub(crate) room: u64,
     /// Its staged bytes.
     pub(crate) staged: u64,
+}
+
+/// Returns what each of `peers` incremental peers of a bucket is entitled to stage: an equal
+/// part of what reaches the bucket (`left`) and what the peers already hold (`held`).
+pub(super) fn entitlement(left: u64, held: u64, peers: u64) -> u64 {
+    left.saturating_add(held) / peers.max(1)
+}
+
+/// Returns an incremental peer's allowance: its room, up to what its `entitled` bytes leave
+/// above what it holds, and no more than what reaches its bucket (`left`). A peer holding its
+/// entitlement gets an allowance only once it drains.
+pub(super) fn incremental_allowance(holding: Holding, entitled: u64, left: u64) -> u64 {
+    holding
+        .room
+        .min(entitled.saturating_sub(holding.staged))
+        .min(left)
+}
+
+/// Returns what a stream with `figures` holds of the split.
+pub(super) fn holding(figures: Figures) -> Holding {
+    Holding {
+        room: figures.room,
+        staged: figures.staged,
+    }
 }
 
 /// Where a stream with demand stands in its bucket.
@@ -127,21 +152,21 @@ struct Node<K> {
 
 /// Treaps whose nodes are slots, each slot in at most one of them, that count and sum the weights
 /// of every subtree. Their roots are kept by the caller.
-struct Treaps<K> {
+pub(super) struct Treaps<K> {
     nodes: Vec<Node<K>>,
     /// The state of the generator of priorities.
     rng: u32,
 }
 
 impl<K: Copy + Default + Ord> Treaps<K> {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Treaps {
             nodes: Vec::new(),
             rng: 0x2545_f491,
         }
     }
 
-    fn key(&self, slot: u32) -> K {
+    pub(super) fn key(&self, slot: u32) -> K {
         self.nodes[slot as usize].key
     }
 
@@ -157,7 +182,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
 
     /// Returns the number of nodes of the treap at `root` with keys below `key`, and the sum of
     /// their weights.
-    fn below(&self, root: u32, key: K) -> (u64, u64) {
+    pub(super) fn below(&self, root: u32, key: K) -> (u64, u64) {
         let (mut count, mut sum, mut cur) = (0, 0, root);
         while cur != NIL {
             let node = &self.nodes[cur as usize];
@@ -174,7 +199,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
     }
 
     /// Inserts `slot`, which is not in a treap, into the treap at `root` with `key` and `weight`.
-    fn insert(&mut self, root: &mut u32, slot: u32, key: K, weight: u64) {
+    pub(super) fn insert(&mut self, root: &mut u32, slot: u32, key: K, weight: u64) {
         let at = slot as usize;
         if at >= self.nodes.len() {
             let out = Node {
@@ -226,7 +251,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
     }
 
     /// Takes `slot` out of the treap at `root`.
-    fn remove(&mut self, root: &mut u32, slot: u32) {
+    pub(super) fn remove(&mut self, root: &mut u32, slot: u32) {
         loop {
             let Node { left, right, .. } = self.nodes[slot as usize];
             if left == NIL || right == NIL {
@@ -264,7 +289,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
     }
 
     /// Gives `slot`, in a treap, a new `weight`.
-    fn reweigh(&mut self, slot: u32, weight: u64) {
+    pub(super) fn reweigh(&mut self, slot: u32, weight: u64) {
         let old = std::mem::replace(&mut self.nodes[slot as usize].weight, weight);
         let mut at = slot;
         while at != NIL {
@@ -275,7 +300,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
     }
 
     /// Moves `slot`, in the treap at `root`, to `key` with `weight`.
-    fn rekey(&mut self, root: &mut u32, slot: u32, key: K, weight: u64) {
+    pub(super) fn rekey(&mut self, root: &mut u32, slot: u32, key: K, weight: u64) {
         let node = &mut self.nodes[slot as usize];
         if *root == slot && node.left == NIL && node.right == NIL {
             // The only node of its treap: rekeying it cannot break the order.
@@ -287,7 +312,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
     }
 
     /// Returns the first node of the subtree at `slot`, or [`NIL`].
-    fn leftmost(&self, mut slot: u32) -> u32 {
+    pub(super) fn leftmost(&self, mut slot: u32) -> u32 {
         if slot == NIL {
             return NIL;
         }
@@ -298,7 +323,7 @@ impl<K: Copy + Default + Ord> Treaps<K> {
     }
 
     /// Returns the in-order successor of `slot` in its treap, or [`NIL`].
-    fn successor(&self, mut slot: u32) -> u32 {
+    pub(super) fn successor(&self, mut slot: u32) -> u32 {
         let right = self.nodes[slot as usize].right;
         if right != NIL {
             return self.leftmost(right);
@@ -310,6 +335,21 @@ impl<K: Copy + Default + Ord> Treaps<K> {
             }
             slot = parent;
         }
+    }
+
+    /// Returns the first node of the treap at `root` whose key is above `key`, or [`NIL`].
+    pub(super) fn after(&self, root: u32, key: K) -> u32 {
+        let (mut after, mut cur) = (NIL, root);
+        while cur != NIL {
+            let node = &self.nodes[cur as usize];
+            if node.key > key {
+                after = cur;
+                cur = node.left;
+            } else {
+                cur = node.right;
+            }
+        }
+        after
     }
 
     /// Returns the next value of a xorshift sequence: treap priorities need only be well spread,
@@ -746,7 +786,7 @@ impl Iterator for Members<'_> {
 impl<K: Copy + Default + Ord> Treaps<K> {
     /// Checks the treap at `root`: its links, key and priority order, counts and sums. Returns
     /// its slots in order.
-    fn check(&self, root: u32) -> Vec<u32> {
+    pub(super) fn check(&self, root: u32) -> Vec<u32> {
         let mut slots = Vec::new();
         self.check_below(root, NIL, &mut slots);
         assert!(
@@ -774,6 +814,16 @@ impl<K: Copy + Default + Ord> Treaps<K> {
         let totals = (1 + left.0 + right.0, node.weight + left.1 + right.1);
         assert_eq!(self.totals(at), totals, "count and sum of {at}");
         totals
+    }
+
+    /// Returns what `slot`, in a treap, adds to the sums.
+    pub(super) fn weight(&self, slot: u32) -> u64 {
+        self.nodes[slot as usize].weight
+    }
+
+    /// Returns the capacity, in nodes, of the node array.
+    pub(super) fn capacity(&self) -> usize {
+        self.nodes.capacity()
     }
 }
 

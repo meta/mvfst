@@ -62,7 +62,7 @@ use crate::ConnOptions;
 use crate::Connection;
 use crate::EndpointConfig;
 use crate::EndpointEvent;
-use crate::FairShare;
+use crate::MvfstOrder;
 use crate::Prioritizer;
 use crate::RxDatagram;
 use crate::RxMeta;
@@ -363,7 +363,7 @@ impl std::error::Error for ConnectError {}
 
 /// Connection ID routing and connection creation for one set of sockets. `P` is the
 /// [`Prioritizer`] of the connections it creates.
-pub struct Endpoint<P: Prioritizer = FairShare> {
+pub struct Endpoint<P: Prioritizer = MvfstOrder> {
     config: Arc<EndpointConfig>,
     server: Option<Arc<ServerConfig>>,
     /// The connection IDs routed to each connection: its own and, for a server, the client's
@@ -979,6 +979,7 @@ mod tests {
     use crate::CloseReason;
     use crate::ConnEvent;
     use crate::Ecn;
+    use crate::FairShare;
     use crate::Initiator;
     use crate::MvfstCid;
     use crate::MvfstV2Fields;

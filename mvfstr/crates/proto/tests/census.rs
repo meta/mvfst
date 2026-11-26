@@ -121,13 +121,13 @@ const IDLE_SERVER: usize = 2_882;
 /// The most heap that an idle client holds after a handshake without session tickets.
 const IDLE_CLIENT: usize = 6_348;
 /// The most heap that a server holds after one request and response.
-const REQUEST_SERVER: usize = 7_042;
+const REQUEST_SERVER: usize = 7_138;
 /// The most heap that a client holds after one request and response.
-const REQUEST_CLIENT: usize = 10_508;
+const REQUEST_CLIENT: usize = 10_604;
 /// The most heap that a server holds after an HTTP/3-shaped flight.
-const H3_SERVER: usize = 10_818;
+const H3_SERVER: usize = 10_914;
 /// The most heap that a client holds after an HTTP/3-shaped flight.
-const H3_CLIENT: usize = 14_284;
+const H3_CLIENT: usize = 14_380;
 /// The most heap that an idle client holds after its session tickets arrive.
 const TICKETS_CLIENT: usize = 6_508;
 /// The most heap that an idle server holds after a handshake with a production-size chain: no

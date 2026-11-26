@@ -44,8 +44,10 @@ use mvfstr_wire::TransportErrorCode;
 use super::map::Half;
 use super::map::PeerStream;
 use super::map::StreamTable;
+#[cfg(test)]
 use super::prioritizer::FairShare;
 use super::prioritizer::Figures;
+use super::prioritizer::MvfstOrder;
 use super::prioritizer::Peer;
 use super::prioritizer::Peers;
 use super::prioritizer::PeersMut;
@@ -309,7 +311,7 @@ impl<D: StreamData> Stream<D> {
 
 /// A connection's streams with their lists, and the prioritizer `P`, which holds their wire order
 /// and the split of the staging budget among the streams on the demand list.
-pub(crate) struct Streams<D, P = FairShare> {
+pub(crate) struct Streams<D, P = MvfstOrder> {
     table: StreamTable<Entry<D>>,
     lists: [ListHead; LISTS],
     plug: P,
@@ -325,7 +327,7 @@ pub(crate) struct Streams<D, P = FairShare> {
 }
 
 /// Exclusive access to one stream; dropping it reindexes the stream.
-pub(crate) struct StreamGuard<'a, D: StreamData, P: Prioritizer = FairShare> {
+pub(crate) struct StreamGuard<'a, D: StreamData, P: Prioritizer = MvfstOrder> {
     streams: &'a mut Streams<D, P>,
     slot: u32,
     id: StreamId,
@@ -384,7 +386,8 @@ impl<D: StreamData> PeersMut for ViewMut<'_, D> {
 
 impl<D: StreamData, P: Prioritizer> Streams<D, P> {
     /// Creates an empty set for the endpoint whose role is `side`, advertising `max_streams_bidi`
-    /// and `max_streams_uni`, with incremental streams taking turns every `quantum` bytes.
+    /// and `max_streams_uni`, with `quantum` for a prioritizer that counts turns in bytes (see
+    /// [`Prioritizer::new`]).
     pub(crate) fn new(
         side: Side,
         max_streams_bidi: u64,
@@ -546,8 +549,8 @@ impl<D: StreamData, P: Prioritizer> Streams<D, P> {
         &self.plug
     }
 
-    /// Commits `bytes` of stream `id`, in `slot`, sealed in a packet or GSO run, whether or not
-    /// the build has since unscheduled the stream (see [`Prioritizer::commit`]).
+    /// Commits `bytes` of stream `id`, in `slot`, sealed in a packet, whether or not the build has
+    /// since unscheduled the stream (see [`Prioritizer::commit`]).
     pub(crate) fn commit(&mut self, slot: u32, id: StreamId, bytes: u64) {
         self.plug.commit(slot, id, bytes, &View(&self.table));
     }
@@ -1246,7 +1249,6 @@ impl<D: StreamData, P: Prioritizer> Streams<D, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streams::scheduler::Cursor;
     use crate::streams::share::share_key;
 
     #[derive(Debug, Default)]
@@ -1282,12 +1284,18 @@ mod tests {
 
     const CODE: AppCode = AppCode::from_u32(9);
 
-    /// Returns a server's streams with room for ten streams of each type both ways.
-    fn streams() -> Streams<Data> {
+    /// Returns a server's streams, ordered by `P`, with room for ten streams of each type both
+    /// ways.
+    fn streams_with<P: Prioritizer>() -> Streams<Data, P> {
         let mut s = Streams::new(Side::Server, 10, 10, 1200);
         s.on_peer_max_streams(Dir::Bi, 10).unwrap();
         s.on_peer_max_streams(Dir::Uni, 10).unwrap();
         s
+    }
+
+    /// Returns a server's streams, ordered by the default plug.
+    fn streams() -> Streams<Data> {
+        streams_with()
     }
 
     /// Where a stream is indexed.
@@ -1306,7 +1314,7 @@ mod tests {
         scheduled: None,
     };
 
-    fn on(s: &Streams<Data>, id: StreamId) -> On {
+    fn on<P: Prioritizer>(s: &Streams<Data, P>, id: StreamId) -> On {
         s.assert_indexed();
         let listed = |list| {
             let mut at = s.first(list);
@@ -1323,12 +1331,12 @@ mod tests {
             readiness: listed(List::Readiness),
             pull_ready: listed(List::PullReady),
             control: listed(List::Control),
-            scheduled: s.scheduler().order(key.slot()),
+            scheduled: s.prioritizer().order(key.slot()),
         }
     }
 
     /// Opens a local stream with its producer woken, as at a pull driver's first poll.
-    fn open(s: &mut Streams<Data>, dir: Dir, data: Data) -> StreamId {
+    fn open<P: Prioritizer>(s: &mut Streams<Data, P>, dir: Dir, data: Data) -> StreamId {
         let mut stream = s.open_local(dir, ORDER, data).unwrap();
         stream.set_producer_pending(false);
         stream.id()
@@ -1355,14 +1363,14 @@ mod tests {
         assert_eq!(on(&s, without), NOWHERE);
     }
 
-    fn peer(s: &mut Streams<Data>, dir: Dir, index: u64) -> StreamId {
+    fn peer<P: Prioritizer>(s: &mut Streams<Data, P>, dir: Dir, index: u64) -> StreamId {
         let id = StreamId::new(Side::Client, dir, index).unwrap();
         let guard = s.peer_frame(id, Half::Recv, |_| (ORDER, Data::default()));
         assert!(matches!(guard, Ok(Some(_))));
         id
     }
 
-    fn take_edge(s: &mut Streams<Data>, id: StreamId) -> Option<StreamReady> {
+    fn take_edge<P: Prioritizer>(s: &mut Streams<Data, P>, id: StreamId) -> Option<StreamReady> {
         s.stream(id).unwrap().take_edge()
     }
 
@@ -1416,7 +1424,7 @@ mod tests {
 
     #[test]
     fn a_stream_that_keeps_its_demand_takes_its_share_to_its_new_order() {
-        let mut s = streams();
+        let mut s = streams_with::<FairShare>();
         let ready = Data {
             wire: false,
             room: true,
@@ -1807,7 +1815,7 @@ mod tests {
         }
         assert_eq!(s.max_streams(Dir::Uni), 15);
         assert_eq!(s.table.map().len(), 0);
-        assert_eq!(s.scheduler().len(), 0);
+        assert_eq!(s.prioritizer().len(), 0);
         s.assert_indexed();
         // The peer may use the new credit once the MAX_STREAMS carrying it is sent.
         let above = StreamId::new(Side::Client, Dir::Uni, 10).unwrap();
@@ -1859,15 +1867,15 @@ mod tests {
             .into_iter()
             .map(|order| s.open_local(Dir::Uni, order, wire()).unwrap().id())
             .collect();
-        let mut cursor = Cursor::default();
+        let mut cursor = Default::default();
         let mut written = Vec::new();
-        while let Some(slot) = s.scheduler().next(&mut cursor) {
+        while let Some(slot) = s.prioritizer().next(&mut cursor) {
             let mut guard = s.by_slot(slot).unwrap();
             written.push(guard.id());
             guard.data_mut().wire = false;
         }
         assert_eq!(written, ids);
-        assert!(s.scheduler().is_empty());
+        assert!(s.prioritizer().is_empty());
         s.assert_indexed();
     }
 
@@ -1875,7 +1883,7 @@ mod tests {
     fn a_stream_the_build_drained_is_charged_for_what_it_sealed() {
         // Stream a's GSO run of ten packets drains it, so its guard unschedules it before the
         // run is committed, and its producer refills it before the next run.
-        let mut s = streams();
+        let mut s = streams_with::<FairShare>();
         let incremental = SendOrder {
             incremental: true,
             ..ORDER
@@ -1910,7 +1918,7 @@ mod tests {
 
     #[test]
     fn a_commit_that_raises_the_front_stream_moves_its_share_to_its_new_place() {
-        let mut s = streams();
+        let mut s = streams_with::<FairShare>();
         let incremental = SendOrder {
             incremental: true,
             ..ORDER
@@ -1944,7 +1952,7 @@ mod tests {
 
     #[test]
     fn a_stream_in_a_reaped_streams_slot_owes_nothing_for_it() {
-        let mut s = streams();
+        let mut s = streams_with::<FairShare>();
         let incremental = SendOrder {
             incremental: true,
             ..ORDER
@@ -1972,7 +1980,7 @@ mod tests {
             .view()
             .slot();
         assert_eq!(c, a, "the slot is reused");
-        let order = |s: &Streams<Data>| s.scheduler().iter().collect::<Vec<_>>();
+        let order = |s: &Streams<Data, FairShare>| s.scheduler().iter().collect::<Vec<_>>();
         assert_eq!(order(&s), [b, c]);
         s.commit(b, b_id, 1200);
         assert_eq!(order(&s), [c, b]);
@@ -1983,7 +1991,7 @@ mod tests {
     fn a_late_commit_for_a_reaped_stream_charges_no_stream() {
         // Drain, reap, reuse, then a late commit. A commit for a stream that was reaped, before
         // or after another stream takes its slot, does not change the order.
-        let mut s = streams();
+        let mut s = streams_with::<FairShare>();
         let incremental = SendOrder {
             incremental: true,
             ..ORDER
@@ -1992,7 +2000,7 @@ mod tests {
             wire: true,
             room: false,
         };
-        let open = |s: &mut Streams<Data>| {
+        let open = |s: &mut Streams<Data, FairShare>| {
             let guard = s.open_local(Dir::Uni, incremental, wire()).unwrap();
             (guard.view().slot(), guard.id())
         };
@@ -2001,7 +2009,7 @@ mod tests {
         let (w, w_id) = open(&mut s);
         s.commit(a, x, 10 * 1200);
         s.commit(w, w_id, 3 * 1200);
-        let order = |s: &Streams<Data>| s.scheduler().iter().collect::<Vec<_>>();
+        let order = |s: &Streams<Data, FairShare>| s.scheduler().iter().collect::<Vec<_>>();
         assert_eq!(order(&s), [z, w, a]);
         // Stream x drains, ends and is reaped.
         s.stream(x).unwrap().data_mut().wire = false;
@@ -2118,7 +2126,11 @@ mod tests {
     }
 
     /// Opens a local unidirectional stream at `order` whose woken producer has room: it has demand.
-    fn open_with_demand(s: &mut Streams<Data>, order: SendOrder, wire: bool) -> (u32, StreamId) {
+    fn open_with_demand<P: Prioritizer>(
+        s: &mut Streams<Data, P>,
+        order: SendOrder,
+        wire: bool,
+    ) -> (u32, StreamId) {
         let mut guard = s
             .open_local(Dir::Uni, order, Data { wire, room: true })
             .unwrap();
@@ -2157,9 +2169,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_census_counts_a_share_rekey_per_move_within_a_bucket() {
-        let mut s = streams();
+    /// Returns the share rekeys counted after each step, for streams ordered by `P`: a sequential
+    /// peer among others takes a new order within its bucket and is then reindexed in place, an
+    /// incremental peer seals a quantum, and another seals less.
+    fn share_rekeys_per_step<P: Prioritizer>() -> [u64; 4] {
+        let mut s = streams_with::<P>();
         let (_, a) = open_with_demand(&mut s, ORDER, false);
         open_with_demand(&mut s, ORDER, false);
         let incremental = SendOrder {
@@ -2172,30 +2186,53 @@ mod tests {
         s.stream(a)
             .unwrap()
             .set_order(SendOrder { order: 5, ..ORDER });
-        assert_eq!(
-            census::read().share_rekeys,
-            1,
-            "a new order within the bucket"
-        );
+        let moved = census::read().share_rekeys;
         drop(s.stream(a).unwrap());
-        assert_eq!(
-            census::read().share_rekeys,
-            1,
-            "a reshare in place does not move it"
-        );
+        let in_place = census::read().share_rekeys;
         s.commit(x, x_id, 1200);
-        assert_eq!(
-            census::read().share_rekeys,
-            2,
-            "a commit that moves it to the next turn"
-        );
+        let quantum = census::read().share_rekeys;
         s.commit(y, y_id, 100);
-        assert_eq!(
-            census::read().share_rekeys,
-            2,
-            "a commit within its quantum"
-        );
+        let less = census::read().share_rekeys;
         s.assert_indexed();
+        [moved, in_place, quantum, less]
+    }
+
+    #[test]
+    fn the_census_counts_a_share_rekey_per_move_within_a_bucket() {
+        // A new order within the bucket moves the peer once, and a reshare in place does not; a
+        // commit that takes an incremental peer to its next turn moves it, and one within its
+        // quantum does not.
+        assert_eq!(
+            share_rekeys_per_step::<FairShare>(),
+            [1, 1, 2, 2],
+            "FairShare"
+        );
+        // The default plug keeps its incremental peers in counters, which commits do not touch.
+        assert_eq!(
+            share_rekeys_per_step::<MvfstOrder>(),
+            [1, 1, 1, 1],
+            "MvfstOrder"
+        );
+    }
+
+    /// Moves a lone sequential peer, ordered by `P`, to a new order within its bucket, then opens
+    /// a second peer in the bucket ahead of it, checking the indexes after each step.
+    fn reorder_a_lone_sequential_peer<P: Prioritizer>() {
+        let mut s = streams_with::<P>();
+        let (_, lone) = open_with_demand(&mut s, ORDER, false);
+        s.assert_indexed();
+        s.stream(lone)
+            .unwrap()
+            .set_order(SendOrder { order: 5, ..ORDER });
+        s.assert_indexed();
+        open_with_demand(&mut s, ORDER, false);
+        s.assert_indexed();
+    }
+
+    #[test]
+    fn a_lone_sequential_peer_keeps_its_indexes_through_a_new_order_within_its_bucket() {
+        reorder_a_lone_sequential_peer::<FairShare>();
+        reorder_a_lone_sequential_peer::<MvfstOrder>();
     }
 
     #[test]

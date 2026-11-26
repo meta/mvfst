@@ -16,7 +16,7 @@ use bytes::Bytes;
 use mvfstr_wire::StreamId;
 use roxygen_bufqueue::BufQueue;
 
-use super::prioritizer::FairShare;
+use super::prioritizer::MvfstOrder;
 use super::prioritizer::Prioritizer;
 use super::send_buf::SendBuffer;
 use crate::AppCode;
@@ -28,7 +28,7 @@ use crate::SendOrder;
 ///
 /// Dropping the handle recomputes the stream's membership in the connection's readiness,
 /// pull and scheduling lists from its state.
-pub struct StreamMut<'a, P: Prioritizer = FairShare> {
+pub struct StreamMut<'a, P: Prioritizer = MvfstOrder> {
     conn: &'a mut Connection<P>,
     id: StreamId,
 }

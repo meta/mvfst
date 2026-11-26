@@ -100,10 +100,10 @@ use crate::ConnEvent;
 use crate::DatagramError;
 use crate::DatagramStats;
 use crate::EndpointEvent;
-use crate::FairShare;
 use crate::Initiator;
 use crate::KeepAlive;
 use crate::KeyUpdatePolicy;
+use crate::MvfstOrder;
 use crate::OpenError;
 use crate::Prioritizer;
 use crate::Random;
@@ -357,7 +357,7 @@ impl ConnSetup {
 ///
 /// Dropping a connection does not send anything. `P` is the [`Prioritizer`] that orders its
 /// streams on the wire and splits its staging budget.
-pub struct Connection<P: Prioritizer = FairShare> {
+pub struct Connection<P: Prioritizer = MvfstOrder> {
     side: Side,
     version: Version,
     config: Arc<TransportConfig>,
@@ -1703,7 +1703,7 @@ impl<P: Prioritizer> fmt::Debug for Connection<P> {
 }
 
 /// Streams whose readiness changed, from [`Connection::readiness`].
-pub struct Readiness<'a, P: Prioritizer = FairShare> {
+pub struct Readiness<'a, P: Prioritizer = MvfstOrder> {
     conn: &'a mut Connection<P>,
 }
 
@@ -1732,7 +1732,7 @@ impl<P: Prioritizer> fmt::Debug for Readiness<'_, P> {
 
 /// Streams ready to be polled for data with their allowances, from
 /// [`Connection::pull_ready`].
-pub struct PullReady<'a, P: Prioritizer = FairShare> {
+pub struct PullReady<'a, P: Prioritizer = MvfstOrder> {
     conn: &'a mut Connection<P>,
     /// The index of the next collected stream.
     index: usize,

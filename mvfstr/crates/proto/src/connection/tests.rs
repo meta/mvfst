@@ -57,6 +57,7 @@ use crate::Initiator;
 use crate::InlineSealer;
 use crate::Inputs;
 use crate::PathEvent;
+use crate::Prioritizer;
 use crate::RecvSummary;
 use crate::Route;
 use crate::RxDatagram;
@@ -2250,7 +2251,7 @@ fn ack_view(conn: &Connection, ids: &[StreamId]) -> Vec<String> {
                 stream.id(),
                 stream.send_state(),
                 stream.recv_state(),
-                streams.scheduler().order(stream.slot()),
+                streams.prioritizer().order(stream.slot()),
             )
         })
         .collect();
@@ -2261,7 +2262,7 @@ fn ack_view(conn: &Connection, ids: &[StreamId]) -> Vec<String> {
                 .collect();
         view.push(format!("{list:?} {order:?}"));
     }
-    let scheduled: Vec<_> = streams.scheduler().iter().map(id_of).collect();
+    let scheduled: Vec<_> = streams.prioritizer().iter().map(id_of).collect();
     view.push(format!("scheduled {scheduled:?}, lost {}", streams.lost()));
     view
 }

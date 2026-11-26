@@ -7,10 +7,10 @@
 
 //! The wire scheduler (RFC 9218).
 //!
-//! The scheduler is the transport's only wire-order queue, for every stream: sparse buckets per
-//! `(class, urgency)`, sequential streams ordered by `order` then stream ID, incremental streams
-//! round-robin with a quantum of about one packet, a read-only cursor for the attempt and a commit
-//! that rotates by the bytes sealed, so the scheduler never rolls back.
+//! The scheduler is the wire order of the byte-fair plug, [`FairShare`](super::FairShare): sparse
+//! buckets per `(class, urgency)`, sequential streams ordered by `order` then stream ID,
+//! incremental streams round-robin with a quantum of about one packet, a read-only cursor for the
+//! attempt and a commit that rotates by the bytes sealed, so the scheduler never rolls back.
 //!
 //! Streams are named by their slab slot (see [`StreamKey::slot`](super::map::StreamKey::slot)),
 //! and every per-stream link lives in a node array indexed by slot, so scheduling does not
@@ -24,24 +24,24 @@
 //! they reached that turn, so a walk visits the stream served least first. A stream keeps its
 //! place until it has been served another quantum and then goes behind every stream served as
 //! much or less: streams that fill the room they are offered take turns of a quantum each, as
-//! round robin does, and a stream served many quanta at once (one commit per GSO run) waits
-//! until the others catch up. A packet carries several streams of a bucket when the first
-//! writes less than the room it is offered; the bytes of the streams that fill the rest count
-//! the same way, and the front stream does not gain a claim on later turns for the room it left
-//! (see [`Scheduler::commit`]). So bytes are shared max-min fairly: streams that can use their
-//! share get equal bytes, and a stream that writes less than it is offered gets what it writes.
-//! A round-robin list cannot order streams by bytes served, which this needs once packets carry
-//! several streams; the treap keeps every operation O(log n).
+//! round robin does, and a stream served many quanta at once waits until the others catch up. A
+//! packet carries several streams of a bucket when the first writes less than the room it is
+//! offered; the bytes of the streams that fill the rest count the same way, and the front stream
+//! does not gain a claim on later turns for the room it left (see [`Scheduler::commit`]). So bytes
+//! are shared max-min fairly: streams that can use their share get equal bytes, and a stream that
+//! writes less than it is offered gets what it writes. A round-robin list cannot order streams by
+//! bytes served, which this needs once packets carry several streams; the treap keeps every
+//! operation O(log n).
 //!
 //! What a stream has been served outlives its place in the scheduler. The guard unschedules a
-//! stream as soon as a build drains it, before the packet or run is committed, and its producer
-//! may refill it before the next run. So an incremental stream that leaves keeps what it has
+//! stream as soon as a build drains it, before its packet is committed, and its producer
+//! may refill it before the next packet. So an incremental stream that leaves keeps what it has
 //! been served, a commit for it still counts, and when it rejoins its bucket it resumes its
 //! place unless the bucket's turn has passed it. The bucket's turn is its front stream's turn
 //! as of the last commit or removal, kept while the bucket does not have an incremental stream,
-//! and it never goes down. A drain therefore does not cancel what a GSO run served, and a stream
-//! that was away while the others caught up joins their turn; the turns it missed do not count
-//! for or against it. A stream that moves to another bucket, or another stream in its slot,
+//! and it never goes down. A drain therefore does not cancel what its last packet served, and a
+//! stream that was away while the others caught up joins their turn; the turns it missed do not
+//! count for or against it. A stream that moves to another bucket, or another stream in its slot,
 //! starts on that bucket's turn.
 
 use mvfstr_wire::StreamId;
@@ -205,24 +205,24 @@ struct Treap {
 
 /// One bit per bucket key, with a summary word of non-zero words.
 #[derive(Default)]
-struct KeyMask {
+pub(super) struct KeyMask {
     summary: u32,
     words: [u64; 32],
 }
 
 /// Returns the bucket key of `order`: class, then urgency (RFC 9218 urgencies are 0 to 7).
-fn bucket_key(order: SendOrder) -> u16 {
+pub(super) fn bucket_key(order: SendOrder) -> u16 {
     u16::from(order.class) << 3 | u16::from(order.urgency.min(7))
 }
 
 impl KeyMask {
-    fn set(&mut self, key: u16) {
+    pub(super) fn set(&mut self, key: u16) {
         let word = usize::from(key >> 6);
         self.words[word] |= 1 << (key & 63);
         self.summary |= 1 << word;
     }
 
-    fn clear(&mut self, key: u16) {
+    pub(super) fn clear(&mut self, key: u16) {
         let word = usize::from(key >> 6);
         self.words[word] &= !(1 << (key & 63));
         if self.words[word] == 0 {
@@ -231,7 +231,7 @@ impl KeyMask {
     }
 
     /// Returns the smallest set key at or above `from`.
-    fn next_set(&self, from: u16) -> Option<u16> {
+    pub(super) fn next_set(&self, from: u16) -> Option<u16> {
         let word = usize::from(from >> 6);
         if word >= self.words.len() {
             return None;
@@ -470,10 +470,9 @@ impl Scheduler {
     /// stream that has left counts as not in front; if it was in front, every other stream had
     /// been served more than a quantum above that floor, so the floor does not raise any of them.
     ///
-    /// Commit what a packet, or a whole GSO run, sealed after it is sealed, for every stream
-    /// that sealed bytes, in the order they were written, whether or not it is still scheduled;
-    /// one commit per GSO run latches the order for the run. The scheduler never rolls back:
-    /// bytes not sealed are never committed. O(log n).
+    /// Commit what each packet sealed after it is sealed, for every stream that sealed bytes, in
+    /// the order they were written, whether or not it is still scheduled. The scheduler never rolls
+    /// back: bytes not sealed are never committed. O(log n).
     ///
     /// Returns whether the committed stream reached another turn, and the slot of the front
     /// stream whose served bytes it raised, if any: only those places may have changed.

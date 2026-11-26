@@ -139,6 +139,7 @@ pub use receive::RxMeta;
 pub use roxygen_bufqueue::BufQueue;
 pub use streams::CreditDue;
 pub use streams::FairShare;
+pub use streams::MvfstOrder;
 pub use streams::OpenError;
 pub use streams::Prioritizer;
 pub use streams::SendError;

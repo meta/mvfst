@@ -36,8 +36,8 @@ use super::guard::Owed;
 use super::guard::StreamData;
 use super::guard::Streams;
 use super::map::Half;
-use super::prioritizer::FairShare;
 use super::prioritizer::Figures;
+use super::prioritizer::MvfstOrder;
 use super::prioritizer::Prioritizer;
 use super::recv_buf::PagePool;
 use super::recv_buf::RecvBuffer;
@@ -275,7 +275,7 @@ pub(crate) fn dir_index(dir: Dir) -> usize {
 
 /// A connection's streams and flow control, and the datagrams it sends in the streams' wire order,
 /// which the prioritizer `P` sets.
-pub(crate) struct StreamState<P: Prioritizer = FairShare> {
+pub(crate) struct StreamState<P: Prioritizer = MvfstOrder> {
     pub(crate) streams: Streams<StreamParts, P>,
     /// The DATAGRAM frames (RFC 9221) waiting to be sent.
     pub(crate) datagrams: SendQueue,
@@ -723,9 +723,9 @@ impl<P: Prioritizer> StreamState<P> {
         self.streams.first(List::PullReady).is_some()
     }
 
-    /// Collects the pull-ready streams in wire order, an incremental bucket's in the scheduler's
-    /// turn order, with their allowances when the connection stages at most `budget` bytes, for
-    /// [`pulled`](Self::pulled).
+    /// Collects the pull-ready streams in the prioritizer's order, which is the wire order for the
+    /// streams it schedules, with their allowances when the connection stages at most `budget`
+    /// bytes, for [`pulled`](Self::pulled).
     pub(crate) fn collect_pull_ready(&mut self, budget: u64) {
         if !self.has_pull_ready() {
             self.ranked.clear();
@@ -1090,8 +1090,8 @@ impl<P: Prioritizer> StreamState<P> {
         Ok(())
     }
 
-    /// Applies what the frames of a sealed packet change only once sealed: the scheduler rotates
-    /// by each stream's bytes.
+    /// Applies what the frames of a sealed packet change only once sealed: each stream's bytes are
+    /// committed to the prioritizer, which may move the stream in the wire order.
     pub(crate) fn on_sealed(&mut self, frames: &[SentFrame]) {
         for frame in frames {
             if let SentFrame::Stream { id, len, .. } = *frame
@@ -1461,7 +1461,9 @@ mod tests {
     use super::*;
     use crate::recovery::test_epoch;
     use crate::streams::guard::census;
+    use crate::streams::prioritizer::FairShare;
     use crate::streams::prioritizer::MirroredUrgency;
+    use crate::streams::prioritizer::MvfstOrder;
 
     fn state() -> StreamState {
         let config = TransportConfig::builder()
@@ -1728,7 +1730,7 @@ mod tests {
         assert_eq!(
             allowances,
             [STREAM_CAP, 0],
-            "the default plug gives the budget to the most urgent stream"
+            "the byte-fair plug gives the budget to the most urgent stream"
         );
         assert_eq!(pulled, [(urgent, STREAM_CAP)]);
 
@@ -1739,5 +1741,121 @@ mod tests {
             "a plug that mirrors urgencies gives the budget to the least urgent stream"
         );
         assert_eq!(pulled, [(background, STREAM_CAP)]);
+    }
+
+    /// Opens four streams of class 1 on a server whose streams `P` orders, with stream windows of
+    /// 10,000 bytes: `first`, sequential at urgency 1 with 1,000 bytes staged; `full` and `free`,
+    /// incremental at urgency 2, `full` with more stream credit and 60,000 bytes staged, its room
+    /// cut to 5,536 by the per-stream cap, and `free` pull-ready without staged bytes; and
+    /// `behind`, sequential at urgency 5 and pull-ready. Returns the state and the streams in that
+    /// order.
+    fn behind_an_incremental_bucket<P: Prioritizer>() -> (StreamState<P>, [StreamId; 4]) {
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 24),
+            initial_max_stream_data_uni: VarInt::from_u32(10_000),
+            initial_max_streams_uni: VarInt::from_u32(4),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let ids = [(1, false), (2, true), (2, true), (5, false)].map(|(urgency, incremental)| {
+            let order = SendOrder {
+                urgency,
+                incremental,
+                ..PEER_ORDER
+            };
+            s.open(Dir::Uni, order).unwrap()
+        });
+        let [first, full, free, behind] = ids;
+        s.on_max_stream_data(full, 1 << 20).unwrap();
+        for (id, len) in [(first, 1_000), (full, 60_000)] {
+            let bytes = Bytes::from(vec![0; len]);
+            s.stage(id, false, |buf| buf.push(bytes)).unwrap();
+        }
+        for id in [free, behind] {
+            s.streams.stream(id).unwrap().set_producer_pending(false);
+        }
+        assert_eq!(s.staged, 61_000);
+        (s, ids)
+    }
+
+    /// Returns the allowances of `ids` and the pull-ready streams when the connection stages at
+    /// most 91,000 bytes, 30,000 more than the streams hold.
+    fn split_behind<P: Prioritizer>(
+        s: &mut StreamState<P>,
+        ids: [StreamId; 4],
+    ) -> ([u64; 4], Vec<(StreamId, u64)>) {
+        let budget = 91_000;
+        let allowances = ids.map(|id| s.allowance(id, budget));
+        s.collect_pull_ready(budget);
+        let pulled = (0..).map_while(|index| s.pulled(index)).collect();
+        (allowances, pulled)
+    }
+
+    #[test]
+    fn mvfst_order_leaves_a_later_bucket_what_the_rooms_of_an_incremental_bucket_leave() {
+        // 30,000 bytes are free. `first` takes its room, 9,000, and 21,000 reach the incremental
+        // bucket, whose two peers, holding 60,000, are entitled to 40,500 each: `full` already
+        // holds more and gets an allowance of 0, and `free` gets its room, 10,000.
+        let (mut s, ids) = behind_an_incremental_bucket::<FairShare>();
+        let [_, _, free, behind] = ids;
+        let (allowances, pulled) = split_behind(&mut s, ids);
+        // The byte-fair plug passes on what its incremental peers do not take: 11,000.
+        assert_eq!(allowances, [9_000, 0, 10_000, 10_000], "FairShare");
+        assert_eq!(pulled, [(free, 10_000), (behind, 10_000)], "FairShare");
+        s.streams.assert_indexed();
+
+        // The counter split passes on what the incremental peers' rooms leave: 21,000 less
+        // 5,536 and 10,000, whatever the peers take.
+        let (mut s, ids) = behind_an_incremental_bucket::<MvfstOrder>();
+        let [_, _, free, behind] = ids;
+        let (allowances, pulled) = split_behind(&mut s, ids);
+        assert_eq!(allowances, [9_000, 0, 10_000, 5_464], "MvfstOrder");
+        assert_eq!(pulled, [(free, 10_000), (behind, 5_464)], "MvfstOrder");
+        s.streams.assert_indexed();
+    }
+
+    #[test]
+    fn commits_of_incremental_peers_leave_the_default_split_alone() {
+        let mut s = state();
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+            initial_max_streams_uni: VarInt::from_u32(2),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let order = SendOrder {
+            incremental: true,
+            ..PEER_ORDER
+        };
+        let ids = [(); 2].map(|()| s.open(Dir::Uni, order).unwrap());
+        for id in ids {
+            let bytes = Bytes::from(vec![0; 20_000]);
+            s.stage(id, false, |buf| buf.push(bytes)).unwrap();
+        }
+        s.streams.assert_indexed();
+        census::reset();
+        // Ten packets, each carrying a full datagram of one peer, taking turns.
+        for packet in 0..10u64 {
+            let id = ids[(packet % 2) as usize];
+            let offset = packet / 2 * 1200;
+            s.on_sealed(&[SentFrame::Stream {
+                id,
+                offset,
+                len: 1200,
+                fin: false,
+            }]);
+        }
+        let counted = census::read();
+        assert_eq!(
+            (counted.share_rekeys, counted.reshares),
+            (0, 0),
+            "a commit moves an incremental peer in the wire order only"
+        );
+        s.streams.assert_indexed();
     }
 }

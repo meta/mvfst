@@ -598,7 +598,7 @@ mod tests {
         let (opened, offered) = offered_in_wire_order::<FairShare>();
         assert_eq!(
             offered, opened,
-            "the default plug offers the most urgent stream first"
+            "the byte-fair plug offers the most urgent stream first"
         );
         let (opened, offered) = offered_in_wire_order::<MirroredUrgency<FairShare>>();
         let reversed: Vec<_> = opened.into_iter().rev().collect();

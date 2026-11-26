@@ -39,6 +39,7 @@ use crate::ConnEvent;
 use crate::CreditDue;
 use crate::InlineSealer;
 use crate::OpenError;
+use crate::Prioritizer;
 use crate::SendError;
 use crate::SendOrder;
 use crate::Stop;
@@ -2465,9 +2466,8 @@ fn refused_push_senders_across_buckets_hear_writable_in_wire_order() {
         order,
     };
     // The wire order goes by urgency, then by order and stream ID in a sequential bucket. An
-    // incremental bucket goes by the scheduler's turns, and its streams without a place in the
-    // scheduler follow those on the bucket's turn, by stream ID. The streams open in another
-    // order.
+    // incremental bucket goes by its rotation, and its streams outside the rotation follow it in
+    // the order they gained demand. The streams open in another order.
     let low = conn.open_stream(Dir::Uni, at(5, false, 0)).unwrap();
     let [unplaced_a, unplaced_b] =
         [(); 2].map(|()| conn.open_stream(Dir::Uni, at(3, true, 0)).unwrap());
@@ -2476,7 +2476,7 @@ fn refused_push_senders_across_buckets_hear_writable_in_wire_order() {
     let first = conn.open_stream(Dir::Uni, at(0, false, 1)).unwrap();
     let busy = conn.open_stream(Dir::Uni, at(0, false, 1)).unwrap();
     let quiet = conn.open_stream(Dir::Uni, at(0, false, 0)).unwrap();
-    // `placed` stages bytes, which give it a place in the scheduler, and is refused the rest;
+    // `placed` stages bytes, which give it a place in the rotation, and is refused the rest;
     // `busy` stages bytes within its credit and is not refused.
     let credit = [placed, busy].map(|id| Frame::MaxStreamData {
         id,
@@ -2488,7 +2488,7 @@ fn refused_push_senders_across_buckets_hear_writable_in_wire_order() {
     assert_eq!(conn.stream(placed).unwrap().send(&mut data), Ok(1_000));
     let mut data = Bytes::from_static(&ZEROS[..500]);
     assert_eq!(conn.stream(busy).unwrap().send(&mut data), Ok(500));
-    // The others are refused at zero credit, in yet another order.
+    // The others are refused at zero credit, which gives them demand, in yet another order.
     for id in [low, unplaced_b, unplaced_a, second, first, quiet] {
         let mut data = Bytes::from_static(&ZEROS[..1_000]);
         assert_eq!(conn.stream(id).unwrap().send(&mut data), Ok(0));
@@ -2511,7 +2511,7 @@ fn refused_push_senders_across_buckets_hear_writable_in_wire_order() {
     to_client_numbered(&mut pair, 11, &credit);
     assert_eq!(
         edges(pair.client.conn_mut()),
-        [first, second, placed, unplaced_a, unplaced_b, low].map(|id| (id, StreamReady::Writable)),
+        [first, second, placed, unplaced_b, unplaced_a, low].map(|id| (id, StreamReady::Writable)),
         "woken in the wire order"
     );
     let credit = [Frame::MaxStreamData {
@@ -2567,11 +2567,11 @@ fn wide_windows() -> Setup {
     }
 }
 
-/// Returns the streams the wire scheduler holds, in wire order.
+/// Returns the streams the prioritizer schedules, in wire order.
 fn wire_order(conn: &Connection) -> Vec<StreamId> {
     let streams = &conn.sources.streams.streams;
     streams
-        .scheduler()
+        .prioritizer()
         .iter()
         .filter_map(|slot| streams.get_slot(slot).map(|stream| stream.id()))
         .collect()
@@ -2591,7 +2591,7 @@ fn pull_ready_follows_the_wire_schedulers_turns_within_an_incremental_bucket() {
         );
     }
     assert_eq!(wire_order(conn), [a, b]);
-    // One datagram at a time until `a` has been served a quantum and goes behind `b`.
+    // One datagram at a time until `a` has filled one and goes behind `b`.
     let one = TxLimits {
         max_segments: 1,
         ..pair.limits()
@@ -2606,9 +2606,69 @@ fn pull_ready_follows_the_wire_schedulers_turns_within_an_incremental_bucket() {
     }
     assert_eq!(wire_order(conn), [b, a]);
     assert_eq!(pull_ready_ids(conn), [b, a]);
-    // A stream without a place yet joins on the bucket's turn, behind the streams on it.
+    // A stream that has not staged bytes is outside the rotation and comes after its streams.
     conn.stream(late).unwrap().wake_producer();
-    assert_eq!(pull_ready_ids(conn), [b, late, a]);
+    assert_eq!(pull_ready_ids(conn), [b, a, late]);
+}
+
+#[test]
+fn incremental_streams_take_turns_of_one_datagram_and_join_behind_the_rotation() {
+    let (_, mut pair) = handshake(wide_windows().pair());
+    let one = TxLimits {
+        max_segments: 1,
+        ..pair.limits()
+    };
+    let mut sink = VecSink::new(1500);
+    let conn = pair.client.conn_mut();
+    let [x, a, b] = [(); 3].map(|()| conn.open_stream(Dir::Uni, INCREMENTAL).unwrap());
+    let stage = |conn: &mut Connection, id, len| {
+        let mut data = Bytes::from(vec![0; len]);
+        assert_eq!(conn.stream(id).unwrap().send(&mut data), Ok(len));
+    };
+    for (id, len) in [(x, 500), (a, 32 * 1024), (b, 32 * 1024)] {
+        stage(conn, id, len);
+    }
+    assert_eq!(wire_order(conn), [x, a, b]);
+    // `x` runs out in its first datagram, and `a` fills the rest of it, which is its turn
+    // however few bytes it wrote.
+    for _ in 0..4 {
+        if !wire_order(conn).contains(&x) {
+            break;
+        }
+        conn.poll_transmit(&one, &mut sink, &mut InlineSealer);
+    }
+    assert_eq!(
+        wire_order(conn),
+        [b, a],
+        "after the datagram `x` ran out in"
+    );
+    // Refilled, `x` joins behind both, and a new stream joins behind it.
+    stage(conn, x, 32 * 1024);
+    assert_eq!(wire_order(conn), [b, a, x]);
+    let d = conn.open_stream(Dir::Uni, INCREMENTAL).unwrap();
+    stage(conn, d, 32 * 1024);
+    assert_eq!(wire_order(conn), [b, a, x, d]);
+    // A new order within the bucket does not move the stream; a move to another bucket and back
+    // puts the stream at the back.
+    conn.stream(x).unwrap().set_order(SendOrder {
+        order: 9,
+        ..INCREMENTAL
+    });
+    assert_eq!(wire_order(conn), [b, a, x, d], "a new order field");
+    conn.stream(a).unwrap().set_order(SendOrder {
+        urgency: 6,
+        ..INCREMENTAL
+    });
+    conn.stream(a).unwrap().set_order(INCREMENTAL);
+    assert_eq!(wire_order(conn), [b, x, d, a], "back from another bucket");
+    // Each full datagram is one turn.
+    for _ in 0..4 {
+        if wire_order(conn) != [b, x, d, a] {
+            break;
+        }
+        conn.poll_transmit(&one, &mut sink, &mut InlineSealer);
+    }
+    assert_eq!(wire_order(conn), [x, d, a, b], "after a datagram of `b`");
 }
 
 /// What a producer that always has data stages: zeros, shared.

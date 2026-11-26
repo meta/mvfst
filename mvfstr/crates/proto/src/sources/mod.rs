@@ -60,7 +60,7 @@ use crate::recovery::sent::PacketEvent;
 use crate::recovery::sent::SentFrame;
 use crate::recovery::sent::SentPacket;
 use crate::streams::conn::StreamState;
-use crate::streams::prioritizer::FairShare;
+use crate::streams::prioritizer::MvfstOrder;
 use crate::streams::prioritizer::Prioritizer;
 use crate::streams::send_buf::FrameWriter;
 use crate::transmit::admission::Class;
@@ -264,7 +264,7 @@ pub(crate) struct PacketCx {
 }
 
 /// The state of every frame source of a connection.
-pub(crate) struct Sources<P: Prioritizer = FairShare> {
+pub(crate) struct Sources<P: Prioritizer = MvfstOrder> {
     pub(crate) close: CloseSource,
     pub(crate) ack: [AckSource; 3],
     pub(crate) crypto: [CryptoSource; 3],
@@ -423,8 +423,8 @@ impl<P: Prioritizer> Sources<P> {
         }
     }
 
-    /// Applies what the frames of a sealed packet change only once sealed: the scheduler rotates
-    /// by the stream bytes.
+    /// Applies what the frames of a sealed packet change only once sealed: the stream bytes are
+    /// committed to the prioritizer, which may move the streams in the wire order.
     pub(crate) fn on_frames_sealed(&mut self, frames: &[SentFrame]) {
         self.streams.on_sealed(frames);
         for frame in frames {

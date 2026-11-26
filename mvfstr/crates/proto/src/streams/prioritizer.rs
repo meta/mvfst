@@ -10,8 +10,9 @@
 //! A [`Prioritizer`] owns a connection's wire order and the split of its staging budget within
 //! the buckets of that order. A connection reaches its plug by static dispatch, through the type
 //! parameter of [`Connection`](crate::Connection) and [`Endpoint`](crate::Endpoint), whose default
-//! is [`FairShare`]; code that names `Connection` alone gets the default. Every plug reads the same
-//! priority signal, each stream's [`SendOrder`], so the stream API does not depend on the plug.
+//! is [`MvfstOrder`], mvfst's order; code that names `Connection` alone gets the default.
+//! [`FairShare`] shares incremental streams by bytes instead. Every plug reads the same priority
+//! signal, each stream's [`SendOrder`], so the stream API does not depend on the plug.
 //!
 //! A plug names streams by their slab slot (see [`StreamKey::slot`](super::map::StreamKey::slot))
 //! and reads them through [`Peers`].
@@ -21,6 +22,7 @@ use std::fmt;
 use mvfstr_wire::StreamId;
 
 pub use super::fair_share::FairShare;
+pub use super::mvfst_order::MvfstOrder;
 use super::scheduler::SendOrder;
 
 /// The wire order of a connection's streams and the split of its staging budget among the streams
@@ -29,7 +31,7 @@ use super::scheduler::SendOrder;
 /// The stream guard keeps the plug up to date: each reindex schedules or unschedules the stream
 /// and, while the stream is on the demand list or leaves it, lets the plug record it
 /// ([`reshare`](Self::reshare)). A packet build walks the scheduled streams with a cursor, and each
-/// sealed packet or GSO run is committed.
+/// sealed packet is committed.
 pub trait Prioritizer: Sized {
     /// A position in a walk over the scheduled streams in wire order, for one packet; the default
     /// is the start of a walk.
@@ -49,7 +51,7 @@ pub trait Prioritizer: Sized {
 
     /// Schedules the stream in `slot`, whose ID is `id`, at `order`, or moves it there if it is
     /// scheduled. Returns whether it scheduled or moved the stream: false for a stream already
-    /// scheduled at `order`.
+    /// scheduled at `order`, or one whose place the plug keeps for `order`.
     fn insert(&mut self, slot: u32, id: StreamId, order: SendOrder) -> bool;
 
     /// Unschedules the stream in `slot` and returns whether it was scheduled.
@@ -74,9 +76,9 @@ pub trait Prioritizer: Sized {
         std::iter::from_fn(move || self.next(&mut cursor))
     }
 
-    /// Records that `bytes` of stream `id`, in `slot`, were sealed in a packet or GSO run, whether
-    /// or not the stream is still scheduled; a commit for a stream the slot no longer holds is
-    /// ignored. Every guard is closed, so `streams` reads each stream as its last reindex left it.
+    /// Records that `bytes` of stream `id`, in `slot`, were sealed in a packet, whether or not the
+    /// stream is still scheduled; a commit for a stream the slot no longer holds is ignored. Every
+    /// guard is closed, so `streams` reads each stream as its last reindex left it.
     fn commit(&mut self, slot: u32, id: StreamId, bytes: u64, streams: &impl Peers);
 
     /// Records the stream in `slot` as its reindex left it: on the demand list, or just off it.
@@ -287,6 +289,9 @@ impl<P: Prioritizer> Prioritizer for MirroredUrgency<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
+    use std::any::type_name;
+
     use mvfstr_wire::Dir;
     use mvfstr_wire::Side;
 
@@ -329,13 +334,29 @@ mod tests {
         Commit(u32, u64),
     }
 
-    #[test]
-    fn fair_share_is_the_default_plug_and_orders_streams_as_the_scheduler_does() {
-        // Code that names the types without a plug gets the byte-fair one.
-        let _: fn(Connection) -> Connection<FairShare> = |conn| conn;
-        let _: fn(Endpoint) -> Endpoint<FairShare> = |endpoint| endpoint;
-        let _: fn(StreamState) -> StreamState<FairShare> = |state| state;
+    /// Returns whether `A` and `B` are the same type, with their names for a failure message.
+    fn same<A: 'static, B: 'static>() -> (bool, &'static str, &'static str) {
+        (
+            TypeId::of::<A>() == TypeId::of::<B>(),
+            type_name::<A>(),
+            type_name::<B>(),
+        )
+    }
 
+    #[test]
+    fn mvfst_order_is_the_default_plug() {
+        // Code that names the types without a plug gets mvfst's order.
+        for (equal, default, named) in [
+            same::<Connection, Connection<MvfstOrder>>(),
+            same::<Endpoint, Endpoint<MvfstOrder>>(),
+            same::<StreamState, StreamState<MvfstOrder>>(),
+        ] {
+            assert!(equal, "the default is {default}, not {named}");
+        }
+    }
+
+    #[test]
+    fn fair_share_orders_streams_as_the_scheduler_does() {
         // Two sequential buckets and two incremental ones, with turns taken, a stream that leaves
         // and comes back with a commit made while it was away, a move, an insert that does not
         // change anything, and a stream gone for good.
