@@ -54,6 +54,7 @@ use crate::CloseReason;
 use crate::ConnEvent;
 use crate::DatagramSize;
 use crate::Initiator;
+use crate::Prioritizer;
 use crate::RecvSummary;
 use crate::RxDatagram;
 use crate::RxMeta;
@@ -108,7 +109,7 @@ struct PacketInfo {
     token: bool,
 }
 
-impl Connection {
+impl<P: Prioritizer> Connection<P> {
     /// Processes one receive batch.
     pub(super) fn receive(
         &mut self,

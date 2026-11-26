@@ -10,8 +10,8 @@
 //!
 //! Each bucket's totals (peers, staged bytes, room) are kept as the streams change, so that a
 //! stream's allowance costs a step per sequential bucket ahead of it and O(log n) per incremental
-//! one, rather than a walk over every stream with demand. The stream guard updates a stream's
-//! entry each time it reindexes it, except while the stream stays its bucket's only peer.
+//! one, rather than a walk over every stream with demand. The byte-fair plug updates a stream's
+//! entry each time the guard reindexes it, except while the stream stays its bucket's only peer.
 //!
 //! A sequential bucket keeps its peers in a treap keyed by `(order, stream ID)` whose nodes sum
 //! the rooms below them, so the rooms ahead of a place cost O(log n). An incremental bucket keeps
@@ -22,9 +22,9 @@
 //! bucket also keeps its peers in two treaps summing those ends, which give what the whole bucket
 //! takes in O(log n).
 //!
-//! The guard does not record what a bucket's only peer holds or where it stands, which saves an
-//! update each time it reindexes that stream: readers take both from the stream, and the guard
-//! brings the peer's record up to date when another stream joins the bucket.
+//! The plug does not record what a bucket's only peer holds or where it stands, which saves an
+//! update each time the guard reindexes that stream: readers take both from the stream, and the
+//! plug brings the peer's record up to date when another stream joins the bucket.
 
 use super::scheduler::SendOrder;
 

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A connection's streams: the stream table with its lists and scheduler, each stream's data
+//! A connection's streams: the stream table with its lists and prioritizer, each stream's data
 //! parts (send buffer and credit, receive buffer and window), connection flow control both ways,
 //! and the staged bytes, which the application has handed a stream and which are not sent yet.
 //!
@@ -36,15 +36,15 @@ use super::guard::Owed;
 use super::guard::StreamData;
 use super::guard::Streams;
 use super::map::Half;
+use super::prioritizer::FairShare;
+use super::prioritizer::Figures;
+use super::prioritizer::Prioritizer;
 use super::recv_buf::PagePool;
 use super::recv_buf::RecvBuffer;
 use super::recv_buf::RecvError;
 use super::send_buf::Pending;
 use super::send_buf::PushError;
 use super::send_buf::SendBuffer;
-use super::share::Bucket;
-use super::share::Holding;
-use super::share::share_key;
 use super::state::RecvState;
 use super::state::SendState;
 use super::state::Transition;
@@ -140,26 +140,6 @@ impl SendPart {
     }
 }
 
-/// What the split of the staging budget reads of a stream.
-#[derive(Clone, Copy, Debug)]
-struct Figures {
-    /// The bytes it may stage: [`SendPart::room`].
-    room: u64,
-    /// Its stream credit beyond its staged bytes.
-    credit: u64,
-    /// Its staged bytes.
-    staged: u64,
-}
-
-impl Figures {
-    fn holding(self) -> Holding {
-        Holding {
-            room: self.room,
-            staged: self.staged,
-        }
-    }
-}
-
 /// A stream's receiving part.
 #[derive(Debug)]
 pub(crate) struct RecvPart {
@@ -192,10 +172,10 @@ impl StreamData for StreamParts {
             .is_some_and(|send| send.buf.staged() > 0 || send.push_blocked)
     }
 
-    fn holding(&self) -> Holding {
+    fn figures(&self) -> Figures {
         self.send
             .as_ref()
-            .map_or_else(Holding::default, |send| send.figures().holding())
+            .map_or_else(Figures::default, SendPart::figures)
     }
 }
 
@@ -285,22 +265,6 @@ fn reaches_low_water(allowance: u64, share: u64, credit: u64) -> bool {
     allowance > 0 && allowance >= LOW_WATER.min(share).min(credit)
 }
 
-/// Returns what each of `peers` incremental peers of a bucket is entitled to stage: an equal
-/// part of what reaches the bucket (`left`) and what the peers already hold (`held`).
-fn entitlement(left: u64, held: u64, peers: u64) -> u64 {
-    left.saturating_add(held) / peers.max(1)
-}
-
-/// Returns an incremental peer's allowance: its room, up to what its `entitled` bytes leave
-/// above what it holds, and no more than what reaches its bucket (`left`). A peer holding its
-/// entitlement gets an allowance only once it drains.
-fn incremental_allowance(holding: Holding, entitled: u64, left: u64) -> u64 {
-    holding
-        .room
-        .min(entitled.saturating_sub(holding.staged))
-        .min(left)
-}
-
 /// Returns the index of direction `dir` in per-direction arrays.
 pub(crate) fn dir_index(dir: Dir) -> usize {
     match dir {
@@ -309,9 +273,10 @@ pub(crate) fn dir_index(dir: Dir) -> usize {
     }
 }
 
-/// A connection's streams and flow control, and the datagrams it sends in the streams' wire order.
-pub(crate) struct StreamState {
-    pub(crate) streams: Streams<StreamParts>,
+/// A connection's streams and flow control, and the datagrams it sends in the streams' wire order,
+/// which the prioritizer `P` sets.
+pub(crate) struct StreamState<P: Prioritizer = FairShare> {
+    pub(crate) streams: Streams<StreamParts, P>,
     /// The DATAGRAM frames (RFC 9221) waiting to be sent.
     pub(crate) datagrams: SendQueue,
     config: PartsConfig,
@@ -372,7 +337,7 @@ impl AckedProgress {
     }
 }
 
-impl std::fmt::Debug for StreamState {
+impl<P: Prioritizer> std::fmt::Debug for StreamState<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamState")
             .field("conn_send", &self.conn_send)
@@ -395,7 +360,7 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
     }
 }
 
-impl StreamState {
+impl<P: Prioritizer> StreamState<P> {
     /// Creates the streams of a new connection at the endpoint whose role is `side`, with the
     /// endpoint's receive pages.
     pub(crate) fn new(side: Side, config: &TransportConfig, pool: PagePool) -> Self {
@@ -476,7 +441,7 @@ impl StreamState {
             self.max_streams,
             self.streams_blocked,
             lists,
-            self.streams.scheduler().len(),
+            self.streams.prioritizer().len(),
         );
         for stream in self.streams.iter() {
             let parts = stream.data();
@@ -499,7 +464,7 @@ impl StreamState {
                 stream.digest(),
                 send,
                 recv,
-                self.streams.scheduler().digest(stream.slot()),
+                self.streams.prioritizer().digest(stream.slot()),
             );
         }
     }
@@ -590,9 +555,7 @@ impl StreamState {
 
     /// Returns the allowance of stream `id` when the connection stages at most `budget` bytes:
     /// its room, up to its part of what the budget has left as [`rank`](Self::rank) splits it,
-    /// counting the stream among its bucket's peers, as a stream offering bytes has demand. Each
-    /// sequential bucket ahead costs one step, read from its totals, each incremental one
-    /// O(log n), and the rooms ahead of a sequential stream in its own bucket O(log n).
+    /// counting the stream among its bucket's peers, as a stream offering bytes has demand.
     pub(crate) fn allowance(&self, id: StreamId, budget: u64) -> u64 {
         let Some(stream) = self.streams.get(id) else {
             return 0;
@@ -600,80 +563,12 @@ impl StreamState {
         if !stream.send_state().is_some_and(|s| s.takes_new_data()) {
             return 0;
         }
-        let Some(asker) = stream.data().send.as_ref().map(SendPart::figures) else {
-            return 0;
-        };
-        if asker.room == 0 {
+        let asker = stream.peer();
+        if asker.figures.room == 0 {
             return 0;
         }
-        let (order, key) = (stream.order(), share_key(stream.order()));
-        let shares = self.streams.shares();
-        let mut left = budget.saturating_sub(self.staged);
-        for ahead in shares.buckets().take_while(|b| b.key() < key) {
-            if left == 0 {
-                break;
-            }
-            left = left.saturating_sub(self.bucket_takes(ahead, left));
-        }
-        let counted = self.streams.is_on(List::Demand, stream.slot());
-        let bucket = shares.bucket(key);
-        let (peers, held) = bucket.map_or((0, 0), |b| (b.peers(), self.held(b).staged));
-        if key.2 {
-            let (peers, held) = if counted {
-                (peers, held)
-            } else {
-                (peers + 1, held.saturating_add(asker.staged))
-            };
-            incremental_allowance(asker.holding(), entitlement(left, held, peers), left)
-        } else {
-            let ahead = bucket.map_or(0, |b| self.room_before(b, order.order, id));
-            asker.room.min(left.saturating_sub(ahead))
-        }
-    }
-
-    /// Returns what the peers of `bucket` hold, read from the stream for a lone peer, which the
-    /// shares do not follow.
-    fn held(&self, bucket: &Bucket) -> Holding {
-        match bucket.lone() {
-            Some(slot) => self
-                .streams
-                .get_slot(slot)
-                .map_or_else(Holding::default, |stream| stream.data().holding()),
-            None => Holding {
-                room: bucket.room(),
-                staged: bucket.staged(),
-            },
-        }
-    }
-
-    /// Returns the sum of the rooms of the peers of sequential `bucket` ahead of a stream at
-    /// `order` with ID `id`.
-    fn room_before(&self, bucket: &Bucket, order: u128, id: StreamId) -> u64 {
-        let shares = self.streams.shares();
-        let Some(lone) = bucket.lone().and_then(|slot| self.streams.get_slot(slot)) else {
-            return shares.room_before(bucket.key(), order, id.into_inner());
-        };
-        if (lone.order().order, lone.id().into_inner()) < (order, id.into_inner()) {
-            lone.data().holding().room
-        } else {
-            0
-        }
-    }
-
-    /// Returns what the peers of `bucket` take of the `left` bytes that reach it: the sum of the
-    /// allowances [`rank`](Self::rank) computes for them before the low-water mark applies, up to
-    /// `left`. An incremental allowance is also capped at `left`, which changes the sum only when
-    /// the sum reaches `left` anyway.
-    fn bucket_takes(&self, bucket: &Bucket, left: u64) -> u64 {
-        let held = self.held(bucket);
-        if !bucket.key().2 {
-            return held.room.min(left);
-        }
-        let entitled = entitlement(left, held.staged, bucket.peers());
-        if bucket.lone().is_some() {
-            return incremental_allowance(held, entitled, left);
-        }
-        self.streams.shares().takes(bucket, entitled).min(left)
+        self.streams
+            .allowance(asker, budget.saturating_sub(self.staged))
     }
 
     /// Checks that stream `id`'s send half takes bytes, and fails with the reason if not.
@@ -841,54 +736,25 @@ impl StreamState {
     }
 
     /// Ranks the streams with demand in wire order with their allowances when the connection
-    /// stages at most `budget` bytes: buckets in wire order take from what the budget has left,
-    /// `left`. A sequential bucket's streams take their rooms in turn from `left`; an incremental
-    /// bucket's peers are each entitled to an equal part of `left` and what they hold, and take
-    /// their rooms up to that. An allowance below the stream's low-water mark, 16 KiB capped by
-    /// its entitlement (or by `left` in a sequential bucket) and by its stream credit, is zero.
-    /// Once `left` runs out, the rest of a sequential bucket and the buckets after it are not
-    /// ranked, so their allowances are zero.
+    /// stages at most `budget` bytes, as the prioritizer splits what the budget has left. An
+    /// allowance below the stream's low-water mark, 16 KiB capped by its share and by its stream
+    /// credit, is zero. The streams the split leaves out are not ranked, so their allowances are
+    /// zero.
     fn rank(&mut self, budget: u64) {
         #[cfg(test)]
         super::guard::census::count(|c| c.ranks += 1);
         let mut ranked = std::mem::take(&mut self.ranked);
         ranked.clear();
-        self.streams.settle_shares();
-        let shares = self.streams.shares();
-        let mut left = budget.saturating_sub(self.staged);
-        for bucket in shares.buckets() {
-            if left == 0 {
-                break;
-            }
-            // What reaches an incremental bucket is split before any of it is taken.
-            let (reaching, incremental) = (left, bucket.key().2);
-            let entitled = entitlement(reaching, self.held(bucket).staged, bucket.peers());
-            for slot in shares.members(bucket) {
-                if left == 0 && !incremental {
-                    break;
-                }
-                let Some(stream) = self.streams.get_slot(slot) else {
-                    continue;
-                };
-                let Some(figures) = stream.data().send.as_ref().map(SendPart::figures) else {
-                    continue;
-                };
-                let (allowance, share) = if incremental {
-                    let allowance = incremental_allowance(figures.holding(), entitled, reaching);
-                    (allowance, entitled)
-                } else {
-                    (figures.room.min(left), left)
-                };
-                left = left.saturating_sub(allowance);
-                let reached = reaches_low_water(allowance, share, figures.credit);
-                ranked.push(Ranked {
-                    id: stream.id(),
-                    slot,
-                    pull: self.streams.is_on(List::PullReady, slot),
-                    allowance: if reached { allowance } else { 0 },
-                });
-            }
-        }
+        let left = budget.saturating_sub(self.staged);
+        self.streams.split(left, |slot, stream, allowance, share| {
+            let reached = reaches_low_water(allowance, share, stream.figures.credit);
+            ranked.push(Ranked {
+                id: stream.id,
+                slot,
+                pull: stream.pull,
+                allowance: if reached { allowance } else { 0 },
+            });
+        });
         self.ranked = ranked;
     }
 
@@ -1595,6 +1461,7 @@ mod tests {
     use super::*;
     use crate::recovery::test_epoch;
     use crate::streams::guard::census;
+    use crate::streams::prioritizer::MirroredUrgency;
 
     fn state() -> StreamState {
         let config = TransportConfig::builder()
@@ -1820,5 +1687,57 @@ mod tests {
             "reading a stream without demand does not reshare it"
         );
         s.streams.assert_indexed();
+    }
+
+    /// Opens sequential streams of class 1 at urgencies 0 and 7 on a server whose streams `P`
+    /// orders and makes both pull-ready, checking the streams' indexes. Returns them, their
+    /// allowances and the collected pull-ready streams when the connection stages at most one
+    /// stream's cap.
+    fn split_one_cap<P: Prioritizer>() -> ([StreamId; 2], [u64; 2], Vec<(StreamId, u64)>) {
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+            initial_max_streams_uni: VarInt::from_u32(2),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let ids = [0, 7].map(|urgency| {
+            let order = SendOrder {
+                urgency,
+                ..PEER_ORDER
+            };
+            let id = s.open(Dir::Uni, order).unwrap();
+            s.streams.stream(id).unwrap().set_producer_pending(false);
+            id
+        });
+        s.streams.assert_indexed();
+        s.collect_pull_ready(STREAM_CAP);
+        s.streams.assert_indexed();
+        let pulled = (0..).map_while(|index| s.pulled(index)).collect();
+        (ids, ids.map(|id| s.allowance(id, STREAM_CAP)), pulled)
+    }
+
+    #[test]
+    fn the_staging_budget_is_split_in_the_wire_order_of_the_plug() {
+        // Either stream could stage the whole budget; the one first in the wire order takes it.
+        let ([urgent, _], allowances, pulled) = split_one_cap::<FairShare>();
+        assert_eq!(
+            allowances,
+            [STREAM_CAP, 0],
+            "the default plug gives the budget to the most urgent stream"
+        );
+        assert_eq!(pulled, [(urgent, STREAM_CAP)]);
+
+        let ([_, background], allowances, pulled) = split_one_cap::<MirroredUrgency<FairShare>>();
+        assert_eq!(
+            allowances,
+            [0, STREAM_CAP],
+            "a plug that mirrors urgencies gives the budget to the least urgent stream"
+        );
+        assert_eq!(pulled, [(background, STREAM_CAP)]);
     }
 }

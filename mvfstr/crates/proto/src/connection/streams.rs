@@ -15,13 +15,14 @@ use roxygen_bufqueue::BufQueue;
 use super::Connection;
 use crate::AppCode;
 use crate::CreditDue;
+use crate::Prioritizer;
 use crate::SendError;
 use crate::SendOrder;
 use crate::StreamError;
 use crate::streams::conn::staging_budget;
 use crate::streams::send_buf::SendBuffer;
 
-impl Connection {
+impl<P: Prioritizer> Connection<P> {
     /// Returns the bytes the connection may stage on all its streams, from its congestion window.
     pub(super) fn staging_budget(&self) -> u64 {
         staging_budget(self.cc.cwnd())

@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,6 +62,8 @@ use crate::ConnOptions;
 use crate::Connection;
 use crate::EndpointConfig;
 use crate::EndpointEvent;
+use crate::FairShare;
+use crate::Prioritizer;
 use crate::RxDatagram;
 use crate::RxMeta;
 use crate::ServerConfig;
@@ -358,8 +361,9 @@ impl fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
-/// Connection ID routing and connection creation for one set of sockets.
-pub struct Endpoint {
+/// Connection ID routing and connection creation for one set of sockets. `P` is the
+/// [`Prioritizer`] of the connections it creates.
+pub struct Endpoint<P: Prioritizer = FairShare> {
     config: Arc<EndpointConfig>,
     server: Option<Arc<ServerConfig>>,
     /// The connection IDs routed to each connection: its own and, for a server, the client's
@@ -391,6 +395,7 @@ pub struct Endpoint {
     pool: DatagramPool,
     /// Free pages for the data its connections receive.
     pages: PagePool,
+    _plug: PhantomData<fn() -> P>,
 }
 
 /// A token bucket for stateless replies: RFC 9000 lets a server limit the Version Negotiation
@@ -441,9 +446,20 @@ pub(crate) const MIN_RESET: usize = 21;
 const MAX_RESET: usize = 43;
 
 impl Endpoint {
-    /// Creates an endpoint. With a server config it accepts connections; without one it only
-    /// opens them.
+    /// Creates an endpoint whose connections use the default prioritizer. With a server config it
+    /// accepts connections; without one it only opens them.
     pub fn new(config: Arc<EndpointConfig>, server: Option<Arc<ServerConfig>>) -> Self {
+        Self::with_prioritizer(config, server)
+    }
+}
+
+impl<P: Prioritizer> Endpoint<P> {
+    /// Creates an endpoint whose connections order their streams and split their staging budgets
+    /// with the prioritizer `P`, as [`new`](Endpoint::new) does with the default.
+    pub fn with_prioritizer(
+        config: Arc<EndpointConfig>,
+        server: Option<Arc<ServerConfig>>,
+    ) -> Self {
         Self {
             cids: CidGenerator::new(&config),
             host_id_truncations: u64::from(config.cid_layout().has_wide_host_id()),
@@ -459,6 +475,7 @@ impl Endpoint {
             shared_src_ports: Arc::default(),
             pool: DatagramPool::default(),
             pages: PagePool::new(),
+            _plug: PhantomData,
         }
     }
 
@@ -671,7 +688,7 @@ impl Endpoint {
         incoming: Incoming,
         config: &Arc<ServerConfig>,
         options: ConnOptions,
-    ) -> Result<Connection, AcceptError> {
+    ) -> Result<Connection<P>, AcceptError> {
         if self.routes.contains_key(&incoming.dcid) {
             return Err(AcceptError::CidInUse(incoming.dcid));
         }
@@ -732,7 +749,7 @@ impl Endpoint {
         server_name: ServerName<'static>,
         config: &Arc<ClientConfig>,
         options: ConnOptions,
-    ) -> Result<Connection, ConnectError> {
+    ) -> Result<Connection<P>, ConnectError> {
         if remote.ip().is_unspecified() || remote.port() == 0 {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
@@ -945,7 +962,7 @@ fn rustls_error(error: TlsError) -> rustls::Error {
     }
 }
 
-impl fmt::Debug for Endpoint {
+impl<P: Prioritizer> fmt::Debug for Endpoint<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Endpoint").finish_non_exhaustive()
     }
@@ -968,6 +985,7 @@ mod tests {
     use crate::TxLimits;
     use crate::parse_v2;
     use crate::recovery::test_epoch;
+    use crate::streams::prioritizer::MirroredUrgency;
     use crate::testing::TestRng;
     use crate::testing::VecSink;
     use crate::testing::fixtures::Setup;
@@ -1067,6 +1085,54 @@ mod tests {
             Route::Accept(incoming) => incoming,
             other => panic!("expected Accept, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn endpoints_create_their_connections_with_their_prioritizer() {
+        type Plug = MirroredUrgency<FairShare>;
+        let now = test_epoch();
+        let setup = Setup::default();
+        let config = setup.pair();
+        let mut client = Endpoint::<Plug>::with_prioritizer(config.endpoint.clone(), None);
+        let mut server =
+            Endpoint::<Plug>::with_prioritizer(config.endpoint, Some(config.server.clone()));
+        let mut rng = TestRng::new(1);
+        let mut cx = Inputs {
+            now,
+            unix_now: unix_now(),
+            rng: &mut rng,
+        };
+        let mut conn: Connection<Plug> = client
+            .connect(
+                &mut cx,
+                KEY,
+                server_addr(),
+                ServerName::try_from("localhost").unwrap(),
+                &config.client,
+                ConnOptions::default(),
+            )
+            .unwrap();
+        let mut sink = VecSink::new(1500);
+        let limits = TxLimits {
+            now,
+            max_segments: 1,
+            max_datagram: 1500,
+            max_bytes: u32::MAX,
+            epoch: None,
+        };
+        conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+        let datagram = sink.take().remove(0).data;
+        let incoming = incoming(server.route(now, &meta(now), &datagram));
+        let accepted: Connection<Plug> = server
+            .accept(
+                &mut cx,
+                KEY,
+                incoming,
+                &config.server,
+                ConnOptions::default(),
+            )
+            .unwrap();
+        assert_eq!((conn.side(), accepted.side()), (Side::Client, Side::Server));
     }
 
     #[test]

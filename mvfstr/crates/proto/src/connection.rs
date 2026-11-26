@@ -100,10 +100,12 @@ use crate::ConnEvent;
 use crate::DatagramError;
 use crate::DatagramStats;
 use crate::EndpointEvent;
+use crate::FairShare;
 use crate::Initiator;
 use crate::KeepAlive;
 use crate::KeyUpdatePolicy;
 use crate::OpenError;
+use crate::Prioritizer;
 use crate::Random;
 use crate::RecvSummary;
 use crate::RxDatagram;
@@ -353,8 +355,9 @@ impl ConnSetup {
 /// One QUIC connection, client or server, created by
 /// [`Endpoint::accept`](crate::Endpoint::accept) or [`Endpoint::connect`](crate::Endpoint::connect).
 ///
-/// Dropping a connection does not send anything.
-pub struct Connection {
+/// Dropping a connection does not send anything. `P` is the [`Prioritizer`] that orders its
+/// streams on the wire and splits its staging budget.
+pub struct Connection<P: Prioritizer = FairShare> {
     side: Side,
     version: Version,
     config: Arc<TransportConfig>,
@@ -369,7 +372,7 @@ pub struct Connection {
     tls: TlsSession,
     tls_host: HostState,
     spaces: [PacketSpace; 3],
-    sources: Sources,
+    sources: Sources<P>,
     cid_gen: CidGenerator,
     rng: ConnRng,
     /// The 1-RTT key phases, once 1-RTT keys exist.
@@ -445,7 +448,7 @@ pub struct Connection {
     _not_sync: PhantomData<Cell<()>>,
 }
 
-impl Connection {
+impl<P: Prioritizer> Connection<P> {
     /// Creates a client connection and, on rustls, its ClientHello; an External client's host
     /// writes it from the first [`tls_input`](Self::tls_input).
     pub(crate) fn client(
@@ -893,7 +896,7 @@ impl Connection {
     }
 
     /// Gives mutable access to an open stream.
-    pub fn stream(&mut self, id: StreamId) -> Result<StreamMut<'_>, StreamError> {
+    pub fn stream(&mut self, id: StreamId) -> Result<StreamMut<'_, P>, StreamError> {
         if !self.sources.streams.is_open(id) {
             return Err(StreamError::Closed);
         }
@@ -901,14 +904,14 @@ impl Connection {
     }
 
     /// Drains the streams whose readiness changed since the last call, each with its edge.
-    pub fn readiness(&mut self) -> Readiness<'_> {
+    pub fn readiness(&mut self) -> Readiness<'_, P> {
         Readiness { conn: self }
     }
 
     /// Returns the streams whose producer should be polled for data, in wire order, each with its
     /// allowance. A stream with room is listed from [`StreamMut::wake_producer`] until
     /// [`StreamMut::park_producer`].
-    pub fn pull_ready(&mut self) -> PullReady<'_> {
+    pub fn pull_ready(&mut self) -> PullReady<'_, P> {
         let budget = self.staging_budget();
         self.sources.streams.collect_pull_ready(budget);
         PullReady {
@@ -1687,7 +1690,7 @@ fn encode(params: &TransportParameters) -> Vec<u8> {
     out
 }
 
-impl fmt::Debug for Connection {
+impl<P: Prioritizer> fmt::Debug for Connection<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection")
             .field("side", &self.side)
@@ -1700,11 +1703,11 @@ impl fmt::Debug for Connection {
 }
 
 /// Streams whose readiness changed, from [`Connection::readiness`].
-pub struct Readiness<'a> {
-    conn: &'a mut Connection,
+pub struct Readiness<'a, P: Prioritizer = FairShare> {
+    conn: &'a mut Connection<P>,
 }
 
-impl Iterator for Readiness<'_> {
+impl<P: Prioritizer> Iterator for Readiness<'_, P> {
     type Item = (StreamId, StreamReady);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1721,7 +1724,7 @@ impl Iterator for Readiness<'_> {
     }
 }
 
-impl fmt::Debug for Readiness<'_> {
+impl<P: Prioritizer> fmt::Debug for Readiness<'_, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Readiness").finish_non_exhaustive()
     }
@@ -1729,13 +1732,13 @@ impl fmt::Debug for Readiness<'_> {
 
 /// Streams ready to be polled for data with their allowances, from
 /// [`Connection::pull_ready`].
-pub struct PullReady<'a> {
-    conn: &'a mut Connection,
+pub struct PullReady<'a, P: Prioritizer = FairShare> {
+    conn: &'a mut Connection<P>,
     /// The index of the next collected stream.
     index: usize,
 }
 
-impl Iterator for PullReady<'_> {
+impl<P: Prioritizer> Iterator for PullReady<'_, P> {
     type Item = (StreamId, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1745,7 +1748,7 @@ impl Iterator for PullReady<'_> {
     }
 }
 
-impl fmt::Debug for PullReady<'_> {
+impl<P: Prioritizer> fmt::Debug for PullReady<'_, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PullReady").finish_non_exhaustive()
     }

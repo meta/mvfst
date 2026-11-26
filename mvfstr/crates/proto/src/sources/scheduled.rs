@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The Scheduled source: STREAM frames in the wire scheduler's order, each stream's lost bytes
+//! The Scheduled source: STREAM frames in the prioritizer's wire order, each stream's lost bytes
 //! before its new ones, and DATAGRAM frames (RFC 9221). A PTO probe takes every stream's lost
 //! bytes before any new ones, because the PTO queues the oldest data in flight as lost bytes for
 //! it.
@@ -32,7 +32,7 @@ use crate::recovery::Space;
 use crate::recovery::sent::SentFrame;
 use crate::streams::conn::StreamState;
 use crate::streams::guard::Owed;
-use crate::streams::scheduler::Cursor;
+use crate::streams::prioritizer::Prioritizer;
 use crate::streams::send_buf::FrameKind;
 use crate::streams::send_buf::Pending;
 use crate::transmit::admission::Class;
@@ -48,7 +48,10 @@ pub(crate) const DATAGRAM: ScheduledCand = u32::MAX;
 /// comes before the first stream with something to send, or ties with it, and that stream
 /// otherwise. Lost bytes and a lone FIN do not take connection credit, new bytes do. A probe takes
 /// lost bytes first, whichever stream holds them.
-pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, ScheduledCand)> {
+pub(crate) fn next<P: Prioritizer>(
+    state: &StreamState<P>,
+    cx: &SendCx<'_>,
+) -> Option<(Class, ScheduledCand)> {
     if cx.space != Space::Data {
         return None;
     }
@@ -70,8 +73,8 @@ pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, Sched
 /// something to send, or ties with it, and that stream otherwise.
 // Out of line, so the code that sends streams alone stays as small as without datagrams.
 #[inline(never)]
-fn datagram_or(
-    state: &StreamState,
+fn datagram_or<P: Prioritizer>(
+    state: &StreamState<P>,
     cx: &SendCx<'_>,
     stream: Option<(Class, ScheduledCand)>,
 ) -> Option<(Class, ScheduledCand)> {
@@ -84,7 +87,7 @@ fn datagram_or(
         Some((Class::NewStream, _)) if state.conn_send.available() == 0 => true,
         Some((_, slot)) => state
             .streams
-            .scheduler()
+            .prioritizer()
             .order(slot)
             .is_none_or(|order| datagram <= wire_key(order)),
     };
@@ -95,19 +98,19 @@ fn datagram_or(
 }
 
 /// Returns the class and slot of the stream to send from next.
-fn next_stream(state: &StreamState) -> Option<(Class, ScheduledCand)> {
+fn next_stream<P: Prioritizer>(state: &StreamState<P>) -> Option<(Class, ScheduledCand)> {
     let conn_credit = state.conn_send.available();
-    let scheduler = state.streams.scheduler();
-    let mut cursor = Cursor::default();
+    let prioritizer = state.streams.prioritizer();
+    let mut cursor = P::Cursor::default();
     // When the credit is spent and the streams do not hold lost data or a lone FIN, every
     // scheduled stream waits for credit, and the walk below would offer the first.
     if conn_credit == 0 && state.streams.lost() == 0 && state.streams.fin_only() == 0 {
-        return scheduler
+        return prioritizer
             .next(&mut cursor)
             .map(|slot| (Class::NewStream, slot));
     }
     let mut blocked = None;
-    while let Some(slot) = scheduler.next(&mut cursor) {
+    while let Some(slot) = prioritizer.next(&mut cursor) {
         let Some(send) = state
             .streams
             .get_slot(slot)
@@ -130,10 +133,10 @@ fn next_stream(state: &StreamState) -> Option<(Class, ScheduledCand)> {
 }
 
 /// Returns the first stream in the wire order with lost bytes to send.
-fn retransmission(state: &StreamState) -> Option<ScheduledCand> {
-    let scheduler = state.streams.scheduler();
-    let mut cursor = Cursor::default();
-    iter::from_fn(|| scheduler.next(&mut cursor)).find(|&slot| {
+fn retransmission<P: Prioritizer>(state: &StreamState<P>) -> Option<ScheduledCand> {
+    let prioritizer = state.streams.prioritizer();
+    let mut cursor = P::Cursor::default();
+    iter::from_fn(|| prioritizer.next(&mut cursor)).find(|&slot| {
         state
             .streams
             .get_slot(slot)
@@ -145,7 +148,11 @@ fn retransmission(state: &StreamState) -> Option<ScheduledCand> {
 /// Returns the room the candidate takes: the oldest datagram's whole frame, or the smallest STREAM
 /// frame of the stream, one byte at its first unsent offset (lost bytes start below it, so their
 /// offset does not take more room).
-pub(crate) fn min_len(state: &StreamState, cand: ScheduledCand, cx: &SendCx<'_>) -> usize {
+pub(crate) fn min_len<P: Prioritizer>(
+    state: &StreamState<P>,
+    cand: ScheduledCand,
+    cx: &SendCx<'_>,
+) -> usize {
     if cand == DATAGRAM {
         return state.datagrams.head_frame_len(cx.now).unwrap_or(0);
     }
@@ -167,9 +174,9 @@ pub(crate) fn min_len(state: &StreamState, cand: ScheduledCand, cx: &SendCx<'_>)
 }
 
 /// The Scheduled source over a connection's streams.
-pub(crate) struct ScheduledSource<'a>(pub(crate) &'a mut StreamState);
+pub(crate) struct ScheduledSource<'a, P: Prioritizer>(pub(crate) &'a mut StreamState<P>);
 
-impl FrameSource for ScheduledSource<'_> {
+impl<P: Prioritizer> FrameSource for ScheduledSource<'_, P> {
     type Cand = ScheduledCand;
 
     fn next(&self, cx: &SendCx<'_>) -> Option<(Class, ScheduledCand)> {
@@ -252,6 +259,8 @@ mod tests {
     use crate::recovery::test_epoch;
     use crate::sources::PacketCx;
     use crate::streams::guard::census;
+    use crate::streams::prioritizer::FairShare;
+    use crate::streams::prioritizer::MirroredUrgency;
     use crate::streams::recv_buf::PagePool;
 
     /// Returns a server's streams with `count` sequential streams in one bucket, in the wire order
@@ -533,5 +542,69 @@ mod tests {
         assert_eq!(counts(&s), (0, 1), "a reset drops the FIN");
         s.on_stop_sending(empty, AppCode::from_u32(2)).unwrap();
         assert_eq!(counts(&s), (0, 0), "the peer's STOP_SENDING drops the FIN");
+    }
+
+    /// Opens sequential streams of class 1 at urgencies 0, 3 and 7 on a server whose streams `P`
+    /// orders, with 100 bytes staged on each, and returns them in the order they were opened and
+    /// in the order the source offers them. Each stream is reset once offered, which unschedules
+    /// it, so the next walk goes on to the stream after it. The streams' indexes are checked
+    /// after each step.
+    fn offered_in_wire_order<P: Prioritizer>() -> (Vec<StreamId>, Vec<StreamId>) {
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+            initial_max_streams_uni: VarInt::from_u32(3),
+            ..TransportParameters::default()
+        })
+        .expect("valid parameters");
+        let opened: Vec<_> = [0, 3, 7]
+            .into_iter()
+            .map(|urgency| {
+                let order = SendOrder {
+                    class: 1,
+                    urgency,
+                    incremental: false,
+                    order: 0,
+                };
+                let id = s.open(Dir::Uni, order).unwrap();
+                let staged = s.send(id, &mut Bytes::from_static(&[7; 100]), u64::MAX);
+                assert_eq!(staged, Ok(100));
+                id
+            })
+            .collect();
+        s.streams.assert_indexed();
+        let mut offered = Vec::new();
+        let mut sent = Vec::new();
+        loop {
+            let candidate = next(&s, &cx(0, &mut sent));
+            let Some((class, slot)) = candidate else {
+                break;
+            };
+            assert_eq!(class, Class::NewStream, "new bytes within credit");
+            let id = s.streams.get_slot(slot).expect("a live stream").id();
+            offered.push(id);
+            s.reset(id, AppCode::from_u32(1)).unwrap();
+            s.streams.assert_indexed();
+        }
+        (opened, offered)
+    }
+
+    #[test]
+    fn the_source_offers_streams_in_the_wire_order_of_their_plug() {
+        let (opened, offered) = offered_in_wire_order::<FairShare>();
+        assert_eq!(
+            offered, opened,
+            "the default plug offers the most urgent stream first"
+        );
+        let (opened, offered) = offered_in_wire_order::<MirroredUrgency<FairShare>>();
+        let reversed: Vec<_> = opened.into_iter().rev().collect();
+        assert_eq!(
+            offered, reversed,
+            "a plug that mirrors urgencies offers the least urgent stream first"
+        );
     }
 }

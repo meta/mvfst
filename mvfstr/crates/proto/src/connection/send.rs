@@ -43,6 +43,7 @@ use super::MIN_DATAGRAM;
 use super::State;
 use crate::ClockEpoch;
 use crate::PathId;
+use crate::Prioritizer;
 use crate::Release;
 use crate::SegmentSink;
 use crate::Stop;
@@ -180,7 +181,7 @@ enum Outcome {
     Sent { len: u16, paced: bool },
 }
 
-impl Connection {
+impl<P: Prioritizer> Connection<P> {
     /// Makes one transmit attempt, as the module docs describe.
     pub(super) fn transmit<S: SegmentSink, Z: Sealer>(
         &mut self,

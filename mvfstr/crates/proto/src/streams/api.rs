@@ -16,6 +16,8 @@ use bytes::Bytes;
 use mvfstr_wire::StreamId;
 use roxygen_bufqueue::BufQueue;
 
+use super::prioritizer::FairShare;
+use super::prioritizer::Prioritizer;
 use super::send_buf::SendBuffer;
 use crate::AppCode;
 use crate::Connection;
@@ -26,19 +28,19 @@ use crate::SendOrder;
 ///
 /// Dropping the handle recomputes the stream's membership in the connection's readiness,
 /// pull and scheduling lists from its state.
-pub struct StreamMut<'a> {
-    conn: &'a mut Connection,
+pub struct StreamMut<'a, P: Prioritizer = FairShare> {
+    conn: &'a mut Connection<P>,
     id: StreamId,
 }
 
-impl<'a> StreamMut<'a> {
+impl<'a, P: Prioritizer> StreamMut<'a, P> {
     /// Returns the handle of open stream `id` of `conn`.
-    pub(crate) fn new(conn: &'a mut Connection, id: StreamId) -> Self {
+    pub(crate) fn new(conn: &'a mut Connection<P>, id: StreamId) -> Self {
         Self { conn, id }
     }
 }
 
-impl StreamMut<'_> {
+impl<P: Prioritizer> StreamMut<'_, P> {
     /// Returns the stream's ID.
     pub fn id(&self) -> StreamId {
         self.id
@@ -149,7 +151,7 @@ impl StreamMut<'_> {
     }
 }
 
-impl fmt::Debug for StreamMut<'_> {
+impl<P: Prioritizer> fmt::Debug for StreamMut<'_, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamMut")
             .field("id", &self.id)

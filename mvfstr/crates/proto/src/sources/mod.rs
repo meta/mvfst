@@ -60,6 +60,8 @@ use crate::recovery::sent::PacketEvent;
 use crate::recovery::sent::SentFrame;
 use crate::recovery::sent::SentPacket;
 use crate::streams::conn::StreamState;
+use crate::streams::prioritizer::FairShare;
+use crate::streams::prioritizer::Prioritizer;
 use crate::streams::send_buf::FrameWriter;
 use crate::transmit::admission::Class;
 
@@ -262,8 +264,7 @@ pub(crate) struct PacketCx {
 }
 
 /// The state of every frame source of a connection.
-#[derive(Debug)]
-pub(crate) struct Sources {
+pub(crate) struct Sources<P: Prioritizer = FairShare> {
     pub(crate) close: CloseSource,
     pub(crate) ack: [AckSource; 3],
     pub(crate) crypto: [CryptoSource; 3],
@@ -271,7 +272,7 @@ pub(crate) struct Sources {
     pub(crate) probe: ProbeSource,
     pub(crate) ping: PingSource,
     /// The streams and flow control the Control and Scheduled sources send from.
-    pub(crate) streams: StreamState,
+    pub(crate) streams: StreamState<P>,
     /// The connection IDs whose frames the Control source sends after the streams'.
     pub(crate) cids: Cids,
     /// The calls of [`Sources::fill`] into a packet without room left.
@@ -301,7 +302,14 @@ pub(crate) struct AckedRun {
 impl AckedRun {
     /// Adds the acknowledged frame `(offset, len, fin)` of stream `id`. Unless the frame continues
     /// the run, the run goes to its stream first and a new one starts.
-    fn add(&mut self, streams: &mut StreamState, id: StreamId, offset: u64, len: u16, fin: bool) {
+    fn add<P: Prioritizer>(
+        &mut self,
+        streams: &mut StreamState<P>,
+        id: StreamId,
+        offset: u64,
+        len: u16,
+        fin: bool,
+    ) {
         if self.id != Some(id) || offset != self.end {
             self.flush(streams);
             self.id = Some(id);
@@ -313,7 +321,7 @@ impl AckedRun {
     }
 
     /// Applies the run to its stream, if it holds one, and empties it.
-    pub(crate) fn flush(&mut self, streams: &mut StreamState) {
+    pub(crate) fn flush<P: Prioritizer>(&mut self, streams: &mut StreamState<P>) {
         let run = std::mem::take(self);
         if let Some(id) = run.id {
             streams.on_stream_acked(id, run.start, run.end - run.start, run.fin);
@@ -321,10 +329,10 @@ impl AckedRun {
     }
 }
 
-impl Sources {
+impl<P: Prioritizer> Sources<P> {
     /// Creates a connection's sources over `streams`; ACK tracking keeps at most
     /// `max_ack_ranges` ranges.
-    pub(crate) fn new(max_ack_ranges: usize, streams: StreamState, cids: Cids) -> Self {
+    pub(crate) fn new(max_ack_ranges: usize, streams: StreamState<P>, cids: Cids) -> Self {
         Self {
             close: CloseSource::default(),
             ack: Space::ALL.map(|space| AckSource::new(space, max_ack_ranges)),

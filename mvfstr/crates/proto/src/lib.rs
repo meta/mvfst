@@ -33,7 +33,7 @@
 //! | [`transmit`] | the transmit attempt, its stops and limits, I/O-neutral transmit types |
 //! | [`receive`] | received datagrams and their metadata |
 //! | `sources` | the frame sources, tried in a fixed order for each frame to write |
-//! | [`streams`] | stream API, buffers, map, state machines, scheduler, guard |
+//! | [`streams`] | stream API, buffers, map, state machines, scheduler, prioritizers, guard |
 //! | [`flow_control`] | connection and stream credit, receive windows |
 //! | [`recovery`] | RTT, ACK tracking, sent packets, loss detection, PTO (RFC 9002) |
 //! | [`cc`] | NewReno and CUBIC with explicit inputs and outputs |
@@ -138,7 +138,9 @@ pub use receive::RxDatagram;
 pub use receive::RxMeta;
 pub use roxygen_bufqueue::BufQueue;
 pub use streams::CreditDue;
+pub use streams::FairShare;
 pub use streams::OpenError;
+pub use streams::Prioritizer;
 pub use streams::SendError;
 pub use streams::SendOrder;
 pub use streams::StreamError;

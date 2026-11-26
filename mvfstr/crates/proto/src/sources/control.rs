@@ -27,6 +27,7 @@ use crate::streams::conn::StreamState;
 use crate::streams::conn::dir_index;
 use crate::streams::guard::List;
 use crate::streams::guard::Owed;
+use crate::streams::prioritizer::Prioritizer;
 use crate::streams::state::SendState;
 use crate::transmit::admission::Class;
 
@@ -80,7 +81,10 @@ pub(crate) enum ControlCand {
 
 /// Returns the next control frame to send: connection frames first, then the first stream on
 /// the control list.
-pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, ControlCand)> {
+pub(crate) fn next<P: Prioritizer>(
+    state: &StreamState<P>,
+    cx: &SendCx<'_>,
+) -> Option<(Class, ControlCand)> {
     if cx.space != Space::Data {
         return None;
     }
@@ -109,12 +113,15 @@ pub(crate) fn next(state: &StreamState, cx: &SendCx<'_>) -> Option<(Class, Contr
 }
 
 /// Returns the room the candidate's frame takes.
-pub(crate) fn min_len(state: &StreamState, cand: ControlCand) -> usize {
+pub(crate) fn min_len<P: Prioritizer>(state: &StreamState<P>, cand: ControlCand) -> usize {
     frame(state, cand).map_or(0, |(frame, _)| frame.encoded_len())
 }
 
 /// Builds the candidate's frame and its sent-frame record.
-fn frame(state: &StreamState, cand: ControlCand) -> Option<(Frame<'static>, SentFrame)> {
+fn frame<P: Prioritizer>(
+    state: &StreamState<P>,
+    cand: ControlCand,
+) -> Option<(Frame<'static>, SentFrame)> {
     let varint = |value: u64| VarInt::from_u64(value).unwrap_or(VarInt::MAX);
     let record = |kind, key, value| SentFrame::Control { kind, key, value };
     match cand {
@@ -215,9 +222,9 @@ fn frame(state: &StreamState, cand: ControlCand) -> Option<(Frame<'static>, Sent
 }
 
 /// The Control source over a connection's streams.
-pub(crate) struct ControlSource<'a>(pub(crate) &'a mut StreamState);
+pub(crate) struct ControlSource<'a, P: Prioritizer>(pub(crate) &'a mut StreamState<P>);
 
-impl FrameSource for ControlSource<'_> {
+impl<P: Prioritizer> FrameSource for ControlSource<'_, P> {
     type Cand = ControlCand;
 
     fn next(&self, cx: &SendCx<'_>) -> Option<(Class, ControlCand)> {

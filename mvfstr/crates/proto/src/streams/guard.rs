@@ -12,7 +12,7 @@
 //! (readable, writable and pull-ready, control-pending, demand, scheduler) from state.
 //! [`StreamMut`](crate::StreamMut) is its public face.
 //!
-//! [`Streams`] owns the stream table, the lists and the scheduler, and hands out a stream only
+//! [`Streams`] owns the stream table, the lists and the prioritizer, and hands out a stream only
 //! as a [`StreamGuard`], so a mutation cannot skip the reindex. A stream's state is its two half
 //! state machines, its undelivered readiness edges, its owed control frames and its producer
 //! state, plus the data parts (send and receive buffers, flow control) behind [`StreamData`].
@@ -26,12 +26,13 @@
 //!   keeps an undelivered `Writable` edge; these streams share the staging budget;
 //! - control: an owed MAX_STREAM_DATA, STOP_SENDING, RESET_STREAM or STREAM_DATA_BLOCKED that
 //!   the half states still permit;
-//! - the scheduler: the send half may send STREAM frames and the data parts have bytes or a FIN
-//!   for the wire. Connection credit is not considered; it is checked when frames are written.
+//! - the scheduler, the prioritizer's wire order: the send half may send STREAM frames and the
+//!   data parts have bytes or a FIN for the wire. Connection credit is not considered; it is
+//!   checked when frames are written.
 //!
-//! The same reindex records each stream on the demand list in the [`Shares`], by bucket of the
-//! staging split with its place and holding, so the split reads per-bucket totals. While the
-//! stream stays its bucket's only peer, the reindex skips this and the split reads the stream.
+//! The same reindex lets the [`Prioritizer`] record each stream that is on the demand list or
+//! leaves it, for the staging split, except while the prioritizer has marked the stream alone and
+//! it keeps its demand and its order.
 //!
 //! A closed stream whose `Closed` edge has been delivered is reaped by the same reindex.
 
@@ -43,14 +44,13 @@ use mvfstr_wire::TransportErrorCode;
 use super::map::Half;
 use super::map::PeerStream;
 use super::map::StreamTable;
-use super::scheduler::Scheduler;
+use super::prioritizer::FairShare;
+use super::prioritizer::Figures;
+use super::prioritizer::Peer;
+use super::prioritizer::Peers;
+use super::prioritizer::PeersMut;
+use super::prioritizer::Prioritizer;
 use super::send_buf::Pending;
-use super::share::Holding;
-use super::share::Peer;
-use super::share::Place;
-use super::share::Shares;
-use super::share::Standing;
-use super::share::share_key;
 use super::state::Halves;
 use super::state::InvalidTransition;
 use super::state::RecvState;
@@ -77,9 +77,9 @@ pub(crate) trait StreamData {
     /// waits for `Writable`.
     fn has_demand(&self) -> bool;
 
-    /// Returns what the stream holds of the staging budget's split while it has demand: its room
-    /// and staged bytes.
-    fn holding(&self) -> Holding;
+    /// Returns what the staging budget's split reads of the stream: its room, its stream credit
+    /// beyond its staged bytes, and its staged bytes.
+    fn figures(&self) -> Figures;
 }
 
 /// A readiness edge the connection marks after updating the data parts.
@@ -184,8 +184,8 @@ struct Entry<D> {
     /// One bit per [`List`] the stream is on, and [`LOST_DATA`] or [`FIN_ONLY`] while it is counted
     /// in [`Streams::lost`] or [`Streams::fin_only`].
     member: u8,
-    /// Whether the shares record the stream as the only peer of its order's bucket; cleared when
-    /// the order changes, until the next reindex checks again.
+    /// Whether the prioritizer marked the stream alone (see [`PeersMut::set_alone`]); cleared when
+    /// the order changes, until the next reshare marks it again.
     alone: bool,
 }
 
@@ -307,13 +307,12 @@ impl<D: StreamData> Stream<D> {
     }
 }
 
-/// A connection's streams with their lists, scheduler and shares of the staging budget.
-pub(crate) struct Streams<D> {
+/// A connection's streams with their lists, and the prioritizer `P`, which holds their wire order
+/// and the split of the staging budget among the streams on the demand list.
+pub(crate) struct Streams<D, P = FairShare> {
     table: StreamTable<Entry<D>>,
     lists: [ListHead; LISTS],
-    scheduler: Scheduler,
-    /// The streams on the demand list, by bucket of the split.
-    shares: Shares,
+    plug: P,
     /// How many streams have lost bytes or a lost FIN in their send buffers, kept by the reindex
     /// that every guard runs when dropped, so every change to a send buffer's lost state is
     /// counted: a loss, a retransmission, an acknowledgment of lost bytes or a reset.
@@ -326,8 +325,8 @@ pub(crate) struct Streams<D> {
 }
 
 /// Exclusive access to one stream; dropping it reindexes the stream.
-pub(crate) struct StreamGuard<'a, D: StreamData> {
-    streams: &'a mut Streams<D>,
+pub(crate) struct StreamGuard<'a, D: StreamData, P: Prioritizer = FairShare> {
+    streams: &'a mut Streams<D, P>,
     slot: u32,
     id: StreamId,
 }
@@ -335,11 +334,55 @@ pub(crate) struct StreamGuard<'a, D: StreamData> {
 /// Read-only access to one stream, so that frame sources pick candidates without changing state.
 pub(crate) struct StreamRef<'a, D> {
     stream: &'a Stream<D>,
+    /// The lists the stream is on, as [`Entry::member`] holds them.
+    member: u8,
     slot: u32,
     id: StreamId,
 }
 
-impl<D: StreamData> Streams<D> {
+/// Returns the stream `id`, whose state is `stream` and whose list bits are `member`, as the
+/// prioritizer reads it.
+fn peer<D: StreamData>(id: StreamId, stream: &Stream<D>, member: u8) -> Peer {
+    Peer {
+        id,
+        order: stream.order,
+        demand: member & List::Demand.bit() != 0,
+        pull: member & List::PullReady.bit() != 0,
+        figures: stream.data.figures(),
+    }
+}
+
+/// The streams as the prioritizer reads them.
+struct View<'a, D>(&'a StreamTable<Entry<D>>);
+
+impl<D: StreamData> Peers for View<'_, D> {
+    fn peer(&self, slot: u32) -> Option<Peer> {
+        let (_, id, entry) = self.0.map().get_slot(slot)?;
+        Some(peer(id, &entry.stream, entry.member))
+    }
+}
+
+/// The streams as the prioritizer reads them, with the alone marks it sets.
+struct ViewMut<'a, D>(&'a mut StreamTable<Entry<D>>);
+
+impl<D: StreamData> Peers for ViewMut<'_, D> {
+    fn peer(&self, slot: u32) -> Option<Peer> {
+        let (_, id, entry) = self.0.map().get_slot(slot)?;
+        Some(peer(id, &entry.stream, entry.member))
+    }
+}
+
+impl<D: StreamData> PeersMut for ViewMut<'_, D> {
+    fn set_alone(&mut self, slot: u32, alone: bool) {
+        match self.0.get_slot_mut(slot) {
+            Some((_, _, entry)) => entry.alone = alone,
+            // Invariant: the prioritizer marks only live streams.
+            None => unreachable!("slot {slot} is not a live stream"),
+        }
+    }
+}
+
+impl<D: StreamData, P: Prioritizer> Streams<D, P> {
     /// Creates an empty set for the endpoint whose role is `side`, advertising `max_streams_bidi`
     /// and `max_streams_uni`, with incremental streams taking turns every `quantum` bytes.
     pub(crate) fn new(
@@ -351,8 +394,7 @@ impl<D: StreamData> Streams<D> {
         Streams {
             table: StreamTable::new(side, max_streams_bidi, max_streams_uni),
             lists: [EMPTY_LIST; LISTS],
-            scheduler: Scheduler::new(quantum),
-            shares: Shares::new(),
+            plug: P::new(quantum),
             lost: 0,
             fin_only: 0,
             #[cfg(test)]
@@ -383,7 +425,7 @@ impl<D: StreamData> Streams<D> {
         dir: Dir,
         order: SendOrder,
         data: D,
-    ) -> Result<StreamGuard<'_, D>, OpenError> {
+    ) -> Result<StreamGuard<'_, D, P>, OpenError> {
         let side = self.table.side();
         let (id, key) = self
             .table
@@ -399,7 +441,7 @@ impl<D: StreamData> Streams<D> {
         id: StreamId,
         half: Half,
         make: impl FnOnce(StreamId) -> (SendOrder, D),
-    ) -> Result<Option<StreamGuard<'_, D>>, TransportErrorCode> {
+    ) -> Result<Option<StreamGuard<'_, D, P>>, TransportErrorCode> {
         let side = self.table.side();
         let found = self.table.peer_frame(id, half, |id| {
             let (order, data) = make(id);
@@ -439,6 +481,7 @@ impl<D: StreamData> Streams<D> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = StreamRef<'_, D>> {
         self.table.map().iter().map(|(key, id, entry)| StreamRef {
             stream: &entry.stream,
+            member: entry.member,
             slot: key.slot(),
             id,
         })
@@ -454,19 +497,20 @@ impl<D: StreamData> Streams<D> {
         let (_, id, entry) = self.table.map().get_slot(slot)?;
         Some(StreamRef {
             stream: &entry.stream,
+            member: entry.member,
             slot,
             id,
         })
     }
 
     /// Returns `id`'s stream, or `None` if `id` never opened or was reaped.
-    pub(crate) fn stream(&mut self, id: StreamId) -> Option<StreamGuard<'_, D>> {
+    pub(crate) fn stream(&mut self, id: StreamId) -> Option<StreamGuard<'_, D, P>> {
         let key = self.table.map().key(id)?;
         Some(self.guard(key.slot(), id))
     }
 
     /// Returns the stream in slab slot `slot`, as named by a list or the scheduler.
-    pub(crate) fn by_slot(&mut self, slot: u32) -> Option<StreamGuard<'_, D>> {
+    pub(crate) fn by_slot(&mut self, slot: u32) -> Option<StreamGuard<'_, D, P>> {
         let (_, id, _) = self.table.map().get_slot(slot)?;
         Some(self.guard(slot, id))
     }
@@ -485,6 +529,7 @@ impl<D: StreamData> Streams<D> {
     }
 
     /// Returns whether the stream in `slot` is on `list`.
+    #[cfg(test)]
     pub(crate) fn is_on(&self, list: List, slot: u32) -> bool {
         self.entry(slot)
             .is_some_and(|entry| entry.member & list.bit() != 0)
@@ -496,55 +541,27 @@ impl<D: StreamData> Streams<D> {
         self.lists[list as usize].len as usize
     }
 
-    /// Returns the wire scheduler, for a packet build to walk with its cursor.
-    pub(crate) fn scheduler(&self) -> &Scheduler {
-        &self.scheduler
+    /// Returns the prioritizer, for a packet build to walk the wire order with its cursor.
+    pub(crate) fn prioritizer(&self) -> &P {
+        &self.plug
     }
 
-    /// Rotates the scheduler for `bytes` of stream `id`, in `slot`, sealed in a packet or GSO
-    /// run, whether or not the build has since unscheduled the stream (see
-    /// [`Scheduler::commit`]). The commit may move incremental streams' places, which the shares
-    /// follow for peers that are not alone in their buckets; what they hold has not changed since
-    /// their guards last reindexed them.
+    /// Commits `bytes` of stream `id`, in `slot`, sealed in a packet or GSO run, whether or not
+    /// the build has since unscheduled the stream (see [`Prioritizer::commit`]).
     pub(crate) fn commit(&mut self, slot: u32, id: StreamId, bytes: u64) {
-        let moved = self.scheduler.commit(slot, id, bytes);
-        // Every guard is closed here, so the shares record each stream's bucket as it stands.
-        if moved.committed && self.shares.among(slot) {
-            self.replace(slot);
-        }
-        if let Some(raised) = moved.raised
-            && self.shares.among(raised)
-        {
-            self.replace(raised);
-        }
+        self.plug.commit(slot, id, bytes, &View(&self.table));
     }
 
-    /// Records the place of the stream in `slot`, a peer among others, in the shares.
-    #[inline(never)]
-    fn replace(&mut self, slot: u32) {
-        if let Some((_, id, entry)) = self.table.map().get_slot(slot) {
-            let place = self.place(slot, id, entry.stream.order);
-            self.shares.replace(slot, place);
-        }
+    /// Returns the allowance the prioritizer gives `asker` of `left` free bytes of the staging
+    /// budget (see [`Prioritizer::allowance`]).
+    pub(crate) fn allowance(&self, asker: Peer, left: u64) -> u64 {
+        self.plug.allowance(asker, left, &View(&self.table))
     }
 
-    /// Returns the streams with demand by bucket of the split.
-    pub(crate) fn shares(&self) -> &Shares {
-        &self.shares
-    }
-
-    /// Brings the incremental buckets of the shares up to the scheduler's turns, which listing
-    /// their peers in the wire order requires.
-    pub(crate) fn settle_shares(&mut self) {
-        let scheduler = &self.scheduler;
-        self.shares.settle(|(class, urgency, _)| {
-            scheduler.turn(SendOrder {
-                class,
-                urgency,
-                incremental: true,
-                order: 0,
-            })
-        });
+    /// Splits `left` free bytes of the staging budget among the streams on the demand list in wire
+    /// order (see [`Prioritizer::split`]).
+    pub(crate) fn split(&mut self, left: u64, f: impl FnMut(u32, Peer, u64, u64)) {
+        self.plug.split(left, &View(&self.table), f);
     }
 
     /// Returns the limit for peer streams in direction `dir` that the next MAX_STREAMS carries.
@@ -588,7 +605,7 @@ impl<D: StreamData> Streams<D> {
         self.table.shutdown();
     }
 
-    fn guard(&mut self, slot: u32, id: StreamId) -> StreamGuard<'_, D> {
+    fn guard(&mut self, slot: u32, id: StreamId) -> StreamGuard<'_, D, P> {
         StreamGuard {
             streams: self,
             slot,
@@ -649,96 +666,26 @@ impl<D: StreamData> Streams<D> {
             }
         }
         let moved = match want.scheduled {
-            Some(order) => self.scheduler.insert(slot, id, order),
-            None => self.scheduler.remove(slot),
+            Some(order) => self.plug.insert(slot, id, order),
+            None => self.plug.remove(slot),
         };
         let demand = List::Demand.bit();
         if (have | want.lists) & demand == 0 {
-            // The shares hold only streams on the demand list, and a stream that leaves it is
-            // reshared, which clears `alone`.
+            // The prioritizer holds only streams on the demand list, and a stream that leaves it
+            // is reshared, which clears `alone`.
             debug_assert!(
-                !alone && !self.shares.alone(slot) && !self.shares.among(slot),
+                !alone && !self.plug.is_peer(slot),
                 "stream {id} without demand is marked alone or is in the shares"
             );
         } else if !alone || want.lists & demand == 0 {
-            // The shares do not follow a lone peer that keeps its demand.
-            self.reshare(slot, id, moved);
+            // The prioritizer does not follow a stream marked alone that keeps its demand.
+            self.plug
+                .reshare(slot, moved, &mut ViewMut(&mut self.table));
         }
         if want.reap {
             debug_assert!(want.lists == 0 && want.scheduled.is_none());
-            self.scheduler.forget(slot);
+            self.plug.forget(slot);
             self.table.reap(id);
-        }
-    }
-
-    /// Records the stream in `slot` in the shares as it stands, unless it is alone in its bucket:
-    /// a lone peer's record is brought up to date only when another stream joins it, and its guard
-    /// skips this while it stays alone with demand. An incremental stream that stays a peer of its
-    /// bucket keeps its recorded place unless `moved` is set, which means that the scheduler has
-    /// just scheduled, moved or unscheduled it. Its place changes otherwise only with a commit,
-    /// which refreshes the place, or with its bucket's turn passing it, which [`Shares::settle`]
-    /// catches up with.
-    #[inline(never)]
-    fn reshare(&mut self, slot: u32, id: StreamId, moved: bool) {
-        #[cfg(test)]
-        census::count(|c| c.reshares += 1);
-        if let Some(entry) = self.entry(slot)
-            && entry.member & List::Demand.bit() != 0
-        {
-            let order = entry.stream.order;
-            match self.shares.standing(slot, share_key(order)) {
-                Standing::Alone => {
-                    self.entry_mut(slot).alone = true;
-                    return;
-                }
-                Standing::Among if !moved && order.incremental => {
-                    self.shares.hold(slot, entry.stream.data.holding());
-                    return;
-                }
-                Standing::Among | Standing::Out => {}
-            }
-        }
-        let peer = self.peer(slot, id);
-        let regrouped = self.shares.update(slot, peer);
-        let alone = self.shares.alone(slot);
-        self.entry_mut(slot).alone = alone;
-        if let Some(left) = regrouped.left {
-            self.entry_mut(left).alone = true;
-        }
-        if let Some(joined) = regrouped.joined
-            && let Some((_, id, _)) = self.table.map().get_slot(joined)
-        {
-            let peer = self.peer(joined, id);
-            self.shares.update(joined, peer);
-            self.entry_mut(joined).alone = false;
-        }
-    }
-
-    /// Returns the stream in `slot` as a peer of its bucket of the split, if it is on the demand
-    /// list.
-    fn peer(&self, slot: u32, id: StreamId) -> Option<Peer> {
-        let entry = self.entry(slot)?;
-        if entry.member & List::Demand.bit() == 0 {
-            return None;
-        }
-        let order = entry.stream.order;
-        Some(Peer {
-            key: share_key(order),
-            id: id.into_inner(),
-            place: self.place(slot, id, order),
-            holding: entry.stream.data.holding(),
-        })
-    }
-
-    /// Returns where the stream in `slot` at `order` stands in its bucket of the split.
-    fn place(&self, slot: u32, id: StreamId, order: SendOrder) -> Place {
-        if !order.incremental {
-            return Place::Sequential(order.order);
-        }
-        match self.scheduler.place(slot, id, order) {
-            // The scheduler would place the stream on the bucket's turn behind every stream on it.
-            (_, u64::MAX) => Place::Unplaced,
-            (turn, ticket) => Place::Placed { turn, ticket },
         }
     }
 
@@ -824,7 +771,7 @@ impl<D> Entry<D> {
     }
 }
 
-impl<D: StreamData> StreamGuard<'_, D> {
+impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
     /// Returns the stream's ID.
     pub(crate) fn id(&self) -> StreamId {
         self.id
@@ -1082,6 +1029,7 @@ impl<'a, D> StreamRef<'a, D> {
     }
 
     /// Returns the stream's place in the wire order.
+    #[cfg(test)]
     pub(crate) fn order(&self) -> SendOrder {
         self.stream.order
     }
@@ -1122,6 +1070,14 @@ impl<'a, D> StreamRef<'a, D> {
         &self.stream.data
     }
 
+    /// Returns the stream as the prioritizer reads it.
+    pub(crate) fn peer(&self) -> Peer
+    where
+        D: StreamData,
+    {
+        peer(self.id, self.stream, self.member)
+    }
+
     /// Returns the stream's own state, for the empty-attempt digest.
     #[cfg(debug_assertions)]
     pub(crate) fn digest(&self) -> impl std::fmt::Debug {
@@ -1139,7 +1095,7 @@ impl<'a, D> StreamRef<'a, D> {
     }
 }
 
-impl<D: StreamData> Drop for StreamGuard<'_, D> {
+impl<D: StreamData, P: Prioritizer> Drop for StreamGuard<'_, D, P> {
     fn drop(&mut self) {
         self.streams.reindex(self.slot, self.id);
     }
@@ -1204,49 +1160,48 @@ pub(crate) mod census {
 }
 
 #[cfg(test)]
-impl<D: StreamData> Streams<D> {
-    /// Checks that every list and the scheduler hold exactly the streams whose state calls for
-    /// them, that every list's links are consistent, and that the shares record exactly the
-    /// streams on the demand list, each in its place with what it holds.
+impl<D: StreamData> Streams<D, FairShare> {
+    /// Returns the byte-fair plug's wire scheduler.
+    pub(crate) fn scheduler(&self) -> &super::scheduler::Scheduler {
+        self.plug.scheduler()
+    }
+
+    /// Returns the byte-fair plug's shares of the staging budget.
+    pub(crate) fn shares(&self) -> &super::share::Shares {
+        self.plug.shares()
+    }
+
+    /// Brings the incremental buckets of the shares up to the scheduler's turns.
+    pub(crate) fn settle_shares(&mut self) {
+        self.plug.settle();
+    }
+}
+
+#[cfg(test)]
+impl<D: StreamData, P: Prioritizer> Streams<D, P> {
+    /// Checks that every list and the wire order hold exactly the streams whose state calls for
+    /// them, that every list's links are consistent, and that the prioritizer records exactly the
+    /// streams on the demand list as peers of the split.
     pub(crate) fn assert_indexed(&self) {
         for (key, id, entry) in self.table.map().iter() {
             let want = entry.stream.membership();
             assert_eq!(entry.member, want.lists, "lists of stream {id}");
             assert_eq!(
-                self.scheduler.order(key.slot()),
+                self.plug.order(key.slot()),
                 want.scheduled,
                 "scheduling of stream {id}"
             );
             assert!(!want.reap, "stream {id} should have been reaped");
-            assert_eq!(
+            self.plug.assert_stream(
+                key.slot(),
                 entry.alone,
-                self.shares.alone(key.slot()),
-                "stream {id} alone in its bucket"
+                peer(id, &entry.stream, entry.member),
             );
-            let peer = self.peer(key.slot(), id);
-            let recorded = self.shares.recorded(key.slot()).map(|mut recorded| {
-                if let Some(peer) = peer
-                    && let Some(bucket) = self.shares.bucket(recorded.key)
-                    && bucket.lone() == Some(key.slot())
-                {
-                    // What a lone peer holds and where it stands are not recorded.
-                    (recorded.place, recorded.holding) = (peer.place, peer.holding);
-                }
-                // A place behind its bucket's turn stays recorded until the next settle moves it
-                // among the unplaced peers, where the scheduler already puts it.
-                if let Place::Placed { turn, .. } = recorded.place
-                    && turn < self.scheduler.turn(entry.stream.order)
-                {
-                    recorded.place = Place::Unplaced;
-                }
-                recorded
-            });
-            assert_eq!(recorded, peer, "share of stream {id}");
         }
         assert_eq!(
-            self.shares.assert_consistent(),
+            self.plug.assert_consistent(),
             self.len(List::Demand),
-            "the shares record the demand list"
+            "the prioritizer records the demand list"
         );
         for list in List::ALL {
             let mut count = 0;
@@ -1264,7 +1219,7 @@ impl<D: StreamData> Streams<D> {
             assert_eq!(self.lists[list as usize].tail, prev, "{list:?} tail");
         }
         assert_eq!(
-            self.scheduler.len(),
+            self.plug.len(),
             self.table
                 .map()
                 .iter()
@@ -1292,6 +1247,7 @@ impl<D: StreamData> Streams<D> {
 mod tests {
     use super::*;
     use crate::streams::scheduler::Cursor;
+    use crate::streams::share::share_key;
 
     #[derive(Debug, Default)]
     struct Data {
@@ -1312,8 +1268,8 @@ mod tests {
             false
         }
 
-        fn holding(&self) -> Holding {
-            Holding::default()
+        fn figures(&self) -> Figures {
+            Figures::default()
         }
     }
 
@@ -1367,7 +1323,7 @@ mod tests {
             readiness: listed(List::Readiness),
             pull_ready: listed(List::PullReady),
             control: listed(List::Control),
-            scheduled: s.scheduler.order(key.slot()),
+            scheduled: s.scheduler().order(key.slot()),
         }
     }
 

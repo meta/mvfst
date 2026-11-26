@@ -35,6 +35,7 @@ use crate::CloseReason;
 use crate::ConnEvent;
 use crate::Initiator;
 use crate::PathEvent;
+use crate::Prioritizer;
 use crate::Random;
 use crate::recovery::rtt::RttEstimator;
 use crate::sources::path::ALTERNATE;
@@ -52,7 +53,7 @@ pub(super) struct AltPath {
     pub(super) rx_dcid: ConnectionId,
 }
 
-impl Connection {
+impl<P: Prioritizer> Connection<P> {
     /// Credits a datagram of `len` bytes from `src`, not the current address, to the alternate
     /// path's anti-amplification budget when it comes from there.
     pub(super) fn credit_received(&mut self, src: SocketAddr, len: u64) {
