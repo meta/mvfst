@@ -7,12 +7,11 @@
 
 //! Wakes from any thread: a stream waker or a connection's own waker sets a bit on the
 //! connection's [`ConnWake`], which queues the connection once on the endpoint's ready list and
-//! wakes the endpoint task; the next turn takes the bits. Commands from
-//! [`ConnHandle`](crate::ConnHandle)s wait in a bounded queue per connection.
+//! wakes the endpoint task; the next turn takes the bits. A close from a
+//! [`ConnHandle`](crate::ConnHandle) waits in a single slot per connection.
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -32,7 +31,7 @@ use roxygen_runtime::worker::SubmitError;
 
 /// The session's own waker or a [`ConnHandle`](crate::ConnHandle) woke the session.
 pub(crate) const APP: u8 = 1;
-/// A command is queued.
+/// A close is pending.
 pub(crate) const CMD: u8 = 1 << 1;
 /// The connection's own socket may be readable.
 pub(crate) const RX: u8 = 1 << 2;
@@ -42,9 +41,6 @@ pub(crate) const TX: u8 = 1 << 3;
 pub(crate) const STREAM: u8 = 1 << 4;
 /// The session's datagram waker fired.
 pub(crate) const DATAGRAM: u8 = 1 << 5;
-
-/// The most commands queued per connection; [`ConnWake::submit`] fails with `Overloaded` past it.
-pub(crate) const COMMAND_CAPACITY: usize = 64;
 
 /// The ready list and task waker that the endpoint task shares with every connection's wakes.
 #[derive(Default)]
@@ -94,11 +90,11 @@ impl fmt::Debug for Shared {
     }
 }
 
-/// A command from a [`ConnHandle`](crate::ConnHandle).
+/// A close from a [`ConnHandle`](crate::ConnHandle), with an application CONNECTION_CLOSE.
 #[derive(Debug)]
-pub(crate) enum Command {
-    /// Close with an application CONNECTION_CLOSE.
-    Close { code: AppCode, reason: Bytes },
+pub(crate) struct Close {
+    pub(crate) code: AppCode,
+    pub(crate) reason: Bytes,
 }
 
 /// One connection's wake state, shared with its wakers and handles.
@@ -110,7 +106,7 @@ pub(crate) struct ConnWake {
     closed: AtomicBool,
     /// The stream wakers that fired since the last take, each once.
     streams: Mutex<Vec<Arc<StreamWake>>>,
-    commands: Mutex<VecDeque<Command>>,
+    pending: Mutex<Option<Close>>,
 }
 
 impl ConnWake {
@@ -122,7 +118,7 @@ impl ConnWake {
             bits: AtomicU8::new(0),
             closed: AtomicBool::new(false),
             streams: Mutex::new(Vec::new()),
-            commands: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(None),
         })
     }
 
@@ -175,27 +171,27 @@ impl ConnWake {
         }
     }
 
-    /// Queues `command` and sets [`CMD`]. Fails with `Closed` once the connection is gone, and
-    /// with `Overloaded` when the queue holds [`COMMAND_CAPACITY`] commands.
-    pub(crate) fn submit(&self, command: Command) -> Result<(), SubmitError> {
+    /// Puts `close` in the slot and sets [`CMD`], or drops it while an earlier close waits there:
+    /// a closing connection ignores later closes. Fails with `Closed` once the connection is gone.
+    pub(crate) fn submit(&self, close: Close) -> Result<(), SubmitError> {
         {
-            let mut commands = lock(&self.commands);
-            // Checked under the lock, so a command never lands after `close` cleared the queue.
+            let mut slot = lock(&self.pending);
+            // Checked under the lock, so a close never lands after `Self::close` emptied the slot.
             if self.is_closed() {
                 return Err(SubmitError::Closed);
             }
-            if commands.len() >= COMMAND_CAPACITY {
-                return Err(SubmitError::Overloaded);
+            if slot.is_some() {
+                return Ok(());
             }
-            commands.push_back(command);
+            *slot = Some(close);
         }
         self.wake(CMD);
         Ok(())
     }
 
-    /// Takes the oldest queued command.
-    pub(crate) fn take_command(&self) -> Option<Command> {
-        lock(&self.commands).pop_front()
+    /// Takes the pending close.
+    pub(crate) fn take_close(&self) -> Option<Close> {
+        lock(&self.pending).take()
     }
 
     /// Returns whether the connection is gone.
@@ -205,10 +201,10 @@ impl ConnWake {
 
     /// Marks the connection gone: handles fail from now on and wakes are ignored.
     pub(crate) fn close(&self) {
-        let mut commands = lock(&self.commands);
+        let mut slot = lock(&self.pending);
         self.closed.store(true, Ordering::SeqCst);
-        commands.clear();
-        drop(commands);
+        *slot = None;
+        drop(slot);
         lock(&self.streams).clear();
     }
 }
@@ -406,35 +402,33 @@ mod tests {
     }
 
     #[test]
-    fn commands_are_bounded_and_refused_once_the_connection_is_gone() {
+    fn many_closes_first_wins() {
         let shared = Arc::new(Shared::default());
         let wake = ConnWake::new(shared, KEY);
-        let close = |code| Command::Close {
+        let close = |code| Close {
             code: AppCode::from_u32(code),
             reason: Bytes::new(),
         };
-        for code in 0..COMMAND_CAPACITY as u32 {
-            wake.submit(close(code)).unwrap();
-        }
-        assert_eq!(wake.submit(close(99)), Err(SubmitError::Overloaded));
-        assert_eq!(wake.take(), CMD);
-        for expected in 0..COMMAND_CAPACITY as u32 {
-            let Some(Command::Close { code, .. }) = wake.take_command() else {
-                panic!("command {expected} is missing");
-            };
+        for code in 1..=100 {
             assert_eq!(
-                code,
-                AppCode::from_u32(expected),
-                "commands come out in order"
+                wake.submit(close(code)),
+                Ok(()),
+                "close {code} is refused while the connection is live"
             );
         }
-        assert!(wake.take_command().is_none());
-        wake.submit(close(1)).unwrap();
+        assert_eq!(wake.take(), CMD);
+        let Some(Close { code, .. }) = wake.take_close() else {
+            panic!("the first close is missing");
+        };
+        assert_eq!(code, AppCode::from_u32(1), "the first close wins");
+        assert!(wake.take_close().is_none(), "the later closes are not kept");
+
+        wake.submit(close(101)).unwrap();
         wake.close();
         assert!(
-            wake.take_command().is_none(),
-            "closing drops queued commands"
+            wake.take_close().is_none(),
+            "closing drops the pending close"
         );
-        assert_eq!(wake.submit(close(2)), Err(SubmitError::Closed));
+        assert_eq!(wake.submit(close(102)), Err(SubmitError::Closed));
     }
 }

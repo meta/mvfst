@@ -5316,6 +5316,53 @@ fn a_close_by_handle_reaches_the_session_while_the_socket_holds_it_back() {
 }
 
 #[test]
+fn many_closes_by_handle_close_the_connection_with_the_first_code() {
+    let harness = Harness::new();
+    let (tx, rx) = mpsc::channel();
+    let addr = harness.serve({
+        let tx = tx.clone();
+        move || recording_server(tx)
+    });
+    let conn = harness.connect(addr, move || Recorder {
+        name: "client",
+        reports: tx,
+    });
+    await_reports(&rx, vec![Report::Event("server", ConnEvent::Connected)]);
+    // The closes go in from a command on the client worker, which runs between its driver's polls,
+    // so the driver does not serve any of them before the last.
+    let (answer_tx, answer_rx) = mpsc::channel();
+    harness
+        .client
+        .handle()
+        .submit(move |_| {
+            let refused: Vec<(u32, crate::SubmitError)> = (1..=100)
+                .filter_map(|code| {
+                    conn.close(AppCode::from_u32(code), Bytes::new())
+                        .err()
+                        .map(|error| (code, error))
+                })
+                .collect();
+            let _ = answer_tx.send(refused);
+        })
+        .expect("the client worker takes commands");
+    let refused = answer_rx
+        .recv_timeout(WAIT)
+        .expect("the client worker answers");
+    assert!(
+        refused.is_empty(),
+        "closes refused while the connection was live: {refused:?}"
+    );
+    await_reports(
+        &rx,
+        vec![
+            Report::Event("client", closed_locally(1)),
+            Report::Event("server", closed_by_peer(1)),
+        ],
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn a_quiesce_close_reaches_the_session_while_the_socket_holds_it_back() {
     let ping = GatedPing::new();
     // The flush of the ping meets an EAGAIN, and the client socket refuses everything after it.

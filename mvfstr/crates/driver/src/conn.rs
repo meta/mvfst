@@ -28,7 +28,7 @@ use mvfstr_proto::datagram::datagram_frame_len;
 use roxygen_runtime::worker::SubmitError;
 
 use crate::wake;
-use crate::wake::Command;
+use crate::wake::Close;
 use crate::wake::ConnWake;
 
 /// A connection lent to a session callback.
@@ -315,8 +315,8 @@ impl fmt::Debug for DatagramSink<'_> {
     }
 }
 
-/// A handle to a connection usable from any thread. Commands go through a bounded queue to the
-/// connection's worker, and fail with [`SubmitError::Overloaded`] when it is full.
+/// A handle to a connection usable from any thread. Its calls fail with [`SubmitError::Closed`]
+/// once the connection is gone.
 #[derive(Clone, Debug)]
 pub struct ConnHandle {
     wake: Arc<ConnWake>,
@@ -340,9 +340,10 @@ impl ConnHandle {
         Ok(())
     }
 
-    /// Closes the connection with an application CONNECTION_CLOSE.
+    /// Closes the connection with an application CONNECTION_CLOSE. The first close wins: later
+    /// ones succeed but do not change the connection.
     pub fn close(&self, code: AppCode, reason: Bytes) -> Result<(), SubmitError> {
-        self.wake.submit(Command::Close { code, reason })
+        self.wake.submit(Close { code, reason })
     }
 }
 
@@ -561,15 +562,15 @@ mod tests {
     }
 
     #[test]
-    fn a_handle_queues_closes_and_fails_once_its_connection_is_gone() {
+    fn a_handle_submits_a_close_and_fails_once_its_connection_is_gone() {
         let wake = ConnWake::new(Arc::new(Shared::default()), KEY);
         let handle = ConnHandle::new(Arc::clone(&wake));
         handle
             .close(AppCode::from_u32(5), Bytes::from_static(b"bye"))
             .expect("the connection is live");
         assert_eq!(wake.take(), wake::CMD);
-        let Some(Command::Close { code, reason }) = wake.take_command() else {
-            panic!("the close is queued");
+        let Some(Close { code, reason }) = wake.take_close() else {
+            panic!("the close is pending");
         };
         assert_eq!((code, &reason[..]), (AppCode::from_u32(5), &b"bye"[..]));
 

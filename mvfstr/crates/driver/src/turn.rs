@@ -108,7 +108,7 @@ use crate::timers::HostWake;
 use crate::timers::Kind;
 use crate::timers::Timers;
 use crate::wake;
-use crate::wake::Command;
+use crate::wake::Close;
 use crate::wake::ConnWake;
 use crate::wake::Shared;
 
@@ -1724,10 +1724,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 self.sched.borrow_mut().rx.push_back(key);
             }
             if bits & wake::CMD != 0 {
-                while let Some(command) = entry.wake.take_command() {
-                    match command {
-                        Command::Close { code, reason } => entry.conn.close(now, code, reason),
-                    }
+                if let Some(Close { code, reason }) = entry.wake.take_close() {
+                    entry.conn.close(now, code, reason);
                 }
                 self.mark_dirty(key, entry);
                 self.queue_app(key, entry);
