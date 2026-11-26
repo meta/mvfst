@@ -2115,7 +2115,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 }
                 #[cfg(test)]
                 self.record.borrow_mut().attempt(key, at);
-                let sent_before = entry.conn.stats().sent_packets;
+                let sent_before = entry.conn.sent_packets();
                 let allowance = entry
                     .datagrams_ready
                     .then(|| entry.conn.datagram_allowance());
@@ -2141,7 +2141,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     staged += u32::from(outcome.datagrams);
                 }
                 // Read once per attempt, off the per-packet path.
-                let sent = entry.conn.stats().sent_packets - sent_before;
+                let sent = entry.conn.sent_packets() - sent_before;
                 self.sent_packets.set(self.sent_packets.get() + sent);
                 self.sent_datagrams
                     .set(self.sent_datagrams.get() + u64::from(outcome.datagrams));
@@ -2358,7 +2358,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let blocked = flushed.blocked && socket.poll_writable(cx).is_pending();
         self.add_tx_counters(socket.take_counters());
         let mut reports = mem::take(&mut self.sched.borrow_mut().reports);
-        socket.drain_reports(|key, report| reports.push((key, report)));
+        // Only the reports of dropped datagrams change a connection, so the others are not applied.
+        socket.drain_reports(|key, report| {
+            if matches!(report, TxReport::Dropped { .. }) {
+                reports.push((key, report));
+            }
+        });
         drop(socket);
         for (key, report) in reports.drain(..) {
             self.with_entry(key, "tx report", |entry| {
@@ -2368,9 +2373,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     "a connection's reports came before its last attempt"
                 );
                 entry.conn.on_tx_report(now, report);
-                if matches!(report, TxReport::Dropped { .. }) {
-                    self.mark_dirty(key, entry);
-                }
+                self.mark_dirty(key, entry);
             });
         }
         let mut sched = self.sched.borrow_mut();
@@ -2590,6 +2593,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 self.steered_in.set(self.steered_in.get() + 1);
                 self.queue_waiting(waiting);
             });
+        }
+        if self.sched.borrow().waiting.is_empty() {
+            return;
         }
         let now = self.clock();
         let mut reading = Some(now);

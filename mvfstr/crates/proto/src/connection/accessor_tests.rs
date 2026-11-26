@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests of the read-only accessors over the pair harness: the latest RTT, the openable streams
-//! and the peer's transport parameters.
+//! Tests of the read-only accessors over the pair harness: the latest RTT, the openable streams,
+//! the peer's transport parameters and the count of packets sent.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -23,9 +23,11 @@ use super::DatagramPool;
 use super::stream_tests::ORDER;
 use super::tests::LIMIT;
 use super::tests::handshake;
+use super::tests::packet_types;
 use super::tests::start;
 use crate::AckPolicy;
 use crate::AppCode;
+use crate::ConnEvent;
 use crate::OpenError;
 use crate::TransportConfig;
 use crate::streams::recv_buf::PagePool;
@@ -33,6 +35,7 @@ use crate::testing::Link;
 use crate::testing::LinkConfig;
 use crate::testing::Pair;
 use crate::testing::PairConfig;
+use crate::testing::Peer;
 use crate::testing::fixtures::Setup;
 
 const MS: Duration = Duration::from_millis(1);
@@ -114,6 +117,14 @@ fn start_sending(
 /// Returns how many bidirectional and unidirectional streams `conn` may open.
 fn openable(conn: &Connection) -> [u64; 2] {
     [Dir::Bi, Dir::Uni].map(|dir| conn.openable_streams(dir))
+}
+
+/// Returns how many packets each datagram that `peer` sent coalesces, in sending order.
+fn packets_per_datagram(peer: &Peer) -> Vec<usize> {
+    peer.sent
+        .iter()
+        .map(|(_, datagram)| packet_types(&datagram.data).len())
+        .collect()
 }
 
 #[test]
@@ -288,4 +299,31 @@ fn the_peers_max_datagram_frame_size_is_the_value_it_sent() {
     assert_eq!(pair.server.conn().peer_max_datagram_frame_size(), 65_535);
     // The server does not send it, which means 0 (RFC 9221).
     assert_eq!(pair.client.conn().peer_max_datagram_frame_size(), 0);
+}
+
+#[test]
+fn the_sent_packet_count_is_the_stats_count_through_coalesced_handshake_datagrams() {
+    let (epoch, mut pair) = start(Setup::default().pair());
+    let confirmed = pair.run_until(epoch + LIMIT, |pair| {
+        for (side, peer) in [("client", &pair.client), ("server", &pair.server)] {
+            let Some(conn) = &peer.conn else {
+                continue;
+            };
+            let at = pair.now - epoch;
+            let stats = conn.stats().sent_packets;
+            assert_eq!(conn.sent_packets(), stats, "the {side} at {at:?}");
+            let packets = packets_per_datagram(peer);
+            assert_eq!(
+                stats,
+                packets.iter().sum::<usize>() as u64,
+                "the {side} at {at:?} counts each packet of its datagrams: {packets:?}"
+            );
+        }
+        pair.client.has_event(&ConnEvent::Confirmed) && pair.server.has_event(&ConnEvent::Confirmed)
+    });
+    assert!(confirmed, "the handshake completes");
+    // The client's second datagram coalesces Initial, Handshake and 1-RTT packets, and the
+    // server's first its Initial and Handshake packets.
+    assert_eq!(packets_per_datagram(&pair.client), [1, 3]);
+    assert_eq!(packets_per_datagram(&pair.server), [2, 1]);
 }

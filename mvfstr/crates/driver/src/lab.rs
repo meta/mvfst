@@ -157,6 +157,8 @@ struct Port {
     blocked: Cell<bool>,
     /// The waker to wake when the socket is unblocked.
     writable: RefCell<Option<Waker>>,
+    /// Whether the socket drops the next run it flushes.
+    drop_next: Cell<bool>,
 }
 
 struct NetState {
@@ -252,6 +254,11 @@ impl Net {
         if let Some(waker) = port.writable.borrow_mut().take() {
             waker.wake();
         }
+    }
+
+    /// Makes the socket at `addr` drop the next run it flushes and report it `Dropped`.
+    pub(crate) fn drop_next_run(&self, addr: SocketAddr) {
+        self.port(addr).drop_next.set(true);
     }
 
     /// Hands `arrival` to the socket at `dst` at once.
@@ -456,7 +463,7 @@ impl TxBackend for MemBackend {
         self.net.log(NetEvent::Flush(self.addr));
         let mut datagrams = 0;
         for (conn, meta, segments) in self.runs.drain(..) {
-            if !meta.sealed {
+            if !meta.sealed || self.port.drop_next.take() {
                 self.reports.push((
                     conn,
                     TxReport::Dropped {

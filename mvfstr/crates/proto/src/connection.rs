@@ -1190,6 +1190,12 @@ impl Connection {
         }
     }
 
+    /// Returns the number of packets sent, the `sent_packets` of [`stats`](Self::stats), without
+    /// building the other stats.
+    pub fn sent_packets(&self) -> u64 {
+        self.stats.sent_packets
+    }
+
     /// Paces at the congestion controller's rate for the current window and RTT. An unpaced
     /// connection's pacer only stamps releases, which do not depend on the rate.
     fn refresh_pacing_rate(&mut self) {

@@ -110,7 +110,7 @@ pub(super) fn handshake(config: PairConfig) -> (Instant, Pair) {
 }
 
 /// Returns the types of the packets coalesced in a datagram.
-fn packet_types(mut datagram: &[u8]) -> Vec<PacketType> {
+pub(super) fn packet_types(mut datagram: &[u8]) -> Vec<PacketType> {
     let mut types = Vec::new();
     while !datagram.is_empty() {
         let Ok(Header::Protected(header)) = Header::parse(datagram, 8) else {

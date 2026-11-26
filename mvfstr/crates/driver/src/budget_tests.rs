@@ -856,6 +856,66 @@ fn a_polls_admit_and_its_first_turn_share_one_clock_reading() {
     );
 }
 
+#[test]
+fn with_no_initials_waiting_a_server_turn_reads_no_clock_in_its_receive_phase() {
+    let mut scene = Scene::new(ServerPlan::default());
+    scene.establish(1);
+    assert_eq!(scene.server.waiting(), (0, false));
+    // The mark wakes the server for one turn, whose attempt has nothing to send.
+    scene.server_core().mark_dirty_at(0);
+    let reads = |scene: &Scene| scene.server.tx_record().clock_reads;
+    let before = reads(&scene);
+    let marks = scene.poll_server();
+    assert_eq!(
+        marks.iter().filter(|&&mark| mark == Mark::Turn).count(),
+        1,
+        "one turn: {marks:?}"
+    );
+    assert_eq!(
+        reads(&scene) - before,
+        5,
+        "one reading for the intake and the first application phase, one each for the first \
+         transmit phase, the second application phase and the second transmit phase, and one as \
+         the turn parks: {marks:?}"
+    );
+}
+
+#[test]
+fn a_run_the_server_socket_drops_is_declared_lost_at_the_flush_and_sent_again_in_the_turn() {
+    let mut scene = Scene::new(ServerPlan {
+        len: Some(4_000),
+        ..ServerPlan::default()
+    });
+    scene.establish(1);
+    let lost = |scene: &Scene| scene.server_core().conn_stats()[0].lost_packets;
+    assert_eq!(lost(&scene), 0);
+    // The stream's 4,000 bytes fill four datagrams, which leave as one run.
+    scene.lab.net.drop_next_run(SERVER);
+    scene.lab.net.clear_events();
+    scene.servers()[0].open_streams(1);
+    let marks = scene.poll_server();
+    let built: Vec<u16> = scene
+        .lab
+        .net
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            NetEvent::Built(SERVER, _, built) => Some(built),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lost(&scene),
+        4,
+        "the dropped run's packets are lost at the flush: {marks:?}"
+    );
+    assert_eq!(
+        built,
+        [4, 4],
+        "the second transmit phase sends the lost data again: {marks:?}"
+    );
+}
+
 /// Connects a client and has it send one stream of 400,000 bytes while the datagrams to the server
 /// are held; returns 200 of those datagrams of one length, coalesced into one arrival.
 fn gro_batch(scene: &mut Scene) -> Arrival {
