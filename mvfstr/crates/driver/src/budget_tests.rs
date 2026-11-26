@@ -234,6 +234,23 @@ impl Scene {
 
     /// Opens a client connection as [`connect`](Self::connect) does, to `remote`.
     fn connect_to(&mut self, remote: SocketAddr, streams: usize, len: Option<usize>) -> Rc<Probe> {
+        self.connect_with(remote, false, streams, len)
+    }
+
+    /// Opens a client connection as [`connect`](Self::connect) does, with pacing on.
+    fn connect_paced(&mut self, streams: usize, len: Option<usize>) -> Rc<Probe> {
+        self.connect_with(SERVER, true, streams, len)
+    }
+
+    /// Opens a client connection as [`connect`](Self::connect) does, to `remote`, with pacing on
+    /// or off.
+    fn connect_with(
+        &mut self,
+        remote: SocketAddr,
+        pacing: bool,
+        streams: usize,
+        len: Option<usize>,
+    ) -> Rc<Probe> {
         let (session, probe) = Bulk::new(&self.lab.net, streams, len);
         self.client
             .connect(
@@ -241,7 +258,7 @@ impl Scene {
                 ServerName::try_from("localhost").expect("a name"),
                 Arc::clone(&self.client_config),
                 ConnOptions {
-                    transport: Some(transport(false)),
+                    transport: Some(transport(pacing)),
                 },
                 session,
             )
@@ -1881,6 +1898,142 @@ fn a_thousand_due_wakes_among_ten_thousand_queued_connections_move_keys_in_step_
             "round {round} moved {moved} keys for {attempts} attempts"
         );
     }
+}
+
+#[test]
+fn without_a_budget_a_thousand_serves_mid_queue_move_each_key_in_and_out_once() {
+    const CONNECTIONS: u32 = 10_000;
+    const WAKES: u32 = 1_000;
+    let mut scene = Scene::new(ServerPlan::default());
+    scene.connect_nowhere(CONNECTIONS as usize);
+    let core = scene.client_core();
+    scene.lab.net.set_costs(Costs {
+        attempt: us(1),
+        ..Costs::default()
+    });
+    for index in 0..CONNECTIONS {
+        core.mark_dirty_at(index);
+    }
+    // The wakes come due during the first attempt, past the intake, so the transmit phase serves
+    // them one after another while their connections wait mid-queue, where a search for a slot by
+    // its key would cost most.
+    let due = scene.lab.net.now() + us(1);
+    let served = (CONNECTIONS - WAKES) / 2..(CONNECTIONS + WAKES) / 2;
+    for index in served.clone() {
+        core.arm_pacing_at(index, due);
+    }
+    KEYS_MOVED.with(|moved| moved.set(0));
+    let marks = scene.poll_client();
+    let moved = KEYS_MOVED.with(|moved| moved.get());
+    let order = attempted(&marks);
+    assert_eq!(
+        order.len(),
+        CONNECTIONS as usize,
+        "one attempt per connection: {order:?}"
+    );
+    assert_eq!(order[0], 0, "the first attempt is slot 0's");
+    assert_eq!(
+        order[1..=WAKES as usize],
+        served.collect::<Vec<_>>(),
+        "the serves follow the first attempt"
+    );
+    // Each slot moves into the queue once, as the phase drains the dirty list, and out once, as
+    // it pops; a serve moves no key.
+    assert_eq!(moved, 2 * u64::from(CONNECTIONS), "keys moved");
+    assert_eq!(
+        skipped(&marks),
+        WAKES as usize,
+        "each served connection's slot is skipped once"
+    );
+}
+
+/// The slot of [`redirtied_run`]'s paced client connection.
+const PACED: u32 = 0;
+
+/// The slot of [`redirtied_run`]'s client connection that waits behind [`PACED`].
+const QUEUED: u32 = 1;
+
+/// Polls a client without a budget once, after client slot [`PACED`], which paces, opened a
+/// stream of 60,000 bytes and slot [`QUEUED`] was woken with nothing to send, so both wait in the
+/// queue of the turn's first transmit phase, slot [`PACED`] first. Slot [`PACED`]'s socket drops
+/// the run of its first attempt, which puts it on the dirty list for the next phase. An attempt
+/// costs 1 ms, longer than its pacer waits before the next run, so its wake is due at the check
+/// after that attempt, while slot [`QUEUED`] still waits in the queue. Returns the scene, the
+/// poll's marks and the client's record from before the poll.
+fn redirtied_run() -> (Scene, Vec<Mark>, TxRecord) {
+    let mut scene = Scene::new(ServerPlan::default());
+    scene.connect_paced(0, Some(60_000));
+    scene.connect(0, Some(0));
+    scene.settle_connected();
+    scene.lab.net.drop_next_run(nth_socket(PACED as u16));
+    scene.lab.net.set_costs(Costs {
+        attempt: us(1_000),
+        ..Costs::default()
+    });
+    scene.clients[PACED as usize].open_streams(1);
+    scene.clients[QUEUED as usize].poke(1);
+    let before = scene.client.tx_record();
+    let marks = scene.poll_client();
+    (scene, marks, before)
+}
+
+#[test]
+fn without_a_budget_a_due_wake_of_a_connection_on_the_dirty_list_gives_it_the_next_attempt() {
+    let (scene, marks, before) = redirtied_run();
+    let record = scene.client.tx_record();
+    let Some(&wake) = record.wakes.get(before.wakes.len()) else {
+        panic!("no wake was taken: {marks:?}");
+    };
+    assert_eq!(
+        (wake.index, wake.phase.is_some(), wake.queued),
+        (PACED, true, false),
+        "the wake is taken in a transmit phase while its connection waits on the dirty list: \
+         {wake:?}"
+    );
+    let Some(next) = wake.next else {
+        panic!("the wake gave no attempt in its phase: {wake:?}");
+    };
+    let attempt = record.attempts[next];
+    assert_eq!(
+        (attempt.key.index, Some(attempt.phase), attempt.at),
+        (PACED, wake.phase, wake.taken),
+        "the attempt after {wake:?}"
+    );
+    // The first attempt's run is dropped and the second sends it again. The wake after that, due
+    // while the connection is off the dirty list, sends the rest, still ahead of the connection
+    // that waits in the queue.
+    assert_eq!(
+        attempted(phase_marks(&marks, Phase::FirstTransmit)),
+        [PACED, PACED, PACED, QUEUED],
+        "{marks:?}"
+    );
+}
+
+#[test]
+fn without_a_budget_the_slot_a_serve_retires_on_the_dirty_list_is_skipped_once() {
+    let (scene, marks, before) = redirtied_run();
+    let steps = |marks: &[Mark]| -> Vec<(bool, u32)> {
+        marks
+            .iter()
+            .filter_map(|mark| match mark {
+                Mark::Attempt(key) => Some((true, key.index)),
+                Mark::Skip(key) => Some((false, key.index)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        steps(phase_marks(&marks, Phase::SecondTransmit)),
+        [(false, PACED)],
+        "the next phase skips the retired slot without an attempt: {marks:?}"
+    );
+    scene.lab.run_quiet(Duration::from_millis(100));
+    let record = scene.client.tx_record();
+    let skips: Vec<u32> = steps(&record.marks[before.marks.len()..])
+        .into_iter()
+        .filter_map(|(attempt, index)| (!attempt).then_some(index))
+        .collect();
+    assert_eq!(skips, [PACED], "{:?}", record.marks);
 }
 
 #[test]

@@ -465,8 +465,8 @@ struct Entry<S, B> {
     parked: bool,
     /// Queued for a transmit attempt, with a live slot.
     dirty: bool,
-    /// The generation of the connection's transmit slot. Under a work budget a pacing serve bumps
-    /// it, and a slot pushed with an older one is stale.
+    /// The generation of the connection's transmit slot. A pacing serve bumps it, and a slot pushed
+    /// with an older one is stale.
     slot_generation: u32,
     /// Queued for an application phase.
     app_queued: bool,
@@ -720,11 +720,10 @@ enum Due {
 enum Take {
     /// The check, if one ran, did not find a due pacing wake.
     Nothing,
-    /// A wake whose connection makes the next attempt, out of the phase's queue if it waited
-    /// there.
+    /// A wake whose connection makes the next attempt. A slot of the connection that waits in the
+    /// phase's queue or in [`Sched::dirty`] is retired.
     Serve(ConnKey),
-    /// A wake whose slot is empty or, without a work budget, whose connection waits in
-    /// [`Sched::dirty`] for the next phase, dirtied again after its attempt in this one.
+    /// A wake whose slot is empty, as its connection was freed.
     Deferred,
 }
 
@@ -1982,18 +1981,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// pool behind a stale reading; these flushes of the server socket stop once one meets EAGAIN.
     /// While a pacing wake is armed, the phase checks before each pop from its queue, including any
     /// pop that finds it empty, whether a wake has come due; the earliest due wake's connection
-    /// makes the next attempt at the check's reading unless it waits for the next phase, so a wake
-    /// is late by about an attempt rather than a turn. A pop that finds the queue empty ends the
-    /// phase unless the check before it took a wake that does not give an attempt. Serves that give
-    /// an attempt count against `limits.requeues` with full-batch requeues, and the checks stop
-    /// once that cap is spent.
+    /// makes the next attempt at the check's reading, so a wake is late by about an attempt rather
+    /// than a turn. A serve retires the connection's slot wherever it waits by bumping its slot
+    /// generation, and a popped slot with an older generation, or of a connection since freed, is
+    /// skipped without an attempt. A pop that finds the queue empty ends the phase unless the check
+    /// before it took the wake of a freed connection. Serves count against `limits.requeues` with
+    /// full-batch requeues, and the checks stop once that cap is spent.
     ///
     /// Under a work budget, while the queue holds slots, a serve and a pop take turns, and the
     /// turn carries across stops; the pacing check runs only on the wakes' turn, and a due wake is
-    /// taken only once the budget lets its attempt run. A serve retires the connection's slot
-    /// wherever it waits by bumping its slot generation. A popped slot with an older generation, or
-    /// of a connection since freed, is skipped without an attempt or a change of turn, and each 64
-    /// skips in a row are a unit of work. Inside such a run the pacing check runs only with each
+    /// taken only once the budget lets its attempt run. A skip does not change the turn, and each
+    /// 64 skips in a row are a unit of work. Inside such a run the pacing check runs only with each
     /// unit's check, which shares its reading.
     // Inlining it into `turn`, its one caller, slows paced tperf by about 3% at equal instruction
     // counts.
@@ -2015,7 +2013,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         // phase still flushes it and waits for it to be writable.
         let mut server_flushes = true;
         let mut requeues = 0;
-        // Serves that gave an attempt plus full-batch requeues, at most `limits.requeues`.
+        // Serves plus full-batch requeues, at most `limits.requeues`.
         let mut spent = 0;
         let budgeted = self.budget.is_some();
         // Stale slots popped since the last attempt.
@@ -2051,7 +2049,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 {
                     break;
                 }
-                take = self.take_pacing_wake(at, &mut queue);
+                take = self.take_pacing_wake(at, &queue);
             }
             let served = matches!(take, Take::Serve(_));
             let next = match take {
@@ -2303,8 +2301,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         budget.leftover(at.saturating_duration_since(stop));
     }
 
-    /// Takes the pacing wake due earliest at `at`, of either kind, inside a transmit phase.
-    fn take_pacing_wake(&self, at: Instant, queue: &mut SlotQueue) -> Take {
+    /// Takes the pacing wake due earliest at `at`, of either kind, inside a transmit phase whose
+    /// queue is `queue`.
+    #[cfg_attr(not(test), expect(unused_variables, reason = "only tests read it"))]
+    fn take_pacing_wake(&self, at: Instant, queue: &SlotQueue) -> Take {
         #[cfg(test)]
         let due = self.sched.borrow().timers.next_pacing();
         let Some(index) = self.sched.borrow_mut().timers.pop_due_pacing(at) else {
@@ -2319,15 +2319,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             self.with_entry(key, "pacing", |entry| {
                 entry.pacing = None;
                 if entry.dirty {
-                    if self.budget.is_some() {
-                        // Retires the connection's slot wherever it waits.
-                        entry.slot_generation = entry.slot_generation.wrapping_add(1);
-                    } else {
-                        queue.remove(key)?;
-                    }
+                    // Retires the connection's slot wherever it waits.
+                    entry.slot_generation = entry.slot_generation.wrapping_add(1);
                 }
-                Some(key)
-            })?
+                key
+            })
         });
         #[cfg(test)]
         if let Some(due) = due {
@@ -3641,13 +3637,6 @@ impl SlotQueue {
         self.slots.extend(slots);
     }
 
-    /// Removes the slot of `key`; returns `None` if it is not queued.
-    fn remove(&mut self, key: ConnKey) -> Option<Slot> {
-        let place = self.slots.iter().position(|slot| slot.key == key)?;
-        moved(place.min(self.slots.len() - place));
-        self.slots.remove(place)
-    }
-
     #[cfg(test)]
     fn contains(&self, key: &ConnKey) -> bool {
         self.slots.iter().any(|slot| slot.key == *key)
@@ -3664,11 +3653,11 @@ impl SlotQueue {
 
 #[cfg(test)]
 thread_local! {
-    /// The number of connection keys moved into, out of or within queues on this thread, in tests.
+    /// The number of connection keys moved into or out of queues on this thread, in tests.
     pub(crate) static KEYS_MOVED: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Counts `keys` moved into, out of or within a queue, in tests.
+/// Counts `keys` moved into or out of a queue, in tests.
 #[cfg_attr(not(test), expect(unused_variables, reason = "only tests count"))]
 fn moved(keys: usize) {
     #[cfg(test)]

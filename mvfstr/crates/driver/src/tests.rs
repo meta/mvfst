@@ -124,6 +124,7 @@ use crate::test_support::mmsg_options;
 use crate::test_support::reset_key;
 use crate::timers::Kind;
 use crate::turn::Limits;
+use crate::turn::Mark;
 use crate::turn::POLL_CHARGE;
 use crate::turn::RX_BATCHES;
 use crate::turn::TURN_STAGING;
@@ -9124,56 +9125,52 @@ fn stalled_clients(
 }
 
 #[test]
-fn a_pacing_wake_taken_while_its_connection_waits_for_the_next_phase_gives_no_attempt_in_this_one()
-{
-    // The first attempt's first run is dropped, which dirties its connection for the next phase,
-    // and that connection's pacing wake comes due in the stall after the attempt, while the other
-    // connection waits in the phase's queue.
+fn a_pacing_wake_taken_while_its_connection_waits_for_the_next_phase_gives_it_the_next_attempt() {
+    // The first attempt's first run is dropped, which puts its connection on the dirty list for
+    // the next phase, and that connection's pacing wake comes due in the stall after the attempt.
+    // The serve retires the slot on the dirty list, which the next phase skips.
     let paced = sluggish_and_paced();
     let (record, stats) = stalled_clients(Limits::default(), &[Arc::clone(&paced), paced], true);
-    let mut followed = false;
-    for wake in record.wakes.iter().filter(|wake| wake.next.is_none()) {
-        let Some(phase) = wake.phase else {
-            continue;
+    let taken: Vec<&WakeRecord> = record
+        .wakes
+        .iter()
+        .filter(|wake| wake.phase.is_some())
+        .collect();
+    for wake in &taken {
+        let Some(next) = wake.next else {
+            panic!("{wake:?} gave no attempt in its phase: {:?}", record.wakes);
         };
-        // Paced attempts run at a fresh reading or at their check's, so those after the take
-        // run at its reading or later.
-        let after: Vec<_> = record
-            .attempts
-            .iter()
-            .filter(|attempt| attempt.phase == phase && attempt.at >= wake.taken)
-            .collect();
+        let attempt = record.attempts[next];
         assert!(
-            after.iter().all(|attempt| attempt.key.index != wake.index),
-            "the connection of {wake:?} attempted again in its phase: {after:?}"
+            attempt.key.index == wake.index
+                && Some(attempt.phase) == wake.phase
+                && attempt.at == wake.taken,
+            "the attempt after {wake:?} is not its connection's at its reading: {attempt:?}"
         );
-        assert!(
-            record
-                .attempts
-                .iter()
-                .any(|attempt| attempt.phase == phase + 1 && attempt.key.index == wake.index),
-            "the connection of {wake:?} did not attempt in the next phase: {:?}",
-            record.attempts
-        );
-        // The take was the check before the next pop.
-        if let Some(next) = after.first() {
-            assert_eq!(
-                next.at, wake.taken,
-                "the attempt after {wake:?} ran at a reading of its own: {after:?}"
-            );
-            followed = true;
-        }
     }
+    let skipped = |index: u32| {
+        record
+            .marks
+            .iter()
+            .any(|mark| matches!(mark, Mark::Skip(key) if key.index == index))
+    };
+    let redirtied = taken.iter().any(|wake| {
+        let earlier = wake.next.map_or(&[][..], |next| &record.attempts[..next]);
+        !wake.queued
+            && earlier
+                .iter()
+                .any(|attempt| Some(attempt.phase) == wake.phase && attempt.key.index == wake.index)
+            && skipped(wake.index)
+    });
     assert!(
-        followed,
-        "no wake was taken while its connection waited for the next phase and another waited \
-         in the queue: {:?}",
+        redirtied,
+        "no wake was taken while its connection, which had attempted in the phase, waited on the \
+         dirty list: {:?}",
         record.wakes
     );
-    let taken = record.wakes.iter().filter(|wake| wake.phase.is_some());
     assert_eq!(
         stats.phase_pacing_wakes,
-        taken.count() as u64,
+        taken.len() as u64,
         "not every take in a transmit phase counted: {:?}",
         record.wakes
     );
