@@ -58,6 +58,7 @@ use crate::turn::Limits;
 use crate::turn::Mark;
 use crate::turn::Phase;
 use crate::turn::TxRecord;
+use crate::wake::BIT_WAKES;
 
 type Handle = EndpointHandle<LabApp, MemBackend>;
 
@@ -1563,6 +1564,38 @@ fn the_keys_a_poll_moves_grow_with_the_units_it_runs_not_with_the_connections_le
     assert!(
         app > CONNECTIONS - 100 && transmit > CONNECTIONS - 100,
         "the connections are left over in both queues: {app} and {transmit}"
+    );
+}
+
+#[test]
+fn only_a_connection_on_its_own_socket_builds_receive_and_transmit_wakers() {
+    // Every connection gets an application waker. The receive and transmit wakers serve the
+    // connection's own socket, which a client connection has and an accepted one, on the server
+    // socket, does not. These sessions do not poll a datagram producer, whose waker is another
+    // `BitWake`, and stream wakers are not `BitWake`s.
+    const CONNECTIONS: u64 = 4;
+    let mut scene = Scene::new(ServerPlan::default());
+    BIT_WAKES.with(|built| built.set(0));
+    // A connect stores the client connection at once; the server sees nothing until the lab runs.
+    for _ in 0..CONNECTIONS {
+        scene.connect(0, Some(0));
+    }
+    let client = BIT_WAKES.with(|built| built.replace(0));
+    scene.settle_connected();
+    let server = BIT_WAKES.with(|built| built.get());
+    assert_eq!(
+        scene.accepted.borrow().len() as u64,
+        CONNECTIONS,
+        "the server accepts every connection"
+    );
+    assert_eq!(
+        client,
+        3 * CONNECTIONS,
+        "each client connection builds its application, receive and transmit wakers"
+    );
+    assert_eq!(
+        server, CONNECTIONS,
+        "each accepted connection builds its application waker alone"
     );
 }
 

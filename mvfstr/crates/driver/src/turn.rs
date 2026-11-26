@@ -449,16 +449,21 @@ pub(crate) struct Waiting {
     pub(crate) datagram: Vec<u8>,
 }
 
+/// A connection's own connected socket, with the wakers for its receive and writable polls.
+struct OwnSocket<B> {
+    socket: B,
+    rx_waker: Waker,
+    tx_waker: Waker,
+}
+
 /// One connection and its session.
 struct Entry<S, B> {
     conn: Connection,
     session: S,
     wake: Arc<ConnWake>,
     /// The connection's own connected socket; `None` on the server socket.
-    socket: Option<Box<B>>,
+    socket: Option<Box<OwnSocket<B>>>,
     app_waker: Waker,
-    rx_waker: Waker,
-    tx_waker: Waker,
     /// The connection's own socket holds runs behind an EAGAIN until it is writable.
     tx_blocked: bool,
     /// On the list of connections the server socket refused.
@@ -1097,7 +1102,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         match self.create_client(remote, server_name, &config, options) {
             Ok((key, conn, socket)) => {
                 let hosted = matches!(config.tls(), ClientTls::External);
-                let wake = self.insert(key, conn, session, Some(Box::new(socket)), paces, hosted);
+                let wake = self.insert(key, conn, session, Some(socket), paces, hosted);
                 // The call may come from outside the driver's own poll.
                 self.shared.wake_task();
                 Ok(ConnHandle::new(wake))
@@ -2077,8 +2082,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     stale = Some(generation);
                     return;
                 }
-                let release = entry.socket.as_deref().map_or(server_release, |socket| {
-                    socket.caps().release.epoch().is_some()
+                let release = entry.socket.as_deref().map_or(server_release, |own| {
+                    own.socket.caps().release.epoch().is_some()
                 });
                 // Only paced connections arm pacing wakes, so a served attempt runs at its
                 // check's reading.
@@ -2118,9 +2123,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     .datagrams_ready
                     .then(|| entry.conn.datagram_allowance());
                 let outcome = match entry.socket.as_deref_mut() {
-                    Some(socket) => {
-                        attempt(&mut entry.conn, socket, key, at, self.limits.max_segments)
-                    }
+                    Some(own) => attempt(
+                        &mut entry.conn,
+                        &mut own.socket,
+                        key,
+                        at,
+                        self.limits.max_segments,
+                    ),
                     None => {
                         let Some(server) = &self.server else {
                             return;
@@ -2438,14 +2447,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         );
         let Entry {
             conn,
-            socket: Some(socket),
-            tx_waker,
+            socket: Some(own),
             tx_blocked,
             ..
         } = entry
         else {
             return;
         };
+        let OwnSocket {
+            socket, tx_waker, ..
+        } = &mut **own;
         let mut dropped = false;
         *tx_blocked = socket.flush(now).blocked
             && socket
@@ -2868,13 +2879,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     fn receive_own(&self, key: ConnKey, entry: &mut Entry<A::Session, B>) {
         let Entry {
             conn,
-            socket: Some(socket),
-            rx_waker,
+            socket: Some(own),
             ..
         } = entry
         else {
             return;
         };
+        let OwnSocket {
+            socket, rx_waker, ..
+        } = &mut **own;
         let mut cx = Context::from_waker(rx_waker);
         let mut received = false;
         let mut tls_due = false;
@@ -3201,7 +3214,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         key: ConnKey,
         conn: Connection,
         session: A::Session,
-        socket: Option<Box<B>>,
+        socket: Option<B>,
         paces: bool,
         hosted: bool,
     ) -> Arc<ConnWake> {
@@ -3229,12 +3242,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             conn,
             session,
             app_waker: wake.waker(wake::APP),
-            rx_waker: wake.waker(wake::RX),
-            tx_waker: wake.waker(wake::TX),
+            socket: socket.map(|socket| {
+                Box::new(OwnSocket {
+                    socket,
+                    rx_waker: wake.waker(wake::RX),
+                    tx_waker: wake.waker(wake::TX),
+                })
+            }),
             tx_blocked: false,
             parked: false,
             wake: Arc::clone(&wake),
-            socket,
             dirty: true,
             slot_generation: 0,
             app_queued: true,
@@ -3716,6 +3733,31 @@ mod tests {
     use mvfstr_proto::Ecn;
 
     use super::*;
+    use crate::lab::Bulk;
+    use crate::lab::MemBackend;
+
+    /// The bytes an [`Entry`] holds besides its connection and its session, in a build without
+    /// debug assertions. Both of those are inline, and the test subtracts their sizes.
+    const ENTRY_OWN: usize = 192;
+
+    #[test]
+    fn an_entry_keeps_the_own_socket_wakers_in_the_socket_box() {
+        let entry = size_of::<Entry<Bulk, MemBackend>>();
+        let (conn, session) = (size_of::<Connection>(), size_of::<Bulk>());
+        // The reading of the connection's last attempt is kept with debug assertions only.
+        let expected = if cfg!(debug_assertions) {
+            ENTRY_OWN + size_of::<Option<Instant>>()
+        } else {
+            ENTRY_OWN
+        };
+        assert_eq!(
+            entry - conn - session,
+            expected,
+            "an entry of {entry} bytes, with a connection of {conn} and a session of {session}, \
+             aligned to {}",
+            align_of::<Entry<Bulk, MemBackend>>()
+        );
+    }
 
     #[test]
     fn a_recycled_vector_keeps_its_allocation() {

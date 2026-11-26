@@ -10,6 +10,8 @@
 //! wakes the endpoint task; the next turn takes the bits. Commands from
 //! [`ConnHandle`](crate::ConnHandle)s wait in a bounded queue per connection.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
@@ -145,6 +147,8 @@ impl ConnWake {
 
     /// Returns a waker that sets `bits`.
     pub(crate) fn waker(self: &Arc<Self>, bits: u8) -> Waker {
+        #[cfg(test)]
+        BIT_WAKES.with(|built| built.set(built.get() + 1));
         Waker::from(Arc::new(BitWake {
             conn: Arc::clone(self),
             bits,
@@ -215,6 +219,12 @@ impl fmt::Debug for ConnWake {
             .field("key", &self.key)
             .finish_non_exhaustive()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of [`BitWake`]s built on this thread, in tests.
+    pub(crate) static BIT_WAKES: Cell<u64> = const { Cell::new(0) };
 }
 
 /// A waker that sets bits on a connection.
