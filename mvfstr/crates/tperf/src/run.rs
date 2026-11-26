@@ -285,7 +285,12 @@ pub fn start_hosted_server_with<B: Backend>(
     .map_err(RunError::Start)?;
     Ok(HostedServer {
         addr,
-        startup: startup_line(&setup.transport, setup.build_horizon, &caps),
+        startup: startup_line(
+            &setup.transport,
+            setup.build_horizon,
+            &caps,
+            flags.initial_rtt_ms,
+        ),
         closed: setup.closed,
     })
 }
@@ -367,7 +372,7 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
     Ok(RunningServer {
         _worker: worker,
         addr,
-        startup: startup_line(&transport, build_horizon, &caps),
+        startup: startup_line(&transport, build_horizon, &caps, flags.initial_rtt_ms),
         closed,
         summary,
     })
@@ -1230,6 +1235,52 @@ mod tests {
         assert!(
             line.ends_with(&format!(" so_sndbuf={}", 2 * asked.min(wmem_max))),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn a_server_given_initial_rtt_ms_ends_its_startup_line_with_it() {
+        let lowered = Flags {
+            initial_rtt_ms: Some(100),
+            ..loopback(Mode::Server, 0)
+        };
+        let ends_with_the_initial_rtt = |line: &str| {
+            let (rest, last) = line.rsplit_once(' ').unwrap_or_default();
+            last == "initial_rtt_ms=100"
+                && rest
+                    .rsplit_once(' ')
+                    .is_some_and(|(_, sndbuf)| sndbuf.starts_with("so_sndbuf="))
+        };
+        let server = start_server(&lowered).unwrap();
+        assert!(
+            ends_with_the_initial_rtt(server.startup_line()),
+            "{}",
+            server.startup_line()
+        );
+        let worker = ManagedWorker::new(WORKER_COMMANDS).unwrap();
+        let (started_tx, started) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |context| {
+                let open = |addr, options: &MmsgOptions| {
+                    Ok((MmsgBackend::bind(addr, options)?, HostTimers::tokio()))
+                };
+                let hosted = start_hosted_server(context, &lowered, open)
+                    .map(|server| server.startup_line().to_owned())
+                    .map_err(|error| error.to_string());
+                let _ = started_tx.send(hosted);
+            })
+            .unwrap();
+        let hosted = started.recv().unwrap().unwrap();
+        assert!(
+            ends_with_the_initial_rtt(&hosted),
+            "a hosted server: {hosted}"
+        );
+        let default = start_server(&loopback(Mode::Server, 0)).unwrap();
+        assert!(
+            !default.startup_line().contains("initial_rtt_ms"),
+            "{}",
+            default.startup_line()
         );
     }
 

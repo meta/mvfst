@@ -21,6 +21,7 @@ use mvfstr_proto::ServerConfig;
 use mvfstr_proto::ServerTls;
 use mvfstr_proto::TransportConfig;
 use mvfstr_proto::Version;
+use mvfstr_proto::config::TransportConfigBuilder;
 use mvfstr_tls::ServerVerification;
 use rustls::CipherSuite;
 use rustls::crypto::CryptoProvider;
@@ -55,8 +56,9 @@ const SERVER_CONNECTION_ID_LIMIT: u64 = 5;
 /// Returns the client's transport settings, those of mvfst's tperf client: a `--window`
 /// connection window that autotunes up to 32 MiB with `--autotune_window`, a 4 GiB
 /// unidirectional stream window, and `--max_receive_packet_size` as max_udp_payload_size.
+/// `--initial_rtt_ms` sets the initial RTT, as on the server.
 pub(crate) fn client_transport(flags: &Flags) -> Result<Arc<TransportConfig>, ConfigError> {
-    TransportConfig::builder()
+    initial_rtt(TransportConfig::builder(), flags)
         .max_data(flags.window)
         .max_data_autotune(
             flags
@@ -76,14 +78,15 @@ pub(crate) fn client_transport(flags: &Flags) -> Result<Arc<TransportConfig>, Co
 /// with `--override_packet_size` datagrams at the peer's max_udp_payload_size, capped by
 /// `--max_receive_packet_size` as mvfst caps it at its own. `--pacing` also sets mvfst tperf's
 /// 200 µs tick and minimum burst of 5, or the pacing flags' values, and `--writes_per_loop` as
-/// the maximum burst. Flow-control windows are mvfst's defaults.
+/// the maximum burst. `--initial_rtt_ms` sets the initial RTT, as on the client. Flow-control
+/// windows are mvfst's defaults.
 pub(crate) fn server_transport(flags: &Flags) -> Result<Arc<TransportConfig>, ConfigError> {
     let datagram_size = if flags.override_packet_size {
         DatagramSize::PeerMaximum
     } else {
         DatagramSize::Minimum
     };
-    let mut builder = TransportConfig::builder();
+    let mut builder = initial_rtt(TransportConfig::builder(), flags);
     if flags.pacing {
         let tick = flags.pacing_granularity_us.unwrap_or(PACING_TICK_US);
         builder = builder
@@ -102,6 +105,14 @@ pub(crate) fn server_transport(flags: &Flags) -> Result<Arc<TransportConfig>, Co
         .active_connection_id_limit(SERVER_CONNECTION_ID_LIMIT)
         .datagram_size(datagram_size)
         .build()
+}
+
+/// Sets `--initial_rtt_ms`, if given, as the RTT assumed before the first sample.
+fn initial_rtt(builder: TransportConfigBuilder, flags: &Flags) -> TransportConfigBuilder {
+    match flags.initial_rtt_ms {
+        Some(ms) => builder.initial_rtt(Duration::from_millis(u64::from(ms))),
+        None => builder,
+    }
 }
 
 /// Generates the server's certificate and key; mvfst's tperf client accepts any certificate.
@@ -269,6 +280,7 @@ mod tests {
     use rustls::sign::CertifiedKey;
 
     use super::*;
+    use crate::flags::Mode;
 
     #[test]
     fn the_client_advertises_what_the_mvfst_tperf_client_does() {
@@ -381,6 +393,88 @@ mod tests {
             ..Flags::default()
         };
         assert_eq!(bursts(&unpaced), (us(1000), 5, 44));
+    }
+
+    /// The initial RTTs `--initial_rtt_ms` may give, from the smallest to the largest the
+    /// transport accepts, with the RTT each sets.
+    const INITIAL_RTTS: [(u32, Duration); 4] = [
+        (1, Duration::from_millis(1)),
+        (100, Duration::from_millis(100)),
+        (333, Duration::from_millis(333)),
+        (3_600_000, Duration::from_secs(3600)),
+    ];
+
+    #[test]
+    fn initial_rtt_ms_sets_the_client_transports_initial_rtt_and_without_it_the_default_stays() {
+        let client = Flags {
+            mode: Mode::Client,
+            ..Flags::default()
+        };
+        assert_eq!(
+            client_transport(&client).unwrap().initial_rtt(),
+            TransportConfig::default().initial_rtt(),
+            "the transport's default without the flag"
+        );
+        for (ms, rtt) in INITIAL_RTTS {
+            let flags = Flags {
+                initial_rtt_ms: Some(ms),
+                ..client.clone()
+            };
+            assert_eq!(
+                client_transport(&flags).unwrap().initial_rtt(),
+                rtt,
+                "--initial_rtt_ms={ms}"
+            );
+        }
+        let lowered = Flags {
+            initial_rtt_ms: Some(100),
+            ..client
+        };
+        assert_eq!(
+            client_config(&lowered).unwrap().transport().initial_rtt(),
+            Duration::from_millis(100),
+            "the client's connections take it"
+        );
+    }
+
+    #[test]
+    fn initial_rtt_ms_sets_the_server_transports_initial_rtt_and_without_it_the_default_stays() {
+        assert_eq!(
+            server_transport(&Flags::default()).unwrap().initial_rtt(),
+            TransportConfig::default().initial_rtt(),
+            "the transport's default without the flag"
+        );
+        for (ms, rtt) in INITIAL_RTTS {
+            let flags = Flags {
+                initial_rtt_ms: Some(ms),
+                ..Flags::default()
+            };
+            assert_eq!(
+                server_transport(&flags).unwrap().initial_rtt(),
+                rtt,
+                "--initial_rtt_ms={ms}"
+            );
+        }
+        let lowered = Flags {
+            initial_rtt_ms: Some(100),
+            ..Flags::default()
+        };
+        let (config, _) = server_config(&lowered).unwrap();
+        assert_eq!(
+            config.transport().initial_rtt(),
+            Duration::from_millis(100),
+            "the server's connections take it"
+        );
+        let external = Flags {
+            tls_backend: TlsBackend::External,
+            ..lowered
+        };
+        let (config, _) = server_config(&external).unwrap();
+        assert_eq!(
+            config.transport().initial_rtt(),
+            Duration::from_millis(100),
+            "with handshakes on an external TLS host too"
+        );
     }
 
     #[test]

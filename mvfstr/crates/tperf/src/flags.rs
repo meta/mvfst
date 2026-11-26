@@ -12,6 +12,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use mvfstr_proto::CongestionControl;
+use mvfstr_proto::recovery::RecoveryConfig;
 
 use crate::object::HEADER_LEN;
 
@@ -115,6 +116,9 @@ pub struct Flags {
     /// The length of each object when `object_rate` is set, its 16-byte header included. The
     /// client counts an object of another length as bad.
     pub(crate) object_size: u32,
+    /// This side's initial RTT in milliseconds, from 1 to an hour: the RTT assumed before the first
+    /// sample. Without it the transport's default applies.
+    pub(crate) initial_rtt_ms: Option<u32>,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -161,6 +165,7 @@ impl Default for Flags {
             num_conns: 1,
             object_rate: 0,
             object_size: OBJECT_SIZE,
+            initial_rtt_ms: None,
         }
     }
 }
@@ -325,6 +330,16 @@ impl Flags {
                     .filter(|&size| size >= HEADER_LEN as u32)
                     .ok_or_else(bad)?
             }
+            // The transport's bounds, checked here so that a bad value fails at parse.
+            "initial_rtt_ms" => {
+                self.initial_rtt_ms = Some(
+                    positive(value)
+                        .filter(|&ms: &u32| {
+                            u128::from(ms) <= RecoveryConfig::MAX_TIMER_SETTING.as_millis()
+                        })
+                        .ok_or_else(bad)?,
+                )
+            }
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -350,7 +365,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 25] = [
+const VALUE_FLAGS: [&str; 26] = [
     "mode",
     "host",
     "port",
@@ -374,6 +389,7 @@ const VALUE_FLAGS: [&str; 25] = [
     "num_conns",
     "object_rate",
     "object_size",
+    "initial_rtt_ms",
     "minloglevel",
     "v",
 ];
@@ -513,6 +529,7 @@ mod tests {
             num_conns: 1,
             object_rate: 0,
             object_size: 1200,
+            initial_rtt_ms: None,
         };
         assert_eq!(flags, expected);
     }
@@ -542,6 +559,7 @@ mod tests {
             "--compat_mvfst=false",
             "--quic_version=mvfst",
             "--stats=true",
+            "--initial_rtt_ms=100",
         ])
         .unwrap();
         assert_eq!(
@@ -578,6 +596,7 @@ mod tests {
                 num_conns: 1,
                 object_rate: 0,
                 object_size: 1200,
+                initial_rtt_ms: Some(100),
             }
         );
         let server = parse(&[
@@ -989,6 +1008,91 @@ mod tests {
         assert_eq!(
             parse(&["--object_size=16", "--object_size=4294967295"]).map(|flags| flags.object_size),
             Ok(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn initial_rtt_ms_takes_one_millisecond_to_an_hour_on_either_side() {
+        assert_eq!(
+            Flags::default().initial_rtt_ms,
+            None,
+            "the transport's default unless the flag is given"
+        );
+        assert_eq!(
+            parse(&["--initial_rtt_ms=100"]),
+            Ok(Flags {
+                initial_rtt_ms: Some(100),
+                ..Flags::default()
+            }),
+            "a server's, and nothing else changes"
+        );
+        assert_eq!(
+            parse(&["--mode=client", "--initial_rtt_ms", "100"]),
+            Ok(Flags {
+                mode: Mode::Client,
+                initial_rtt_ms: Some(100),
+                ..Flags::default()
+            }),
+            "a client's, from the next argument"
+        );
+        // 333 is the transport's default, but a given flag stays given.
+        for (arg, ms) in [
+            ("--initial_rtt_ms=1", 1),
+            ("--initial_rtt_ms=333", 333),
+            ("--initial_rtt_ms=3600000", 3_600_000),
+        ] {
+            for mode in ["--mode=client", "--mode=server"] {
+                assert_eq!(
+                    parse(&[mode, arg]).map(|flags| flags.initial_rtt_ms),
+                    Ok(Some(ms)),
+                    "{mode} {arg}"
+                );
+            }
+        }
+        assert_eq!(
+            parse(&["--initial_rtt_ms=50", "--initial_rtt_ms=100"])
+                .map(|flags| flags.initial_rtt_ms),
+            Ok(Some(100)),
+            "the last one wins"
+        );
+    }
+
+    #[test]
+    fn initial_rtt_ms_outside_one_millisecond_to_an_hour_is_refused_at_parse() {
+        // The transport refuses a zero initial RTT or one above an hour only when it is built,
+        // after the flags are read.
+        for mode in ["--mode=client", "--mode=server"] {
+            for value in [
+                "0",
+                "-1",
+                "3600001",
+                "4294967296",
+                "fast",
+                "",
+                "1.5",
+                "100ms",
+            ] {
+                let arg = format!("--initial_rtt_ms={value}");
+                assert_eq!(
+                    parse(&[mode, &arg]),
+                    Err(FlagError::BadValue {
+                        flag: "initial_rtt_ms".to_owned(),
+                        value: value.to_owned(),
+                    }),
+                    "{mode} {arg}"
+                );
+            }
+        }
+        assert_eq!(
+            parse(&["--initial_rtt_ms"]),
+            Err(FlagError::MissingValue("initial_rtt_ms".to_owned())),
+            "it takes a value"
+        );
+        assert_eq!(
+            parse(&["--mode=client", "--initial_rtt_ms=0"])
+                .unwrap_err()
+                .to_string(),
+            "illegal value '0' specified for flag 'initial_rtt_ms'"
         );
     }
 }

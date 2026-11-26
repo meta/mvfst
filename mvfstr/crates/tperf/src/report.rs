@@ -322,18 +322,20 @@ pub(crate) fn closed_line(
 /// Returns the line with the server's sending setup, logged at startup: its connections'
 /// controller and pacing, its socket's kernel release and send buffer, and the endpoint's build
 /// horizon, capped by the socket's release horizon. A connection may build less far ahead than
-/// the endpoint allows, to keep its advertised max_ack_delay in range.
+/// the endpoint allows, to keep its advertised max_ack_delay in range. The line ends with
+/// `--initial_rtt_ms` only when the server is given it.
 pub(crate) fn startup_line(
     transport: &TransportConfig,
     build_horizon: Duration,
     caps: &TxCaps,
+    initial_rtt_ms: Option<u32>,
 ) -> String {
     let congestion = match transport.congestion_control() {
         CongestionControl::NewReno => "newreno",
         CongestionControl::Cubic => "cubic",
         CongestionControl::Bbr3 => "bbr3",
     };
-    format!(
+    let mut line = format!(
         "Server: congestion={congestion} pacing={} pacing_granularity_us={} pacing_min_burst={} \
          pacing_max_burst={} txtime={} endpoint_horizon_us={} so_sndbuf={}",
         transport.pacing(),
@@ -343,7 +345,11 @@ pub(crate) fn startup_line(
         caps.release != ReleaseSupport::None,
         build_horizon.min(caps.release.horizon()).as_micros(),
         caps.send_buffer,
-    )
+    );
+    if let Some(ms) = initial_rtt_ms {
+        line.push_str(&format!(" initial_rtt_ms={ms}"));
+    }
+    line
 }
 
 /// Formats `value` as a C++ `std::ostream` prints a `double` by default: `%g` with six
@@ -685,20 +691,61 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         })
         .unwrap();
         assert_eq!(
-            startup_line(&bbr3, ms(5), &caps(kernel(ms(100)))),
+            startup_line(&bbr3, ms(5), &caps(kernel(ms(100))), None),
             "Server: congestion=bbr3 pacing=true pacing_granularity_us=200 pacing_min_burst=5 \
              pacing_max_burst=44 txtime=true endpoint_horizon_us=5000 so_sndbuf=14544416"
         );
-        let capped = startup_line(&bbr3, ms(5), &caps(kernel(ms(2))));
+        let capped = startup_line(&bbr3, ms(5), &caps(kernel(ms(2))), None);
         assert!(
             capped.contains(" endpoint_horizon_us=2000 "),
             "the socket's release horizon caps the endpoint's: {capped}"
         );
         let cubic = server_transport(&Flags::default()).unwrap();
         assert_eq!(
-            startup_line(&cubic, Duration::ZERO, &caps(ReleaseSupport::None)),
+            startup_line(&cubic, Duration::ZERO, &caps(ReleaseSupport::None), None),
             "Server: congestion=cubic pacing=false pacing_granularity_us=1000 pacing_min_burst=5 \
              pacing_max_burst=44 txtime=false endpoint_horizon_us=0 so_sndbuf=14544416"
+        );
+    }
+
+    #[test]
+    fn the_startup_line_ends_with_the_initial_rtt_only_when_the_flag_sets_it() {
+        let caps = TxCaps {
+            max_segments: 64,
+            max_datagram: 1500,
+            gro: true,
+            ecn: true,
+            pktinfo: true,
+            release: ReleaseSupport::None,
+            send_buffer: 212_992,
+        };
+        let without = "Server: congestion=cubic pacing=false pacing_granularity_us=1000 \
+                       pacing_min_burst=5 pacing_max_burst=44 txtime=false endpoint_horizon_us=0 \
+                       so_sndbuf=212992";
+        let lowered = server_transport(&Flags {
+            initial_rtt_ms: Some(100),
+            ..Flags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            startup_line(&lowered, Duration::ZERO, &caps, Some(100)),
+            format!("{without} initial_rtt_ms=100")
+        );
+        let default = server_transport(&Flags::default()).unwrap();
+        assert_eq!(
+            startup_line(&default, Duration::ZERO, &caps, None),
+            without,
+            "the line stays as it was without the flag"
+        );
+        let given = server_transport(&Flags {
+            initial_rtt_ms: Some(333),
+            ..Flags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            startup_line(&given, Duration::ZERO, &caps, Some(333)),
+            format!("{without} initial_rtt_ms=333"),
+            "a flag that gives the transport's default value still shows"
         );
     }
 
