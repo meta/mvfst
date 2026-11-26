@@ -245,8 +245,10 @@ def mvfst_cxx_test(name, srcs, headers = [], deps = [], header_namespace = "", p
     )
 
 def mvfst_cpp_binary(name, deps = (), external_deps = (), header_namespace = None, **kwargs):
+    # FBCODE-only binaries may depend on fbcode-only projects (`//xsec_crypto`).
+    convert_deps = _convert_deps_keep_fbcode if kwargs.get("platforms") == (FBCODE,) else _convert_deps
     mvfst_cxx_binary(
-        name, deps = _convert_deps(deps, external_deps), header_namespace = header_namespace or _compute_header_namespace(), visibility = ["PUBLIC"], **kwargs
+        name, deps = convert_deps(deps, external_deps), header_namespace = header_namespace or _compute_header_namespace(), visibility = ["PUBLIC"], **kwargs
     )
 
 # Binaries build for the host (CXX) and, as `<name>Fbcode`, for fbcode, which
