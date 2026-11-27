@@ -35,6 +35,8 @@ mod endpoint;
 #[cfg(test)]
 mod gated;
 #[cfg(test)]
+mod hold_tests;
+#[cfg(test)]
 mod lab;
 mod slab;
 mod steer;

@@ -140,6 +140,23 @@ pub(crate) enum NetEvent {
     Run(SocketAddr, ConnKey, Release, usize),
 }
 
+/// A flush of a lab socket: the socket, when the flush began and ended on the test clock, and the
+/// runs it sent, in order, each with its connection, release and datagrams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlushRecord {
+    pub(crate) addr: SocketAddr,
+    pub(crate) began: Instant,
+    pub(crate) ended: Instant,
+    pub(crate) runs: Vec<(ConnKey, Release, usize)>,
+}
+
+impl FlushRecord {
+    /// Returns the datagrams the flush sent.
+    pub(crate) fn datagrams(&self) -> usize {
+        self.runs.iter().map(|&(_, _, datagrams)| datagrams).sum()
+    }
+}
+
 /// Datagrams that reach a socket together: one, or several of `stride` bytes each but the last,
 /// coalesced as GRO coalesces them.
 #[derive(Clone, Debug)]
@@ -159,6 +176,13 @@ struct Port {
     writable: RefCell<Option<Waker>>,
     /// Whether the socket drops the next run it flushes.
     drop_next: Cell<bool>,
+    /// The slot of the connection whose next run the socket drops when it flushes it, if any.
+    drop_run_of: Cell<Option<u32>>,
+    /// Whether the next flush meets an EAGAIN.
+    eagain_next: Cell<bool>,
+    /// Whether the socket keeps its runs while it is blocked, as behind an EAGAIN that a flush
+    /// met, rather than sending them at each flush.
+    keeps: Cell<bool>,
 }
 
 struct NetState {
@@ -171,6 +195,7 @@ struct NetState {
     flights: RefCell<BTreeMap<(Instant, u64), (SocketAddr, Arrival)>>,
     sent: Cell<u64>,
     events: RefCell<Vec<NetEvent>>,
+    flushes: RefCell<Vec<FlushRecord>>,
     /// The address whose datagrams are kept instead of delivered, and the datagrams kept.
     held: RefCell<Option<(SocketAddr, Vec<Arrival>)>>,
 }
@@ -191,6 +216,7 @@ impl Net {
             flights: RefCell::default(),
             sent: Cell::new(0),
             events: RefCell::default(),
+            flushes: RefCell::default(),
             held: RefCell::default(),
         }))
     }
@@ -222,6 +248,12 @@ impl Net {
 
     pub(crate) fn clear_events(&self) {
         self.0.events.borrow_mut().clear();
+        self.0.flushes.borrow_mut().clear();
+    }
+
+    /// Returns the flushes of every socket since the events were last cleared, in order.
+    pub(crate) fn flushes(&self) -> Vec<FlushRecord> {
+        self.0.flushes.borrow().clone()
     }
 
     fn log(&self, event: NetEvent) {
@@ -247,10 +279,17 @@ impl Net {
         self.port(addr).blocked.set(true);
     }
 
+    /// Makes the next flush of the socket at `addr` meet an EAGAIN: it sends nothing, and the
+    /// socket keeps its runs and refuses datagrams until [`unblock`](Self::unblock).
+    pub(crate) fn block_next_flush(&self, addr: SocketAddr) {
+        self.port(addr).eagain_next.set(true);
+    }
+
     /// Makes the socket at `addr` writable again and wakes the task waiting for that.
     pub(crate) fn unblock(&self, addr: SocketAddr) {
         let port = self.port(addr);
         port.blocked.set(false);
+        port.keeps.set(false);
         if let Some(waker) = port.writable.borrow_mut().take() {
             waker.wake();
         }
@@ -259,6 +298,12 @@ impl Net {
     /// Makes the socket at `addr` drop the next run it flushes and report it `Dropped`.
     pub(crate) fn drop_next_run(&self, addr: SocketAddr) {
         self.port(addr).drop_next.set(true);
+    }
+
+    /// Makes the socket at `addr` drop the next run it flushes of the connection in slot `index`,
+    /// and report it `Dropped`.
+    pub(crate) fn drop_next_run_of(&self, addr: SocketAddr, index: u32) {
+        self.port(addr).drop_run_of.set(Some(index));
     }
 
     /// Hands `arrival` to the socket at `dst` at once.
@@ -461,9 +506,29 @@ impl TxBackend for MemBackend {
 
     fn flush(&mut self, _now: Instant) -> FlushOutcome {
         self.net.log(NetEvent::Flush(self.addr));
+        let began = self.net.now();
+        if self.port.eagain_next.take() {
+            self.port.blocked.set(true);
+            self.port.keeps.set(true);
+        }
+        if self.port.keeps.get() && self.port.blocked.get() {
+            self.net.0.flushes.borrow_mut().push(FlushRecord {
+                addr: self.addr,
+                began,
+                ended: began,
+                runs: Vec::new(),
+            });
+            return FlushOutcome {
+                datagrams: 0,
+                blocked: true,
+            };
+        }
         let mut datagrams = 0;
+        let mut sent = Vec::new();
         for (conn, meta, segments) in self.runs.drain(..) {
-            if !meta.sealed || self.port.drop_next.take() {
+            let dropped = self.port.drop_run_of.get() == Some(conn.index)
+                && self.port.drop_run_of.take().is_some();
+            if !meta.sealed || self.port.drop_next.take() || dropped {
                 self.reports.push((
                     conn,
                     TxReport::Dropped {
@@ -473,6 +538,7 @@ impl TxBackend for MemBackend {
                 ));
                 continue;
             }
+            sent.push((conn, meta.release, segments.len()));
             for data in segments {
                 datagrams += 1;
                 let stride = u16::try_from(data.len()).expect("a datagram fits a stride");
@@ -488,6 +554,12 @@ impl TxBackend for MemBackend {
             self.reports.push((conn, TxReport::Flushed { tx: meta.tx }));
         }
         self.net.charge(self.net.costs().flush * datagrams);
+        self.net.0.flushes.borrow_mut().push(FlushRecord {
+            addr: self.addr,
+            began,
+            ended: self.net.now(),
+            runs: sent,
+        });
         FlushOutcome {
             datagrams,
             blocked: self.port.blocked.get(),

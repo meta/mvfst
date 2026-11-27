@@ -69,6 +69,8 @@ use mvfstr_proto::StreamId;
 use mvfstr_proto::StreamReady;
 use mvfstr_proto::TransportConfig;
 use mvfstr_proto::TxLimits;
+use mvfstr_proto::TxReport;
+use mvfstr_proto::TxSeqRange;
 use mvfstr_proto::datagram::datagram_frame_len;
 use mvfstr_proto::testing::TestRng;
 use mvfstr_proto::testing::VecSink;
@@ -9536,4 +9538,322 @@ fn the_serves_and_full_batch_requeues_of_a_transmit_phase_share_its_requeue_cap(
         contested,
         "no phase reached its cap with both connections attempting in it: {spent:?}"
     );
+}
+
+/// What a server on gated sockets did in [`held_fan_out`] from its clients' requests on.
+struct HeldFanOut {
+    /// The driver's record of its transmit phases.
+    record: TxRecord,
+    /// The attempts the server socket saw, in order; the first is at place `first` in the record.
+    started: Vec<Started>,
+    first: usize,
+    /// The places in `started` of the attempts that built a run, in order.
+    built: Vec<usize>,
+    /// The runs the server socket was handed and the reports the driver took from it since the
+    /// requests, each with its connection, in order.
+    handed: Vec<(ConnKey, TxSeqRange)>,
+    reported: Vec<(ConnKey, TxReport)>,
+}
+
+impl HeldFanOut {
+    /// Returns the hold the driver recorded after the attempt at place `n` in `started`.
+    fn hold_after(&self, n: usize) -> Option<Instant> {
+        self.record
+            .holds
+            .iter()
+            .find(|hold| hold.attempt == self.first + n)
+            .unwrap_or_else(|| panic!("no hold after attempt {n}: {:?}", self.record.holds))
+            .until
+    }
+
+    /// Returns the reading of the attempt at place `n` in `started`.
+    fn reading(&self, n: usize) -> Instant {
+        self.record.attempts[self.first + n].at
+    }
+}
+
+/// Has `conns` [`Bulk`] clients each send 100 bytes to a [`Bulk`] server, which answers each
+/// with `server_len` bytes, over gated sockets with `mmsg` and the driver settings `limits`. The
+/// server socket has kernel release and the server's connections build up to 10 ms ahead, and
+/// sluggish peers acknowledge nothing within the test. The requests reach the server while its
+/// worker is held, so its connections answer in one transmit phase. With `block`, the first
+/// flush of the server socket after the requests meets the simulated EAGAIN, and the socket
+/// opens again once the driver waits for it.
+fn held_fan_out(
+    mmsg: MmsgOptions,
+    limits: Limits,
+    conns: usize,
+    server_len: usize,
+    block: bool,
+) -> HeldFanOut {
+    const CLIENT_LEN: usize = 100;
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg,
+        valves: Arc::clone(&valves),
+    });
+    harness.endpoint = building_ahead(Duration::from_millis(10));
+    harness.limits = limits;
+    let (tx, rx) = mpsc::channel();
+    let server_reports = tx.clone();
+    let addr = harness.serve(move || {
+        let mut app = App::new(move |_| {
+            Ok(Bulk::new(
+                "server",
+                server_len,
+                None,
+                server_reports.clone(),
+            ))
+        });
+        app.transport = Some(sluggish());
+        app
+    });
+    let go = Arc::new(AtomicBool::new(false));
+    let handles: Vec<ConnHandle> = (0..conns)
+        .map(|_| {
+            let (go, tx) = (Arc::clone(&go), tx.clone());
+            let options = ConnOptions {
+                transport: Some(sluggish()),
+            };
+            harness.connect_with(addr, options, move || {
+                Bulk::new("client", CLIENT_LEN, Some(go), tx)
+            })
+        })
+        .collect();
+    let confirmed = (0..conns)
+        .map(|_| Report::Event("client", ConnEvent::Confirmed))
+        .collect();
+    await_reports(&rx, confirmed);
+    let answers = || {
+        (0..conns)
+            .map(|_| Report::Received(uni(3), server_len))
+            .collect()
+    };
+    let held = Harness::block(&harness.server);
+    valves.server.clear();
+    valves.client.clear();
+    let (handed, reported) = (valves.server.handed().len(), valves.server.reported().len());
+    if block {
+        valves.server.block_next_flush();
+    }
+    go.store(true, Ordering::SeqCst);
+    for conn in &handles {
+        conn.wake().expect("the connection is live");
+    }
+    let deadline = Instant::now() + WAIT;
+    while valves
+        .client
+        .events()
+        .iter()
+        .filter(|&&event| event == Event::Flush)
+        .count()
+        < conns
+    {
+        assert!(Instant::now() < deadline, "the clients never sent");
+        std::thread::yield_now();
+    }
+    // A command runs between the client driver's polls, so its flushes have returned.
+    harness.client_stats::<Bulk>();
+    drop(held);
+    let read = Arc::clone(&valves);
+    let read_record = move || {
+        (
+            (read.server.started(), read.server.runs()),
+            read.server.handed(),
+            read.server.reported(),
+        )
+    };
+    let (record, ((started, runs), all_handed, all_reported)) = if block {
+        let deadline = Instant::now() + WAIT;
+        while !valves.server.waiting() {
+            assert!(
+                Instant::now() < deadline,
+                "the server never waited for its socket"
+            );
+            std::thread::yield_now();
+        }
+        let (record, (before_open, _, _)) =
+            tx_record::<Bulk, _>(&harness.server, read_record.clone());
+        valves.server.open();
+        await_reports(&rx, answers());
+        let (_, (_, all_handed, all_reported)) = tx_record::<Bulk, _>(&harness.server, read_record);
+        (record, (before_open, all_handed, all_reported))
+    } else {
+        await_reports(&rx, answers());
+        tx_record::<Bulk, _>(&harness.server, read_record)
+    };
+    let stats = harness.server_stats::<Bulk>();
+    assert_eq!(stats.contained_panics, 0, "{stats:?}");
+    harness.shutdown();
+    let first = record
+        .attempts
+        .len()
+        .checked_sub(started.len())
+        .expect("the driver recorded every attempt the socket saw");
+    for (attempt, start) in record.attempts[first..].iter().zip(&started) {
+        assert_eq!(
+            attempt.key, start.conn,
+            "the driver and the socket disagree"
+        );
+    }
+    let mut built: Vec<usize> = runs.iter().map(|run| run.attempt).collect();
+    built.dedup();
+    HeldFanOut {
+        record,
+        started,
+        first,
+        built,
+        handed: all_handed[handed..].to_vec(),
+        reported: all_reported[reported..].to_vec(),
+    }
+}
+
+/// A hold no attempt in the tests reaches, so only the queue's own sends move held runs.
+const LONG_HOLD: Duration = Duration::from_secs(10);
+
+#[test]
+fn with_a_release_hold_a_backend_send_inside_an_attempt_restarts_the_bound_from_that_attempt() {
+    // Each server connection answers with two datagrams. Seven slots leave three to data, so each
+    // attempt after the first finds the pool full at its second datagram and sends the runs queued
+    // before it, and only its own run is left held.
+    let mmsg = MmsgOptions {
+        tx_slots: 7,
+        ..kernel_release(Duration::from_millis(100))
+    };
+    let limits = Limits {
+        release_hold: Some(LONG_HOLD),
+        ..Limits::default()
+    };
+    let fan_out = held_fan_out(mmsg, limits, 4, 2_000, false);
+    let (started, built) = (&fan_out.started, &fan_out.built);
+    assert_eq!(
+        built.len(),
+        4,
+        "each connection answered in one attempt: {started:?}"
+    );
+    for (k, &n) in built.iter().enumerate() {
+        if k > 0 {
+            assert_eq!(
+                started[n].queued, 2,
+                "the run before attempt {n} was held: {started:?}"
+            );
+        }
+        if let Some(next) = started.get(n + 1) {
+            assert_eq!(
+                next.queued, 2,
+                "attempt {n} sent the run before it and held its own: {started:?}"
+            );
+        }
+        assert_eq!(
+            fan_out.hold_after(n),
+            Some(fan_out.reading(n) + LONG_HOLD),
+            "the bound after attempt {n} is its own: {:?}",
+            fan_out.record.holds
+        );
+    }
+}
+
+#[test]
+fn with_a_release_hold_a_backend_send_that_empties_the_socket_ends_the_bound() {
+    // Two messages fill a call and each server connection answers with one datagram, so every
+    // second attempt's run sends both from inside the attempt and leaves nothing held.
+    let mmsg = MmsgOptions {
+        tx_batch: 2,
+        ..kernel_release(Duration::from_millis(100))
+    };
+    let limits = Limits {
+        release_hold: Some(LONG_HOLD),
+        ..Limits::default()
+    };
+    let fan_out = held_fan_out(mmsg, limits, 4, 100, false);
+    let (started, built) = (&fan_out.started, &fan_out.built);
+    assert_eq!(
+        built.len(),
+        4,
+        "each connection answered in one attempt: {started:?}"
+    );
+    for (k, &n) in built.iter().enumerate() {
+        let (until, queued) = (fan_out.hold_after(n), started[n].queued);
+        if k % 2 == 0 {
+            assert_eq!(
+                queued, 0,
+                "nothing was held before attempt {n}: {started:?}"
+            );
+            assert_eq!(
+                until,
+                Some(fan_out.reading(n) + LONG_HOLD),
+                "attempt {n} held its run"
+            );
+        } else {
+            assert_eq!(
+                queued, 1,
+                "the run before attempt {n} was held: {started:?}"
+            );
+            assert_eq!(until, None, "attempt {n} emptied the socket");
+        }
+    }
+}
+
+#[test]
+fn with_a_release_hold_each_connections_datagrams_reach_the_kernel_in_build_order() {
+    // Without a bound on the hold each answer's run waits on the socket for the call that four
+    // queued messages make from inside an attempt, or for the end of the phase, whose flush meets
+    // the simulated EAGAIN and leaves the rest until the socket opens.
+    let mmsg = MmsgOptions {
+        tx_batch: 4,
+        ..kernel_release(Duration::from_millis(100))
+    };
+    let limits = Limits {
+        release_hold: Some(Duration::MAX),
+        ..Limits::default()
+    };
+    let fan_out = held_fan_out(mmsg, limits, 6, 3_000, true);
+    assert!(
+        fan_out.started.iter().any(|start| start.queued > 0),
+        "the runs were held across attempts: {:?}",
+        fan_out.started
+    );
+    let datagrams = |ranges: Vec<(ConnKey, TxSeqRange)>| -> Vec<(ConnKey, u64)> {
+        ranges
+            .into_iter()
+            .flat_map(|(conn, tx)| (tx.start..tx.end).map(move |seq| (conn, seq)))
+            .collect()
+    };
+    let handed = datagrams(fan_out.handed.clone());
+    let flushed = datagrams(
+        fan_out
+            .reported
+            .iter()
+            .filter_map(|&(conn, report)| match report {
+                TxReport::Flushed { tx } => Some((conn, tx)),
+                TxReport::Dropped { .. } => None,
+            })
+            .collect(),
+    );
+    assert!(
+        fan_out
+            .reported
+            .iter()
+            .all(|(_, report)| matches!(report, TxReport::Flushed { .. })),
+        "nothing was dropped: {:?}",
+        fan_out.reported
+    );
+    assert_eq!(
+        flushed, handed,
+        "the socket sent each datagram once, in the order built"
+    );
+    let mut last: HashMap<ConnKey, u64> = HashMap::new();
+    for &(conn, report) in &fan_out.reported {
+        let TxReport::Flushed { tx } = report else {
+            continue;
+        };
+        if let Some(&end) = last.get(&conn) {
+            assert!(
+                tx.start >= end && tx.end > tx.start,
+                "the flushed ranges of {conn:?} went back: {:?}",
+                fan_out.reported
+            );
+        }
+        last.insert(conn, tx.end);
+    }
 }

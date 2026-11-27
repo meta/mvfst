@@ -41,6 +41,7 @@ use mvfstr_proto::SlotId;
 use mvfstr_proto::TxClass;
 use mvfstr_proto::TxMeta;
 use mvfstr_proto::TxReport;
+use mvfstr_proto::TxSeqRange;
 
 use crate::turn::add_buckets;
 
@@ -120,6 +121,12 @@ struct State {
     runs: Vec<Run>,
     /// The transmit attempts since the record last started afresh, in order.
     started: Vec<Started>,
+    /// Every run the sockets were handed, with its connection, in order; the record starting
+    /// afresh does not clear it.
+    handed: Vec<(ConnKey, TxSeqRange)>,
+    /// Every report the driver took from the sockets, in order; the record starting afresh does
+    /// not clear it.
+    reported: Vec<(ConnKey, TxReport)>,
     /// How long the worker is held after each attempt, and for how many attempts more.
     stall: Option<(Duration, usize)>,
 }
@@ -244,6 +251,16 @@ impl Valve {
     pub(crate) fn started(&self) -> Vec<Started> {
         self.state().started.clone()
     }
+
+    /// Returns every run the sockets were handed, with its connection, in order.
+    pub(crate) fn handed(&self) -> Vec<(ConnKey, TxSeqRange)> {
+        self.state().handed.clone()
+    }
+
+    /// Returns every report the driver took from the sockets, in order.
+    pub(crate) fn reported(&self) -> Vec<(ConnKey, TxReport)> {
+        self.state().reported.clone()
+    }
 }
 
 /// The valves of a driver pair: one for the server socket and one for every client socket.
@@ -283,6 +300,7 @@ impl Gated {
 pub(crate) struct GatedSink<'a> {
     inner: MmsgSink<'a>,
     valve: &'a Valve,
+    conn: ConnKey,
     blocked: bool,
     /// The attempt's number; the attempt began at `started`.
     attempt: usize,
@@ -329,6 +347,7 @@ impl SegmentSink for GatedSink<'_> {
                 ahead,
                 behind,
             });
+            state.handed.push((self.conn, meta.tx));
             state.events.push(Event::Run);
             let dropped = state
                 .drop_run_of
@@ -393,6 +412,7 @@ impl TxBackend for Gated {
             epoch: self.inner.caps().release.epoch(),
             inner: self.inner.sink(conn),
             valve,
+            conn,
             blocked,
             attempt,
             started,
@@ -437,8 +457,16 @@ impl TxBackend for Gated {
         self.inner.poll_writable(cx)
     }
 
-    fn drain_reports(&mut self, f: impl FnMut(ConnKey, TxReport)) {
-        self.inner.drain_reports(f);
+    fn drain_reports(&mut self, mut f: impl FnMut(ConnKey, TxReport)) {
+        let valve = if self.server {
+            &self.valves.server
+        } else {
+            &self.valves.client
+        };
+        self.inner.drain_reports(|conn, report| {
+            valve.state().reported.push((conn, report));
+            f(conn, report);
+        });
     }
 
     fn take_counters(&mut self) -> TxCounters {

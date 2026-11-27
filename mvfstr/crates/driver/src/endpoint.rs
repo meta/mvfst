@@ -163,6 +163,19 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
         self
     }
 
+    /// Lets a server socket with kernel release hold the runs of connections that build ahead
+    /// across transmit attempts, so that one flush hands the runs of many connections to the
+    /// kernel. A run due at once waits at most about `hold` and one attempt; a run released later
+    /// reaches the kernel by half its lead and one attempt, or by `hold` if that comes first.
+    /// `Duration::MAX` sets no bound on the wait of runs due at once, which then leave at the end
+    /// of the transmit phase or with another flush. The runs of unpaced connections that do not
+    /// build ahead also wait for one of those flushes. Default: off, so each attempt on such a
+    /// socket is flushed on its own.
+    pub fn release_hold(mut self, hold: Duration) -> Self {
+        self.limits.release_hold = Some(hold);
+        self
+    }
+
     /// Bounds at `bytes` the Initials of new connections that the server keeps for a later turn
     /// once a turn's connection attempts run out, and with the same bound the datagrams that other
     /// workers of a [`steering`](Self::steering) group hand to this one. Each datagram counts as
@@ -664,6 +677,29 @@ mod tests {
             builder().max_segments(0).limits.max_segments,
             1,
             "an attempt always may build one datagram"
+        );
+    }
+
+    #[test]
+    fn release_hold_sets_the_bound_on_held_runs_and_is_off_by_default() {
+        let builder = || {
+            EndpointDriver::<NoApp, MmsgBackend>::builder(
+                EndpointConfig::builder([7; 32]).build().unwrap(),
+                NoApp,
+            )
+        };
+        assert_eq!(builder().limits.release_hold, None, "off by default");
+        assert_eq!(
+            builder()
+                .release_hold(Duration::from_micros(50))
+                .limits
+                .release_hold,
+            Some(Duration::from_micros(50))
+        );
+        assert_eq!(
+            builder().release_hold(Duration::MAX).limits.release_hold,
+            Some(Duration::MAX),
+            "no bound on the wait of runs due at once"
         );
     }
 

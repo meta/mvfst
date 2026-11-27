@@ -180,6 +180,10 @@ pub(crate) struct Limits {
     /// The most bytes charged for the Initials kept for a later turn once a turn's connection
     /// attempts run out, and for the datagrams other workers may hand to this one's inbox.
     pub(crate) waiting_initial_bytes: usize,
+    /// How long the server socket, when it has kernel release, may hold a run that is due at
+    /// once before a flush hands it to the kernel; `Duration::MAX` sets no such bound. `None`
+    /// turns the hold off.
+    pub(crate) release_hold: Option<Duration>,
 }
 
 impl Default for Limits {
@@ -192,6 +196,7 @@ impl Default for Limits {
             turn_staging: TURN_STAGING,
             handshakes: HANDSHAKES_PER_TURN,
             waiting_initial_bytes: WAITING_INITIAL_BYTES,
+            release_hold: None,
         }
     }
 }
@@ -273,6 +278,11 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     sent_packets: Cell<u64>,
     sent_datagrams: Cell<u64>,
     phase_pacing_wakes: Cell<u64>,
+    /// See [`EndpointStats::release_attempts`].
+    release_attempts: Cell<[u64; 4]>,
+    hold_stats: Cell<HoldStats>,
+    /// See [`EndpointStats::pacing_wake_lateness`].
+    pacing_wake_lateness: Cell<[u64; 8]>,
     /// The sockets' transmit counters, taken after each flush.
     tx_counters: Cell<TxCounters>,
     recv_batch_calls: Cell<u64>,
@@ -308,8 +318,9 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     /// Under a work budget, the leftover wait being measured: the reading of the stop that began
     /// it, and the transmit queue's pop count at which the last slot the stop left pops.
     leftover: Cell<Option<(Instant, u64)>>,
-    /// Under a work budget, what the end-of-phase flush of the server socket has cost per
-    /// datagram, from which a transmit phase predicts the cost of flushing the socket's queue.
+    /// What the timed flushes of the server socket have cost per datagram, from which a transmit
+    /// phase predicts the cost of flushing the socket's queue: the end-of-phase flushes under a
+    /// work budget, and the flushes before attempts under a release hold.
     flush_cost: Cell<FlushCost>,
     /// Makes the next turn panic outside every connection's guard.
     #[cfg(test)]
@@ -692,6 +703,30 @@ pub struct EndpointStats {
     /// [`TxCounters::messages_per_call`]: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, and 128 or
     /// more.
     pub messages_per_call: [u64; 8],
+    /// Transmit attempts on sockets with kernel release, by what they built: nothing, only runs
+    /// released at the attempt's reading, only runs released after it, and both.
+    pub release_attempts: [u64; 4],
+    /// With a release hold, flushes of the server socket before an attempt because a held run
+    /// had waited the hold's bound.
+    pub hold_flushes_age: u64,
+    /// With a release hold, flushes of the server socket before an attempt because the bound was
+    /// half the lead of a held run released after its attempt's reading, and that came first.
+    pub hold_flushes_stamp: u64,
+    /// With a release hold, flushes of the server socket after attempts that held their runs but
+    /// filled their batch or were refused by the socket.
+    pub hold_stop_flushes: u64,
+    /// Flushes of held runs, counted in `hold_flushes_age` and `hold_flushes_stamp`, that ended
+    /// after the bound they flushed for.
+    pub hold_late: u64,
+    /// Bounds of held runs that passed while an EAGAIN had stopped the transmit phase's flushes of
+    /// the server socket.
+    pub hold_blocked: u64,
+    /// With a release hold, flushes of the server socket after attempts of paced connections that
+    /// do not build ahead, which also carried runs that other attempts held.
+    pub hold_carried_flushes: u64,
+    /// Pacing wakes taken inside transmit phases, counted in `phase_pacing_wakes`, by how late
+    /// the check that took each one ran, in the buckets of `release_lateness`.
+    pub pacing_wake_lateness: [u64; 8],
     /// `recv_batch` calls the driver makes on its connections. The call inside `Endpoint::accept`
     /// on a new server connection's first datagram is not counted.
     pub recv_batch_calls: u64,
@@ -700,6 +735,59 @@ pub struct EndpointStats {
     pub receive_passes: u64,
     /// Moves of a connection's deadline timer.
     pub deadline_rearms: u64,
+}
+
+/// The counters of the release hold, kept as the [`EndpointStats`] fields of the same names after
+/// `hold_`.
+#[derive(Clone, Copy, Debug, Default)]
+struct HoldStats {
+    flushes_age: u64,
+    flushes_stamp: u64,
+    stop_flushes: u64,
+    late: u64,
+    blocked: u64,
+    carried_flushes: u64,
+}
+
+/// The time by which the runs a server socket with kernel release holds are to reach the kernel,
+/// and whether it is half the lead of a run released after its attempt's reading (`stamp`)
+/// rather than that reading plus the release hold.
+#[derive(Clone, Copy, Debug)]
+struct HoldBound {
+    until: Instant,
+    stamp: bool,
+}
+
+impl HoldBound {
+    /// Returns the earlier of `a` and `b`, either of which may set no bound. A tie counts as the
+    /// stamp's.
+    fn earlier(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) if a.until == b.until => Some(Self {
+                until: a.until,
+                stamp: a.stamp || b.stamp,
+            }),
+            (Some(a), Some(b)) => Some(if a.until < b.until { a } else { b }),
+            (bound, None) | (None, bound) => bound,
+        }
+    }
+}
+
+/// The inclusive upper edges of every bucket of [`EndpointStats::pacing_wake_lateness`] but the
+/// last, those of [`TxCounters::release_lateness`].
+const LATENESS_EDGES: [Duration; 7] = [
+    Duration::ZERO,
+    Duration::from_micros(10),
+    Duration::from_micros(25),
+    Duration::from_micros(50),
+    Duration::from_micros(100),
+    Duration::from_micros(250),
+    Duration::from_millis(1),
+];
+
+/// Returns the bucket of [`EndpointStats::pacing_wake_lateness`] for a wake taken `late`.
+fn lateness_bucket(late: Duration) -> usize {
+    LATENESS_EDGES.partition_point(|&edge| edge < late)
 }
 
 /// Adds each of `counts` to the bucket of `total` at its index.
@@ -895,6 +983,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             sent_packets: Cell::new(0),
             sent_datagrams: Cell::new(0),
             phase_pacing_wakes: Cell::new(0),
+            release_attempts: Cell::new([0; 4]),
+            hold_stats: Cell::default(),
+            pacing_wake_lateness: Cell::new([0; 8]),
             tx_counters: Cell::new(TxCounters::default()),
             recv_batch_calls: Cell::new(0),
             receive_passes: Cell::new(0),
@@ -1107,9 +1198,16 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.sched.borrow().waiting.bytes
     }
 
+    /// Returns what the timed flushes of the server socket have cost per datagram.
+    #[cfg(test)]
+    pub(crate) fn flush_cost(&self) -> FlushCost {
+        self.flush_cost.get()
+    }
+
     /// Returns the endpoint's counters.
     pub(crate) fn stats(&self) -> EndpointStats {
         let tx = self.tx_counters.get();
+        let hold = self.hold_stats.get();
         EndpointStats {
             turns: self.turns.get(),
             empty_ready_polls: self.empty_ready_polls.get(),
@@ -1130,6 +1228,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             gso_disabled: tx.gso_disabled,
             release_lateness: tx.release_lateness,
             messages_per_call: tx.messages_per_call,
+            release_attempts: self.release_attempts.get(),
+            hold_flushes_age: hold.flushes_age,
+            hold_flushes_stamp: hold.flushes_stamp,
+            hold_stop_flushes: hold.stop_flushes,
+            hold_late: hold.late,
+            hold_blocked: hold.blocked,
+            hold_carried_flushes: hold.carried_flushes,
+            pacing_wake_lateness: self.pacing_wake_lateness.get(),
             recv_batch_calls: self.recv_batch_calls.get(),
             receive_passes: self.receive_passes.get(),
             deadline_rearms: self.deadline_rearms.get(),
@@ -1465,7 +1571,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// slots. Under a work budget, a poll also reads it as it begins, for the budget and its first
     /// turn, and a check reads it only when it cannot reuse one of these. Under a work budget, a
     /// transmit phase also reads it after its end-of-phase flush, and before the flush unless a
-    /// check stopped the phase.
+    /// check stopped the phase. With a release hold, a transmit phase also reads it after each
+    /// flush the check before an attempt makes; while the server socket holds runs, for that check
+    /// before an unpaced attempt on a socket without kernel release or on its own; and at its end
+    /// if an EAGAIN stopped its flushes with runs held.
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
@@ -2087,6 +2196,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// before it took the wake of a freed connection. Serves count against `limits.requeues` with
     /// full-batch requeues, and the checks stop once that cap is spent.
     ///
+    /// With a release hold, an attempt on the server socket with kernel release by a connection
+    /// that builds ahead is flushed after itself only if it filled its batch or the socket refused
+    /// it. Its runs wait on the socket until the attempt's reading plus the hold, or until half the
+    /// lead of its first run released later if that comes first. The check before each attempt
+    /// flushes the server socket once the reading plus the predicted cost of that flush reaches the
+    /// earliest bound of the runs held, and the attempt then runs at a reading taken after the
+    /// flush. With the hold, an attempt on that socket by a connection that does not build ahead
+    /// is flushed after itself only if it paces and built a run.
+    ///
     /// Under a work budget, while the queue holds slots, a serve and a pop take turns, and the
     /// turn carries across stops; the pacing check runs only on the wakes' turn, and a due wake is
     /// taken only once the budget lets its attempt run. A skip does not change the turn, and each
@@ -2111,6 +2229,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         // Per-attempt flushes of the server socket stop once one meets an EAGAIN; the end of the
         // phase still flushes it and waits for it to be writable.
         let mut server_flushes = true;
+        let hold = self.limits.release_hold;
+        // The bound on the runs the server socket holds, `None` while it holds none with a bound.
+        let mut hold_until: Option<HoldBound> = None;
         let mut requeues = 0;
         // Serves plus full-batch requeues, at most `limits.requeues`.
         let mut spent = 0;
@@ -2133,27 +2254,24 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             let check_wakes = !(budgeted
                 && !queue.is_empty()
                 && (self.queue_turn.get() || skips % BUDGET_STEP != 0));
-            if check_wakes
-                && spent < self.limits.requeues
-                && self.sched.borrow().timers.next_pacing().is_some()
-            {
+            let wake = if check_wakes && spent < self.limits.requeues {
+                self.sched.borrow().timers.next_pacing()
+            } else {
+                None
+            };
+            if let Some(wake) = wake {
                 let at = self.clock();
                 latest = at;
                 reading = Some(at);
                 // Under a work budget, a due wake is taken only once its attempt may run, so a
                 // stop leaves it armed and its connection where it waits.
                 if budgeted
-                    && self
-                        .sched
-                        .borrow()
-                        .timers
-                        .next_pacing()
-                        .is_some_and(|wake| wake <= at)
+                    && wake <= at
                     && !self.gate_staged(UnitKind::Attempt, reading, server_queued)
                 {
                     break;
                 }
-                take = self.take_pacing_wake(at, &queue);
+                take = self.take_pacing_wake(wake, at, &queue);
             }
             let served = matches!(take, Take::Serve(_));
             let next = match take {
@@ -2209,6 +2327,38 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 }
                 ran = true;
                 entry.dirty = false;
+                let mut at = at;
+                if let Some(bound) = hold_until
+                    && let Some(server) = &self.server
+                {
+                    // An unpaced attempt on a socket without kernel release or on its own runs at
+                    // the phase's reading, so the check takes a current one.
+                    let t = if release || entry.paces {
+                        at
+                    } else {
+                        latest = self.clock();
+                        latest
+                    };
+                    if server_flushes
+                        && t + self.flush_cost.get().predict(server_queued()) >= bound.until
+                    {
+                        let (after, blocked) = self.hold_flush(server, t, bound);
+                        server_flushes = !blocked;
+                        // Reports the end-of-phase flush applies must not precede an attempt.
+                        latest = after;
+                        if !blocked {
+                            hold_until = None;
+                        }
+                        // The attempt's runs are stamped from a reading after the flush.
+                        if release || entry.paces {
+                            at = after;
+                        }
+                    }
+                    if !server_flushes && latest >= bound.until {
+                        self.count_hold(|stats| stats.blocked += 1);
+                        hold_until = None;
+                    }
+                }
                 #[cfg(debug_assertions)]
                 {
                     debug_assert!(
@@ -2250,6 +2400,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 self.sent_packets.set(self.sent_packets.get() + sent);
                 self.sent_datagrams
                     .set(self.sent_datagrams.get() + u64::from(outcome.datagrams));
+                if release {
+                    let built = usize::from(outcome.due) + 2 * usize::from(outcome.ahead.is_some());
+                    let mut counts = self.release_attempts.get();
+                    counts[built] += 1;
+                    self.release_attempts.set(counts);
+                }
                 let requeued = outcome.stop == Stop::BatchFull && spent < self.limits.requeues;
                 match outcome.stop {
                     Stop::BatchFull if requeued => {
@@ -2271,7 +2427,20 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     }
                     _ => {}
                 }
-                let flush = release || (entry.paces && outcome.datagrams > 0);
+                // With a release hold, the runs of an attempt on the server socket with kernel
+                // release stay on the socket if its connection builds ahead, so that they are
+                // stamped, unless the connection attempts again or the socket refused it. Without
+                // a build horizon the runs are not stamped, and only a paced attempt's are flushed
+                // at once.
+                let hold_rule = hold.is_some() && entry.socket.is_none() && release;
+                let holds = hold_rule && !entry.conn.build_horizon().is_zero();
+                let flush = if holds {
+                    matches!(outcome.stop, Stop::BatchFull | Stop::Socket)
+                } else if hold_rule {
+                    entry.paces && outcome.datagrams > 0
+                } else {
+                    release || (entry.paces && outcome.datagrams > 0)
+                };
                 if entry.socket.is_some() && (!requeued || flush) {
                     self.flush_own(key, entry, at, outcome.stop == Stop::Socket);
                 } else if entry.socket.is_none()
@@ -2279,8 +2448,47 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     && server_flushes
                     && let Some(server) = &self.server
                 {
+                    if hold_rule {
+                        let carried = !holds
+                            && server.socket.borrow().queued_datagrams()
+                                > u32::from(outcome.datagrams);
+                        self.count_hold(|stats| {
+                            stats.stop_flushes += u64::from(holds);
+                            stats.carried_flushes += u64::from(carried);
+                        });
+                    }
                     server_flushes = !server.socket.borrow_mut().flush(at).blocked;
+                    if server_flushes {
+                        hold_until = None;
+                    }
                 }
+                if holds && !flush && outcome.datagrams > 0 {
+                    let age = hold
+                        .and_then(|wait| at.checked_add(wait))
+                        .map(|until| HoldBound {
+                            until,
+                            stamp: false,
+                        });
+                    let stamp = outcome.ahead.map(|ahead| HoldBound {
+                        until: at + ahead.saturating_duration_since(at) / 2,
+                        stamp: true,
+                    });
+                    let due_by = HoldBound::earlier(age, stamp);
+                    let queued = server_queued();
+                    // The queue sends from its front, so if it holds no more than the attempt
+                    // built, a send inside the attempt took every older run.
+                    hold_until = if queued == 0 {
+                        None
+                    } else if queued <= u32::from(outcome.datagrams) {
+                        due_by
+                    } else {
+                        HoldBound::earlier(hold_until, due_by)
+                    };
+                }
+                #[cfg(test)]
+                self.record
+                    .borrow_mut()
+                    .hold(hold_until.map(|bound| bound.until));
                 self.set_pacing(key, entry, outcome.pacing_at);
                 // A ready datagram producer is polled again once the attempt frees allowance,
                 // which it does without sending when it drops expired or oversize datagrams.
@@ -2331,6 +2539,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
         self.sched.borrow_mut().tx_queue = queue;
         self.requeues.set(self.requeues.get() + requeues);
+        if !server_flushes
+            && let Some(bound) = hold_until
+            && self.clock() >= bound.until
+        {
+            self.count_hold(|stats| stats.blocked += 1);
+        }
         if flush_server {
             #[cfg(test)]
             self.record.borrow_mut().marks.push(Mark::Flush);
@@ -2366,6 +2580,35 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if flushed.is_some_and(|flushed| !flushed.blocked) {
             self.remark_parked();
         }
+    }
+
+    /// Flushes the server socket before a transmit attempt at the reading `t`, because the runs
+    /// it holds are due to reach the kernel by `bound`, and times the flush into the driver's
+    /// flush cost. Returns the reading after the flush and whether the flush met an EAGAIN.
+    #[cold]
+    fn hold_flush(&self, server: &Server<B>, t: Instant, bound: HoldBound) -> (Instant, bool) {
+        #[cfg(test)]
+        self.record.borrow_mut().marks.push(Mark::HoldFlush);
+        let flushed = server.socket.borrow_mut().flush(t);
+        let after = self.clock();
+        let mut cost = self.flush_cost.get();
+        cost.record(after.saturating_duration_since(t), flushed.datagrams);
+        self.flush_cost.set(cost);
+        self.count_hold(|stats| {
+            if bound.stamp {
+                stats.flushes_stamp += 1;
+            } else {
+                stats.flushes_age += 1;
+            }
+            stats.late += u64::from(after > bound.until);
+        });
+        (after, flushed.blocked)
+    }
+
+    fn count_hold(&self, count: impl FnOnce(&mut HoldStats)) {
+        let mut stats = self.hold_stats.get();
+        count(&mut stats);
+        self.hold_stats.set(stats);
     }
 
     /// Begins measuring the leftover wait of the slots a transmit stop left in `queue`, at the
@@ -2405,17 +2648,18 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         budget.leftover(at.saturating_duration_since(stop));
     }
 
-    /// Takes the pacing wake due earliest at `at`, of either kind, inside a transmit phase whose
-    /// queue is `queue`.
+    /// Takes the pacing wake due earliest, at `due`, of either kind, if it is due at `at`, inside
+    /// a transmit phase whose queue is `queue`.
     #[cfg_attr(not(test), expect(unused_variables, reason = "only tests read it"))]
-    fn take_pacing_wake(&self, at: Instant, queue: &SlotQueue) -> Take {
-        #[cfg(test)]
-        let due = self.sched.borrow().timers.next_pacing();
+    fn take_pacing_wake(&self, due: Instant, at: Instant, queue: &SlotQueue) -> Take {
         let Some(index) = self.sched.borrow_mut().timers.pop_due_pacing(at) else {
             return Take::Nothing;
         };
         self.phase_pacing_wakes
             .set(self.phase_pacing_wakes.get() + 1);
+        let mut counts = self.pacing_wake_lateness.get();
+        counts[lateness_bucket(at.saturating_duration_since(due))] += 1;
+        self.pacing_wake_lateness.set(counts);
         let key = self.slab.borrow().key_at(index);
         #[cfg(test)]
         let queued = key.is_some_and(|key| queue.contains(&key));
@@ -2430,11 +2674,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             })
         });
         #[cfg(test)]
-        if let Some(due) = due {
-            self.record
-                .borrow_mut()
-                .wake(index, due, at, queued, next.is_some());
-        }
+        self.record
+            .borrow_mut()
+            .wake(index, due, at, queued, next.is_some());
         next.map_or(Take::Deferred, Take::Serve)
     }
 
@@ -3553,6 +3795,8 @@ pub(crate) struct TxRecord {
     /// Every check before a transmit attempt that reserved time for flushing the server socket,
     /// in order.
     pub(crate) reserves: Vec<ReserveRecord>,
+    /// The hold on the server socket's queue after every transmit attempt, in order.
+    pub(crate) holds: Vec<HoldRecord>,
     /// The steps of the driver's polls, in order.
     pub(crate) marks: Vec<Mark>,
     /// Units of work the budget let run.
@@ -3573,6 +3817,9 @@ pub(crate) enum Mark {
     Attempt(ConnKey),
     /// A transmit phase flushed the server socket at its end.
     Flush,
+    /// A transmit phase flushed the server socket before an attempt, because the runs it held
+    /// were due to reach the kernel.
+    HoldFlush,
     /// The server socket's batch was routed from datagram `start` to datagram `end`, counted
     /// from 0, stepping over `walked` datagrams.
     Route {
@@ -3644,6 +3891,16 @@ pub(crate) struct ReserveRecord {
     pub(crate) next: usize,
 }
 
+/// The hold on the server socket's queue after a transmit attempt: the attempt's place in
+/// [`TxRecord::attempts`], and the time by which the runs held on the socket are to reach the
+/// kernel, if any are held with a bound.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldRecord {
+    pub(crate) attempt: usize,
+    pub(crate) until: Option<Instant>,
+}
+
 #[cfg(test)]
 impl TxRecord {
     fn begin_phase(&mut self) {
@@ -3696,6 +3953,16 @@ impl TxRecord {
         let phase = self.phase.expect("attempts run inside transmit phases");
         self.attempts.push(AttemptRecord { key, phase, at });
         self.marks.push(Mark::Attempt(key));
+    }
+
+    /// Records the hold on the server socket's queue, `until`, after the last attempt.
+    fn hold(&mut self, until: Option<Instant>) {
+        let attempt = self
+            .attempts
+            .len()
+            .checked_sub(1)
+            .expect("a hold follows an attempt");
+        self.holds.push(HoldRecord { attempt, until });
     }
 
     /// Records a wake of slot `index` due at `due` and taken at `taken`; `queued` if its
