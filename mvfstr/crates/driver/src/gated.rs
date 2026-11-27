@@ -7,9 +7,9 @@
 
 //! A backend for the driver's tests: [`MmsgBackend`] behind a [`Valve`] that the test thread
 //! controls. A valve can hold its sockets' flushes behind a simulated EAGAIN, which loopback never
-//! returns, drop a run as the backend drops one that must not leave, fail a receive, add GSO counts
-//! to what the sockets count, and hold the worker after an attempt. It records what the sockets
-//! did.
+//! returns, drop a run as the backend drops one that must not leave, fail a receive, add GSO and
+//! histogram counts to what the sockets count, and hold the worker after an attempt. It records
+//! what the sockets did.
 
 use std::io;
 use std::mem;
@@ -41,6 +41,8 @@ use mvfstr_proto::SlotId;
 use mvfstr_proto::TxClass;
 use mvfstr_proto::TxMeta;
 use mvfstr_proto::TxReport;
+
+use crate::turn::add_buckets;
 
 /// What a gated socket did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +100,10 @@ struct State {
     /// GSO counts the sockets add to what they count when they are next taken.
     gso_retries: u64,
     gso_disabled: u64,
+    /// Histogram counts the sockets add, bucket by bucket, to what they count when they are next
+    /// taken.
+    release_lateness: [u64; 8],
+    messages_per_call: [u64; 8],
     /// The sockets keep their queued runs and refuse every segment until the test opens them.
     blocked: bool,
     /// The waker of the last `poll_writable` while blocked.
@@ -165,6 +171,14 @@ impl Valve {
         let mut state = self.state();
         state.gso_retries += retries;
         state.gso_disabled += disabled;
+    }
+
+    /// Adds `release_lateness` and `messages_per_call` bucket by bucket to the histograms the
+    /// sockets return when they are next taken.
+    pub(crate) fn count_histograms(&self, release_lateness: [u64; 8], messages_per_call: [u64; 8]) {
+        let mut state = self.state();
+        add_buckets(&mut state.release_lateness, release_lateness);
+        add_buckets(&mut state.messages_per_call, messages_per_call);
     }
 
     /// Returns whether the sockets are blocked and the driver is waiting for them to be writable.
@@ -432,6 +446,14 @@ impl TxBackend for Gated {
         let mut state = self.valve().state();
         counted.gso_retries += mem::take(&mut state.gso_retries);
         counted.gso_disabled += mem::take(&mut state.gso_disabled);
+        add_buckets(
+            &mut counted.release_lateness,
+            mem::take(&mut state.release_lateness),
+        );
+        add_buckets(
+            &mut counted.messages_per_call,
+            mem::take(&mut state.messages_per_call),
+        );
         counted
     }
 }

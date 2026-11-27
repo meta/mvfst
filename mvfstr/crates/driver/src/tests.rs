@@ -7977,6 +7977,47 @@ fn the_gso_counts_of_the_server_socket_reach_the_endpoint_counters() {
 }
 
 #[test]
+fn the_lateness_and_call_size_histograms_of_each_socket_reach_the_endpoint_counters() {
+    let ping = GatedPing::new();
+    let server_before = ping.harness.server_stats::<Echo>();
+    let client_before = ping.harness.client_stats::<Ping>();
+    // A different count in every bucket, so that a bucket added into another or left out shows.
+    let rising = [1, 2, 3, 4, 5, 6, 7, 8];
+    let falling = [80, 70, 60, 50, 40, 30, 20, 10];
+    ping.valves.server.count_histograms(rising, falling);
+    ping.valves.client.count_histograms(falling, rising);
+    ping.ping();
+    ping.await_echo(0);
+    // The sluggish sides do not flush again before these run.
+    let server_after = ping.harness.server_stats::<Echo>();
+    let client_after = ping.harness.client_stats::<Ping>();
+    let moved = |after: &crate::EndpointStats, before: &crate::EndpointStats| {
+        let buckets = |after: [u64; 8], before: [u64; 8]| -> [u64; 8] {
+            std::array::from_fn(|i| after[i] - before[i])
+        };
+        (
+            after.sendmmsg_calls - before.sendmmsg_calls,
+            after.sendmmsg_messages - before.sendmmsg_messages,
+            buckets(after.release_lateness, before.release_lateness),
+            buckets(after.messages_per_call, before.messages_per_call),
+        )
+    };
+    assert_eq!(
+        moved(&server_after, &server_before),
+        (1, 1, rising, [81, 70, 60, 50, 40, 30, 20, 10]),
+        "the server socket's counts, bucket by bucket, and the echo's call of one message; the \
+         socket does not have release support, so its own calls do not add lateness"
+    );
+    assert_eq!(
+        moved(&client_after, &client_before),
+        (1, 1, falling, [2, 2, 3, 4, 5, 6, 7, 8]),
+        "the client socket's counts, bucket by bucket, and the ping's call of one message; client \
+         sockets never carry a release"
+    );
+    ping.harness.shutdown();
+}
+
+#[test]
 fn a_finished_drivers_handle_keeps_its_last_counters() {
     let harness = Harness::new();
     let (tx, rx) = mpsc::channel();

@@ -120,6 +120,9 @@ pub(crate) struct Tx {
     /// kernel.
     #[cfg(test)]
     injected: VecDeque<i32>,
+    /// The clock reads `send` made, for tests that count them.
+    #[cfg(test)]
+    clock_reads: u64,
 }
 
 impl Tx {
@@ -156,6 +159,8 @@ impl Tx {
             counters: TxCounters::default(),
             #[cfg(test)]
             injected: VecDeque::new(),
+            #[cfg(test)]
+            clock_reads: 0,
         }
     }
 
@@ -182,6 +187,10 @@ impl Tx {
             match result {
                 Ok(accepted) => {
                     self.counters.messages += accepted as u64;
+                    if accepted > 0 {
+                        self.counters.messages_per_call[messages_per_call_bucket(accepted)] += 1;
+                        self.count_lateness(accepted);
+                    }
                     if let Some(first) = self.queue.front()
                         && self
                             .queue
@@ -246,6 +255,35 @@ impl Tx {
         // SAFETY: `prepare` pointed every header at names, iovecs, control data and slot bytes
         // owned by `self`, and these do not change until the call returns.
         unsafe { sys::sendmmsg(fd.as_raw_fd(), &mut self.hdrs[..n]) }
+    }
+
+    /// Counts each of the first `accepted` queued messages that carries a release by how late it
+    /// reached the kernel, from one clock reading taken only if one of them does.
+    fn count_lateness(&mut self, accepted: usize) {
+        // Sockets without release support carry only messages sent as soon as possible.
+        if matches!(self.caps.release, ReleaseSupport::None) {
+            return;
+        }
+        let mut ticks = self
+            .queue
+            .iter()
+            .take(accepted)
+            .filter_map(|msg| match msg.release {
+                Release::At(tick) => Some(tick.0),
+                Release::Asap => None,
+            })
+            .peekable();
+        if ticks.peek().is_none() {
+            return;
+        }
+        let read = sys::monotonic_ns();
+        #[cfg(test)]
+        {
+            self.clock_reads += 1;
+        }
+        for tick in ticks {
+            self.counters.release_lateness[lateness_bucket(read, tick)] += 1;
+        }
     }
 
     pub(crate) fn take_counters(&mut self) -> TxCounters {
@@ -592,6 +630,23 @@ fn did_not_leave(error: &io::Error) -> Option<DropReason> {
     }
 }
 
+/// The inclusive upper edges, in nanoseconds, of every bucket of
+/// [`TxCounters::release_lateness`] but the last.
+const LATENESS_EDGES_NS: [u64; 7] = [0, 10_000, 25_000, 50_000, 100_000, 250_000, 1_000_000];
+
+/// Returns the bucket of [`TxCounters::release_lateness`] for a message released at `tick` and
+/// handed to the kernel at the clock reading `read`, both in nanoseconds of CLOCK_MONOTONIC.
+fn lateness_bucket(read: u64, tick: u64) -> usize {
+    let late = read.saturating_sub(tick);
+    LATENESS_EDGES_NS.partition_point(|&edge| edge < late)
+}
+
+/// Returns the bucket of [`TxCounters::messages_per_call`] for a call that accepted `messages`, at
+/// least one.
+fn messages_per_call_bucket(messages: usize) -> usize {
+    messages.max(1).ilog2().min(7) as usize
+}
+
 /// Writes a message's control data: UDP_SEGMENT for a GSO send, its TOS byte, its source
 /// address and its release. Returns the length.
 fn encode_cmsgs(buf: &mut [u8], msg: &Msg, ipv6_socket: bool) -> usize {
@@ -815,6 +870,18 @@ mod tests {
 
     /// Queues one sealed run of datagrams of `lens` bytes to `dst`, sent as soon as possible.
     fn queue_run(tx: &mut Tx, fd: BorrowedFd<'_>, conn: ConnKey, dst: SocketAddr, lens: &[u16]) {
+        queue_released(tx, fd, conn, dst, lens, Release::Asap);
+    }
+
+    /// Queues one sealed run of datagrams of `lens` bytes to `dst`, with `release`.
+    fn queue_released(
+        tx: &mut Tx,
+        fd: BorrowedFd<'_>,
+        conn: ConnKey,
+        dst: SocketAddr,
+        lens: &[u16],
+        release: Release,
+    ) {
         tx.begin_sink(conn);
         for (i, &len) in lens.iter().enumerate() {
             let (_, slot) = tx.lend(fd, conn, len, TxClass::Data).expect("a slot");
@@ -831,7 +898,7 @@ mod tests {
                 tos: 0,
                 segment_size: lens[0],
                 segments: lens.len() as u16,
-                release: Release::Asap,
+                release,
                 class: TxClass::Data,
                 tx: TxSeqRange {
                     start: 0,
@@ -1059,9 +1126,10 @@ mod tests {
                 calls: 2,
                 messages: 3,
                 gso_retries: 1,
+                messages_per_call: [0, 1, 0, 0, 0, 0, 0, 0],
                 ..TxCounters::default()
             },
-            "the refused GSO send, then one call with its three datagrams"
+            "the refused GSO send, then one call with its three datagrams, in the bucket of 2-3"
         );
     }
 
@@ -1118,5 +1186,215 @@ mod tests {
                 .collect();
             assert_eq!(stamps, vec![release.0.to_ne_bytes().to_vec()], "send {i}");
         }
+    }
+
+    #[test]
+    fn hand_off_lateness_falls_in_buckets_whose_upper_edges_are_inclusive_in_nanoseconds() {
+        const US: u64 = 1_000;
+        let read = 10_000_000_000;
+        let late = |ns: u64| (read, read - ns);
+        let cases = [
+            ((0, u64::MAX), 0),
+            ((read, read + 1), 0),
+            (late(0), 0),
+            (late(1), 1),
+            (late(10 * US), 1),
+            (late(10 * US + 1), 2),
+            (late(25 * US), 2),
+            (late(25 * US + 1), 3),
+            (late(50 * US), 3),
+            (late(50 * US + 1), 4),
+            (late(100 * US), 4),
+            (late(100 * US + 1), 5),
+            (late(250 * US), 5),
+            (late(250 * US + 1), 6),
+            (late(1_000 * US), 6),
+            (late(1_000 * US + 1), 7),
+            ((u64::MAX, 0), 7),
+        ];
+        let got: Vec<((u64, u64), usize)> = cases
+            .iter()
+            .map(|&((read, tick), _)| ((read, tick), lateness_bucket(read, tick)))
+            .collect();
+        assert_eq!(
+            got, cases,
+            "((read, release), bucket): early or on time, then up to 10, 25, 50, 100, 250 and \
+             1,000 µs, then later"
+        );
+    }
+
+    #[test]
+    fn calls_fall_in_buckets_of_accepted_messages_by_powers_of_two() {
+        let cases = [
+            (1, 0),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (7, 2),
+            (8, 3),
+            (15, 3),
+            (16, 4),
+            (31, 4),
+            (32, 5),
+            (63, 5),
+            (64, 6),
+            (127, 6),
+            (128, 7),
+            (1024, 7),
+        ];
+        let got: Vec<(usize, usize)> = cases
+            .iter()
+            .map(|&(messages, _)| (messages, messages_per_call_bucket(messages)))
+            .collect();
+        assert_eq!(
+            got, cases,
+            "(messages, bucket): 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, then 128 or more"
+        );
+    }
+
+    /// Returns kernel release support whose clock epoch is now.
+    fn kernel_release() -> ReleaseSupport {
+        ReleaseSupport::Kernel {
+            horizon: Duration::from_millis(100),
+            epoch: ClockEpoch {
+                instant: Instant::now(),
+                tick: Tick(sys::monotonic_ns()),
+            },
+        }
+    }
+
+    /// Returns a loopback socket with SO_TXTIME on CLOCK_MONOTONIC, without which the kernel
+    /// refuses a send that carries a release, and a peer socket to send to.
+    fn txtime_pair() -> (UdpSocket, UdpSocket) {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sys::set_txtime(&socket, libc::CLOCK_MONOTONIC).unwrap();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        (socket, peer)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_call_whose_messages_are_sent_at_once_does_not_read_the_clock_and_counts_only_its_size() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let to = peer.local_addr().unwrap();
+        let fd = socket.as_fd();
+        let conn = ConnKey {
+            index: 4,
+            generation: 1,
+        };
+        // A socket without release support, as timer and client sockets are, and one with it.
+        for release in [ReleaseSupport::None, kernel_release()] {
+            let mut tx = tx(4, release);
+            // GSO sends of three, of four and one, and a single datagram: four messages.
+            queue_run(&mut tx, fd, conn, to, &[100; 3]);
+            queue_run(&mut tx, fd, conn, to, &[100; 5]);
+            queue_run(&mut tx, fd, conn, to, &[100]);
+            assert_eq!(tx.send(fd), 9);
+            assert_eq!(
+                tx.clock_reads, 0,
+                "a call whose messages do not carry a release does not read the clock: {release:?}"
+            );
+            assert_eq!(
+                tx.take_counters(),
+                TxCounters {
+                    calls: 1,
+                    messages: 4,
+                    messages_per_call: [0, 0, 1, 0, 0, 0, 0, 0],
+                    ..TxCounters::default()
+                },
+                "one call of four messages, in the bucket of 4-7, whose messages do not carry a \
+                 release: {release:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_call_with_released_messages_reads_the_clock_once_and_counts_each_by_its_lateness() {
+        let (socket, peer) = txtime_pair();
+        let to = peer.local_addr().unwrap();
+        let fd = socket.as_fd();
+        let mut tx = tx(4, kernel_release());
+        let conn = ConnKey {
+            index: 6,
+            generation: 1,
+        };
+        // Releases a second ahead of the call and two seconds behind it, so that the bucket does
+        // not depend on how long the call takes.
+        let now = sys::monotonic_ns();
+        let early = Release::At(Tick(now + 1_000_000_000));
+        let late = Release::At(Tick(now.saturating_sub(2_000_000_000)));
+        // A GSO send released early, a datagram sent at once, GSO sends of four and one released
+        // late, and a late single datagram: five messages, four of them with a release.
+        queue_released(&mut tx, fd, conn, to, &[100; 3], early);
+        queue_released(&mut tx, fd, conn, to, &[100], Release::Asap);
+        queue_released(&mut tx, fd, conn, to, &[100; 5], late);
+        queue_released(&mut tx, fd, conn, to, &[100], late);
+        assert_eq!(tx.send(fd), 10);
+        assert_eq!(
+            tx.clock_reads, 1,
+            "one reading serves every message of the call"
+        );
+        assert_eq!(
+            tx.take_counters(),
+            TxCounters {
+                calls: 1,
+                messages: 5,
+                release_lateness: [1, 0, 0, 0, 0, 0, 0, 3],
+                messages_per_call: [0, 0, 1, 0, 0, 0, 0, 0],
+                ..TxCounters::default()
+            },
+            "each message with a release counted once, however many datagrams it carries, and the \
+             one sent at once not at all"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn only_accepted_messages_are_counted_and_only_calls_that_accept_one_read_the_clock() {
+        let (socket, peer) = txtime_pair();
+        let to = peer.local_addr().unwrap();
+        let fd = socket.as_fd();
+        let mut tx = tx(4, kernel_release());
+        let conn = ConnKey {
+            index: 8,
+            generation: 1,
+        };
+        let late = Release::At(Tick(sys::monotonic_ns().saturating_sub(2_000_000_000)));
+        // An IPv6 destination on an IPv4 socket fails with EAFNOSUPPORT.
+        let unreachable = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+        queue_released(&mut tx, fd, conn, to, &[100; 2], late);
+        queue_released(&mut tx, fd, conn, to, &[100], late);
+        queue_released(&mut tx, fd, conn, unreachable, &[100], late);
+        queue_released(&mut tx, fd, conn, to, &[100], late);
+
+        tx.injected.push_back(libc::EAGAIN);
+        assert_eq!(tx.send(fd), 0);
+        assert!(tx.blocked());
+        assert_eq!(
+            tx.clock_reads, 0,
+            "the call met EAGAIN and did not take a message"
+        );
+
+        // The kernel takes the two messages before the IPv6 one, a call of its own refuses that
+        // one, and a last call takes the fourth.
+        assert_eq!(tx.send(fd), 4);
+        assert_eq!(
+            tx.clock_reads, 2,
+            "one reading for each call that took messages"
+        );
+        assert_eq!(
+            tx.take_counters(),
+            TxCounters {
+                calls: 4,
+                messages: 3,
+                release_lateness: [0, 0, 0, 0, 0, 0, 0, 3],
+                messages_per_call: [1, 1, 0, 0, 0, 0, 0, 0],
+                ..TxCounters::default()
+            },
+            "the calls that took two messages and one; the EAGAIN and the refused message count \
+             only as calls"
+        );
     }
 }

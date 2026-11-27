@@ -684,6 +684,14 @@ pub struct EndpointStats {
     /// Sockets that stopped using GSO after the kernel refused three GSO sends whose datagrams it
     /// then took alone.
     pub gso_disabled: u64,
+    /// Accepted messages with a release time, by how late they reached the kernel, in the buckets
+    /// of [`TxCounters::release_lateness`]: 0 µs or less (early), up to 10, 25, 50, 100, 250 and
+    /// 1,000 µs, and over 1,000 µs.
+    pub release_lateness: [u64; 8],
+    /// `sendmmsg` calls by the messages the kernel accepted, in the buckets of
+    /// [`TxCounters::messages_per_call`]: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, and 128 or
+    /// more.
+    pub messages_per_call: [u64; 8],
     /// `recv_batch` calls the driver makes on its connections. The call inside `Endpoint::accept`
     /// on a new server connection's first datagram is not counted.
     pub recv_batch_calls: u64,
@@ -692,6 +700,13 @@ pub struct EndpointStats {
     pub receive_passes: u64,
     /// Moves of a connection's deadline timer.
     pub deadline_rearms: u64,
+}
+
+/// Adds each of `counts` to the bucket of `total` at its index.
+pub(crate) fn add_buckets(total: &mut [u64; 8], counts: [u64; 8]) {
+    for (bucket, count) in total.iter_mut().zip(counts) {
+        *bucket += count;
+    }
 }
 
 /// A graceful shutdown in progress. A step's time is `None` once the step is taken, or when it lies
@@ -1113,6 +1128,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             multi_connection_calls: tx.multi_connection_calls,
             gso_retries: tx.gso_retries,
             gso_disabled: tx.gso_disabled,
+            release_lateness: tx.release_lateness,
+            messages_per_call: tx.messages_per_call,
             recv_batch_calls: self.recv_batch_calls.get(),
             receive_passes: self.receive_passes.get(),
             deadline_rearms: self.deadline_rearms.get(),
@@ -1127,6 +1144,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         total.multi_connection_calls += counted.multi_connection_calls;
         total.gso_retries += counted.gso_retries;
         total.gso_disabled += counted.gso_disabled;
+        add_buckets(&mut total.release_lateness, counted.release_lateness);
+        add_buckets(&mut total.messages_per_call, counted.messages_per_call);
         self.tx_counters.set(total);
     }
 

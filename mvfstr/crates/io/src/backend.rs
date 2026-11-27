@@ -86,7 +86,8 @@ pub struct FlushOutcome {
 }
 
 /// Counters of a backend's transmit half, from [`TxBackend::take_counters`]. Each event costs one
-/// add, without a clock read.
+/// add. The only clock read is the one after a call that hands the kernel a message with a
+/// release.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TxCounters {
@@ -102,6 +103,14 @@ pub struct TxCounters {
     /// Sockets that stopped using GSO after refused GSO sends whose datagrams the kernel then took
     /// alone: at most one per socket.
     pub gso_disabled: u64,
+    /// Accepted messages with a [`Release::At`](mvfstr_proto::Release::At), by how late they
+    /// reached the kernel: the clock reading taken once after their call, less their release.
+    /// Buckets, in µs, each upper edge inclusive: 0 or less (early), 10, 25, 50, 100, 250, 1,000,
+    /// and over 1,000.
+    pub release_lateness: [u64; 8],
+    /// Calls by the messages the kernel accepted: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, and
+    /// 128 or more. Only calls that accepted a message are counted.
+    pub messages_per_call: [u64; 8],
 }
 
 /// The transmit half of a backend.
