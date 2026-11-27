@@ -1393,6 +1393,244 @@ fn a_closing_connection_sends_no_packet_without_its_close() {
     }
 }
 
+/// Returns a server that has processed a ClientHello and, at its write keys, written 40 bytes on a
+/// unidirectional stream, as an HTTP/3 server writes its control streams. Its certificate has
+/// `cert_names` names, which set the length of its flight.
+fn stream_data_at_write_keys(cert_names: usize) -> (Instant, Connection) {
+    let setup = Setup {
+        cert_names,
+        ..Setup::default()
+    };
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&setup);
+    assert_eq!(server.poll_event(), Some(ConnEvent::WriteKeysReady));
+    let id = server.open_stream(Dir::Uni, ORDER).unwrap();
+    server
+        .stream(id)
+        .unwrap()
+        .send(&mut Bytes::from(vec![7; 40]))
+        .unwrap();
+    (now, server)
+}
+
+/// Makes `conn` transmit at `now`; returns why the attempt stopped and the datagrams.
+fn attempt(conn: &mut Connection, now: Instant) -> (Stop, Vec<Vec<u8>>) {
+    let mut sink = VecSink::new(1500);
+    let outcome = conn.poll_transmit(&limits(now), &mut sink, &mut InlineSealer);
+    (
+        outcome.stop,
+        sink.take().into_iter().map(|d| d.data).collect(),
+    )
+}
+
+/// Where a packet sits in a run of datagrams: the datagram's index, then the packet's.
+type At = (usize, usize);
+
+/// Checks that the first `joiner` packet in the `datagrams` that `server` sent follows the last
+/// `crypto` packet with CRYPTO data, in that packet's datagram, and returns its plaintext. A client
+/// opens a packet of a later space only once it has processed that CRYPTO data, and may drop one
+/// that arrives earlier (RFC 9001).
+fn expect_joiner_after_crypto_data(
+    server: &Connection,
+    datagrams: &[Vec<u8>],
+    crypto: PacketType,
+    joiner: PacketType,
+) -> Vec<u8> {
+    assert!(
+        datagrams.len() > 1,
+        "the CRYPTO data takes more than one datagram"
+    );
+    assert_eq!(datagrams[0].len(), 1200, "the Initial's datagram is padded");
+    let (end, first, plaintext) = crypto_end_and_joiner(server, datagrams, crypto, joiner);
+    assert!(
+        first > end,
+        "a {joiner:?} packet at {first:?}, ahead of the end of the {crypto:?} CRYPTO data at \
+         {end:?}"
+    );
+    assert_eq!(
+        first.0, end.0,
+        "the {joiner:?} packet rides in the datagram that ends the {crypto:?} CRYPTO data"
+    );
+    plaintext
+}
+
+/// Returns where the last `crypto` packet with CRYPTO data and the first `joiner` packet sit in
+/// the `datagrams` that `server` sent, and the joiner's plaintext.
+fn crypto_end_and_joiner(
+    server: &Connection,
+    datagrams: &[Vec<u8>],
+    crypto: PacketType,
+    joiner: PacketType,
+) -> (At, At, Vec<u8>) {
+    let mut end: Option<At> = None;
+    let mut first: Option<(At, Vec<u8>)> = None;
+    for (d, datagram) in datagrams.iter().enumerate() {
+        for (p, (ty, plaintext)) in open_own(server, datagram).into_iter().enumerate() {
+            let mut frames = Frames::new(&plaintext).map(Result::unwrap);
+            if ty == crypto && frames.any(|frame| matches!(frame, Frame::Crypto { .. })) {
+                end = Some((d, p));
+            }
+            if ty == joiner && first.is_none() {
+                first = Some(((d, p), plaintext));
+            }
+        }
+    }
+    let end = end.unwrap_or_else(|| panic!("no {crypto:?} packet with CRYPTO data"));
+    let (first, plaintext) = first.unwrap_or_else(|| panic!("no {joiner:?} packet"));
+    (end, first, plaintext)
+}
+
+/// Checks that the first 1-RTT packet in the `datagrams` that `server` sent carries the stream data
+/// and follows the end of the server's handshake flight, in the flight's last datagram: a client
+/// opens a 1-RTT packet only once it has the server's Finished.
+fn expect_stream_data_after_the_flight(server: &Connection, datagrams: &[Vec<u8>]) {
+    let plaintext = expect_joiner_after_crypto_data(
+        server,
+        datagrams,
+        PacketType::Handshake,
+        PacketType::OneRtt,
+    );
+    assert!(
+        Frames::new(&plaintext)
+            .map(Result::unwrap)
+            .any(|frame| matches!(frame, Frame::Stream { .. })),
+        "the first 1-RTT packet carries the stream data"
+    );
+}
+
+#[test]
+fn a_server_sends_no_1rtt_packet_ahead_of_its_handshake_flight() {
+    // The flight fills two datagrams.
+    let (now, mut server) = stream_data_at_write_keys(30);
+    let (_, datagrams) = attempt(&mut server, now);
+    expect_stream_data_after_the_flight(&server, &datagrams);
+}
+
+#[test]
+fn a_server_sends_its_stream_data_after_a_flight_that_outruns_its_credit() {
+    // The flight is longer than three times the ClientHello's datagram.
+    let (now, mut server) = stream_data_at_write_keys(120);
+    let (stop, mut datagrams) = attempt(&mut server, now);
+    assert_eq!(stop, Stop::Amplification);
+    // The client's next datagram brings the credit for the rest of the flight.
+    deliver(&mut server, now, client_addr(), vec![0; 1200]);
+    let (stop, rest) = attempt(&mut server, now);
+    assert_ne!(stop, Stop::Amplification);
+    datagrams.extend(rest);
+    expect_stream_data_after_the_flight(&server, &datagrams);
+}
+
+#[test]
+fn a_server_sends_its_stream_data_after_the_flight_it_sends_again() {
+    let setup = Setup {
+        cert_names: 30,
+        ..Setup::default()
+    };
+    let Accepted {
+        now, mut server, ..
+    } = accepted(&setup);
+    assert_eq!(server.poll_event(), Some(ConnEvent::WriteKeysReady));
+    let (_, flight) = attempt(&mut server, now);
+    assert_eq!(flight.len(), 2, "the flight fills two datagrams");
+    let id = server.open_stream(Dir::Uni, ORDER).unwrap();
+    server
+        .stream(id)
+        .unwrap()
+        .send(&mut Bytes::from(vec![7; 40]))
+        .unwrap();
+    // The flight is lost: the PTO queues its CRYPTO data again as lost data.
+    let pto = server.next_deadline().unwrap();
+    server.on_deadline(pto);
+    assert!(server.sources.crypto[Space::Handshake.index()].has_lost());
+    deliver(&mut server, pto, client_addr(), vec![0; 1200]);
+    let (_, datagrams) = attempt(&mut server, pto);
+    expect_stream_data_after_the_flight(&server, &datagrams);
+}
+
+#[test]
+fn a_server_flight_in_one_datagram_takes_its_stream_data_along() {
+    // The flight and the stream data fit one datagram.
+    let (now, mut server) = stream_data_at_write_keys(1);
+    let (_, datagrams) = attempt(&mut server, now);
+    assert_eq!(datagrams.len(), 1);
+    assert_eq!(datagrams[0].len(), 1200);
+    let types: Vec<_> = open_own(&server, &datagrams[0])
+        .into_iter()
+        .map(|(ty, _)| ty)
+        .collect();
+    assert_eq!(
+        types,
+        [
+            PacketType::Initial,
+            PacketType::Handshake,
+            PacketType::OneRtt
+        ]
+    );
+}
+
+#[test]
+fn a_server_pads_a_flight_that_leaves_too_little_room_for_its_stream_data() {
+    // A certificate name lengthens the flight by about as much as the smallest 1-RTT packet, so
+    // one of these flights ends in its first datagram with too little room left for the stream
+    // data. The stream data then goes in the next datagram, and the first one is still padded to
+    // 1,200 bytes.
+    let mut ends_without_stream_data = false;
+    for cert_names in 1..=20 {
+        let (now, mut server) = stream_data_at_write_keys(cert_names);
+        let (_, datagrams) = attempt(&mut server, now);
+        for datagram in &datagrams {
+            if packet_types(datagram).contains(&PacketType::Initial) {
+                assert_eq!(
+                    datagram.len(),
+                    1200,
+                    "{cert_names} names: a datagram with an Initial packet is padded"
+                );
+            }
+        }
+        let (end, first, _) = crypto_end_and_joiner(
+            &server,
+            &datagrams,
+            PacketType::Handshake,
+            PacketType::OneRtt,
+        );
+        assert!(
+            first > end,
+            "{cert_names} names: a OneRtt packet at {first:?}, ahead of the end of the flight at \
+             {end:?}"
+        );
+        ends_without_stream_data |= end.0 == 0 && first.0 > 0;
+    }
+    assert!(
+        ends_without_stream_data,
+        "a flight ends in its first datagram, without the stream data"
+    );
+}
+
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn a_server_sends_no_handshake_packet_ahead_of_the_end_of_its_server_hello() {
+    // A post-quantum key share makes the ServerHello longer than one Initial packet.
+    let setup = Setup {
+        pq: true,
+        ..Setup::default()
+    };
+    let (epoch, mut pair) = start(setup.pair());
+    assert!(pair.run_until(epoch + LIMIT, |pair| !pair.server.sent.is_empty()));
+    let datagrams: Vec<_> = pair
+        .server
+        .sent
+        .iter()
+        .map(|(_, datagram)| datagram.data.clone())
+        .collect();
+    expect_joiner_after_crypto_data(
+        pair.server.conn(),
+        &datagrams,
+        PacketType::Initial,
+        PacketType::Handshake,
+    );
+}
+
 #[test]
 fn a_connection_takes_the_longest_initial_rtt_the_builder_accepts() {
     let longest = TransportConfig::builder()

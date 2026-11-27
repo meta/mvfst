@@ -20,7 +20,11 @@
 //! The datagram is bounded by the path's anti-amplification credit before validation, so every
 //! byte sent is charged. A client pads every datagram carrying an Initial packet, and a server
 //! every datagram carrying an ack-eliciting one, to 1,200 bytes, as RFC 9000 requires, with
-//! PADDING in the datagram's last packet; earlier packets leave room for the later ones.
+//! PADDING in the datagram's last packet; earlier packets leave room for the later ones. An open
+//! server's datagram is the exception: an Initial or Handshake packet with CRYPTO data to send
+//! leaves no room, and a packet of a later space joins only if the packets ahead of it took all
+//! the CRYPTO data of the earlier spaces, since a client cannot open such a packet until it has
+//! processed that data, and may drop it (RFC 9001).
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -691,6 +695,15 @@ impl<P: Prioritizer> Connection<P> {
         plan
     }
 
+    /// Returns whether `space` has CRYPTO data to send that goes ahead of every packet of a later
+    /// space: an open server's Initial or Handshake data.
+    fn crypto_goes_first(&self, space: Space) -> bool {
+        space != Space::Data
+            && self.side == Side::Server
+            && self.state == State::Open
+            && self.sources.crypto[space.index()].has_data()
+    }
+
     /// Builds one datagram into `buf` and commits it once sealed, with `PACES` as in `attempt`.
     fn build<const PACES: bool, Z: Sealer>(
         &mut self,
@@ -705,18 +718,21 @@ impl<P: Prioritizer> Connection<P> {
             .unwrap_or(usize::MAX)
             .min(buf.len());
         let buf = &mut buf[..room];
-        let plan = self.plan(times, start, joins, room as u64);
-        let planned = |space: Space| plan[space.index()].is_some();
+        let mut plan = self.plan(times, start, joins, room as u64);
         let mut built: [Option<Built>; 3] = [None; 3];
         let mut pos = 0;
         let mut carries_initial = false;
         let mut eliciting_initial = false;
-        for space in Space::ALL.into_iter().filter(|&space| planned(space)) {
-            let later = Space::ALL
-                .into_iter()
-                .filter(|&other| other > space && planned(other));
-            let reserve: usize = later.clone().filter_map(|other| plan[other.index()]).sum();
-            let last = later.count() == 0;
+        for space in Space::ALL {
+            if plan[space.index()].is_none() {
+                continue;
+            }
+            let crypto_first = self.crypto_goes_first(space);
+            let reserve: usize = if crypto_first {
+                0
+            } else {
+                plan[space.index() + 1..].iter().flatten().sum()
+            };
             let end = room.saturating_sub(reserve);
             if end <= pos {
                 continue;
@@ -766,6 +782,12 @@ impl<P: Prioritizer> Connection<P> {
             }
             let packet = cx.packet;
             self.sent_frames[space.index()] = sent;
+            // The packet leaves its reserve and the room it did not use.
+            let left = room - end + w.remaining();
+            keep_joiners(&mut plan, space, left, |space| {
+                self.crypto_goes_first(space)
+            });
+            let last = plan[space.index() + 1..].iter().all(Option::is_none);
             let initial_here = space == Space::Initial;
             let needs_full = match side {
                 Side::Client => carries_initial || initial_here,
@@ -1081,6 +1103,33 @@ impl<P: Prioritizer> Connection<P> {
     }
 }
 
+/// Keeps, in order, the joiners of `plan` after the packet just built in `space` that fit in the
+/// `left` bytes after it and do not come ahead of CRYPTO data that a later datagram carries;
+/// `crypto` returns whether a space has CRYPTO data to send first.
+fn keep_joiners(
+    plan: &mut [Option<usize>; 3],
+    space: Space,
+    mut left: usize,
+    crypto: impl Fn(Space) -> bool,
+) {
+    if space == Space::Data {
+        return;
+    }
+    let mut behind = Space::ALL[..=space.index()]
+        .iter()
+        .any(|&earlier| crypto(earlier));
+    for later in Space::ALL.into_iter().filter(|&later| later > space) {
+        let joiner = &mut plan[later.index()];
+        match *joiner {
+            Some(need) if !behind && need <= left => left -= need,
+            _ => {
+                *joiner = None;
+                behind |= crypto(later);
+            }
+        }
+    }
+}
+
 /// Returns whether a datagram carrying `class` in `space` must reach 1,200 bytes: a client's
 /// datagram with any Initial packet, and an ack-eliciting Initial from either side (RFC 9000).
 fn full_size(side: Side, space: Space, class: Class) -> bool {
@@ -1146,6 +1195,49 @@ mod tests {
             pair.server.conn().sources.fills_without_room,
             0,
             "a source was offered a packet without room in it"
+        );
+    }
+
+    #[test]
+    fn a_joiner_never_comes_ahead_of_crypto_data_a_later_datagram_carries() {
+        let after = |space: Space, mut plan: [Option<usize>; 3], left: usize, crypto: &[Space]| {
+            keep_joiners(&mut plan, space, left, |space| crypto.contains(&space));
+            plan
+        };
+        let kept = |plan, left, crypto: &[Space]| after(Space::Initial, plan, left, crypto);
+        let plan = [Some(60), Some(50), Some(40)];
+        // The Initial packet took all its CRYPTO data and left room for both joiners.
+        assert_eq!(kept(plan, 90, &[Space::Handshake]), plan);
+        // CRYPTO data left in the Initial packet's space holds both back.
+        assert_eq!(
+            kept(plan, 90, &[Space::Initial, Space::Handshake]),
+            [Some(60), None, None]
+        );
+        // Room for the Handshake joiner only.
+        assert_eq!(
+            kept(plan, 89, &[Space::Handshake]),
+            [Some(60), Some(50), None]
+        );
+        // The 1-RTT joiner fits where the Handshake one does not, but the Handshake CRYPTO data
+        // goes in a later datagram, so it waits too; without that data it joins.
+        assert_eq!(kept(plan, 45, &[Space::Handshake]), [Some(60), None, None]);
+        assert_eq!(kept(plan, 45, &[]), [Some(60), None, Some(40)]);
+        // The same holds for a Handshake packet that was not planned.
+        let without_handshake = [Some(60), None, Some(40)];
+        assert_eq!(
+            kept(without_handshake, 90, &[Space::Handshake]),
+            [Some(60), None, None]
+        );
+        assert_eq!(kept(without_handshake, 90, &[]), without_handshake);
+        // And for Initial CRYPTO data left out of a datagram that a Handshake packet starts.
+        let from_handshake = [None, Some(50), Some(40)];
+        assert_eq!(
+            after(Space::Handshake, from_handshake, 90, &[Space::Initial]),
+            [None, Some(50), None]
+        );
+        assert_eq!(
+            after(Space::Handshake, from_handshake, 90, &[]),
+            from_handshake
         );
     }
 

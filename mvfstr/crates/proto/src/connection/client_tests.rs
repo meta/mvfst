@@ -1221,6 +1221,32 @@ fn accepted_0rtt_carries_a_request_before_the_handshake_completes() {
     assert_eq!(client.tls_info().map(|info| info.resumed), Some(true));
 }
 
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn a_client_hello_in_two_datagrams_takes_0rtt_data_in_the_first() {
+    // A post-quantum key share makes the ClientHello longer than one datagram.
+    let config = resumable(&Setup {
+        pq: true,
+        ..early_setup()
+    });
+    let (epoch, mut pair) = start(config);
+    let client = pair.client.conn_mut();
+    let id = client.open_stream(Dir::Bi, ORDER).unwrap();
+    send_all(client, id, 1_000);
+    let sent = transmit(client, epoch);
+    // The 0-RTT data joins the first datagram, ahead of the end of the ClientHello: a server can
+    // keep packets that arrive before their keys (RFC 9001).
+    assert_eq!(
+        packet_types(&sent[0]),
+        [PacketType::Initial, PacketType::ZeroRtt]
+    );
+    assert_eq!(
+        packet_types(&sent[1]).first(),
+        Some(&PacketType::Initial),
+        "the ClientHello goes on in the second datagram"
+    );
+}
+
 #[test]
 fn rejected_0rtt_discards_the_early_streams_and_numbering_starts_over() {
     let config = resumable(&with_ack_progress(early_setup()));

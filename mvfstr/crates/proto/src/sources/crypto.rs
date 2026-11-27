@@ -97,6 +97,14 @@ impl CryptoSource {
         self.send.has_lost()
     }
 
+    /// Returns whether CRYPTO bytes, lost or new, wait to be sent.
+    pub(crate) fn has_data(&self) -> bool {
+        matches!(
+            self.send.pending(u64::MAX),
+            Some(Pending::Retransmit | Pending::New { .. })
+        )
+    }
+
     /// Sends every byte sent and not yet acknowledged again, as a PTO probe in a handshake space
     /// carries data rather than only a PING (RFC 9002).
     pub(crate) fn resend_unacked(&mut self) {
