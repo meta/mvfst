@@ -597,12 +597,12 @@ fn connections_after_the_first_take_their_receive_pages_from_the_endpoints() {
     assert_eq!(
         allocated[1..],
         [0; 3],
-        "connections 2-4 take their STREAM and CRYPTO pages from the pages that connection 1 \
-         gave back: {allocated:?}"
+        "connections 2-4 take their CRYPTO pages from the pages that connection 1 gave back, \
+         and their requests and responses are copied without a page: {allocated:?}"
     );
     assert_eq!(
         allocated[0], 2,
-        "connection 1 allocates one page on each side, which its CRYPTO and STREAM data share"
+        "connection 1 allocates one page on each side, for its CRYPTO data alone"
     );
 }
 
@@ -630,14 +630,15 @@ fn rejected_0rtt() -> (Pair, u64) {
 #[test]
 fn a_client_whose_0rtt_was_rejected_takes_its_receive_pages_from_its_endpoint() {
     let (mut pair, _) = rejected_0rtt();
-    // Both sides' CRYPTO pages went back to their endpoints' pools during the handshake, so the
-    // request and the response take those pages.
+    // The request and the response each complete their stream in one short frame, so they are
+    // copied and take no page.
     let before = pages();
     exchange(&mut pair);
     assert_eq!(
         pages() - before,
         0,
-        "receive pages allocated for a request and its response after a rejected 0-RTT"
+        "receive pages allocated for a request and its response after a rejected 0-RTT: they \
+         are copied without a page"
     );
 }
 

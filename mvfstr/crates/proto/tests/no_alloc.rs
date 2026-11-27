@@ -11,11 +11,12 @@
 //! allocates on a steady path after a warm-up: bulk send with ACK processing, bulk receive with
 //! consume, DATAGRAM receive, and a loss and retransmit cycle, plus a forged Initial through route
 //! and accept. Stream censuses count what a receive buffer allocates for in-order read cycles and
-//! for a short request, and what a send buffer allocates for in-order ACKs. Key censuses count what
-//! one level's key set and one key update built from raw traffic secrets allocate. The census of a
-//! path that is already clean asserts 0, and the other censuses assert their count as an upper
-//! bound. A global allocator counts every allocation on each test's thread, and the binary holds
-//! only these tests.
+//! for a short request, whose bytes the application either drops or holds, and what a send buffer
+//! allocates for in-order ACKs. Key censuses count what one level's key set and one key update
+//! built from raw traffic secrets allocate. The census of a path that is already clean asserts 0,
+//! the short-request censuses pin their count, and the other censuses assert their count as an
+//! upper bound. A global allocator counts every allocation on each test's thread, and the binary
+//! holds only these tests.
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -812,17 +813,47 @@ fn short_request(request: &[u8], pool: &PagePool) -> usize {
 }
 
 #[test]
-fn census_a_short_request_with_its_fin_allocates_only_room_for_its_page() {
+fn census_a_short_request_with_its_fin_is_copied_without_a_page() {
     let request = &PAYLOAD[..200];
     let pool = PagePool::new();
-    // The first request's page goes back to the pool for the second.
-    short_request(request, &pool);
-    let allocations = short_request(request, &pool);
-    assert_eq!(pool.pages_allocated(), 1);
+    let allocations = [short_request(request, &pool), short_request(request, &pool)];
+    assert_eq!(
+        (pool.pages_allocated(), allocations),
+        (0, [1, 1]),
+        "(pages allocated, allocations of each request): each short request with its FIN \
+         allocates only its copy"
+    );
+}
+
+#[test]
+fn census_a_short_request_whose_bytes_the_app_holds_allocates_its_copy_and_one_share() {
+    let request = &PAYLOAD[..200];
+    let pool = PagePool::new();
+    // The application keeps slices of the readable segments past the consume, as an HTTP/3
+    // session keeps the frames it parsed until its next read. Its list has room beforehand.
+    let mut held: Vec<Bytes> = Vec::with_capacity(4);
+    let before = ALLOCATIONS.with(Cell::get);
+    let mut buf = RecvBuffer::new();
+    let got = buf
+        .insert(0, request, true, &pool)
+        .expect("a frame with the FIN");
+    assert!(got.complete);
+    held.extend(buf.readable().segments().map(|segment| segment.slice(0..)));
+    buf.consume(request.len(), &pool)
+        .expect("the request is consumed");
+    assert!(buf.is_finished());
+    drop(buf);
     assert!(
-        allocations <= 1,
-        "a short request with its FIN allocates only the page list's room for its page: \
-         {allocations}"
+        held.iter().flat_map(|slice| slice.iter()).eq(request),
+        "the held slices keep the request"
+    );
+    held.clear();
+    let allocations = ALLOCATIONS.with(Cell::get) - before;
+    assert_eq!(
+        (allocations, pool.pages_allocated()),
+        (2, 0),
+        "(allocations, pages allocated): a short request whose slices the application holds \
+         allocates its copy and the shared header of the copy's first slice"
     );
 }
 

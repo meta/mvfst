@@ -10,12 +10,13 @@
 //! A [`RecvBuffer`] reassembles one stream's STREAM data, or one encryption level's CRYPTO data.
 //! Payloads are copied into the stream's own 16 KiB pages, each covering a fixed, page-aligned span
 //! of stream offsets, so every byte is written at its offset's place in whatever order it arrives.
-//! In-order bytes are readable as slices of those pages in a `roxygen_bufqueue::BufQueue` until
-//! consumed; out-of-order bytes are held in at most [`MAX_RANGES`] disjoint ranges, each byte once
-//! whatever the duplicates and overlaps. Pages are never shared between streams, so unread bytes
-//! keep only their own stream's pages alive. A page goes back to the endpoint's [`PagePool`] once
-//! consumed, or once the buffer is empty and every slice of it has been dropped. Final sizes are
-//! checked as RFC 9000 requires; flow control is counted separately by
+//! A short frame that completes the stream of an empty buffer is copied to a buffer of its own
+//! instead. In-order bytes are readable as slices of those pages in a `roxygen_bufqueue::BufQueue`
+//! until consumed; out-of-order bytes are held in at most [`MAX_RANGES`] disjoint ranges, each byte
+//! once whatever the duplicates and overlaps. Pages are never shared between streams, so unread
+//! bytes keep only their own stream's pages alive. A page goes back to the endpoint's [`PagePool`]
+//! once consumed, or once the buffer is empty and every slice of it has been dropped. Final sizes
+//! are checked as RFC 9000 requires; flow control is counted separately by
 //! [`StreamRecvFlow`](crate::flow_control::StreamRecvFlow).
 
 use std::collections::VecDeque;
@@ -25,6 +26,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 
+use bytes::Bytes;
 use bytes::BytesMut;
 use mvfstr_wire::TransportErrorCode;
 use mvfstr_wire::VarInt;
@@ -42,6 +44,11 @@ const PAGE: u64 = PAGE_SIZE as u64;
 
 /// The most free pages a pool keeps, which the connections of an endpoint share.
 const POOL_PAGES: usize = 64;
+
+/// The most new bytes that [`RecvBuffer::insert`] copies to a buffer of their exact size, instead
+/// of a page, when they complete the stream of an empty buffer. Up to this size the copy costs
+/// less than the pool's lock and a 16 KiB page.
+const COPY_LIMIT: usize = 1024;
 
 /// The room for ranges that a buffer keeps once they empty: a container's first allocation, so a
 /// stream that fills and drains every read cycle does not allocate again.
@@ -173,6 +180,12 @@ pub struct RecvBuffer {
     /// The inserts that wrote and published in-order bytes without touching `pending`.
     #[cfg(test)]
     direct_inserts: usize,
+    /// The inserts that copied a short frame completing the stream, without a page.
+    #[cfg(test)]
+    copied_inserts: usize,
+    /// The copy limit, [`COPY_LIMIT`] unless a test sets it.
+    #[cfg(test)]
+    copy_limit: usize,
 }
 
 /// One page of a stream: it covers offsets `index * PAGE_SIZE..(index + 1) * PAGE_SIZE`.
@@ -206,12 +219,18 @@ impl RecvBuffer {
             oversized: false,
             #[cfg(test)]
             direct_inserts: 0,
+            #[cfg(test)]
+            copied_inserts: 0,
+            #[cfg(test)]
+            copy_limit: COPY_LIMIT,
         }
     }
 
     /// Takes the data of a STREAM or CRYPTO frame at `offset` (with the FIN if `fin`; CRYPTO
     /// frames never carry one). Bytes already held or consumed are dropped and the rest copied.
-    /// On error the buffer is unchanged and the connection closes with [`RecvError::code`].
+    /// A short frame that completes the stream of an empty buffer is copied to a buffer of its
+    /// exact size instead of a page. On error the buffer is unchanged and the connection closes
+    /// with [`RecvError::code`].
     pub fn insert(
         &mut self,
         offset: u64,
@@ -264,15 +283,26 @@ impl RecvBuffer {
             });
         }
         if at == readable_end && at < end && self.pending.is_empty() {
-            // After the publish the buffer holds unread bytes, its pages lie at or above the read
-            // offset and its empty ranges keep at most `KEPT_SLOTS` of room, so `release_pages`
-            // would not change anything.
+            // After the copy or the publish the buffer holds unread bytes, its pages lie at or
+            // above the read offset and its empty ranges keep at most `KEPT_SLOTS` of room, so
+            // `release_pages` would not change anything.
             let new = &data[(at - offset) as usize..];
-            Self::write(&mut self.pages, at, new, readable_end, pool);
-            self.publish(end);
-            #[cfg(test)]
-            {
-                self.direct_inserts += 1;
+            if fin && self.pages.is_empty() && new.len() <= self.copy_limit() {
+                self.readable
+                    .push_bytes(Bytes::copy_from_slice(new))
+                    .expect("the readable queue has no limit");
+                self.oversized |= self.readable.segment_count() > KEPT_SEGMENTS;
+                #[cfg(test)]
+                {
+                    self.copied_inserts += 1;
+                }
+            } else {
+                Self::write(&mut self.pages, at, new, readable_end, pool);
+                self.publish(end);
+                #[cfg(test)]
+                {
+                    self.direct_inserts += 1;
+                }
             }
             return Ok(Inserted {
                 readable: new.len(),
@@ -400,6 +430,22 @@ impl RecvBuffer {
     #[cfg(test)]
     pub(crate) fn held_pages(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Sets the copy limit; 0 sends every frame through the pages.
+    #[cfg(test)]
+    pub(crate) fn set_copy_limit(&mut self, limit: usize) {
+        self.copy_limit = limit;
+    }
+
+    #[cfg(not(test))]
+    fn copy_limit(&self) -> usize {
+        COPY_LIMIT
+    }
+
+    #[cfg(test)]
+    fn copy_limit(&self) -> usize {
+        self.copy_limit
     }
 
     /// Returns the offset after the last readable byte.
@@ -940,6 +986,8 @@ mod tests {
     fn a_stream_read_to_its_end_holds_no_pages() {
         let pool = PagePool::new();
         let mut buf = RecvBuffer::new();
+        // A frame that completes the stream takes a page only past the copy limit.
+        buf.set_copy_limit(0);
         buf.insert(0, b"abc", true, &pool).unwrap();
         buf.consume(3, &pool).unwrap();
         assert!(buf.is_finished());
@@ -1331,6 +1379,232 @@ mod tests {
             (1, 1),
             "only the frame before the stream was discarded goes directly"
         );
+    }
+
+    #[test]
+    fn a_short_frame_with_the_fin_is_copied_without_a_page() {
+        let frame: Vec<u8> = (0..200u8).collect();
+        let pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        let got = buf.insert(0, &frame, true, &pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 200,
+                complete: true
+            }
+        );
+        assert_eq!(readable(&buf), frame);
+        assert_eq!(
+            (
+                buf.held_pages(),
+                pool.locks(),
+                pool.pages_allocated(),
+                buf.copied_inserts
+            ),
+            (0, 0, 0, 1),
+            "(held pages, pool locks, pages allocated, copied inserts)"
+        );
+        buf.consume(200, &pool).unwrap();
+        assert!(buf.is_finished());
+        assert_eq!(pool.locks(), 0, "the consume does not take the pool's lock");
+    }
+
+    #[test]
+    fn a_frame_past_the_copy_limit_keeps_its_page() {
+        let frame = [7u8; 1025];
+        let pool = PagePool::new();
+        let mut at_limit = RecvBuffer::new();
+        at_limit.insert(0, &frame[..1024], true, &pool).unwrap();
+        let mut past = RecvBuffer::new();
+        let got = past.insert(0, &frame, true, &pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 1025,
+                complete: true
+            }
+        );
+        assert_eq!(readable(&past), frame);
+        assert_eq!(
+            [at_limit, past].map(|buf| (buf.held_pages(), buf.copied_inserts, buf.direct_inserts)),
+            [(0, 1, 0), (1, 0, 1)],
+            "(held pages, copied inserts, direct inserts): 1,024 bytes are copied, 1,025 take a page"
+        );
+        assert_eq!(pool.pages_allocated(), 1);
+    }
+
+    #[test]
+    fn fin_frames_that_meet_held_bytes_keep_the_page_path() {
+        let data: Vec<u8> = (0..200u8).collect();
+        let pool = PagePool::new();
+        let counts = |buf: &RecvBuffer| (buf.held_pages(), buf.direct_inserts, buf.copied_inserts);
+
+        // The FIN frame follows unread bytes, which are in a page.
+        let mut unread = RecvBuffer::new();
+        unread.insert(0, &data[..100], false, &pool).unwrap();
+        let got = unread.insert(100, &data[100..], true, &pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 100,
+                complete: true
+            }
+        );
+        assert_eq!(readable(&unread), data);
+        assert_eq!(counts(&unread), (1, 2, 0), "after unread bytes");
+
+        // The FIN frame arrives before the gap in front of it is filled.
+        let mut gap = RecvBuffer::new();
+        assert_eq!(
+            gap.insert(100, &data[100..], true, &pool),
+            Ok(Inserted::default())
+        );
+        let got = gap.insert(0, &data[..100], false, &pool).unwrap();
+        assert_eq!(
+            got,
+            Inserted {
+                readable: 200,
+                complete: true
+            }
+        );
+        assert_eq!(readable(&gap), data);
+        assert_eq!(counts(&gap), (1, 0, 0), "out of order");
+
+        // The FIN frame arrives after a stop, which drops it.
+        let mut stopped = RecvBuffer::new();
+        stopped.stop(&pool);
+        assert_eq!(
+            stopped.insert(0, &data, true, &pool),
+            Ok(Inserted {
+                readable: 0,
+                complete: true
+            })
+        );
+        assert!(stopped.readable().is_empty());
+        assert_eq!(counts(&stopped), (0, 0, 0), "after a stop");
+    }
+
+    /// One call on a buffer. `Insert(start, end, fin)` takes bytes `start..end` of the stream.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        Insert(u64, u64, bool),
+        Consume(usize),
+        Reset(u64),
+        Stop,
+    }
+
+    /// What a step returned.
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Insert(Result<Inserted, RecvError>),
+        Consume(Result<(), BeyondReadable>),
+        Reset(Result<(), RecvError>),
+        Stop,
+    }
+
+    /// What a step returned and the buffer's state after it.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        outcome: Outcome,
+        readable: Vec<u8>,
+        read_offset: u64,
+        buffered: usize,
+        complete: bool,
+        finished: bool,
+        final_size: Option<u64>,
+    }
+
+    /// Runs `steps` on a new buffer whose copy limit is `limit`. Returns what each step saw and
+    /// how many inserts were copied.
+    fn run_steps(limit: usize, steps: &[Step]) -> (Vec<Seen>, usize) {
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 7 % 251) as u8).collect();
+        let pool = PagePool::new();
+        let mut buf = RecvBuffer::new();
+        buf.set_copy_limit(limit);
+        let seen = steps
+            .iter()
+            .map(|&step| {
+                let outcome = match step {
+                    Step::Insert(start, end, fin) => Outcome::Insert(buf.insert(
+                        start,
+                        &data[start as usize..end as usize],
+                        fin,
+                        &pool,
+                    )),
+                    Step::Consume(n) => Outcome::Consume(buf.consume(n, &pool)),
+                    Step::Reset(size) => Outcome::Reset(buf.on_reset(size, &pool)),
+                    Step::Stop => {
+                        buf.stop(&pool);
+                        Outcome::Stop
+                    }
+                };
+                Seen {
+                    outcome,
+                    readable: readable(&buf),
+                    read_offset: buf.read_offset(),
+                    buffered: buf.buffered(),
+                    complete: buf.is_complete(),
+                    finished: buf.is_finished(),
+                    final_size: buf.final_size(),
+                }
+            })
+            .collect();
+        (seen, buf.copied_inserts)
+    }
+
+    #[test]
+    fn copied_and_paged_streams_read_alike() {
+        use Step::*;
+        let fin = Insert(0, 200, true);
+        let sequences: [&[Step]; 7] = [
+            // Partial and full consume, then one past the end.
+            &[fin, Consume(50), Consume(150), Consume(1)],
+            // A duplicate of the FIN frame, before and after the read.
+            &[fin, fin, Consume(200), fin],
+            // Overlapping retransmissions.
+            &[
+                fin,
+                Insert(50, 150, false),
+                Consume(100),
+                Insert(50, 200, true),
+                Consume(100),
+            ],
+            // Frames past the final size, and a FIN that moves it.
+            &[
+                fin,
+                Insert(150, 201, false),
+                Insert(200, 201, false),
+                Insert(0, 199, true),
+                Insert(200, 200, true),
+            ],
+            // RESET_STREAM with the final size, after a partial read.
+            &[
+                fin,
+                Consume(20),
+                Reset(200),
+                Reset(200),
+                Insert(0, 200, true),
+                Insert(0, 201, false),
+            ],
+            // RESET_STREAM with a different final size.
+            &[fin, Reset(201), Reset(199), Consume(200)],
+            // STOP_SENDING after a partial read.
+            &[
+                fin,
+                Consume(20),
+                Stop,
+                fin,
+                Insert(0, 201, false),
+                Reset(200),
+            ],
+        ];
+        for steps in sequences {
+            let (copied, copies) = run_steps(COPY_LIMIT, steps);
+            let (paged, paged_copies) = run_steps(0, steps);
+            assert_eq!((copies, paged_copies), (1, 0), "copied inserts: {steps:?}");
+            assert_eq!(copied, paged, "{steps:?}");
+        }
     }
 
     #[test]
