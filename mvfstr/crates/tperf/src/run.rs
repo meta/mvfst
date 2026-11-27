@@ -290,6 +290,7 @@ pub fn start_hosted_server_with<B: Backend>(
             setup.build_horizon,
             &caps,
             flags.initial_rtt_ms,
+            flags.release_hold,
         ),
         closed: setup.closed,
     })
@@ -372,7 +373,13 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
     Ok(RunningServer {
         _worker: worker,
         addr,
-        startup: startup_line(&transport, build_horizon, &caps, flags.initial_rtt_ms),
+        startup: startup_line(
+            &transport,
+            build_horizon,
+            &caps,
+            flags.initial_rtt_ms,
+            flags.release_hold,
+        ),
         closed,
         summary,
     })
@@ -397,7 +404,8 @@ fn run_client_with(
         ServerName::try_from(SERVER_NAME).map_err(|error| RunError::Start(error.to_string()))?;
     let duration_secs = flags.duration_secs;
     let conns = usize::try_from(flags.num_conns).unwrap_or(usize::MAX);
-    let object_size = (write_mode(flags) == WriteMode::Paced).then_some(flags.object_size);
+    let object_size =
+        matches!(write_mode(flags), WriteMode::Paced { .. }).then_some(flags.object_size);
     let worker = Worker::new(flags.host_loop)?;
     let (outcomes_tx, outcomes) = mpsc::channel();
     let (started_tx, started) = mpsc::channel();
@@ -496,10 +504,14 @@ fn spawn_server<B: Backend>(
 ) -> Result<(SocketAddr, TxCaps), String> {
     let driver = Driver::<B>::default();
     let budget = settings.work_budget;
+    let hold = settings.release_hold;
     let app = ServerApp::new(settings, Rc::clone(&driver));
     let mut builder = socket(EndpointDriver::<_, B>::builder(endpoint, app)).max_segments(segments);
     if let Some(slice) = budget {
         builder = builder.work_budget(WorkBudget::per_poll(slice));
+    }
+    if let Some(hold) = hold {
+        builder = builder.release_hold(hold);
     }
     let handle = spawn.spawn(builder).map_err(|error| error.to_string())?;
     let started = handle
@@ -602,7 +614,9 @@ fn resolve(flags: &Flags) -> Result<SocketAddr, RunError> {
 /// `--object_rate`.
 fn write_mode(flags: &Flags) -> WriteMode {
     if flags.object_rate > 0 {
-        WriteMode::Paced
+        WriteMode::Paced {
+            object_rate: flags.object_rate,
+        }
     } else {
         WriteMode::Saturate
     }
@@ -738,6 +752,7 @@ mod tests {
     use mvfstr_proto::AppCode;
     use mvfstr_proto::Bytes;
     use mvfstr_proto::ConnEvent;
+    use mvfstr_proto::ConnStats;
     use mvfstr_proto::StreamId;
     use mvfstr_proto::StreamReady;
 
@@ -1232,24 +1247,87 @@ mod tests {
             .parse()
             .unwrap();
         let asked: usize = 6_250_000 + 16 * 63_888;
-        assert!(
-            line.ends_with(&format!(" so_sndbuf={}", 2 * asked.min(wmem_max))),
+        let sndbuf = (2 * asked.min(wmem_max)).to_string();
+        assert_eq!(
+            line.split(' ')
+                .find_map(|field| field.strip_prefix("so_sndbuf=")),
+            Some(sndbuf.as_str()),
             "{line}"
+        );
+        assert!(
+            line.ends_with(" release_hold_us=0"),
+            "without a hold: {line}"
         );
     }
 
     #[test]
-    fn a_server_given_initial_rtt_ms_ends_its_startup_line_with_it() {
+    fn unpaced_kernel_release_with_a_horizon_gets_the_send_buffer_of_paced_kernel_release() {
+        let parse = |args: &[&str]| Flags::parse(args.iter().map(|arg| (*arg).to_owned())).unwrap();
+        let unpaced = parse(&["--txtime", "--build_horizon_us=5000"]);
+        let paced = parse(&["--pacing", "--txtime", "--build_horizon_us=5000"]);
+        assert!(backend_options(&unpaced).txtime);
+        assert_eq!(
+            backend_options(&unpaced),
+            backend_options(&paced),
+            "sized for the horizon whether or not the server paces"
+        );
+    }
+
+    /// Returns flags for a server on IPv4 loopback with unpaced kernel release and a 5 ms horizon,
+    /// which stamps its runs due at once, reporting closed connections.
+    fn unpaced_building_5_ms_ahead() -> Flags {
+        Flags {
+            txtime: true,
+            build_horizon_us: Some(5000),
+            stats: true,
+            ..loopback(Mode::Server, 0)
+        }
+    }
+
+    #[test]
+    fn a_hosted_server_given_a_release_hold_ends_its_startup_line_with_it() {
+        let held = Flags {
+            release_hold: Some(Duration::from_micros(50)),
+            ..unpaced_building_5_ms_ahead()
+        };
+        let worker = ManagedWorker::new(WORKER_COMMANDS).unwrap();
+        let (started_tx, started) = mpsc::channel();
+        worker
+            .handle()
+            .submit(move |context| {
+                let open = |addr, options: &MmsgOptions| {
+                    Ok((MmsgBackend::bind(addr, options)?, HostTimers::tokio()))
+                };
+                let hosted = start_hosted_server(context, &held, open)
+                    .map(|server| server.startup_line().to_owned())
+                    .map_err(|error| error.to_string());
+                let _ = started_tx.send(hosted);
+            })
+            .unwrap();
+        let line = started.recv().unwrap().unwrap();
+        assert!(
+            line.contains(" pacing=false ")
+                && line.contains(" txtime=true endpoint_horizon_us=5000 "),
+            "{line}"
+        );
+        assert!(line.ends_with(" release_hold_us=50"), "{line}");
+    }
+
+    #[test]
+    fn a_server_given_initial_rtt_ms_names_it_after_its_send_buffer() {
         let lowered = Flags {
             initial_rtt_ms: Some(100),
             ..loopback(Mode::Server, 0)
         };
+        // The release hold, off here, ends the line.
         let ends_with_the_initial_rtt = |line: &str| {
-            let (rest, last) = line.rsplit_once(' ').unwrap_or_default();
-            last == "initial_rtt_ms=100"
-                && rest
-                    .rsplit_once(' ')
-                    .is_some_and(|(_, sndbuf)| sndbuf.starts_with("so_sndbuf="))
+            let fields: Vec<&str> = line.split(' ').collect();
+            fields.ends_with(&["initial_rtt_ms=100", "release_hold_us=0"])
+                && fields
+                    .iter()
+                    .rev()
+                    .nth(2)
+                    .is_some_and(|sndbuf| sndbuf.starts_with("so_sndbuf="))
         };
         let server = start_server(&lowered).unwrap();
         assert!(
@@ -1323,7 +1401,7 @@ mod tests {
     ];
 
     /// The keys that a paced run adds to the client's summary line, in order.
-    const PACED_KEYS: [&str; 7] = [
+    const PACED_KEYS: [&str; 11] = [
         "objects",
         "bad_objects",
         "lat_us_p50",
@@ -1331,13 +1409,53 @@ mod tests {
         "lat_us_p99",
         "lat_us_p999",
         "lat_us_max",
+        "fanout_us_p50",
+        "fanout_us_p99",
+        "fanout_us_p999",
+        "fanout_incomplete",
     ];
 
     /// The keys of the server's summary line, in order: those of every mode, those that paced
     /// mode adds, and the driver's counters, which end the line in every mode.
     const SERVER_KEYS: [&str; 3] = ["stack", "mode", "conns"];
     const SERVER_PACED_KEYS: [&str; 3] = ["objects_sent", "objects_dropped", "late_ticks"];
-    const SERVER_DRIVER_KEYS: [&str; 2] = ["dropped_initials", "turns"];
+    const SERVER_DRIVER_KEYS: [&str; 16] = [
+        "dropped_initials",
+        "turns",
+        "sendmmsg_calls",
+        "sendmmsg_messages",
+        "multi_connection_calls",
+        "sent_datagrams",
+        "release_attempts",
+        "release_lateness",
+        "messages_per_call",
+        "hold_flushes_age",
+        "hold_flushes_stamp",
+        "hold_stop_flushes",
+        "hold_late",
+        "hold_blocked",
+        "hold_carried_flushes",
+        "pacing_wake_lateness",
+    ];
+
+    /// The release hold's counters in the server's summary line, which stay 0 without a hold.
+    const HOLD_KEYS: [&str; 6] = [
+        "hold_flushes_age",
+        "hold_flushes_stamp",
+        "hold_stop_flushes",
+        "hold_late",
+        "hold_blocked",
+        "hold_carried_flushes",
+    ];
+
+    /// Returns the keys of a saturate server summary line.
+    fn server_saturate_keys() -> Vec<&'static str> {
+        SERVER_KEYS
+            .iter()
+            .chain(&SERVER_DRIVER_KEYS)
+            .copied()
+            .collect()
+    }
 
     /// Returns the keys of a paced server summary line.
     fn server_paced_keys() -> Vec<&'static str> {
@@ -1375,6 +1493,19 @@ mod tests {
             value
                 .parse()
                 .unwrap_or_else(|_| panic!("{key}={value} is not a number in {}", self.line))
+        }
+
+        /// Returns the counts of a histogram, which the line lists in bucket order.
+        fn ints(&self, key: &str) -> Vec<u64> {
+            let value = self.get(key);
+            value
+                .split(',')
+                .map(|count| {
+                    count.parse().unwrap_or_else(|_| {
+                        panic!("{key}={value} is not a list of integers in {}", self.line)
+                    })
+                })
+                .collect()
         }
     }
 
@@ -1744,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn the_server_summary_line_ends_with_its_drivers_dropped_initials_and_turns() {
+    fn the_server_summary_line_has_its_drivers_dropped_initials_and_turns() {
         let server = start_server(&loopback(Mode::Server, 0)).unwrap();
         client_output(
             &server,
@@ -1937,12 +2068,20 @@ mod tests {
         .map(|key| summary.int(key));
         assert!(latencies[0] > 0, "{output}");
         assert!(latencies.is_sorted(), "{output}");
-        // Under `sanitized` the latency tail depends on how busy the host is.
+        let fanout =
+            ["fanout_us_p50", "fanout_us_p99", "fanout_us_p999"].map(|key| summary.int(key));
+        assert!(fanout[0] > 0 && fanout.is_sorted(), "{output}");
+        // Under `sanitized` the latency tails and the stream windows' edges depend on how busy
+        // the host is.
         if !cfg!(sanitized) {
             assert!(
                 latencies[3] < 50_000,
                 "p99.9 under 50 ms on idle loopback: {output}"
             );
+            assert!(fanout[2] < 50_000, "{output}");
+            // Only ticks sent before every connection's window opened or after the first one
+            // closed miss a stream: a few at each end of the 100.
+            assert!(summary.int("fanout_incomplete") <= 20, "{output}");
         }
 
         let line = server.summary_line();
@@ -1996,6 +2135,45 @@ mod tests {
             "one object per stream: {output}"
         );
         assert_eq!(summary.int("bad_objects"), 0, "{output}");
+    }
+
+    #[test]
+    fn the_clients_summary_counts_the_ticks_of_its_object_rate_until_its_window_closed() {
+        // At 100 ticks a second, 10 ms apart, the one stream received ticks 0 and 2, and its
+        // window closed 5 ms after tick 3 started.
+        let tick = |k: u64| 9_000_000_000 + k * 10_000_000;
+        let flags = Flags {
+            mode: Mode::Client,
+            duration_secs: 1,
+            object_rate: 100,
+            object_size: 1200,
+            ..Flags::default()
+        };
+        let mut reports = [ConnReport {
+            index: 0,
+            measurement: Measurement {
+                bytes: 2400,
+                duration_secs: 1,
+                streams: 1,
+            },
+            received: ConnTally {
+                stream_bytes: vec![2400],
+                latencies_us: vec![300, 400],
+                tick_latencies_us: vec![(tick(0), 300), (tick(2), 400)],
+                bad_objects: 0,
+                window_end_ns: tick(3) + 5_000_000,
+            },
+            stats: ConnStats::default(),
+        }];
+        let mut out = Vec::new();
+        write_results(&mut out, &flags, &mut reports).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert_eq!(
+            summary.int("fanout_incomplete"),
+            2,
+            "ticks 1 and 3 never reached the stream: {output}"
+        );
     }
 
     #[test]
@@ -2129,5 +2307,177 @@ mod tests {
             "rolling over loses no object: {output}"
         );
         assert!(summary.float("mbps") > 0.0, "{output}");
+    }
+
+    #[test]
+    fn one_paced_connection_of_one_stream_completes_each_tick_with_its_one_object() {
+        let paced = |mode| Flags {
+            object_rate: 50,
+            ..loopback(mode, 0)
+        };
+        let server = start_server(&paced(Mode::Server)).unwrap();
+        let output = client_output(
+            &server,
+            Flags {
+                duration_secs: 1,
+                ..paced(Mode::Client)
+            },
+        );
+        let summary = read_summary(&output, "tperf_summary", &paced_keys());
+        assert!(summary.int("objects") >= 40, "{output}");
+        assert!(
+            summary.int("fanout_incomplete") <= 1,
+            "every tick until the window closed reached the one stream, but for one sent as it \
+             closed: {output}"
+        );
+        for percentile in ["p50", "p99", "p999"] {
+            assert_eq!(
+                summary.int(&format!("fanout_us_{percentile}")),
+                summary.int(&format!("lat_us_{percentile}")),
+                "a tick completes with its one object: {output}"
+            );
+        }
+    }
+
+    /// Runs a one-second client against `server`, which reports closed connections, and returns
+    /// the connection the server closed and the server's summary line after the close.
+    fn after_one_close(server: &RunningServer) -> (Closed, String) {
+        client_output(
+            server,
+            Flags {
+                duration_secs: 1,
+                ..loopback(Mode::Client, 0)
+            },
+        );
+        let closed = server
+            .closed_connections()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server closes the connection");
+        (closed, server.summary_line())
+    }
+
+    #[test]
+    fn a_server_without_kernel_release_reports_its_send_calls_and_no_release_or_hold_counts() {
+        let server = start_server(&Flags {
+            stats: true,
+            ..loopback(Mode::Server, 0)
+        })
+        .unwrap();
+        let (_, line) = after_one_close(&server);
+        let served = read_summary(&line, "tperf_server_summary", &server_saturate_keys());
+        let calls = served.int("sendmmsg_calls");
+        let messages = served.int("sendmmsg_messages");
+        let per_call = served.ints("messages_per_call");
+        assert_eq!(per_call.len(), 8, "{line}");
+        let counted: u64 = per_call.iter().sum();
+        assert!(
+            0 < counted && counted <= calls,
+            "calls that sent a message count once: {line}"
+        );
+        assert!(
+            counted <= messages && messages <= served.int("sent_datagrams"),
+            "{line}"
+        );
+        assert_eq!(
+            served.int("multi_connection_calls"),
+            0,
+            "one connection: {line}"
+        );
+        assert_eq!(served.ints("release_attempts"), [0; 4], "{line}");
+        assert_eq!(served.ints("release_lateness"), [0; 8], "{line}");
+        assert_eq!(
+            served.ints("pacing_wake_lateness"),
+            [0; 8],
+            "unpaced: {line}"
+        );
+        for key in HOLD_KEYS {
+            assert_eq!(served.int(key), 0, "{key}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_release_hold_reaches_the_server_driver_and_its_counters_stay_zero_without_one() {
+        let off = start_server(&unpaced_building_5_ms_ahead()).unwrap();
+        assert!(
+            off.startup_line().ends_with(" release_hold_us=0"),
+            "{}",
+            off.startup_line()
+        );
+        let (_, line) = after_one_close(&off);
+        let served = read_summary(&line, "tperf_server_summary", &server_saturate_keys());
+        for key in HOLD_KEYS {
+            assert_eq!(served.int(key), 0, "{key} without a hold: {line}");
+        }
+        // Attempts by what they built: nothing, runs due at once, runs released later, both.
+        let attempts = served.ints("release_attempts");
+        assert!(attempts[1] > 0, "unpaced runs are due at once: {line}");
+        assert_eq!(attempts[2..], [0, 0], "and never released later: {line}");
+        assert!(
+            served.ints("release_lateness").iter().sum::<u64>() > 0,
+            "stamped runs reach the kernel: {line}"
+        );
+        assert!(
+            served.ints("messages_per_call").iter().sum::<u64>() > 0,
+            "{line}"
+        );
+
+        let held = start_server(&Flags {
+            release_hold: Some(Duration::MAX),
+            ..unpaced_building_5_ms_ahead()
+        })
+        .unwrap();
+        assert!(
+            held.startup_line().ends_with(" release_hold_us=max"),
+            "{}",
+            held.startup_line()
+        );
+        let (_, line) = after_one_close(&held);
+        let served = read_summary(&line, "tperf_server_summary", &server_saturate_keys());
+        assert!(
+            served.int("hold_stop_flushes") > 0,
+            "held runs go out once an attempt fills its batch: {line}"
+        );
+        // Without an age bound or a run released later the hold sets no bound, and every
+        // connection builds ahead.
+        for key in [
+            "hold_flushes_age",
+            "hold_flushes_stamp",
+            "hold_late",
+            "hold_blocked",
+            "hold_carried_flushes",
+        ] {
+            assert_eq!(served.int(key), 0, "{key}: {line}");
+        }
+        assert!(served.ints("release_attempts")[1] > 0, "{line}");
+    }
+
+    #[test]
+    fn a_paced_servers_summary_has_the_pacing_wakes_of_its_last_close_by_lateness() {
+        let server = start_server(&Flags {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            stats: true,
+            ..building_5_ms_ahead()
+        })
+        .unwrap();
+        let (closed, line) = after_one_close(&server);
+        let served = read_summary(&line, "tperf_server_summary", &server_saturate_keys());
+        assert_eq!(
+            served.ints("pacing_wake_lateness").iter().sum::<u64>(),
+            closed.phase_pacing_wakes,
+            "the wakes that the closed connection's line counts: {line}"
+        );
+        assert_eq!(
+            served.int("dropped_initials"),
+            closed.dropped_initials,
+            "{line}"
+        );
+        assert!(
+            served.ints("release_attempts").iter().sum::<u64>() > 0,
+            "{line}"
+        );
+        for key in HOLD_KEYS {
+            assert_eq!(served.int(key), 0, "{key} without a hold: {line}");
+        }
     }
 }

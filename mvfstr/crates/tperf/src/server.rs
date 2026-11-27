@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -100,6 +102,8 @@ pub(crate) struct Settings {
     closed: mpsc::Sender<Closed>,
     /// The driver's work budget per poll, from `--work_budget_us`.
     pub(crate) work_budget: Option<Duration>,
+    /// The driver's release hold, from `--release_hold_us`.
+    pub(crate) release_hold: Option<Duration>,
     /// The rustls config of each connection's TLS host under `--tls_backend=external`.
     host_tls: Option<Arc<rustls::ServerConfig>>,
     /// What the server has done, for its summary line.
@@ -129,6 +133,7 @@ impl Settings {
             closed,
             work_budget: (flags.work_budget_us > 0)
                 .then(|| Duration::from_micros(u64::from(flags.work_budget_us))),
+            release_hold: flags.release_hold,
             host_tls,
             counters: Arc::default(),
             object_rate: flags.object_rate,
@@ -699,7 +704,7 @@ impl Stripe {
 }
 
 /// Nanoseconds per second.
-const NANOS_PER_SEC: u128 = 1_000_000_000;
+pub(crate) const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// When paced mode's ticks start, for every connection of a server: tick `k` starts `k / rate`
 /// seconds after the epoch.
@@ -754,17 +759,34 @@ pub(crate) struct ServerCounters {
     objects_sent: AtomicU64,
     objects_dropped: AtomicU64,
     late_ticks: AtomicU64,
-    /// The driver's counters, copied on each accept and close.
-    dropped_initials: AtomicU64,
-    turns: AtomicU64,
+    /// The driver's counters in the summary's fields of the same names, copied whole on each
+    /// accept and close; the server's own fields stay 0 there.
+    driver: Mutex<ServerTally>,
 }
 
 impl ServerCounters {
     /// Copies the driver's counters that the summary line reports.
     fn copy_driver(&self, stats: &EndpointStats) {
-        self.dropped_initials
-            .store(stats.dropped_initials, Ordering::Relaxed);
-        self.turns.store(stats.turns, Ordering::Relaxed);
+        let copy = ServerTally {
+            dropped_initials: stats.dropped_initials,
+            turns: stats.turns,
+            sendmmsg_calls: stats.sendmmsg_calls,
+            sendmmsg_messages: stats.sendmmsg_messages,
+            multi_connection_calls: stats.multi_connection_calls,
+            sent_datagrams: stats.sent_datagrams,
+            release_attempts: stats.release_attempts,
+            release_lateness: stats.release_lateness,
+            messages_per_call: stats.messages_per_call,
+            hold_flushes_age: stats.hold_flushes_age,
+            hold_flushes_stamp: stats.hold_flushes_stamp,
+            hold_stop_flushes: stats.hold_stop_flushes,
+            hold_late: stats.hold_late,
+            hold_blocked: stats.hold_blocked,
+            hold_carried_flushes: stats.hold_carried_flushes,
+            pacing_wake_lateness: stats.pacing_wake_lateness,
+            ..ServerTally::default()
+        };
+        *self.driver.lock().unwrap_or_else(PoisonError::into_inner) = copy;
     }
 
     /// Returns the counts so far.
@@ -774,8 +796,7 @@ impl ServerCounters {
             objects_sent: self.objects_sent.load(Ordering::Relaxed),
             objects_dropped: self.objects_dropped.load(Ordering::Relaxed),
             late_ticks: self.late_ticks.load(Ordering::Relaxed),
-            dropped_initials: self.dropped_initials.load(Ordering::Relaxed),
-            turns: self.turns.load(Ordering::Relaxed),
+            ..*self.driver.lock().unwrap_or_else(PoisonError::into_inner)
         }
     }
 }
@@ -852,6 +873,35 @@ mod tests {
         );
         assert_eq!(
             Settings::new(&Flags::default(), closed, None).work_budget,
+            None
+        );
+    }
+
+    #[test]
+    fn the_release_hold_flag_gives_the_driver_its_hold_and_max_no_bound() {
+        let (closed, _) = mpsc::channel();
+        let hold = |release_hold| {
+            let flags = Flags {
+                pacing: true,
+                txtime: true,
+                build_horizon_us: Some(5000),
+                release_hold,
+                ..Flags::default()
+            };
+            Settings::new(&flags, closed.clone(), None).release_hold
+        };
+        assert_eq!(
+            hold(Some(Duration::from_micros(50))),
+            Some(Duration::from_micros(50))
+        );
+        assert_eq!(
+            hold(Some(Duration::MAX)),
+            Some(Duration::MAX),
+            "no bound on the wait of runs due at once"
+        );
+        assert_eq!(hold(None), None, "off");
+        assert_eq!(
+            Settings::new(&Flags::default(), closed, None).release_hold,
             None
         );
     }
@@ -962,6 +1012,52 @@ mod tests {
             ServerTally {
                 dropped_initials: 811,
                 turns: 60_001,
+                ..ServerTally::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_summary_reads_the_drivers_send_path_counters_as_last_copied() {
+        // Every counter takes its own value, so a counter copied into another's place shows.
+        let stats = |base: u64| {
+            let mut stats = EndpointStats::default();
+            stats.sendmmsg_calls = base + 1;
+            stats.sendmmsg_messages = base + 2;
+            stats.multi_connection_calls = base + 3;
+            stats.sent_datagrams = base + 4;
+            stats.release_attempts = std::array::from_fn(|bucket| base + 5 + bucket as u64);
+            stats.release_lateness = std::array::from_fn(|bucket| base + 10 + bucket as u64);
+            stats.messages_per_call = std::array::from_fn(|bucket| base + 20 + bucket as u64);
+            stats.hold_flushes_age = base + 30;
+            stats.hold_flushes_stamp = base + 31;
+            stats.hold_stop_flushes = base + 32;
+            stats.hold_late = base + 33;
+            stats.hold_blocked = base + 34;
+            stats.hold_carried_flushes = base + 35;
+            stats.pacing_wake_lateness = std::array::from_fn(|bucket| base + 40 + bucket as u64);
+            stats
+        };
+        let counters = ServerCounters::default();
+        counters.copy_driver(&stats(1000));
+        counters.copy_driver(&stats(2000));
+        assert_eq!(
+            counters.tally(),
+            ServerTally {
+                sendmmsg_calls: 2001,
+                sendmmsg_messages: 2002,
+                multi_connection_calls: 2003,
+                sent_datagrams: 2004,
+                release_attempts: [2005, 2006, 2007, 2008],
+                release_lateness: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017],
+                messages_per_call: [2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027],
+                hold_flushes_age: 2030,
+                hold_flushes_stamp: 2031,
+                hold_stop_flushes: 2032,
+                hold_late: 2033,
+                hold_blocked: 2034,
+                hold_carried_flushes: 2035,
+                pacing_wake_lateness: [2040, 2041, 2042, 2043, 2044, 2045, 2046, 2047],
                 ..ServerTally::default()
             }
         );

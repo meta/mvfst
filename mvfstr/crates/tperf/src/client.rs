@@ -117,12 +117,22 @@ impl ClientSession {
         }
         self.reported = true;
         conn.close(now, AppCode::from_u32(0), Bytes::new());
-        let _ = self.outcomes.send(Outcome::Measured(ConnReport {
+        let report = self.report(conn.stats());
+        let _ = self.outcomes.send(Outcome::Measured(report));
+    }
+
+    /// Returns what the connection measured and received, with its counters `stats`, and moves
+    /// the latencies out.
+    fn report(&mut self, stats: ConnStats) -> ConnReport {
+        ConnReport {
             index: self.index,
             measurement: self.meter.measurement(),
-            received: self.streams.received(),
-            stats: conn.stats(),
-        }));
+            received: ConnTally {
+                window_end_ns: self.meter.end_ns(),
+                ..self.streams.received()
+            },
+            stats,
+        }
     }
 }
 
@@ -225,6 +235,23 @@ impl Meter {
         self.deadline
     }
 
+    /// Returns when the window closes on the host's CLOCK_MONOTONIC, in ns, the clock of the
+    /// objects' send times; 0 before it opens.
+    pub(crate) fn end_ns(&self) -> u64 {
+        let Some(deadline) = self.deadline else {
+            return 0;
+        };
+        // `Instant` reads the same clock on Linux but does not expose its value, so this pairs
+        // a reading of each.
+        let now = Instant::now();
+        let now_ns = monotonic_ns();
+        let nanos = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        match deadline.checked_duration_since(now) {
+            Some(ahead) => now_ns.saturating_add(nanos(ahead)),
+            None => now_ns.saturating_sub(nanos(now.duration_since(deadline))),
+        }
+    }
+
     /// Returns whether the window has closed by `now`.
     pub(crate) fn is_over(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| now >= deadline)
@@ -247,8 +274,9 @@ struct Streams {
     object_size: Option<u32>,
     /// Each stream by its index among the server's unidirectional streams.
     streams: Vec<StreamTally>,
-    /// The latency of each object completed in the window, in µs.
-    latencies_us: Vec<u64>,
+    /// The tick of each object completed in the window, named by the send time in its header in
+    /// ns, with the object's latency in µs.
+    tick_latencies_us: Vec<(u64, u64)>,
     /// The bad objects found in the window: of another length than `object_size`, or that their
     /// stream's FIN cut short.
     bad_objects: u64,
@@ -293,7 +321,7 @@ impl Streams {
         Self {
             object_size,
             streams: Vec::new(),
-            latencies_us: Vec::new(),
+            tick_latencies_us: Vec::new(),
             bad_objects: 0,
         }
     }
@@ -323,8 +351,8 @@ impl Streams {
                 match found {
                     Found::Object(header) => {
                         let now = *now_ns.get_or_insert_with(monotonic_ns);
-                        self.latencies_us
-                            .push(now.saturating_sub(header.sent_ns) / 1000);
+                        let latency_us = now.saturating_sub(header.sent_ns) / 1000;
+                        self.tick_latencies_us.push((header.sent_ns, latency_us));
                     }
                     Found::Bad => self.bad_objects += 1,
                 }
@@ -348,6 +376,7 @@ impl Streams {
 
     /// Returns what the streams that arrived received, and moves the latencies out.
     fn received(&mut self) -> ConnTally {
+        let tick_latencies_us = mem::take(&mut self.tick_latencies_us);
         ConnTally {
             stream_bytes: self
                 .streams
@@ -355,8 +384,13 @@ impl Streams {
                 .filter(|stream| stream.arrived)
                 .map(|stream| stream.bytes)
                 .collect(),
-            latencies_us: mem::take(&mut self.latencies_us),
+            latencies_us: tick_latencies_us
+                .iter()
+                .map(|&(_, latency)| latency)
+                .collect(),
+            tick_latencies_us,
             bad_objects: self.bad_objects,
+            window_end_ns: 0,
         }
     }
 }
@@ -465,6 +499,56 @@ mod tests {
         );
     }
 
+    /// Returns an object of `len` bytes, at least a header, made on the tick that started at
+    /// `sent_ns`.
+    fn object_of_tick(len: u32, sent_ns: u64) -> Vec<u8> {
+        let mut bytes = ObjectHeader {
+            len,
+            seq: 0,
+            sent_ns,
+        }
+        .encode()
+        .to_vec();
+        bytes.resize(len as usize, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_paced_stream_keeps_the_tick_of_each_counted_object_with_its_latency() {
+        let mut streams = Streams::new(Some(1200));
+        streams.opened(id(0));
+        let two = [object_of_tick(1200, 10), object_of_tick(1200, 20)].concat();
+        streams.read(id(0), &readable(&two[..1800]), true);
+        streams.opened(id(1));
+        streams.read(id(1), &readable(&object_of_tick(1200, 10)), true);
+        streams.read(id(0), &readable(&two[1800..]), true);
+        // Neither an object outside the window nor a bad one names a tick.
+        streams.opened(id(2));
+        streams.read(id(2), &readable(&object_of_tick(1200, 30)), false);
+        streams.opened(id(3));
+        streams.read(id(3), &readable(&object_of_tick(1000, 40)), true);
+        let tally = streams.received();
+        assert_eq!(
+            tally
+                .tick_latencies_us
+                .iter()
+                .map(|&(tick, _)| tick)
+                .collect::<Vec<_>>(),
+            [10, 10, 20],
+            "the send times in the headers, as the objects completed"
+        );
+        assert_eq!(
+            tally
+                .tick_latencies_us
+                .iter()
+                .map(|&(_, latency)| latency)
+                .collect::<Vec<_>>(),
+            tally.latencies_us,
+            "each object's latency"
+        );
+        assert_eq!(tally.bad_objects, 1);
+    }
+
     #[test]
     fn a_paced_stream_whose_fin_comes_inside_an_object_counts_that_object_as_bad() {
         let mut streams = Streams::new(Some(1200));
@@ -520,6 +604,56 @@ mod tests {
                 duration_secs: 2,
                 streams: 2,
             }
+        );
+    }
+
+    #[test]
+    fn the_window_closes_on_the_clock_of_the_objects_send_times() {
+        assert_eq!(Meter::new(2).end_ns(), 0, "not opened");
+        let before = monotonic_ns();
+        let mut ahead = Meter::new(2);
+        ahead.stream_opened(Instant::now());
+        let mut past = Meter::new(0);
+        past.stream_opened(Instant::now());
+        let (ahead_end, past_end) = (ahead.end_ns(), past.end_ns());
+        let after = monotonic_ns();
+        assert!(
+            before + 2_000_000_000 <= ahead_end && ahead_end <= after + 2_000_000_000,
+            "2 s after it opened: {before} + 2 s <= {ahead_end} <= {after} + 2 s"
+        );
+        assert!(
+            before <= past_end && past_end <= after,
+            "as it opened, which has passed: {before} <= {past_end} <= {after}"
+        );
+    }
+
+    #[test]
+    fn a_connections_report_says_when_its_window_closed() {
+        let (outcomes, _) = mpsc::channel();
+        let mut session = ClientSession::new(3, 0, Some(1200), outcomes);
+        assert_eq!(
+            session.report(ConnStats::default()).received.window_end_ns,
+            0,
+            "no window opened"
+        );
+        let before = monotonic_ns();
+        session.meter.stream_opened(Instant::now());
+        session.streams.opened(id(0));
+        session
+            .streams
+            .read(id(0), &readable(&object_of_tick(1200, 10)), true);
+        let report = session.report(ConnStats::default());
+        let after = monotonic_ns();
+        let end = report.received.window_end_ns;
+        assert!(
+            before <= end && end <= after,
+            "its window of 0 s closed as it opened: {before} <= {end} <= {after}"
+        );
+        assert_eq!(report.index, 3);
+        assert_eq!(
+            report.received.tick_latencies_us.len(),
+            1,
+            "with what its streams received"
         );
     }
 }

@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use mvfstr_proto::CongestionControl;
 use mvfstr_proto::recovery::RecoveryConfig;
@@ -119,6 +120,10 @@ pub struct Flags {
     /// This side's initial RTT in milliseconds, from 1 to an hour: the RTT assumed before the first
     /// sample. Without it the transport's default applies.
     pub(crate) initial_rtt_ms: Option<u32>,
+    /// With `--txtime` and a build horizon, how long the server socket may hold a run that is due
+    /// at once, so that one flush hands the kernel the runs of many connections; `Duration::MAX`
+    /// sets no bound. `None` turns the hold off.
+    pub(crate) release_hold: Option<Duration>,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -166,6 +171,7 @@ impl Default for Flags {
             object_rate: 0,
             object_size: OBJECT_SIZE,
             initial_rtt_ms: None,
+            release_hold: None,
         }
     }
 }
@@ -200,8 +206,9 @@ impl Flags {
             }
         }
         // Only the server opens and ends streams, as in mvfst tperf, and only it takes
-        // `--tls_backend`. The client takes `--num_streams`, `--object_rate` and `--object_size`
-        // too, with the server's values, to read what it receives and label its summary line.
+        // `--tls_backend`, and a release hold, since the client never builds ahead. The client
+        // takes `--num_streams`, `--object_rate` and `--object_size` too, with the server's
+        // values, to read what it receives and label its summary line.
         if flags.mode == Mode::Client {
             if flags.bytes_per_stream != 0 {
                 return Err(FlagError::ServerOnly("bytes_per_stream"));
@@ -212,12 +219,16 @@ impl Flags {
             if flags.tls_backend != TlsBackend::Inline {
                 return Err(FlagError::ServerOnly("tls_backend"));
             }
+            if flags.release_hold.is_some() {
+                return Err(FlagError::ServerOnly("release_hold_us"));
+            }
         } else if flags.num_conns != 1 {
             return Err(FlagError::ClientOnly("num_conns"));
         }
         if flags.congestion == CongestionControl::Bbr3 && !flags.pacing {
             return Err(FlagError::Bbr3NeedsPacing);
         }
+        let horizon_us = flags.build_horizon_us.unwrap_or(0);
         if !flags.pacing {
             if flags.pacing_granularity_us.is_some() {
                 return Err(FlagError::NeedsPacing("pacing_granularity_us"));
@@ -225,7 +236,8 @@ impl Flags {
             if flags.pacing_min_burst.is_some() {
                 return Err(FlagError::NeedsPacing("pacing_min_burst"));
             }
-            if flags.txtime {
+            // With a horizon an unpaced connection stamps its runs, due at once.
+            if flags.txtime && horizon_us == 0 {
                 return Err(FlagError::TxtimeNeedsPacing);
             }
         }
@@ -239,6 +251,21 @@ impl Flags {
                 writes_per_loop: flags.writes_per_loop,
                 min_burst,
             });
+        }
+        if let Some(hold) = flags.release_hold {
+            if !flags.txtime {
+                return Err(FlagError::ReleaseHoldNeedsTxtime);
+            }
+            if horizon_us == 0 {
+                return Err(FlagError::ReleaseHoldNeedsHorizon);
+            }
+            // `max` sets no bound, so the horizon cannot cap it.
+            if hold != Duration::MAX && hold >= Duration::from_micros(u64::from(horizon_us)) {
+                return Err(FlagError::ReleaseHoldNotBelowHorizon {
+                    release_hold_us: u32::try_from(hold.as_micros()).unwrap_or(u32::MAX),
+                    build_horizon_us: horizon_us,
+                });
+            }
         }
         Ok(flags)
     }
@@ -340,6 +367,15 @@ impl Flags {
                         .ok_or_else(bad)?,
                 )
             }
+            // 0 turns the hold off, as `--work_budget_us=0` does, and `max` sets no bound.
+            "release_hold_us" => {
+                self.release_hold = if value == "max" {
+                    Some(Duration::MAX)
+                } else {
+                    let us: u32 = value.parse().map_err(|_| bad())?;
+                    (us > 0).then(|| Duration::from_micros(u64::from(us)))
+                }
+            }
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -365,7 +401,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 26] = [
+const VALUE_FLAGS: [&str; 27] = [
     "mode",
     "host",
     "port",
@@ -390,6 +426,7 @@ const VALUE_FLAGS: [&str; 26] = [
     "object_rate",
     "object_size",
     "initial_rtt_ms",
+    "release_hold_us",
     "minloglevel",
     "v",
 ];
@@ -427,8 +464,19 @@ pub enum FlagError {
     NeedsPacing(&'static str),
     /// `--build_horizon_us` was set without `--txtime`.
     BuildHorizonNeedsTxtime,
-    /// `--txtime` was set without `--pacing`.
+    /// `--txtime` was set without `--pacing` or a `--build_horizon_us` above 0.
     TxtimeNeedsPacing,
+    /// `--release_hold_us` was set without `--txtime`.
+    ReleaseHoldNeedsTxtime,
+    /// `--release_hold_us` was set without a `--build_horizon_us` above 0.
+    ReleaseHoldNeedsHorizon,
+    /// `--release_hold_us` is not below `--build_horizon_us`.
+    ReleaseHoldNotBelowHorizon {
+        /// `--release_hold_us`.
+        release_hold_us: u32,
+        /// `--build_horizon_us`.
+        build_horizon_us: u32,
+    },
     /// With `--pacing`, `--writes_per_loop`, the maximum burst, is below the minimum burst.
     BatchBelowMinimumBurst {
         /// `--writes_per_loop`.
@@ -463,8 +511,9 @@ impl fmt::Display for FlagError {
             Self::NeedsPacing(flag) => write!(f, "--{flag} needs --pacing"),
             Self::TxtimeNeedsPacing => write!(
                 f,
-                "--txtime needs --pacing: an unpaced connection has no release times, so kernel \
-                 release would only add a qdisc hop and a larger max_ack_delay"
+                "--txtime needs --pacing or --build_horizon_us above 0: an unpaced connection that \
+                 does not build ahead has no release times, so kernel release would only add a \
+                 qdisc hop and a larger max_ack_delay"
             ),
             Self::BuildHorizonNeedsTxtime => write!(
                 f,
@@ -482,6 +531,23 @@ impl fmt::Display for FlagError {
             Self::BadValue { flag, value } => {
                 write!(f, "illegal value '{value}' specified for flag '{flag}'")
             }
+            Self::ReleaseHoldNeedsTxtime => write!(
+                f,
+                "--release_hold_us needs --txtime: only a socket with kernel release holds runs"
+            ),
+            Self::ReleaseHoldNeedsHorizon => write!(
+                f,
+                "--release_hold_us needs --build_horizon_us above 0: only the runs of connections \
+                 that build ahead are held"
+            ),
+            Self::ReleaseHoldNotBelowHorizon {
+                release_hold_us,
+                build_horizon_us,
+            } => write!(
+                f,
+                "--release_hold_us={release_hold_us} is not below \
+                 --build_horizon_us={build_horizon_us}; --release_hold_us=max sets no bound"
+            ),
         }
     }
 }
@@ -530,6 +596,7 @@ mod tests {
             object_rate: 0,
             object_size: 1200,
             initial_rtt_ms: None,
+            release_hold: None,
         };
         assert_eq!(flags, expected);
     }
@@ -597,6 +664,7 @@ mod tests {
                 object_rate: 0,
                 object_size: 1200,
                 initial_rtt_ms: Some(100),
+                release_hold: None,
             }
         );
         let server = parse(&[
@@ -807,16 +875,78 @@ mod tests {
     }
 
     #[test]
-    fn txtime_without_pacing_is_refused() {
+    fn txtime_without_pacing_is_refused_without_a_build_horizon_above_zero() {
         for args in [
             &["--txtime"][..],
             &["--txtime", "--nopacing"],
-            &["--txtime", "--build_horizon_us=5000"],
+            &["--txtime", "--build_horizon_us=0"],
+            &["--mode=client", "--txtime"],
         ] {
             assert_eq!(parse(args), Err(FlagError::TxtimeNeedsPacing), "{args:?}");
         }
         let message = FlagError::TxtimeNeedsPacing.to_string();
-        assert!(message.contains("--pacing"), "{message}");
+        assert!(
+            message.contains("--txtime needs --pacing or --build_horizon_us above 0"),
+            "the horizon is the alternative: {message}"
+        );
+    }
+
+    #[test]
+    fn txtime_without_pacing_is_accepted_with_a_build_horizon_above_zero() {
+        // With a horizon the runs of unpaced connections are stamped, due at once.
+        assert_eq!(
+            parse(&["--txtime", "--build_horizon_us=5000"]),
+            Ok(Flags {
+                txtime: true,
+                build_horizon_us: Some(5000),
+                ..Flags::default()
+            })
+        );
+        assert_eq!(
+            parse(&["--nopacing", "--txtime", "--build_horizon_us", "1"]).map(|flags| (
+                flags.pacing,
+                flags.txtime,
+                flags.build_horizon_us
+            )),
+            Ok((false, true, Some(1)))
+        );
+        assert_eq!(
+            parse(&[
+                "--txtime",
+                "--build_horizon_us=5000",
+                "--release_hold_us=100"
+            ]),
+            Ok(Flags {
+                txtime: true,
+                build_horizon_us: Some(5000),
+                release_hold: Some(Duration::from_micros(100)),
+                ..Flags::default()
+            }),
+            "a hold over unpaced connections"
+        );
+        assert_eq!(
+            parse(&["--mode=client", "--txtime", "--build_horizon_us=5000"]),
+            Ok(Flags {
+                mode: Mode::Client,
+                txtime: true,
+                build_horizon_us: Some(5000),
+                ..Flags::default()
+            }),
+            "the client takes both and ignores them"
+        );
+        // What else needs --pacing still does.
+        assert_eq!(
+            parse(&["--congestion=bbr3", "--txtime", "--build_horizon_us=5000"]),
+            Err(FlagError::Bbr3NeedsPacing)
+        );
+        assert_eq!(
+            parse(&[
+                "--pacing_granularity_us=1000",
+                "--txtime",
+                "--build_horizon_us=5000"
+            ]),
+            Err(FlagError::NeedsPacing("pacing_granularity_us"))
+        );
     }
 
     #[test]
@@ -1093,6 +1223,251 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "illegal value '0' specified for flag 'initial_rtt_ms'"
+        );
+    }
+
+    /// Returns the flags of a server that builds 5 ms ahead with kernel release, followed by
+    /// `more`.
+    fn building_ahead_and(more: &[&str]) -> Result<Flags, FlagError> {
+        parse(
+            &[
+                &["--pacing", "--txtime", "--build_horizon_us=5000"][..],
+                more,
+            ]
+            .concat(),
+        )
+    }
+
+    #[test]
+    fn release_hold_us_takes_microseconds_or_max_and_zero_turns_it_off() {
+        assert_eq!(Flags::default().release_hold, None, "off by default");
+        assert_eq!(
+            building_ahead_and(&["--release_hold_us=50"]),
+            Ok(Flags {
+                pacing: true,
+                txtime: true,
+                build_horizon_us: Some(5000),
+                release_hold: Some(Duration::from_micros(50)),
+                ..Flags::default()
+            }),
+            "and nothing else changes"
+        );
+        let hold = |more: &[&str]| building_ahead_and(more).map(|flags| flags.release_hold);
+        assert_eq!(
+            hold(&["--release_hold_us", "100"]),
+            Ok(Some(Duration::from_micros(100))),
+            "from the next argument"
+        );
+        assert_eq!(
+            hold(&["--release_hold_us=max"]),
+            Ok(Some(Duration::MAX)),
+            "no bound on the wait"
+        );
+        assert_eq!(hold(&["--release_hold_us", "max"]), Ok(Some(Duration::MAX)));
+        assert_eq!(
+            hold(&["--release_hold_us=0"]),
+            Ok(None),
+            "0 names the arm without a hold"
+        );
+        assert_eq!(
+            hold(&["--release_hold_us=50", "--release_hold_us=0"]),
+            Ok(None),
+            "the last one wins"
+        );
+        assert_eq!(
+            hold(&["--release_hold_us=0", "--release_hold_us=4999"]),
+            Ok(Some(Duration::from_micros(4999)))
+        );
+        // Off needs neither kernel release nor a horizon, on either side.
+        for args in [
+            &["--release_hold_us=0"][..],
+            &["--mode=client", "--release_hold_us=0"],
+            &["--release_hold_us=max", "--release_hold_us=0"],
+        ] {
+            assert_eq!(
+                parse(args).map(|flags| flags.release_hold),
+                Ok(None),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_hold_us_other_than_whole_microseconds_or_max_is_refused() {
+        for value in ["-1", "4294967296", "MAX", "inf", "", "1.5", "50us", "none"] {
+            let arg = format!("--release_hold_us={value}");
+            assert_eq!(
+                building_ahead_and(&[&arg]),
+                Err(FlagError::BadValue {
+                    flag: "release_hold_us".to_owned(),
+                    value: value.to_owned(),
+                }),
+                "{arg}"
+            );
+        }
+        assert_eq!(
+            building_ahead_and(&["--release_hold_us"]),
+            Err(FlagError::MissingValue("release_hold_us".to_owned())),
+            "it takes a value"
+        );
+    }
+
+    #[test]
+    fn a_release_hold_needs_txtime_and_a_build_horizon_above_zero() {
+        for (args, error) in [
+            (
+                &["--release_hold_us=50"][..],
+                FlagError::ReleaseHoldNeedsTxtime,
+            ),
+            (
+                &["--pacing", "--release_hold_us=max"],
+                FlagError::ReleaseHoldNeedsTxtime,
+            ),
+            (
+                &["--pacing", "--notxtime", "--release_hold_us=50"],
+                FlagError::ReleaseHoldNeedsTxtime,
+            ),
+            (
+                &["--pacing", "--txtime", "--release_hold_us=50"],
+                FlagError::ReleaseHoldNeedsHorizon,
+            ),
+            (
+                &["--pacing", "--txtime", "--release_hold_us=max"],
+                FlagError::ReleaseHoldNeedsHorizon,
+            ),
+            (
+                &[
+                    "--pacing",
+                    "--txtime",
+                    "--build_horizon_us=0",
+                    "--release_hold_us=50",
+                ],
+                FlagError::ReleaseHoldNeedsHorizon,
+            ),
+            (
+                &[
+                    "--pacing",
+                    "--txtime",
+                    "--build_horizon_us=0",
+                    "--release_hold_us=max",
+                ],
+                FlagError::ReleaseHoldNeedsHorizon,
+            ),
+            // The checks that were there before come first.
+            (
+                &[
+                    "--pacing",
+                    "--build_horizon_us=5000",
+                    "--release_hold_us=50",
+                ],
+                FlagError::BuildHorizonNeedsTxtime,
+            ),
+            (
+                &["--txtime", "--release_hold_us=50"],
+                FlagError::TxtimeNeedsPacing,
+            ),
+            (
+                &["--txtime", "--build_horizon_us=0", "--release_hold_us=50"],
+                FlagError::TxtimeNeedsPacing,
+            ),
+            (
+                &[
+                    "--congestion=bbr3",
+                    "--txtime",
+                    "--build_horizon_us=5000",
+                    "--release_hold_us=50",
+                ],
+                FlagError::Bbr3NeedsPacing,
+            ),
+        ] {
+            assert_eq!(parse(args), Err(error), "{args:?}");
+        }
+        let message = FlagError::ReleaseHoldNeedsTxtime.to_string();
+        assert!(message.contains("--txtime"), "{message}");
+        let message = FlagError::ReleaseHoldNeedsHorizon.to_string();
+        assert!(message.contains("--build_horizon_us"), "{message}");
+    }
+
+    #[test]
+    fn a_finite_release_hold_must_be_below_the_build_horizon_and_max_need_not_be() {
+        let hold = |hold: &str, horizon: &str| {
+            parse(&[
+                "--pacing",
+                "--txtime",
+                &format!("--build_horizon_us={horizon}"),
+                &format!("--release_hold_us={hold}"),
+            ])
+            .map(|flags| flags.release_hold)
+        };
+        assert_eq!(hold("4999", "5000"), Ok(Some(Duration::from_micros(4999))));
+        assert_eq!(hold("1", "2"), Ok(Some(Duration::from_micros(1))));
+        assert_eq!(
+            hold("max", "5000"),
+            Ok(Some(Duration::MAX)),
+            "max sets no bound, so the horizon does not cap it"
+        );
+        assert_eq!(hold("max", "1"), Ok(Some(Duration::MAX)));
+        for (release_hold_us, build_horizon_us) in
+            [(5000, 5000), (5001, 5000), (1, 1), (u32::MAX, 5000)]
+        {
+            assert_eq!(
+                hold(&release_hold_us.to_string(), &build_horizon_us.to_string()),
+                Err(FlagError::ReleaseHoldNotBelowHorizon {
+                    release_hold_us,
+                    build_horizon_us,
+                }),
+                "{release_hold_us} against {build_horizon_us}"
+            );
+        }
+        assert_eq!(
+            parse(&[
+                "--txtime",
+                "--build_horizon_us=5000",
+                "--release_hold_us=5000"
+            ]),
+            Err(FlagError::ReleaseHoldNotBelowHorizon {
+                release_hold_us: 5000,
+                build_horizon_us: 5000,
+            }),
+            "unpaced"
+        );
+        let message = FlagError::ReleaseHoldNotBelowHorizon {
+            release_hold_us: 6000,
+            build_horizon_us: 5000,
+        }
+        .to_string();
+        for part in ["--release_hold_us", "6000", "--build_horizon_us", "5000"] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_client_refuses_a_release_hold_other_than_off() {
+        // The client never builds ahead.
+        for args in [
+            &["--mode=client", "--release_hold_us=50"][..],
+            &["--release_hold_us=max", "--mode=client"],
+            &[
+                "--mode=client",
+                "--pacing",
+                "--txtime",
+                "--build_horizon_us=5000",
+                "--release_hold_us=50",
+            ],
+        ] {
+            assert_eq!(
+                parse(args),
+                Err(FlagError::ServerOnly("release_hold_us")),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parse(&["--mode=client", "--release_hold_us=0"]),
+            Ok(Flags {
+                mode: Mode::Client,
+                ..Flags::default()
+            }),
+            "off"
         );
     }
 }

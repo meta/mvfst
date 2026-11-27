@@ -17,6 +17,8 @@ use mvfstr_proto::CongestionControl;
 use mvfstr_proto::ConnStats;
 use mvfstr_proto::TransportConfig;
 
+use crate::server::NANOS_PER_SEC;
+
 /// Bytes per megabit in mvfst tperf's unit, which is really a mebibit (2^20 bits).
 const BYTES_PER_MEGABIT: f64 = 131_072.0;
 
@@ -106,8 +108,8 @@ const STACK: &str = "mvfstr";
 pub(crate) enum WriteMode {
     /// As much as each stream takes, with `--object_rate` 0.
     Saturate,
-    /// One object per stream on each tick of `--object_rate`.
-    Paced,
+    /// One object per stream on each tick, `object_rate` ticks a second.
+    Paced { object_rate: u32 },
 }
 
 impl WriteMode {
@@ -115,7 +117,7 @@ impl WriteMode {
     fn name(self) -> &'static str {
         match self {
             Self::Saturate => "saturate",
-            Self::Paced => "paced",
+            Self::Paced { .. } => "paced",
         }
     }
 }
@@ -127,8 +129,14 @@ pub(crate) struct ConnTally {
     pub(crate) stream_bytes: Vec<u64>,
     /// The latency of each object received, in µs, in any order.
     pub(crate) latencies_us: Vec<u64>,
+    /// The tick of each object received, named by the send time in its header in ns, with the
+    /// object's latency in µs, in any order.
+    pub(crate) tick_latencies_us: Vec<(u64, u64)>,
     /// Objects whose length was not the object size, or that their stream ended inside.
     pub(crate) bad_objects: u64,
+    /// When the window closed, on the host's CLOCK_MONOTONIC in ns, the clock of the objects'
+    /// send times; 0 if it never opened.
+    pub(crate) window_end_ns: u64,
 }
 
 impl ConnTally {
@@ -167,6 +175,37 @@ pub(crate) struct ServerTally {
     /// The driver's [`EndpointStats::turns`](mvfstr_driver::EndpointStats), as of the last accept
     /// or close.
     pub(crate) turns: u64,
+    // The rest are the driver's `EndpointStats` fields of the same names, as of the last accept
+    // or close.
+    /// `sendmmsg` calls on the server's sockets.
+    pub(crate) sendmmsg_calls: u64,
+    /// Messages of those calls that the kernel accepted.
+    pub(crate) sendmmsg_messages: u64,
+    /// Calls whose accepted messages carried the runs of more than one connection.
+    pub(crate) multi_connection_calls: u64,
+    /// Datagrams the connections sent, each segment of a GSO send counted.
+    pub(crate) sent_datagrams: u64,
+    /// Transmit attempts on the socket with kernel release by what they built: nothing, only runs
+    /// due at once, only runs released later, and both.
+    pub(crate) release_attempts: [u64; 4],
+    /// Accepted messages with a release time, by how late they reached the kernel.
+    pub(crate) release_lateness: [u64; 8],
+    /// Calls by the messages the kernel accepted, those that accepted none left out.
+    pub(crate) messages_per_call: [u64; 8],
+    /// Flushes before an attempt because a held run had waited the release hold.
+    pub(crate) hold_flushes_age: u64,
+    /// Flushes before an attempt at half the lead of a held run released later.
+    pub(crate) hold_flushes_stamp: u64,
+    /// Flushes after attempts that held their runs but filled their batch or were refused.
+    pub(crate) hold_stop_flushes: u64,
+    /// Hold flushes that ended after the bound they flushed for.
+    pub(crate) hold_late: u64,
+    /// Bounds of held runs that passed while an EAGAIN had stopped the flushes.
+    pub(crate) hold_blocked: u64,
+    /// Flushes after paced attempts without a build horizon that also carried held runs.
+    pub(crate) hold_carried_flushes: u64,
+    /// Pacing wakes taken inside transmit phases, by how late they were taken.
+    pub(crate) pacing_wake_lateness: [u64; 8],
 }
 
 /// Returns the value at `per_mille` thousandths of `sorted`, by nearest rank: the smallest value
@@ -192,7 +231,9 @@ pub(crate) fn stream_spread_p50_and_max(spreads: &mut [f64]) -> (f64, f64) {
 /// Returns the client's summary line for a run in `mode` of `duration_secs` seconds, with
 /// `streams_per_conn` streams on each of the connections that `conns` describes. Rates are in
 /// megabits of 10^6 bits per second over the whole window, and the stream spreads are the median
-/// and the max of the connections' [`ConnTally::stream_spread`].
+/// and the max of the connections' [`ConnTally::stream_spread`]. In paced mode the line adds the
+/// objects and their latency percentiles, then the percentiles of the ticks' fan-out completions
+/// and the count of the run's ticks that some stream did not receive in its window.
 pub(crate) fn summary_line(
     mode: WriteMode,
     duration_secs: u32,
@@ -235,7 +276,7 @@ pub(crate) fn summary_line(
         streams().min().unwrap_or(0),
         streams().max().unwrap_or(0),
     );
-    if mode == WriteMode::Paced {
+    if let WriteMode::Paced { object_rate } = mode {
         let mut latencies: Vec<u64> = conns
             .iter()
             .flat_map(|conn| conn.latencies_us.iter().copied())
@@ -253,26 +294,112 @@ pub(crate) fn summary_line(
             at(999),
             at(1000),
         ));
+        let (fanout, incomplete) = fanout_completions(conns, streams_per_conn, object_rate);
+        let fanout_at = |per_mille| percentile(&fanout, per_mille).unwrap_or(0);
+        line.push_str(&format!(
+            " fanout_us_p50={} fanout_us_p99={} fanout_us_p999={} fanout_incomplete={incomplete}",
+            fanout_at(500),
+            fanout_at(990),
+            fanout_at(999),
+        ));
     }
     line
 }
 
+/// Returns the fan-out completion of each tick that every stream of `conns` received, sorted, and
+/// the count of the run's other ticks. A tick's completion is the latency of its last object over
+/// the `streams_per_conn` streams of every connection. Objects name their tick by the send time in
+/// their headers, which the connections of one server share, and ticks start `object_rate` times a
+/// second.
+fn fanout_completions(
+    conns: &[ConnTally],
+    streams_per_conn: u32,
+    object_rate: u32,
+) -> (Vec<u64>, u64) {
+    let mut objects: Vec<(u64, u64)> = conns
+        .iter()
+        .flat_map(|conn| conn.tick_latencies_us.iter().copied())
+        .collect();
+    objects.sort_unstable();
+    let streams = conns.len() as u64 * u64::from(streams_per_conn);
+    let mut completions: Vec<u64> = objects
+        .chunk_by(|a, b| a.0 == b.0)
+        .filter_map(|tick| match tick {
+            // Sorted by latency within a tick, so the last object arrived last.
+            [.., (_, last)] if tick.len() as u64 >= streams => Some(*last),
+            _ => None,
+        })
+        .collect();
+    completions.sort_unstable();
+    let incomplete =
+        run_ticks(conns, &objects, object_rate).saturating_sub(completions.len() as u64);
+    (completions, incomplete)
+}
+
+/// Returns how many ticks the run of `conns` had, whose objects sorted by tick are `objects`: every
+/// tick from the first that an object names to the last that started before the last window
+/// closed, so ticks that no stream received count too. Tick k starts k / `object_rate` seconds
+/// after the server's epoch, rounded down to the ns, so the ticks between two send times are
+/// rounded to the nearest.
+fn run_ticks(conns: &[ConnTally], objects: &[(u64, u64)], object_rate: u32) -> u64 {
+    let (Some(&(first, _)), Some(&(last, _))) = (objects.first(), objects.last()) else {
+        return 0;
+    };
+    let rate = u128::from(object_rate);
+    let named = (u128::from(last - first) * rate + NANOS_PER_SEC / 2) / NANOS_PER_SEC + 1;
+    let end = conns
+        .iter()
+        .map(|conn| conn.window_end_ns)
+        .max()
+        .unwrap_or(0);
+    let started = (u128::from(end.saturating_sub(first)) * rate).div_ceil(NANOS_PER_SEC);
+    u64::try_from(named.max(started)).unwrap_or(u64::MAX)
+}
+
+/// Returns `counts` separated by commas, as the server's summary line prints a histogram.
+fn comma_list(counts: &[u64]) -> String {
+    counts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Returns the server's summary line, for a server in `mode` that has done what `tally` counts.
+/// The driver's counters end it in every mode, each histogram as its counts in bucket order.
 pub(crate) fn server_summary_line(mode: WriteMode, tally: &ServerTally) -> String {
     let mut line = format!(
         "tperf_server_summary stack={STACK} mode={} conns={}",
         mode.name(),
         tally.conns
     );
-    if mode == WriteMode::Paced {
+    if matches!(mode, WriteMode::Paced { .. }) {
         line.push_str(&format!(
             " objects_sent={} objects_dropped={} late_ticks={}",
             tally.objects_sent, tally.objects_dropped, tally.late_ticks
         ));
     }
     line.push_str(&format!(
-        " dropped_initials={} turns={}",
-        tally.dropped_initials, tally.turns
+        " dropped_initials={} turns={} sendmmsg_calls={} sendmmsg_messages={} \
+         multi_connection_calls={} sent_datagrams={} release_attempts={} release_lateness={} \
+         messages_per_call={} hold_flushes_age={} hold_flushes_stamp={} hold_stop_flushes={} \
+         hold_late={} hold_blocked={} hold_carried_flushes={} pacing_wake_lateness={}",
+        tally.dropped_initials,
+        tally.turns,
+        tally.sendmmsg_calls,
+        tally.sendmmsg_messages,
+        tally.multi_connection_calls,
+        tally.sent_datagrams,
+        comma_list(&tally.release_attempts),
+        comma_list(&tally.release_lateness),
+        comma_list(&tally.messages_per_call),
+        tally.hold_flushes_age,
+        tally.hold_flushes_stamp,
+        tally.hold_stop_flushes,
+        tally.hold_late,
+        tally.hold_blocked,
+        tally.hold_carried_flushes,
+        comma_list(&tally.pacing_wake_lateness),
     ));
     line
 }
@@ -322,13 +449,15 @@ pub(crate) fn closed_line(
 /// Returns the line with the server's sending setup, logged at startup: its connections'
 /// controller and pacing, its socket's kernel release and send buffer, and the endpoint's build
 /// horizon, capped by the socket's release horizon. A connection may build less far ahead than
-/// the endpoint allows, to keep its advertised max_ack_delay in range. The line ends with
-/// `--initial_rtt_ms` only when the server is given it.
+/// the endpoint allows, to keep its advertised max_ack_delay in range. Then come
+/// `--initial_rtt_ms`, only when the server is given it, and the release hold in µs, which ends
+/// the line: 0 when off and `max` without a bound.
 pub(crate) fn startup_line(
     transport: &TransportConfig,
     build_horizon: Duration,
     caps: &TxCaps,
     initial_rtt_ms: Option<u32>,
+    release_hold: Option<Duration>,
 ) -> String {
     let congestion = match transport.congestion_control() {
         CongestionControl::NewReno => "newreno",
@@ -349,6 +478,12 @@ pub(crate) fn startup_line(
     if let Some(ms) = initial_rtt_ms {
         line.push_str(&format!(" initial_rtt_ms={ms}"));
     }
+    let hold = match release_hold {
+        None => "0".to_owned(),
+        Some(Duration::MAX) => "max".to_owned(),
+        Some(hold) => hold.as_micros().to_string(),
+    };
+    line.push_str(&format!(" release_hold_us={hold}"));
     line
 }
 
@@ -414,6 +549,9 @@ mod tests {
     use super::*;
     use crate::config::server_transport;
     use crate::flags::Flags;
+
+    /// Paced mode, for lines whose objects name no tick.
+    const PACED: WriteMode = WriteMode::Paced { object_rate: 50 };
 
     #[test]
     fn doubles_print_as_cpp_streams_print_them() {
@@ -691,25 +829,33 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         })
         .unwrap();
         assert_eq!(
-            startup_line(&bbr3, ms(5), &caps(kernel(ms(100))), None),
+            startup_line(&bbr3, ms(5), &caps(kernel(ms(100))), None, None),
             "Server: congestion=bbr3 pacing=true pacing_granularity_us=200 pacing_min_burst=5 \
-             pacing_max_burst=44 txtime=true endpoint_horizon_us=5000 so_sndbuf=14544416"
+             pacing_max_burst=44 txtime=true endpoint_horizon_us=5000 so_sndbuf=14544416 \
+             release_hold_us=0"
         );
-        let capped = startup_line(&bbr3, ms(5), &caps(kernel(ms(2))), None);
+        let capped = startup_line(&bbr3, ms(5), &caps(kernel(ms(2))), None, None);
         assert!(
             capped.contains(" endpoint_horizon_us=2000 "),
             "the socket's release horizon caps the endpoint's: {capped}"
         );
         let cubic = server_transport(&Flags::default()).unwrap();
         assert_eq!(
-            startup_line(&cubic, Duration::ZERO, &caps(ReleaseSupport::None), None),
+            startup_line(
+                &cubic,
+                Duration::ZERO,
+                &caps(ReleaseSupport::None),
+                None,
+                None
+            ),
             "Server: congestion=cubic pacing=false pacing_granularity_us=1000 pacing_min_burst=5 \
-             pacing_max_burst=44 txtime=false endpoint_horizon_us=0 so_sndbuf=14544416"
+             pacing_max_burst=44 txtime=false endpoint_horizon_us=0 so_sndbuf=14544416 \
+             release_hold_us=0"
         );
     }
 
     #[test]
-    fn the_startup_line_ends_with_the_initial_rtt_only_when_the_flag_sets_it() {
+    fn the_startup_line_names_the_initial_rtt_only_when_the_flag_sets_it() {
         let caps = TxCaps {
             max_segments: 64,
             max_datagram: 1500,
@@ -728,14 +874,14 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         })
         .unwrap();
         assert_eq!(
-            startup_line(&lowered, Duration::ZERO, &caps, Some(100)),
-            format!("{without} initial_rtt_ms=100")
+            startup_line(&lowered, Duration::ZERO, &caps, Some(100), None),
+            format!("{without} initial_rtt_ms=100 release_hold_us=0")
         );
         let default = server_transport(&Flags::default()).unwrap();
         assert_eq!(
-            startup_line(&default, Duration::ZERO, &caps, None),
-            without,
-            "the line stays as it was without the flag"
+            startup_line(&default, Duration::ZERO, &caps, None, None),
+            format!("{without} release_hold_us=0"),
+            "the line has no initial RTT without the flag"
         );
         let given = server_transport(&Flags {
             initial_rtt_ms: Some(333),
@@ -743,9 +889,228 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         })
         .unwrap();
         assert_eq!(
-            startup_line(&given, Duration::ZERO, &caps, Some(333)),
-            format!("{without} initial_rtt_ms=333"),
+            startup_line(&given, Duration::ZERO, &caps, Some(333), None),
+            format!("{without} initial_rtt_ms=333 release_hold_us=0"),
             "a flag that gives the transport's default value still shows"
+        );
+    }
+
+    #[test]
+    fn the_startup_line_ends_with_the_release_hold_zero_when_off_and_max_without_a_bound() {
+        let caps = TxCaps {
+            max_segments: 64,
+            max_datagram: 1500,
+            gro: true,
+            ecn: true,
+            pktinfo: true,
+            release: ReleaseSupport::Kernel {
+                horizon: Duration::from_millis(100),
+                epoch: ClockEpoch {
+                    instant: Instant::now(),
+                    tick: Tick(0),
+                },
+            },
+            send_buffer: 212_992,
+        };
+        // Unpaced kernel release with a 5 ms horizon.
+        let unpaced = server_transport(&Flags {
+            txtime: true,
+            build_horizon_us: Some(5000),
+            ..Flags::default()
+        })
+        .unwrap();
+        let setup = "Server: congestion=cubic pacing=false pacing_granularity_us=1000 \
+                     pacing_min_burst=5 pacing_max_burst=44 txtime=true endpoint_horizon_us=5000 \
+                     so_sndbuf=212992";
+        let line = |initial_rtt_ms, release_hold| {
+            startup_line(
+                &unpaced,
+                Duration::from_millis(5),
+                &caps,
+                initial_rtt_ms,
+                release_hold,
+            )
+        };
+        assert_eq!(
+            line(None, Some(Duration::from_micros(50))),
+            format!("{setup} release_hold_us=50")
+        );
+        assert_eq!(
+            line(None, Some(Duration::MAX)),
+            format!("{setup} release_hold_us=max"),
+            "no bound on the wait"
+        );
+        assert_eq!(
+            line(None, None),
+            format!("{setup} release_hold_us=0"),
+            "off"
+        );
+        assert_eq!(
+            line(Some(100), Some(Duration::from_micros(4999))),
+            format!("{setup} initial_rtt_ms=100 release_hold_us=4999"),
+            "after the initial RTT"
+        );
+    }
+
+    /// Returns a paced tally of streams that received `stream_bytes`, whose objects arrived at
+    /// `ticks`, each a tick's send time in ns and the object's latency in µs.
+    fn ticked(stream_bytes: &[u64], ticks: &[(u64, u64)]) -> ConnTally {
+        ConnTally {
+            stream_bytes: stream_bytes.to_vec(),
+            latencies_us: ticks.iter().map(|&(_, latency)| latency).collect(),
+            tick_latencies_us: ticks.to_vec(),
+            bad_objects: 0,
+            window_end_ns: 0,
+        }
+    }
+
+    #[test]
+    fn a_paced_summary_line_ends_with_the_fanout_completion_of_ticks_every_stream_received() {
+        // Two connections of two streams each, so a tick completes with its fourth object, the
+        // one that came last. Ticks 1 and 2 complete at 300 and 400 µs. Tick 3 misses an object
+        // on the second connection, and tick 4 reached only one stream.
+        let conns = [
+            ticked(
+                &[4800, 3600],
+                &[
+                    (4_000, 80),
+                    (1_000, 100),
+                    (1_000, 300),
+                    (2_000, 150),
+                    (2_000, 120),
+                    (3_000, 50),
+                    (3_000, 60),
+                ],
+            ),
+            ticked(
+                &[3600, 2400],
+                &[
+                    (1_000, 200),
+                    (2_000, 400),
+                    (3_000, 70),
+                    (1_000, 250),
+                    (2_000, 90),
+                ],
+            ),
+        ];
+        // Ticks 1 µs apart.
+        let paced = WriteMode::Paced {
+            object_rate: 1_000_000,
+        };
+        assert_eq!(
+            summary_line(paced, 1, 2, &conns),
+            "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=2 duration_s=1 \
+             bytes=14400 mbps=0.115 conn_mbps_min=0.048 conn_mbps_p50=0.048 \
+             conn_mbps_max=0.067 stream_bytes_min=2400 stream_bytes_max=4800 streams_opened=4 \
+             stream_spread_p50=1.333 stream_spread_max=1.500 objects=12 bad_objects=0 \
+             lat_us_p50=100 lat_us_p90=300 lat_us_p99=400 lat_us_p999=400 lat_us_max=400 \
+             fanout_us_p50=300 fanout_us_p99=400 fanout_us_p999=400 fanout_incomplete=2"
+        );
+        assert!(
+            !summary_line(WriteMode::Saturate, 1, 2, &conns).contains("fanout"),
+            "a saturate line has no fan-out fields"
+        );
+    }
+
+    #[test]
+    fn fanout_completion_takes_the_nearest_rank_of_each_ticks_last_object() {
+        // Ticks 1 to 1,000 reach two connections of one stream, the first at the tick's number in
+        // µs and the second at half of it, in the other order; tick 1,001 reaches only the second.
+        let tick = |k: u64| 5_000_000_000 + k * 20_000_000;
+        let first: Vec<(u64, u64)> = (1..=1000).map(|k| (tick(k), k)).collect();
+        let mut second: Vec<(u64, u64)> = (1..=1001).rev().map(|k| (tick(k), k / 2)).collect();
+        second.rotate_left(1);
+        let line = summary_line(
+            WriteMode::Paced { object_rate: 50 },
+            1,
+            1,
+            &[ticked(&[1_200_000], &first), ticked(&[1_201_200], &second)],
+        );
+        assert!(
+            line.ends_with(
+                " fanout_us_p50=500 fanout_us_p99=990 fanout_us_p999=999 fanout_incomplete=1"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_tick_that_no_stream_received_is_incomplete_up_to_the_last_window_close() {
+        // Ticks of 1,000 a second reach one stream on each of two connections. Tick 2 reached
+        // neither and tick 4 only the first, whose window closed 5.5 ms after tick 0. Ticks 0, 1
+        // and 3 complete at 200, 120 and 95 µs.
+        let tick = |k: u64| 7_000_000_000 + k * 1_000_000;
+        let line = |second_window_end_ns| {
+            let conns = [
+                ConnTally {
+                    window_end_ns: tick(5) + 500_000,
+                    ..ticked(
+                        &[4800],
+                        &[
+                            (tick(0), 100),
+                            (tick(1), 120),
+                            (tick(3), 90),
+                            (tick(4), 300),
+                        ],
+                    )
+                },
+                ConnTally {
+                    window_end_ns: second_window_end_ns,
+                    ..ticked(&[3600], &[(tick(0), 200), (tick(1), 110), (tick(3), 95)])
+                },
+            ];
+            summary_line(WriteMode::Paced { object_rate: 1000 }, 1, 1, &conns)
+        };
+        let tail = |incomplete| {
+            format!(
+                " fanout_us_p50=120 fanout_us_p99=200 fanout_us_p999=200 \
+                 fanout_incomplete={incomplete}"
+            )
+        };
+        let later = line(tick(6) + 200_000);
+        assert!(
+            later.ends_with(&tail(4)),
+            "ticks 5 and 6 started before the second window closed and reached neither: {later}"
+        );
+        let earlier = line(tick(4) + 200_000);
+        assert!(
+            earlier.ends_with(&tail(3)),
+            "the run ends when its last window closes: {earlier}"
+        );
+    }
+
+    #[test]
+    fn fanout_ticks_follow_an_object_rate_that_does_not_divide_a_second() {
+        // At 3 ticks a second, tick k starts k / 3 s after the epoch, rounded down to the ns, so
+        // ticks 1 and 5, which the one stream received, lie 3.999999999 periods apart.
+        let tick = |k: u64| 7 + k * 1_000_000_000 / 3;
+        let line = |window_end_ns| {
+            let conn = ConnTally {
+                window_end_ns,
+                ..ticked(&[2400], &[(tick(1), 10), (tick(5), 20)])
+            };
+            summary_line(WriteMode::Paced { object_rate: 3 }, 2, 1, &[conn])
+        };
+        let tail = |incomplete| {
+            format!(
+                " fanout_us_p50=10 fanout_us_p99=20 fanout_us_p999=20 \
+                 fanout_incomplete={incomplete}"
+            )
+        };
+        assert!(
+            line(0).ends_with(&tail(3)),
+            "ticks 2 to 4, with no window close: {}",
+            line(0)
+        );
+        assert!(
+            line(tick(6) - 1).ends_with(&tail(3)),
+            "tick 6 started after the window closed: {}",
+            line(tick(6) - 1)
+        );
+        assert!(
+            line(tick(6) + 1).ends_with(&tail(4)),
+            "tick 6 started before the window closed: {}",
+            line(tick(6) + 1)
         );
     }
 
@@ -865,17 +1230,23 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             ConnTally {
                 stream_bytes: vec![1_000_000, 2_000_000],
                 latencies_us: Vec::new(),
+                tick_latencies_us: Vec::new(),
                 bad_objects: 0,
+                window_end_ns: 0,
             },
             ConnTally {
                 stream_bytes: vec![400_000, 600_000],
                 latencies_us: Vec::new(),
+                tick_latencies_us: Vec::new(),
                 bad_objects: 0,
+                window_end_ns: 0,
             },
             ConnTally {
                 stream_bytes: vec![1_500_000, 500_000],
                 latencies_us: Vec::new(),
+                tick_latencies_us: Vec::new(),
                 bad_objects: 0,
+                window_end_ns: 0,
             },
         ];
         // 6 MB in 2 s is 24 Mb/s; the connections carry 12, 4 and 8 Mb/s, so the median is 8.
@@ -892,7 +1263,9 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         let one = [ConnTally {
             stream_bytes: vec![1_234_567, 0, 89],
             latencies_us: Vec::new(),
+            tick_latencies_us: Vec::new(),
             bad_objects: 0,
+            window_end_ns: 0,
         }];
         assert_eq!(
             summary_line(WriteMode::Saturate, 3, 1, &one),
@@ -958,33 +1331,40 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             ConnTally {
                 stream_bytes: vec![600_000],
                 latencies_us: (1..=1000).rev().step_by(2).collect(),
+                tick_latencies_us: Vec::new(),
                 bad_objects: 0,
+                window_end_ns: 0,
             },
             ConnTally {
                 stream_bytes: vec![600_000],
                 latencies_us: (1..=1000).step_by(2).collect(),
+                tick_latencies_us: Vec::new(),
                 bad_objects: 0,
+                window_end_ns: 0,
             },
         ];
         assert_eq!(
-            summary_line(WriteMode::Paced, 1, 1, &conns),
+            summary_line(PACED, 1, 1, &conns),
             "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=1 duration_s=1 \
              bytes=1200000 mbps=9.600 conn_mbps_min=4.800 conn_mbps_p50=4.800 \
              conn_mbps_max=4.800 stream_bytes_min=600000 stream_bytes_max=600000 \
              streams_opened=2 stream_spread_p50=1.000 stream_spread_max=1.000 objects=1000 \
              bad_objects=0 lat_us_p50=500 lat_us_p90=900 lat_us_p99=990 lat_us_p999=999 \
-             lat_us_max=1000"
+             lat_us_max=1000 fanout_us_p50=0 fanout_us_p99=0 fanout_us_p999=0 fanout_incomplete=0"
         );
         let none = [ConnTally {
             stream_bytes: vec![0],
             latencies_us: Vec::new(),
+            tick_latencies_us: Vec::new(),
             bad_objects: 0,
+            window_end_ns: 0,
         }];
         assert!(
-            summary_line(WriteMode::Paced, 1, 1, &none).ends_with(
+            summary_line(PACED, 1, 1, &none).ends_with(
                 " streams_opened=1 stream_spread_p50=NaN stream_spread_max=NaN objects=0 \
                  bad_objects=0 lat_us_p50=0 lat_us_p90=0 lat_us_p99=0 lat_us_p999=0 \
-                 lat_us_max=0"
+                 lat_us_max=0 fanout_us_p50=0 fanout_us_p99=0 fanout_us_p999=0 \
+                 fanout_incomplete=0"
             ),
             "a paced line keeps its fields without objects"
         );
@@ -996,27 +1376,39 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             ConnTally {
                 stream_bytes: vec![2400],
                 latencies_us: vec![100, 200],
+                tick_latencies_us: Vec::new(),
                 bad_objects: 1,
+                window_end_ns: 0,
             },
             ConnTally {
                 stream_bytes: vec![1200],
                 latencies_us: vec![300],
+                tick_latencies_us: Vec::new(),
                 bad_objects: 2,
+                window_end_ns: 0,
             },
         ];
         assert_eq!(
-            summary_line(WriteMode::Paced, 1, 1, &conns),
+            summary_line(PACED, 1, 1, &conns),
             "tperf_summary stack=mvfstr mode=paced conns=2 streams_per_conn=1 duration_s=1 \
              bytes=3600 mbps=0.029 conn_mbps_min=0.010 conn_mbps_p50=0.010 \
              conn_mbps_max=0.019 stream_bytes_min=1200 stream_bytes_max=2400 streams_opened=2 \
              stream_spread_p50=1.000 stream_spread_max=1.000 objects=3 bad_objects=3 \
-             lat_us_p50=200 lat_us_p90=300 lat_us_p99=300 lat_us_p999=300 lat_us_max=300"
+             lat_us_p50=200 lat_us_p90=300 lat_us_p99=300 lat_us_p999=300 lat_us_max=300 \
+             fanout_us_p50=0 fanout_us_p99=0 fanout_us_p999=0 fanout_incomplete=0"
         );
         assert!(
             !summary_line(WriteMode::Saturate, 1, 1, &conns).contains("objects"),
             "a saturate line has no object fields"
         );
     }
+
+    /// The end of a server summary line whose driver sent nothing.
+    const NO_SEND_PATH: &str = "sendmmsg_calls=0 sendmmsg_messages=0 multi_connection_calls=0 \
+        sent_datagrams=0 release_attempts=0,0,0,0 release_lateness=0,0,0,0,0,0,0,0 \
+        messages_per_call=0,0,0,0,0,0,0,0 hold_flushes_age=0 hold_flushes_stamp=0 \
+        hold_stop_flushes=0 hold_late=0 hold_blocked=0 hold_carried_flushes=0 \
+        pacing_wake_lateness=0,0,0,0,0,0,0,0";
 
     #[test]
     fn the_server_summary_line_adds_its_object_counts_in_paced_mode() {
@@ -1028,9 +1420,11 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             ..ServerTally::default()
         };
         assert_eq!(
-            server_summary_line(WriteMode::Paced, &tally),
-            "tperf_server_summary stack=mvfstr mode=paced conns=8 objects_sent=1600 \
-             objects_dropped=3 late_ticks=2 dropped_initials=0 turns=0"
+            server_summary_line(PACED, &tally),
+            format!(
+                "tperf_server_summary stack=mvfstr mode=paced conns=8 objects_sent=1600 \
+                 objects_dropped=3 late_ticks=2 dropped_initials=0 turns=0 {NO_SEND_PATH}"
+            )
         );
         assert_eq!(
             server_summary_line(
@@ -1040,12 +1434,15 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
                     ..ServerTally::default()
                 }
             ),
-            "tperf_server_summary stack=mvfstr mode=saturate conns=4 dropped_initials=0 turns=0"
+            format!(
+                "tperf_server_summary stack=mvfstr mode=saturate conns=4 dropped_initials=0 \
+                 turns=0 {NO_SEND_PATH}"
+            )
         );
     }
 
     #[test]
-    fn the_server_summary_line_ends_with_the_drivers_dropped_initials_and_turns() {
+    fn the_server_summary_line_has_the_drivers_dropped_initials_and_turns_in_both_modes() {
         let tally = ServerTally {
             conns: 1000,
             objects_sent: 1600,
@@ -1053,16 +1450,69 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             late_ticks: 2,
             dropped_initials: 811,
             turns: 52_377,
+            ..ServerTally::default()
         };
         assert_eq!(
             server_summary_line(WriteMode::Saturate, &tally),
-            "tperf_server_summary stack=mvfstr mode=saturate conns=1000 dropped_initials=811 \
-             turns=52377"
+            format!(
+                "tperf_server_summary stack=mvfstr mode=saturate conns=1000 dropped_initials=811 \
+                 turns=52377 {NO_SEND_PATH}"
+            )
         );
         assert_eq!(
-            server_summary_line(WriteMode::Paced, &tally),
-            "tperf_server_summary stack=mvfstr mode=paced conns=1000 objects_sent=1600 \
-             objects_dropped=3 late_ticks=2 dropped_initials=811 turns=52377"
+            server_summary_line(PACED, &tally),
+            format!(
+                "tperf_server_summary stack=mvfstr mode=paced conns=1000 objects_sent=1600 \
+                 objects_dropped=3 late_ticks=2 dropped_initials=811 turns=52377 {NO_SEND_PATH}"
+            )
+        );
+    }
+
+    #[test]
+    fn the_server_summary_line_ends_with_the_drivers_send_path_counters_in_both_modes() {
+        // Every counter takes its own value, so a counter printed in another's place shows.
+        let tally = ServerTally {
+            conns: 1024,
+            objects_sent: 1600,
+            objects_dropped: 3,
+            late_ticks: 2,
+            dropped_initials: 7,
+            turns: 52_377,
+            sendmmsg_calls: 9_001,
+            sendmmsg_messages: 40_002,
+            multi_connection_calls: 8_003,
+            sent_datagrams: 60_004,
+            release_attempts: [11, 12, 13, 14],
+            release_lateness: [21, 22, 23, 24, 25, 26, 27, 28],
+            messages_per_call: [31, 32, 33, 34, 35, 36, 37, 38],
+            hold_flushes_age: 41,
+            hold_flushes_stamp: 42,
+            hold_stop_flushes: 43,
+            hold_late: 44,
+            hold_blocked: 45,
+            hold_carried_flushes: 46,
+            pacing_wake_lateness: [51, 52, 53, 54, 55, 56, 57, 58],
+        };
+        // The attempts by lead are those that built nothing, only runs due at once, only runs
+        // released later, and both; the histograms list their buckets in order.
+        let send_path = "sendmmsg_calls=9001 sendmmsg_messages=40002 multi_connection_calls=8003 \
+            sent_datagrams=60004 release_attempts=11,12,13,14 \
+            release_lateness=21,22,23,24,25,26,27,28 messages_per_call=31,32,33,34,35,36,37,38 \
+            hold_flushes_age=41 hold_flushes_stamp=42 hold_stop_flushes=43 hold_late=44 \
+            hold_blocked=45 hold_carried_flushes=46 pacing_wake_lateness=51,52,53,54,55,56,57,58";
+        assert_eq!(
+            server_summary_line(WriteMode::Saturate, &tally),
+            format!(
+                "tperf_server_summary stack=mvfstr mode=saturate conns=1024 dropped_initials=7 \
+                 turns=52377 {send_path}"
+            )
+        );
+        assert_eq!(
+            server_summary_line(PACED, &tally),
+            format!(
+                "tperf_server_summary stack=mvfstr mode=paced conns=1024 objects_sent=1600 \
+                 objects_dropped=3 late_ticks=2 dropped_initials=7 turns=52377 {send_path}"
+            )
         );
     }
 }
