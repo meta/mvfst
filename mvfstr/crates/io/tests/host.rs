@@ -434,6 +434,42 @@ fn eagain_clears_read_readiness_until_the_host_sets_it_again() {
     assert_eq!(data, vec![vec![2; 30]]);
 }
 
+#[test]
+fn receiving_now_does_not_wake_the_registered_task() {
+    let host = ScriptedHost::default();
+    let mut backend = HostBackend::bind(v4(0), &host.options()).expect("bind");
+    let (fd, readiness) = host.registration(0);
+    let (woken, waker) = counter();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        backend.poll_recv(&mut cx).is_pending(),
+        "the pending poll registers the task"
+    );
+    assert!(
+        backend.poll_recv_now(&mut cx).is_pending(),
+        "nothing to read yet"
+    );
+
+    let sender = UdpSocket::bind(v4(0)).unwrap();
+    sender
+        .send_to(&[3; 50], backend.local_addr().unwrap())
+        .unwrap();
+    wait_readable(fd);
+    assert!(matches!(backend.poll_recv_now(&mut cx), Poll::Ready(Ok(1))));
+    let data: Vec<Vec<u8>> = backend.buffers().map(|(_, data)| data.to_vec()).collect();
+    assert_eq!(data, vec![vec![3; 50]]);
+    assert!(!backend.last_full(), "one datagram in 32 buffers");
+    assert_eq!(wakes(&woken), 0, "neither receive woke the task");
+    assert!(
+        !readiness.is_set(Interest::Read),
+        "the receives left the readiness as it was"
+    );
+
+    // The registration stands: the host's next report wakes the task.
+    readiness.set(Interest::Read);
+    assert_eq!(wakes(&woken), 1);
+}
+
 /// Opens a backend on `host` on one end of a connected Unix datagram pair whose send buffer is as
 /// small as the kernel allows. Loopback UDP never returns EAGAIN, because the loopback device
 /// detaches each datagram from its socket as it sends it; a Unix datagram stays charged to the

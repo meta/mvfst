@@ -119,6 +119,8 @@ pub(crate) struct Costs {
     pub(crate) read: Duration,
     /// A datagram a flush sends, charged at the flush.
     pub(crate) flush: Duration,
+    /// A receive call, charged when it is made, whether or not it finds datagrams.
+    pub(crate) recv: Duration,
 }
 
 /// An event on a lab socket, logged in order.
@@ -131,8 +133,20 @@ pub(crate) enum NetEvent {
     Built(SocketAddr, ConnKey, u16),
     /// The socket flushed.
     Flush(SocketAddr),
-    /// A receive took this many datagrams.
+    /// A receive took this many datagrams; 0 if it found the socket empty.
     Recv(SocketAddr, usize),
+    /// The receive logged next took this many GRO runs, arrivals of more than one datagram;
+    /// logged only for a receive that took one.
+    GroRuns(SocketAddr, usize),
+    /// A receive call failed, as [`Net::fail_next_recv`] made it.
+    RecvFailed(SocketAddr),
+    /// A `poll_recv` on a socket with [`LabReadiness::Cached`] returned `Pending`.
+    Pending(SocketAddr),
+    /// A host poll set the cached readiness of the socket, which held datagrams.
+    Ready(SocketAddr),
+    /// A read of the host clock, at this offset from the lab's start; logged once
+    /// [`Net::log_clock`] turns it on.
+    Clock(Duration),
     /// The driver took the received batch's buffers.
     Chunk(SocketAddr),
     /// A transmit attempt of a connection on the socket at this address ended a run of this many
@@ -170,6 +184,11 @@ pub(crate) struct Arrival {
 struct Port {
     inbox: RefCell<VecDeque<Arrival>>,
     waker: RefCell<Option<Waker>>,
+    /// Whether the socket's readiness is [`LabReadiness::Cached`].
+    cached: Cell<bool>,
+    /// The cached readiness: set by a host poll while the inbox holds datagrams, cleared by a
+    /// receive that finds fewer than a batch.
+    ready: Cell<bool>,
     /// Whether the socket refuses datagrams, as behind an EAGAIN, until it is unblocked.
     blocked: Cell<bool>,
     /// The waker to wake when the socket is unblocked.
@@ -183,6 +202,8 @@ struct Port {
     /// Whether the socket keeps its runs while it is blocked, as behind an EAGAIN that a flush
     /// met, rather than sending them at each flush.
     keeps: Cell<bool>,
+    /// Whether the next receive call on a socket with [`LabReadiness::Cached`] fails.
+    fail_next_recv: Cell<bool>,
 }
 
 struct NetState {
@@ -198,6 +219,8 @@ struct NetState {
     flushes: RefCell<Vec<FlushRecord>>,
     /// The address whose datagrams are kept instead of delivered, and the datagrams kept.
     held: RefCell<Option<(SocketAddr, Vec<Arrival>)>>,
+    /// Whether reads of the host clock are logged.
+    log_clock: Cell<bool>,
 }
 
 /// The in-memory network and the test clock.
@@ -218,7 +241,13 @@ impl Net {
             events: RefCell::default(),
             flushes: RefCell::default(),
             held: RefCell::default(),
+            log_clock: Cell::new(false),
         }))
+    }
+
+    /// Logs every read of the host clock from now on as a [`NetEvent::Clock`].
+    pub(crate) fn log_clock(&self) {
+        self.0.log_clock.set(true);
     }
 
     pub(crate) fn start(&self) -> Instant {
@@ -295,6 +324,12 @@ impl Net {
         }
     }
 
+    /// Makes the next receive call on the socket at `addr`, which has [`LabReadiness::Cached`],
+    /// fail: a `poll_recv` that the cached readiness lets read, or a `poll_recv_now`.
+    pub(crate) fn fail_next_recv(&self, addr: SocketAddr) {
+        self.port(addr).fail_next_recv.set(true);
+    }
+
     /// Makes the socket at `addr` drop the next run it flushes and report it `Dropped`.
     pub(crate) fn drop_next_run(&self, addr: SocketAddr) {
         self.port(addr).drop_next.set(true);
@@ -306,12 +341,16 @@ impl Net {
         self.port(addr).drop_run_of.set(Some(index));
     }
 
-    /// Hands `arrival` to the socket at `dst` at once.
+    /// Hands `arrival` to the socket at `dst` at once. A socket with [`LabReadiness::Cached`] is
+    /// not woken: it waits for the next host poll.
     pub(crate) fn inject(&self, dst: SocketAddr, arrival: Arrival) {
         let Some(port) = self.0.ports.borrow().get(&dst).cloned() else {
             return;
         };
         port.inbox.borrow_mut().push_back(arrival);
+        if port.cached.get() {
+            return;
+        }
         if let Some(waker) = port.waker.borrow_mut().take() {
             waker.wake();
         }
@@ -349,6 +388,28 @@ impl Net {
         }
     }
 
+    /// Delivers every datagram whose arrival time has come to a socket with
+    /// [`LabReadiness::Cached`], and leaves the rest on their way.
+    fn deliver_cached(&self) {
+        let due: Vec<(Instant, u64)> = {
+            let ports = self.0.ports.borrow();
+            self.0
+                .flights
+                .borrow()
+                .iter()
+                .take_while(|((at, _), _)| *at <= self.now())
+                .filter(|(_, (dst, _))| ports.get(dst).is_some_and(|port| port.cached.get()))
+                .map(|(key, _)| *key)
+                .collect()
+        };
+        for key in due {
+            let flight = self.0.flights.borrow_mut().remove(&key);
+            if let Some((dst, arrival)) = flight {
+                self.inject(dst, arrival);
+            }
+        }
+    }
+
     fn next_flight(&self) -> Option<Instant> {
         self.0
             .flights
@@ -368,6 +429,21 @@ impl Net {
     }
 }
 
+/// How a [`MemBackend`] learns that its socket is readable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LabReadiness {
+    /// Each receive reads the inbox, and an arrival wakes the task waiting for the socket.
+    #[default]
+    Fresh,
+    /// As a reactor's cached readiness: an arrival neither marks the socket ready nor wakes its
+    /// task, and `poll_recv` reads only while the mark is set. A batch shorter than the backend's
+    /// clears the mark, and so does a receive that finds the inbox empty, which also registers the
+    /// task. `poll_recv_now` reads whatever the mark says and changes neither the mark nor the
+    /// registration. [`Lab::poll_io`] sets the mark on every such socket that holds datagrams and
+    /// wakes its task.
+    Cached,
+}
+
 /// The settings of a [`MemBackend`].
 #[derive(Clone, Default)]
 pub(crate) struct MemOptions {
@@ -376,6 +452,8 @@ pub(crate) struct MemOptions {
     pub(crate) release: bool,
     /// The most datagrams of one send, 64 if `None`.
     pub(crate) max_segments: Option<u16>,
+    /// How the socket learns that it is readable.
+    pub(crate) readiness: LabReadiness,
 }
 
 /// A socket on the lab network. Its runs leave at its flush and arrive [`DELAY`] later, it takes
@@ -411,8 +489,10 @@ impl MemBackend {
         } else {
             ReleaseSupport::None
         };
+        let port = net.port(addr);
+        port.cached.set(options.readiness == LabReadiness::Cached);
         Ok(Self {
-            port: net.port(addr),
+            port,
             net,
             addr,
             caps: TxCaps {
@@ -586,24 +666,31 @@ impl TxBackend for MemBackend {
     }
 }
 
-impl RxBackend for MemBackend {
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        self.net.deliver();
+impl MemBackend {
+    /// Makes a receive call: takes up to a batch of arrivals into the batch and returns their
+    /// datagrams, or `None` if the inbox is empty.
+    fn receive(&mut self) -> Option<usize> {
+        self.net.charge(self.net.costs().recv);
+        self.batch.clear();
         let mut inbox = self.port.inbox.borrow_mut();
         if inbox.is_empty() {
-            *self.port.waker.borrow_mut() = Some(cx.waker().clone());
-            return Poll::Pending;
+            self.net.log(NetEvent::Recv(self.addr, 0));
+            return None;
         }
-        self.batch.clear();
         let now = self.net.now();
         let mut datagrams = 0;
+        let mut gro_runs = 0;
         while self.batch.len() < RX_BATCH
             && let Some(arrival) = inbox.pop_front()
         {
-            datagrams += arrival
+            let run = arrival
                 .data
                 .len()
                 .div_ceil(usize::from(arrival.stride).max(1));
+            datagrams += run;
+            if run > 1 {
+                gro_runs += 1;
+            }
             let meta = RxMeta {
                 src: arrival.src,
                 dst_ip: None,
@@ -613,8 +700,75 @@ impl RxBackend for MemBackend {
             };
             self.batch.push((meta, arrival.data));
         }
+        if gro_runs > 0 {
+            self.net.log(NetEvent::GroRuns(self.addr, gro_runs));
+        }
         self.net.log(NetEvent::Recv(self.addr, datagrams));
-        Poll::Ready(Ok(datagrams))
+        Some(datagrams)
+    }
+
+    /// Takes the failure [`Net::fail_next_recv`] set for the next receive call, if any, which
+    /// costs a call and leaves no batch.
+    fn failed(&mut self) -> Option<io::Error> {
+        if !self.port.fail_next_recv.take() {
+            return None;
+        }
+        self.net.charge(self.net.costs().recv);
+        self.batch.clear();
+        self.net.log(NetEvent::RecvFailed(self.addr));
+        Some(io::Error::other("an injected receive error"))
+    }
+
+    /// Registers the task in `cx` for the socket's next arrival or host poll.
+    fn register(&self, cx: &Context<'_>) {
+        *self.port.waker.borrow_mut() = Some(cx.waker().clone());
+    }
+}
+
+impl RxBackend for MemBackend {
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        self.net.deliver();
+        if !self.port.cached.get() {
+            if self.port.inbox.borrow().is_empty() {
+                self.register(cx);
+                return Poll::Pending;
+            }
+            let datagrams = self.receive().expect("the inbox holds datagrams");
+            return Poll::Ready(Ok(datagrams));
+        }
+        if self.port.ready.get() {
+            if let Some(error) = self.failed() {
+                return Poll::Ready(Err(error));
+            }
+            if let Some(datagrams) = self.receive() {
+                if self.batch.len() < RX_BATCH {
+                    self.port.ready.set(false);
+                }
+                return Poll::Ready(Ok(datagrams));
+            }
+            self.port.ready.set(false);
+        }
+        self.register(cx);
+        self.net.log(NetEvent::Pending(self.addr));
+        Poll::Pending
+    }
+
+    fn poll_recv_now(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        if !self.port.cached.get() {
+            return Poll::Pending;
+        }
+        self.net.deliver();
+        if let Some(error) = self.failed() {
+            return Poll::Ready(Err(error));
+        }
+        match self.receive() {
+            Some(datagrams) => Poll::Ready(Ok(datagrams)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn last_full(&self) -> bool {
+        self.batch.len() == RX_BATCH
     }
 
     fn buffers(&mut self) -> impl Iterator<Item = (&RxMeta, &mut [u8])> {
@@ -699,7 +853,11 @@ impl LocalHost for Exec {
 
     fn now(&self) -> Instant {
         self.net.charge(self.net.costs().read);
-        self.net.now()
+        let now = self.net.now();
+        if self.net.0.log_clock.get() {
+            self.net.log(NetEvent::Clock(now - self.net.start()));
+        }
+        now
     }
 
     fn sleep_until(&self, _deadline: Instant) -> LocalFuture {
@@ -732,6 +890,13 @@ pub(crate) struct Lab {
     root: usize,
     /// Budgets refilled at the start of each iteration of [`settle`](Self::settle).
     budgets: RefCell<Vec<WorkBudget>>,
+    /// Every how many task polls the host polls the sockets' readiness, besides when every task is
+    /// idle; `None` for only then.
+    io_every: Cell<Option<usize>>,
+    /// Task polls so far.
+    task_polls: Cell<usize>,
+    /// Host polls of the sockets' readiness so far.
+    io_polls: Cell<usize>,
 }
 
 impl Lab {
@@ -759,7 +924,51 @@ impl Lab {
             ctx,
             root,
             budgets: RefCell::default(),
+            io_every: Cell::new(None),
+            task_polls: Cell::new(0),
+            io_polls: Cell::new(0),
         }
+    }
+
+    /// Makes the host poll the sockets' readiness every `polls` task polls, as well as whenever
+    /// every task is idle; with `None`, only then.
+    pub(crate) fn io_every(&self, polls: Option<usize>) {
+        self.io_every.set(polls);
+    }
+
+    /// Returns the host polls of the sockets' readiness so far.
+    pub(crate) fn io_polls(&self) -> usize {
+        self.io_polls.get()
+    }
+
+    /// Polls the sockets' readiness as a host's event loop does: sets the cached readiness of
+    /// every socket with [`LabReadiness::Cached`] that holds datagrams, and wakes the task waiting
+    /// for it. Returns whether it woke a task.
+    pub(crate) fn poll_io(&self) -> bool {
+        self.io_polls.set(self.io_polls.get() + 1);
+        self.net.deliver_cached();
+        let mut ports: Vec<(SocketAddr, Rc<Port>)> = self
+            .net
+            .0
+            .ports
+            .borrow()
+            .iter()
+            .filter(|(_, port)| port.cached.get() && !port.inbox.borrow().is_empty())
+            .map(|(addr, port)| (*addr, Rc::clone(port)))
+            .collect();
+        // In address order, so the lab stays deterministic.
+        ports.sort_by_key(|(addr, _)| *addr);
+        let mut woke = false;
+        for (addr, port) in ports {
+            if !port.ready.replace(true) {
+                self.net.log(NetEvent::Ready(addr));
+            }
+            if let Some(waker) = port.waker.borrow_mut().take() {
+                waker.wake();
+                woke = true;
+            }
+        }
+        woke
     }
 
     /// Refills `budget` at the start of each iteration of [`settle`](Self::settle), as a host
@@ -809,6 +1018,13 @@ impl Lab {
         {
             self.exec.tasks.borrow_mut()[task] = Some(future);
         }
+        let polls = self.task_polls.get() + 1;
+        self.task_polls.set(polls);
+        if let Some(every) = self.io_every.get()
+            && polls.is_multiple_of(every)
+        {
+            self.poll_io();
+        }
         true
     }
 
@@ -829,6 +1045,10 @@ impl Lab {
                     .collect()
             };
             if batch.is_empty() {
+                // Every task is idle, so the host polls the sockets' readiness.
+                if self.poll_io() {
+                    continue;
+                }
                 return;
             }
             for task in batch {
@@ -836,6 +1056,42 @@ impl Lab {
             }
         }
         panic!("the lab does not settle");
+    }
+
+    /// Runs one iteration of the host's loop: refills the budgets given to
+    /// [`refill_each_iteration`](Self::refill_each_iteration), then polls the tasks queued as it
+    /// starts, in wake order. With none queued, the host polls the sockets' readiness, and if that
+    /// wakes no task, moves the clock to the next arrival or wheel wake. Returns the tasks it
+    /// polled.
+    pub(crate) fn step(&self) -> Vec<usize> {
+        for budget in self.budgets.borrow().iter() {
+            budget.refill();
+        }
+        let batch: Vec<usize> = self
+            .exec
+            .ready
+            .lock()
+            .expect("the queue")
+            .iter()
+            .copied()
+            .collect();
+        if batch.is_empty() {
+            if !self.poll_io() {
+                let next = self
+                    .net
+                    .next_flight()
+                    .into_iter()
+                    .chain(self.exec.wheel_at.get())
+                    .min()
+                    .expect("the lab stalled");
+                self.advance_to(next);
+            }
+            return batch;
+        }
+        for &task in &batch {
+            self.poll(task);
+        }
+        batch
     }
 
     /// Polls the queued tasks until the queue is empty.

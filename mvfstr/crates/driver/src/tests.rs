@@ -41,6 +41,7 @@ use bytes::Bytes;
 use mvfstr_io::Backend;
 use mvfstr_io::MmsgBackend;
 use mvfstr_io::MmsgOptions;
+use mvfstr_io::RxBackend;
 use mvfstr_io::SocketOptions;
 use mvfstr_io::TimerFd;
 use mvfstr_io::TxCaps;
@@ -129,7 +130,6 @@ use crate::timers::Kind;
 use crate::turn::Limits;
 use crate::turn::Mark;
 use crate::turn::POLL_CHARGE;
-use crate::turn::RX_BATCHES;
 use crate::turn::ReserveRecord;
 use crate::turn::TURN_STAGING;
 use crate::turn::TxRecord;
@@ -5102,17 +5102,21 @@ fn one_datagram_per_batch() -> MmsgOptions {
 }
 
 #[test]
-fn datagrams_past_a_turns_receive_batches_on_the_server_socket_wait_for_no_wake() {
-    let harness = Harness::<MmsgBackend>::with_options(one_datagram_per_batch());
+fn datagrams_past_a_turns_receive_calls_on_the_server_socket_wait_for_no_wake() {
+    // The receive calls one receive phase makes on the server socket by default.
+    const CALLS: usize = 32;
+    let mut harness = Harness::<MmsgBackend>::with_options(one_datagram_per_batch());
+    // A probe depends on the wall clock, so with it off the counters below are exact.
+    harness.limits.rx_probe = None;
     let (tx, _rx) = mpsc::channel();
     let addr = harness.serve(move || recording_server(tx));
     let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
     peer.set_read_timeout(Some(WAIT)).expect("a read timeout");
 
-    // Datagrams the server drops fill more than a turn's receive batches, and a datagram that needs
-    // an answer waits behind them. Without a connection, the server is not woken by a timer.
+    // Datagrams the server drops fill two turns' receive calls, and a datagram that needs an
+    // answer waits behind them. Without a connection, the server is not woken by a timer.
     let blocked = Harness::block(&harness.server);
-    for _ in 0..2 * RX_BATCHES {
+    for _ in 0..2 * CALLS {
         peer.send_to(&too_small_for_a_reset(), addr)
             .expect("the datagram goes out");
     }
@@ -5127,6 +5131,20 @@ fn datagrams_past_a_turns_receive_batches_on_the_server_socket_wait_for_no_wake(
     assert_eq!(from, addr);
     assert!(len > 5, "{:?}", &reply[..len]);
     assert_eq!(reply[1..5], [0; 4], "version 0");
+    let stats = harness.server_stats::<Recorder>();
+    assert_eq!(
+        (
+            stats.server_rx_batches,
+            stats.server_rx_datagrams,
+            stats.server_rx_bound_hits,
+        ),
+        (2 * CALLS as u64 + 1, 2 * CALLS as u64 + 1, 2),
+        "one call per datagram, and two receive phases end at the bound"
+    );
+    assert_eq!(
+        (stats.server_rx_probes, stats.server_rx_probes_empty),
+        (0, 0)
+    );
     harness.shutdown();
 }
 
@@ -5685,6 +5703,77 @@ fn a_receive_error_on_the_server_socket_leaves_the_rest_of_the_receive_to_run() 
     assert!(len > 5, "{:?}", &reply[..len]);
     assert_eq!(reply[1..5], [0; 4], "version 0");
     harness.shutdown();
+}
+
+#[test]
+fn an_injected_receive_error_after_a_full_batch_reports_that_the_failed_call_filled_no_buffer() {
+    let valves = Arc::new(Valves::default());
+    // One buffer, so one datagram fills the batch.
+    let options = GatedOptions {
+        mmsg: MmsgOptions {
+            rx_batch: 1,
+            ..mmsg_options()
+        },
+        valves: Arc::clone(&valves),
+    };
+    let worker = ManagedWorker::new(16).expect("a worker");
+    let (tx, rx) = mpsc::channel();
+    worker
+        .handle()
+        .submit(move |_| {
+            let mut socket =
+                <Gated as Backend>::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &options)
+                    .expect("a socket");
+            let addr = Backend::local_addr(&socket).expect("the socket is bound");
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
+            // Sends a datagram to the socket and receives now until it has arrived; returns the
+            // datagrams of the batch, or `None` if the call failed or none arrived in a second.
+            let receive_sent = |socket: &mut Gated| {
+                peer.send_to(&[1; 10], addr).expect("the datagram goes out");
+                let mut cx = Context::from_waker(Waker::noop());
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < deadline {
+                    if let Poll::Ready(read) = socket.poll_recv_now(&mut cx) {
+                        return read.ok();
+                    }
+                    std::thread::yield_now();
+                }
+                None
+            };
+            let read = receive_sent(&mut socket);
+            let full = socket.last_full();
+            valves.server.fail_next_recv();
+            let failed = matches!(
+                socket.poll_recv_now(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            );
+            let full_after_failure = socket.last_full();
+            let read_after = receive_sent(&mut socket);
+            let full_after = socket.last_full();
+            let _ = tx.send((
+                read,
+                full,
+                failed,
+                full_after_failure,
+                read_after,
+                full_after,
+            ));
+        })
+        .expect("the worker takes commands");
+    let (read, full, failed, full_after_failure, read_after, full_after) =
+        rx.recv_timeout(WAIT).expect("the worker answers");
+    worker.shutdown().expect("the worker stops");
+    assert_eq!(read, Some(1));
+    assert!(full, "the datagram filled the one buffer");
+    assert!(failed, "the injected error");
+    // The driver reads on past the readiness while a probe's call reports every buffer filled,
+    // so a failed call must report none, as a real backend's does.
+    assert!(
+        !full_after_failure,
+        "the failed call filled no buffer, so a probe it ends does not read on"
+    );
+    assert_eq!(read_after, Some(1));
+    assert!(full_after, "the next call reports its own batch again");
 }
 
 #[test]

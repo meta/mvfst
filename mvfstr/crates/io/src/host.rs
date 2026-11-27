@@ -290,6 +290,18 @@ impl<H: IoHost> RxBackend for HostBackend<H> {
         Poll::Pending
     }
 
+    /// Makes one `recvmmsg` call whatever the readiness says, and leaves the readiness as it is.
+    fn poll_recv_now(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        match self.rx.recv(self.socket.as_raw_fd()) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            result => Poll::Ready(result),
+        }
+    }
+
+    fn last_full(&self) -> bool {
+        !self.rx.drained()
+    }
+
     fn buffers(&mut self) -> impl Iterator<Item = (&RxMeta, &mut [u8])> {
         self.rx.buffers()
     }
@@ -896,5 +908,151 @@ mod tests {
         );
         assert!(backend.poll_recv(&mut cx).is_pending());
         assert_eq!(backend.rx.calls, 3);
+    }
+
+    /// Waits until the socket of `backend` has something to read, so a receive now does not
+    /// depend on timing.
+    fn wait_readable(backend: &HostBackend<ManualHost>) {
+        let mut ready = libc::pollfd {
+            fd: backend.socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd`; the timeout only guards against a hang.
+        let n = unsafe { libc::poll(&raw mut ready, 1, HANG_GUARD.as_millis() as libc::c_int) };
+        assert_eq!(n, 1, "readable within the hang guard");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receiving_now_reads_datagrams_a_short_batch_left_unreported() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = send(&sender, &backend, 0..1);
+        assert_eq!(recv(&host, &mut backend), first);
+        assert_eq!(backend.rx.calls, 1);
+
+        let late = send(&sender, &backend, 1..3);
+        wait_readable(&backend);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            backend.poll_recv(&mut cx).is_pending(),
+            "the short batch cleared readiness, and the host has not polled since"
+        );
+        assert_eq!(backend.rx.calls, 1);
+        assert!(matches!(backend.poll_recv_now(&mut cx), Poll::Ready(Ok(2))));
+        assert_eq!(datagrams(&mut backend), late);
+        assert_eq!(backend.rx.calls, 2);
+        assert!(
+            !backend.readiness.is_set(Interest::Read),
+            "receiving now left the readiness clear"
+        );
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        assert_eq!(backend.rx.calls, 2);
+        assert_eq!(
+            host.poll(Some(Duration::ZERO)).unwrap(),
+            0,
+            "the level-triggered host does not report the socket the receive emptied"
+        );
+        assert!(!backend.readiness.is_set(Interest::Read));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receiving_now_on_an_empty_socket_is_pending_and_a_later_datagram_still_wakes_the_task() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = send(&sender, &backend, 0..3);
+        assert_eq!(recv(&host, &mut backend), first);
+
+        let (woken, waker) = counter();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            backend.poll_recv(&mut cx).is_pending(),
+            "registers the task"
+        );
+        assert!(
+            backend.poll_recv_now(&mut cx).is_pending(),
+            "the socket is empty"
+        );
+        assert_eq!(backend.rx.calls, 2, "one receive found the socket empty");
+        assert_eq!(wakes(&woken), 0);
+
+        let later = send(&sender, &backend, 3..4);
+        assert_eq!(host.poll(Some(HANG_GUARD)).unwrap(), 1);
+        assert_eq!(wakes(&woken), 1, "the registration stood");
+        assert!(matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(1))));
+        assert_eq!(datagrams(&mut backend), later);
+        assert_eq!(backend.rx.calls, 3);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn after_receiving_now_the_reactors_report_of_the_same_datagrams_costs_at_most_one_empty_receive()
+     {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = send(&sender, &backend, 0..1);
+        assert_eq!(recv(&host, &mut backend), first);
+        let late = send(&sender, &backend, 1..3);
+        wait_readable(&backend);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(backend.poll_recv_now(&mut cx), Poll::Ready(Ok(2))));
+        assert_eq!(datagrams(&mut backend), late);
+
+        // A level-triggered host reports only what is still queued.
+        assert_eq!(host.poll(Some(Duration::ZERO)).unwrap(), 0);
+        assert!(!backend.readiness.is_set(Interest::Read));
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        assert_eq!(backend.rx.calls, 2, "the host's poll cost no receive");
+
+        // A full batch of 32 leaves the 33rd datagram, which the next poll reports.
+        let mut sent = send(&sender, &backend, 0..33);
+        wait_readable(&backend);
+        assert!(matches!(
+            backend.poll_recv_now(&mut cx),
+            Poll::Ready(Ok(32))
+        ));
+        assert!(backend.last_full());
+        assert_eq!(datagrams(&mut backend), sent[..32]);
+        assert!(!backend.readiness.is_set(Interest::Read));
+        assert_eq!(host.poll(Some(Duration::ZERO)).unwrap(), 1);
+        assert!(backend.readiness.is_set(Interest::Read));
+        assert!(matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(1))));
+        assert_eq!(datagrams(&mut backend), sent.split_off(32));
+        assert_eq!(backend.rx.calls, 4);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn last_full_is_set_exactly_when_a_call_fills_every_buffer() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert!(!backend.last_full(), "before any receive");
+
+        let sent = send(&sender, &backend, 0..32);
+        assert_eq!(recv(&host, &mut backend), sent);
+        assert!(backend.last_full(), "32 datagrams fill the 32 buffers");
+
+        let mut cx = Context::from_waker(Waker::noop());
+        send(&sender, &backend, 0..31);
+        assert!(matches!(backend.poll_recv(&mut cx), Poll::Ready(Ok(31))));
+        assert!(!backend.last_full(), "31 datagrams leave a buffer empty");
+
+        send_empty(&sender, &backend, 32);
+        wait_readable(&backend);
+        assert!(
+            matches!(backend.poll_recv_now(&mut cx), Poll::Ready(Ok(0))),
+            "a full batch of only discarded datagrams makes no buffer available"
+        );
+        assert!(backend.last_full(), "but the call filled every buffer");
+        send(&sender, &backend, 0..2);
+        wait_readable(&backend);
+        assert!(matches!(backend.poll_recv_now(&mut cx), Poll::Ready(Ok(2))));
+        assert!(!backend.last_full());
     }
 }

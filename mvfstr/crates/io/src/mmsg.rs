@@ -247,6 +247,30 @@ impl RxBackend for MmsgBackend {
         }
     }
 
+    /// Calls `recvmmsg` on the descriptor itself, because tokio's `try_io` does not run a call
+    /// while the cached readiness is clear, and this call must leave that cache as it is. It spends
+    /// the task's budget as [`poll_recv`](RxBackend::poll_recv) does.
+    fn poll_recv_now(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        if !coop::has_budget_remaining() {
+            drop(ready!(coop::poll_proceed(cx)));
+        }
+        match self.rx.recv(self.io.get_ref().as_raw_fd()) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            result => {
+                if result.is_ok()
+                    && let Poll::Ready(spent) = coop::poll_proceed(cx)
+                {
+                    spent.made_progress();
+                }
+                Poll::Ready(result)
+            }
+        }
+    }
+
+    fn last_full(&self) -> bool {
+        !self.rx.drained()
+    }
+
     fn buffers(&mut self) -> impl Iterator<Item = (&RxMeta, &mut [u8])> {
         self.rx.buffers()
     }
@@ -363,6 +387,7 @@ impl Backend for MmsgBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::MaybeUninit;
     use std::net::UdpSocket;
     use std::ops::Range;
 
@@ -439,6 +464,79 @@ mod tests {
         rt.block_on(poll_fn(|cx| {
             Poll::Ready(backend.poll_recv(cx).is_pending())
         }))
+    }
+
+    /// Makes one receive call now in a task of its own, and returns its result with the datagrams
+    /// of the batch it read, if any.
+    fn recv_now(
+        rt: &Runtime,
+        backend: &mut MmsgBackend,
+    ) -> (Poll<io::Result<usize>>, Vec<Vec<u8>>) {
+        let poll = rt.block_on(poll_fn(|cx| Poll::Ready(backend.poll_recv_now(cx))));
+        let got = match poll {
+            Poll::Ready(Ok(_)) => backend.buffers().map(|(_, data)| data.to_vec()).collect(),
+            _ => Vec::new(),
+        };
+        (poll, got)
+    }
+
+    /// Sets the peek offset of `socket`: 0 turns it on at the head of the queue, and -1 off.
+    fn set_peek_offset(socket: &Socket, offset: libc::c_int) {
+        // SAFETY: the option value points at `offset`, a live `c_int` of the length passed.
+        let set = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEEK_OFF,
+                (&raw const offset).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", io::Error::last_os_error());
+    }
+
+    /// Waits, for up to a second, until the socket of `backend` holds `count` datagrams, so that
+    /// a test does not depend on loopback queueing each datagram before `send_to` returns. It
+    /// counts them without taking them: with the socket's peek offset on, each peek moves past
+    /// the datagram it saw, also an empty one, which the kernel marks peeked. So the socket must
+    /// hold no datagram an earlier wait saw. The offset is off again when the wait returns.
+    fn wait_queued(backend: &MmsgBackend, count: usize) {
+        let socket = backend.io.get_ref();
+        set_peek_offset(socket, 0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut queued = 0;
+        let mut buf = [MaybeUninit::uninit(); 1];
+        loop {
+            match socket.recv_with_flags(
+                &mut buf,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            ) {
+                Ok(_) => queued += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if queued >= count {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{queued} of {count} datagrams queued within a second"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        set_peek_offset(socket, -1);
+        assert_eq!(queued, count, "the socket holds only the datagrams sent");
+    }
+
+    /// Spends `units` of the running task's budget.
+    fn spend(cx: &mut Context<'_>, units: usize) {
+        for _ in 0..units {
+            match coop::poll_proceed(cx) {
+                Poll::Ready(spent) => spent.made_progress(),
+                Poll::Pending => panic!("the budget ran out early"),
+            }
+        }
     }
 
     #[test]
@@ -542,5 +640,201 @@ mod tests {
             backend.rx.calls, 4,
             "one receive for the empty datagrams, one for the last"
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receiving_now_reads_datagrams_a_short_batch_left_unreported() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = send(&sender, &backend, 0..1);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, first);
+        assert_eq!(backend.rx.calls, 1);
+
+        let late = send(&sender, &backend, 1..3);
+        wait_queued(&backend, 2);
+        assert!(
+            pending(&rt, &mut backend),
+            "the short batch cleared the cached readiness, and the reactor has not run since"
+        );
+        assert_eq!(backend.rx.calls, 1, "the pending poll made no receive");
+        let (poll, got) = recv_now(&rt, &mut backend);
+        assert!(matches!(poll, Poll::Ready(Ok(2))), "{poll:?}");
+        assert_eq!(got, late);
+        assert_eq!(backend.rx.calls, 2);
+        assert!(
+            pending(&rt, &mut backend),
+            "receiving now left the cached readiness clear"
+        );
+        assert_eq!(backend.rx.calls, 2);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receiving_now_on_an_empty_socket_is_pending_and_a_later_datagram_still_wakes_the_task() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = send(&sender, &backend, 0..3);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, first);
+
+        // One task: a pending poll registers it, a receive now finds the socket empty, and then a
+        // datagram arrives.
+        let mut later = Vec::new();
+        let mut polls = 0;
+        let task = poll_fn(|cx| {
+            polls += 1;
+            if let Poll::Ready(n) = backend.poll_recv(cx) {
+                return Poll::Ready(n);
+            }
+            if polls == 1 {
+                assert!(
+                    backend.poll_recv_now(cx).is_pending(),
+                    "the socket is empty"
+                );
+                assert_eq!(backend.rx.calls, 2, "one receive found the socket empty");
+                later = send(&sender, &backend, 3..4);
+            }
+            Poll::Pending
+        });
+        let n = rt
+            .block_on(tokio::time::timeout(HANG_GUARD, task))
+            .expect("the datagram wakes the task")
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            polls, 2,
+            "the empty receive did not wake the task, and the datagram woke it once"
+        );
+        let got: Vec<Vec<u8>> = backend.buffers().map(|(_, data)| data.to_vec()).collect();
+        assert_eq!(got, later);
+        assert_eq!(backend.rx.calls, 3);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn after_receiving_now_the_reactors_report_of_the_same_datagrams_costs_at_most_one_empty_receive()
+     {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = send(&sender, &backend, 0..1);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, first);
+        let late = send(&sender, &backend, 1..3);
+        wait_queued(&backend, 2);
+        let (poll, got) = recv_now(&rt, &mut backend);
+        assert!(matches!(poll, Poll::Ready(Ok(2))), "{poll:?}");
+        assert_eq!(got, late, "the receive now emptied the socket");
+        assert_eq!(backend.rx.calls, 2);
+
+        // The reactor runs after the datagrams' arrival was queued for it. Epoll checks the
+        // socket again as it reports it, and the socket is empty by then, so the readable edge
+        // is not reported and the poll after it makes no receive.
+        rt.block_on(tokio::time::sleep(Duration::from_millis(1)));
+        assert!(pending(&rt, &mut backend));
+        assert_eq!(
+            backend.rx.calls, 2,
+            "the reactor's report of the datagrams already read cost no receive"
+        );
+        assert!(pending(&rt, &mut backend), "and readiness stays clear");
+        assert_eq!(backend.rx.calls, 2);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receiving_now_spends_one_unit_of_the_task_budget_per_call_and_yields_when_it_is_spent() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(1);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..3);
+        let units = rt.block_on(poll_fn(|cx| {
+            let mut units = 0;
+            while let Poll::Ready(spent) = coop::poll_proceed(cx) {
+                spent.made_progress();
+                units += 1;
+            }
+            Poll::Ready(units)
+        }));
+        assert!(units > 2, "a task poll's budget holds {units} units");
+
+        let mut polls = 0;
+        let mut got = Vec::new();
+        let task = poll_fn(|cx| {
+            polls += 1;
+            if polls > 1 {
+                return backend.poll_recv_now(cx);
+            }
+            spend(cx, units - 2);
+            for _ in 0..2 {
+                assert!(coop::has_budget_remaining());
+                let poll = backend.poll_recv_now(cx);
+                assert!(matches!(poll, Poll::Ready(Ok(1))), "{poll:?}");
+                got.extend(backend.buffers().map(|(_, data)| data.to_vec()));
+            }
+            assert!(
+                !coop::has_budget_remaining(),
+                "the two receives spent the last two units"
+            );
+            assert!(
+                backend.poll_recv_now(cx).is_pending(),
+                "out of budget, the receive yields"
+            );
+            assert_eq!(backend.rx.calls, 2, "without a receive call");
+            Poll::Pending
+        });
+        let n = rt
+            .block_on(tokio::time::timeout(HANG_GUARD, task))
+            .expect("the yield wakes the task")
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(polls, 2, "woken once, after the yield");
+        got.extend(backend.buffers().map(|(_, data)| data.to_vec()));
+        assert_eq!(got, sent);
+        assert_eq!(backend.rx.calls, 3);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn last_full_is_set_exactly_when_a_call_fills_every_buffer() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind(32);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert!(!backend.last_full(), "before any receive");
+
+        let sent = send(&sender, &backend, 0..32);
+        wait_queued(&backend, 32);
+        let (poll, got) = recv_now(&rt, &mut backend);
+        assert!(matches!(poll, Poll::Ready(Ok(32))), "{poll:?}");
+        assert_eq!(got, sent);
+        assert!(backend.last_full(), "32 datagrams fill the 32 buffers");
+
+        send(&sender, &backend, 0..31);
+        wait_queued(&backend, 31);
+        assert!(matches!(recv_now(&rt, &mut backend).0, Poll::Ready(Ok(31))));
+        assert!(!backend.last_full(), "31 datagrams leave a buffer empty");
+
+        send_empty(&sender, &backend, 32);
+        wait_queued(&backend, 32);
+        assert!(
+            matches!(recv_now(&rt, &mut backend).0, Poll::Ready(Ok(0))),
+            "a full batch of only discarded datagrams makes no buffer available"
+        );
+        assert!(backend.last_full(), "but the call filled every buffer");
+
+        // The same holds for the receives of `poll_recv`.
+        let sent = send(&sender, &backend, 0..32);
+        wait_queued(&backend, 32);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent);
+        assert!(backend.last_full());
+        let sent = send(&sender, &backend, 0..3);
+        wait_queued(&backend, 3);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent);
+        assert!(!backend.last_full());
     }
 }

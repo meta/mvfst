@@ -18,6 +18,7 @@ use std::cell::Cell;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU16;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -38,6 +39,7 @@ use mvfstr_driver::EndpointStats;
 use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
 use mvfstr_driver::Refusal;
+use mvfstr_driver::RxProbe;
 use mvfstr_driver::SendSink;
 use mvfstr_io::Backend;
 use mvfstr_proto::Bytes;
@@ -104,6 +106,10 @@ pub(crate) struct Settings {
     pub(crate) work_budget: Option<Duration>,
     /// The driver's release hold, from `--release_hold_us`.
     pub(crate) release_hold: Option<Duration>,
+    /// The receive calls of one receive phase on the driver's socket, from `--server_rx_calls`.
+    pub(crate) server_rx_calls: NonZeroU16,
+    /// The driver's probe of its socket, from `--rx_probe_datagrams` and `--rx_probe_us`.
+    pub(crate) rx_probe: Option<RxProbe>,
     /// The rustls config of each connection's TLS host under `--tls_backend=external`.
     host_tls: Option<Arc<rustls::ServerConfig>>,
     /// What the server has done, for its summary line.
@@ -134,6 +140,9 @@ impl Settings {
             work_budget: (flags.work_budget_us > 0)
                 .then(|| Duration::from_micros(u64::from(flags.work_budget_us))),
             release_hold: flags.release_hold,
+            // Parsing rejects 0.
+            server_rx_calls: NonZeroU16::new(flags.server_rx_calls).unwrap_or(NonZeroU16::MIN),
+            rx_probe: flags.rx_probe(),
             host_tls,
             counters: Arc::default(),
             object_rate: flags.object_rate,
@@ -784,6 +793,11 @@ impl ServerCounters {
             hold_blocked: stats.hold_blocked,
             hold_carried_flushes: stats.hold_carried_flushes,
             pacing_wake_lateness: stats.pacing_wake_lateness,
+            server_rx_batches: stats.server_rx_batches,
+            server_rx_datagrams: stats.server_rx_datagrams,
+            server_rx_probes: stats.server_rx_probes,
+            server_rx_probes_empty: stats.server_rx_probes_empty,
+            server_rx_bound_hits: stats.server_rx_bound_hits,
             ..ServerTally::default()
         };
         *self.driver.lock().unwrap_or_else(PoisonError::into_inner) = copy;
@@ -903,6 +917,38 @@ mod tests {
         assert_eq!(
             Settings::new(&Flags::default(), closed, None).release_hold,
             None
+        );
+    }
+
+    #[test]
+    fn the_receive_flags_give_the_driver_its_receive_bound_and_its_probe() {
+        let (closed, _) = mpsc::channel();
+        let settings = Settings::new(&Flags::default(), closed.clone(), None);
+        assert_eq!(settings.server_rx_calls.get(), 32);
+        assert_eq!(settings.rx_probe, Flags::default().rx_probe());
+        let flags = Flags {
+            server_rx_calls: 4,
+            rx_probe_datagrams: 0,
+            rx_probe_us: 0,
+            ..Flags::default()
+        };
+        let settings = Settings::new(&flags, closed.clone(), None);
+        assert_eq!(
+            (settings.server_rx_calls.get(), settings.rx_probe),
+            (4, None),
+            "the parent's reads"
+        );
+        let flags = Flags {
+            rx_probe_datagrams: 8_192,
+            rx_probe_us: 0,
+            ..Flags::default()
+        };
+        assert_eq!(
+            Settings::new(&flags, closed, None).rx_probe,
+            Some(RxProbe {
+                datagrams: std::num::NonZeroU64::new(8_192),
+                after: None,
+            })
         );
     }
 
@@ -1058,6 +1104,34 @@ mod tests {
                 hold_blocked: 2034,
                 hold_carried_flushes: 2035,
                 pacing_wake_lateness: [2040, 2041, 2042, 2043, 2044, 2045, 2046, 2047],
+                ..ServerTally::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_summary_reads_the_drivers_server_socket_read_counters_as_last_copied() {
+        // Every counter takes its own value, so a counter copied into another's place shows.
+        let stats = |base: u64| {
+            let mut stats = EndpointStats::default();
+            stats.server_rx_batches = base + 1;
+            stats.server_rx_datagrams = base + 2;
+            stats.server_rx_probes = base + 3;
+            stats.server_rx_probes_empty = base + 4;
+            stats.server_rx_bound_hits = base + 5;
+            stats
+        };
+        let counters = ServerCounters::default();
+        counters.copy_driver(&stats(1000));
+        counters.copy_driver(&stats(2000));
+        assert_eq!(
+            counters.tally(),
+            ServerTally {
+                server_rx_batches: 2001,
+                server_rx_datagrams: 2002,
+                server_rx_probes: 2003,
+                server_rx_probes_empty: 2004,
+                server_rx_bound_hits: 2005,
                 ..ServerTally::default()
             }
         );

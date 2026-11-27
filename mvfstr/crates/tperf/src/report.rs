@@ -206,6 +206,16 @@ pub(crate) struct ServerTally {
     pub(crate) hold_carried_flushes: u64,
     /// Pacing wakes taken inside transmit phases, by how late they were taken.
     pub(crate) pacing_wake_lateness: [u64; 8],
+    /// Receive calls on the server socket that returned a batch.
+    pub(crate) server_rx_batches: u64,
+    /// Datagrams of those batches, as routed.
+    pub(crate) server_rx_datagrams: u64,
+    /// Receive calls past the readiness the host last reported.
+    pub(crate) server_rx_probes: u64,
+    /// Those of them that found the socket empty.
+    pub(crate) server_rx_probes_empty: u64,
+    /// Receive phases that ended at their bound on receive calls.
+    pub(crate) server_rx_bound_hits: u64,
 }
 
 /// Returns the value at `per_mille` thousandths of `sorted`, by nearest rank: the smallest value
@@ -383,7 +393,9 @@ pub(crate) fn server_summary_line(mode: WriteMode, tally: &ServerTally) -> Strin
         " dropped_initials={} turns={} sendmmsg_calls={} sendmmsg_messages={} \
          multi_connection_calls={} sent_datagrams={} release_attempts={} release_lateness={} \
          messages_per_call={} hold_flushes_age={} hold_flushes_stamp={} hold_stop_flushes={} \
-         hold_late={} hold_blocked={} hold_carried_flushes={} pacing_wake_lateness={}",
+         hold_late={} hold_blocked={} hold_carried_flushes={} pacing_wake_lateness={} \
+         server_rx_batches={} server_rx_datagrams={} server_rx_probes={} \
+         server_rx_probes_empty={} server_rx_bound_hits={}",
         tally.dropped_initials,
         tally.turns,
         tally.sendmmsg_calls,
@@ -400,6 +412,11 @@ pub(crate) fn server_summary_line(mode: WriteMode, tally: &ServerTally) -> Strin
         tally.hold_blocked,
         tally.hold_carried_flushes,
         comma_list(&tally.pacing_wake_lateness),
+        tally.server_rx_batches,
+        tally.server_rx_datagrams,
+        tally.server_rx_probes,
+        tally.server_rx_probes_empty,
+        tally.server_rx_bound_hits,
     ));
     line
 }
@@ -1408,7 +1425,8 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
         sent_datagrams=0 release_attempts=0,0,0,0 release_lateness=0,0,0,0,0,0,0,0 \
         messages_per_call=0,0,0,0,0,0,0,0 hold_flushes_age=0 hold_flushes_stamp=0 \
         hold_stop_flushes=0 hold_late=0 hold_blocked=0 hold_carried_flushes=0 \
-        pacing_wake_lateness=0,0,0,0,0,0,0,0";
+        pacing_wake_lateness=0,0,0,0,0,0,0,0 server_rx_batches=0 server_rx_datagrams=0 \
+        server_rx_probes=0 server_rx_probes_empty=0 server_rx_bound_hits=0";
 
     #[test]
     fn the_server_summary_line_adds_its_object_counts_in_paced_mode() {
@@ -1469,6 +1487,30 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
     }
 
     #[test]
+    fn the_server_summary_line_ends_with_the_drivers_server_socket_reads_after_its_pacing_wakes() {
+        let tally = ServerTally {
+            pacing_wake_lateness: [51, 52, 53, 54, 55, 56, 57, 58],
+            server_rx_batches: 61,
+            server_rx_datagrams: 62,
+            server_rx_probes: 63,
+            server_rx_probes_empty: 64,
+            server_rx_bound_hits: 65,
+            ..ServerTally::default()
+        };
+        for mode in [WriteMode::Saturate, PACED] {
+            let line = server_summary_line(mode, &tally);
+            assert!(
+                line.ends_with(
+                    " pacing_wake_lateness=51,52,53,54,55,56,57,58 server_rx_batches=61 \
+                     server_rx_datagrams=62 server_rx_probes=63 server_rx_probes_empty=64 \
+                     server_rx_bound_hits=65"
+                ),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn the_server_summary_line_ends_with_the_drivers_send_path_counters_in_both_modes() {
         // Every counter takes its own value, so a counter printed in another's place shows.
         let tally = ServerTally {
@@ -1492,6 +1534,11 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             hold_blocked: 45,
             hold_carried_flushes: 46,
             pacing_wake_lateness: [51, 52, 53, 54, 55, 56, 57, 58],
+            server_rx_batches: 61,
+            server_rx_datagrams: 62,
+            server_rx_probes: 63,
+            server_rx_probes_empty: 64,
+            server_rx_bound_hits: 65,
         };
         // The attempts by lead are those that built nothing, only runs due at once, only runs
         // released later, and both; the histograms list their buckets in order.
@@ -1499,7 +1546,9 @@ I1120 16:02:21.125300 1234 TperfClient.cpp:73] Average per Stream throughput: 41
             sent_datagrams=60004 release_attempts=11,12,13,14 \
             release_lateness=21,22,23,24,25,26,27,28 messages_per_call=31,32,33,34,35,36,37,38 \
             hold_flushes_age=41 hold_flushes_stamp=42 hold_stop_flushes=43 hold_late=44 \
-            hold_blocked=45 hold_carried_flushes=46 pacing_wake_lateness=51,52,53,54,55,56,57,58";
+            hold_blocked=45 hold_carried_flushes=46 pacing_wake_lateness=51,52,53,54,55,56,57,58 \
+            server_rx_batches=61 server_rx_datagrams=62 server_rx_probes=63 \
+            server_rx_probes_empty=64 server_rx_bound_hits=65";
         assert_eq!(
             server_summary_line(WriteMode::Saturate, &tally),
             format!(

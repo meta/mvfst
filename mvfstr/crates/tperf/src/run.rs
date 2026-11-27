@@ -505,8 +505,12 @@ fn spawn_server<B: Backend>(
     let driver = Driver::<B>::default();
     let budget = settings.work_budget;
     let hold = settings.release_hold;
+    let (rx_calls, rx_probe) = (settings.server_rx_calls, settings.rx_probe);
     let app = ServerApp::new(settings, Rc::clone(&driver));
-    let mut builder = socket(EndpointDriver::<_, B>::builder(endpoint, app)).max_segments(segments);
+    let mut builder = socket(EndpointDriver::<_, B>::builder(endpoint, app))
+        .max_segments(segments)
+        .server_receive_calls(rx_calls)
+        .receive_probe(rx_probe);
     if let Some(slice) = budget {
         builder = builder.work_budget(WorkBudget::per_poll(slice));
     }
@@ -1419,7 +1423,7 @@ mod tests {
     /// mode adds, and the driver's counters, which end the line in every mode.
     const SERVER_KEYS: [&str; 3] = ["stack", "mode", "conns"];
     const SERVER_PACED_KEYS: [&str; 3] = ["objects_sent", "objects_dropped", "late_ticks"];
-    const SERVER_DRIVER_KEYS: [&str; 16] = [
+    const SERVER_DRIVER_KEYS: [&str; 21] = [
         "dropped_initials",
         "turns",
         "sendmmsg_calls",
@@ -1436,6 +1440,11 @@ mod tests {
         "hold_blocked",
         "hold_carried_flushes",
         "pacing_wake_lateness",
+        "server_rx_batches",
+        "server_rx_datagrams",
+        "server_rx_probes",
+        "server_rx_probes_empty",
+        "server_rx_bound_hits",
     ];
 
     /// The release hold's counters in the server's summary line, which stay 0 without a hold.

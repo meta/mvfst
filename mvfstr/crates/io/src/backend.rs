@@ -160,6 +160,22 @@ pub trait RxBackend {
     /// a system call, until the socket is readable again.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>>;
 
+    /// Makes one receive call now, whatever readiness the backend has cached, and leaves that
+    /// cache as it is. Call it only after [`poll_recv`](Self::poll_recv) returned `Pending` in the
+    /// same task poll, which registered `cx`. `Ready(Ok(n))` makes `n` buffers available, possibly
+    /// 0 when every datagram was discarded; `Pending` means that the socket was empty or the
+    /// task's budget is spent, and the registration stands. It never wakes a task. Backends
+    /// without a readiness cache keep this default, which is always `Pending`.
+    fn poll_recv_now(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let _ = cx;
+        Poll::Pending
+    }
+
+    /// Returns whether the last receive call filled every buffer. The default is `false`.
+    fn last_full(&self) -> bool {
+        false
+    }
+
     /// Returns the buffers of the last batch with their metadata. A buffer holds one datagram or a
     /// GRO run of datagrams of `meta.stride` bytes, the last possibly shorter.
     fn buffers(&mut self) -> impl Iterator<Item = (&RxMeta, &mut [u8])>;

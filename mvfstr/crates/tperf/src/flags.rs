@@ -9,9 +9,11 @@
 //! defaults, in gflags syntax.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::time::Duration;
 
+use mvfstr_driver::RxProbe;
 use mvfstr_proto::CongestionControl;
 use mvfstr_proto::recovery::RecoveryConfig;
 
@@ -124,6 +126,14 @@ pub struct Flags {
     /// at once, so that one flush hands the kernel the runs of many connections; `Duration::MAX`
     /// sets no bound. `None` turns the hold off.
     pub(crate) release_hold: Option<Duration>,
+    /// The receive calls one receive phase of the server driver makes on its socket.
+    pub(crate) server_rx_calls: u16,
+    /// The datagrams the server's connections send after which the server driver reads its socket
+    /// past the readiness the host last reported; 0 sets no such count.
+    pub(crate) rx_probe_datagrams: u64,
+    /// The time in µs after which the server driver reads its socket past the readiness the host
+    /// last reported; 0 sets no such time. With both at 0 the driver never does.
+    pub(crate) rx_probe_us: u32,
 }
 
 /// The pacing tick mvfst tperf's `--pacing` sets, in µs.
@@ -172,11 +182,23 @@ impl Default for Flags {
             object_size: OBJECT_SIZE,
             initial_rtt_ms: None,
             release_hold: None,
+            server_rx_calls: 32,
+            rx_probe_datagrams: 2_048,
+            rx_probe_us: 0,
         }
     }
 }
 
 impl Flags {
+    /// Returns the server driver's probe of its socket, from `--rx_probe_datagrams` and
+    /// `--rx_probe_us`: `None` when both are 0.
+    pub(crate) fn rx_probe(&self) -> Option<RxProbe> {
+        let after =
+            (self.rx_probe_us > 0).then(|| Duration::from_micros(u64::from(self.rx_probe_us)));
+        let datagrams = NonZeroU64::new(self.rx_probe_datagrams);
+        (datagrams.is_some() || after.is_some()).then_some(RxProbe { datagrams, after })
+    }
+
     /// Parses the arguments after the program name.
     pub fn parse<I>(args: I) -> Result<Flags, FlagError>
     where
@@ -376,6 +398,9 @@ impl Flags {
                     (us > 0).then(|| Duration::from_micros(u64::from(us)))
                 }
             }
+            "server_rx_calls" => self.server_rx_calls = positive(value).ok_or_else(bad)?,
+            "rx_probe_datagrams" => self.rx_probe_datagrams = value.parse().map_err(|_| bad())?,
+            "rx_probe_us" => self.rx_probe_us = value.parse().map_err(|_| bad())?,
             // glog's flags, which mvfst tperf needs to print its results.
             "minloglevel" | "v" => {}
             "logtostderr" => {
@@ -401,7 +426,7 @@ const BOOL_FLAGS: [&str; 9] = [
 ];
 
 /// The flags that take a value, which gflags also takes from the next argument.
-const VALUE_FLAGS: [&str; 27] = [
+const VALUE_FLAGS: [&str; 30] = [
     "mode",
     "host",
     "port",
@@ -427,6 +452,9 @@ const VALUE_FLAGS: [&str; 27] = [
     "object_size",
     "initial_rtt_ms",
     "release_hold_us",
+    "server_rx_calls",
+    "rx_probe_datagrams",
+    "rx_probe_us",
     "minloglevel",
     "v",
 ];
@@ -597,6 +625,9 @@ mod tests {
             object_size: 1200,
             initial_rtt_ms: None,
             release_hold: None,
+            server_rx_calls: 32,
+            rx_probe_datagrams: 2_048,
+            rx_probe_us: 0,
         };
         assert_eq!(flags, expected);
     }
@@ -665,6 +696,9 @@ mod tests {
                 object_size: 1200,
                 initial_rtt_ms: Some(100),
                 release_hold: None,
+                server_rx_calls: 32,
+                rx_probe_datagrams: 2_048,
+                rx_probe_us: 0,
             }
         );
         let server = parse(&[
@@ -701,6 +735,98 @@ mod tests {
             100
         );
         assert_eq!(parse(&["--work_budget_us=0"]).unwrap().work_budget_us, 0);
+    }
+
+    #[test]
+    fn the_server_reads_up_to_32_calls_a_phase_and_probes_at_2048_datagrams_with_no_time_trigger_and_both_probe_flags_at_0_turn_the_probe_off()
+     {
+        let flags = Flags::default();
+        assert_eq!(
+            (
+                flags.server_rx_calls,
+                flags.rx_probe_datagrams,
+                flags.rx_probe_us
+            ),
+            (32, 2_048, 0)
+        );
+        let count = std::num::NonZeroU64::new(2_048);
+        assert_eq!(
+            flags.rx_probe(),
+            Some(RxProbe {
+                datagrams: count,
+                after: None,
+            }),
+            "the count alone by default"
+        );
+        // The parent's reads: four calls a phase and no probe.
+        let parent = parse(&[
+            "--server_rx_calls=4",
+            "--rx_probe_datagrams=0",
+            "--rx_probe_us=0",
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                parent.server_rx_calls,
+                parent.rx_probe_datagrams,
+                parent.rx_probe_us
+            ),
+            (4, 0, 0)
+        );
+        assert_eq!(parent.rx_probe(), None, "both probe flags at 0: no probe");
+        assert_eq!(
+            parse(&["--rx_probe_datagrams=0"]).unwrap().rx_probe(),
+            None,
+            "no count and, by default, no time: no probe"
+        );
+        let ms2 = Some(Duration::from_millis(2));
+        assert_eq!(
+            parse(&["--rx_probe_us=2000"]).unwrap().rx_probe(),
+            Some(RxProbe {
+                datagrams: count,
+                after: ms2,
+            }),
+            "the time trigger beside the count"
+        );
+        assert_eq!(
+            parse(&["--rx_probe_datagrams=0", "--rx_probe_us=2000"])
+                .unwrap()
+                .rx_probe(),
+            Some(RxProbe {
+                datagrams: None,
+                after: ms2,
+            }),
+            "no count"
+        );
+        let next = parse(&[
+            "--server_rx_calls",
+            "64",
+            "--rx_probe_datagrams",
+            "8192",
+            "--rx_probe_us",
+            "4000",
+        ])
+        .unwrap();
+        assert_eq!(
+            next.rx_probe(),
+            Some(RxProbe {
+                datagrams: std::num::NonZeroU64::new(8_192),
+                after: Some(Duration::from_millis(4)),
+            }),
+            "from the next argument"
+        );
+        assert_eq!(next.server_rx_calls, 64);
+        for arg in ["--server_rx_calls=0", "--server_rx_calls=65536"] {
+            assert!(
+                matches!(parse(&[arg]), Err(FlagError::BadValue { .. })),
+                "{arg}"
+            );
+        }
+        let client = parse(&["--mode=client", "--server_rx_calls=8"]).unwrap();
+        assert_eq!(
+            client.server_rx_calls, 8,
+            "a client takes them and ignores them"
+        );
     }
 
     #[test]

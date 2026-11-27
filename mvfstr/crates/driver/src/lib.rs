@@ -38,6 +38,8 @@ mod gated;
 mod hold_tests;
 #[cfg(test)]
 mod lab;
+#[cfg(test)]
+mod receive_tests;
 mod slab;
 mod steer;
 #[cfg(test)]
@@ -77,3 +79,4 @@ pub use steer::Steering;
 pub use timers::FineTimer;
 pub use timers::HostTimers;
 pub use turn::EndpointStats;
+pub use turn::RxProbe;

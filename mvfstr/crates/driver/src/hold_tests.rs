@@ -151,6 +151,7 @@ impl Scene {
             net: Some(lab.net.clone()),
             release: plan.release,
             max_segments: None,
+            ..MemOptions::default()
         };
         let socket = MemBackend::bind(SERVER, &options).expect("the lab binds");
         let mut server = EndpointDriver::builder(Arc::clone(&endpoint), app)
@@ -168,6 +169,7 @@ impl Scene {
                 net: Some(lab.net.clone()),
                 release: plan.client_release,
                 max_segments: None,
+                ..MemOptions::default()
             })
             .host_timers(Lab::timers());
         if let Some(hold) = plan.client_hold {

@@ -13,6 +13,7 @@ use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::rc::Rc;
@@ -40,6 +41,7 @@ use rustls::pki_types::ServerName;
 use crate::ConnHandle;
 use crate::HostTimers;
 use crate::QuicApplication;
+use crate::RxProbe;
 use crate::Steering;
 use crate::WorkBudget;
 #[cfg(test)]
@@ -184,6 +186,24 @@ impl<A: QuicApplication, B: Backend> EndpointDriverBuilder<A, B> {
     /// [`EndpointStats::dropped_initials`], and its client sends it again. Default: 4 MiB.
     pub fn waiting_initial_bytes(mut self, bytes: usize) -> Self {
         self.limits.waiting_initial_bytes = bytes;
+        self
+    }
+
+    /// Bounds the receive calls one receive phase makes on the server socket at `calls`, each call
+    /// that returns a batch, an empty one or an error counted; at the bound the next turn reads
+    /// on. One call can make several system calls: [`MmsgBackend`](mvfstr_io::MmsgBackend)'s
+    /// `poll_recv` reads on past full batches whose every datagram it discarded, within tokio's
+    /// task budget. A connection's own socket keeps four batches per turn. Default: 32.
+    pub fn server_receive_calls(mut self, calls: NonZeroU16) -> Self {
+        self.limits.server_rx_calls = calls;
+        self
+    }
+
+    /// Sets when a receive phase reads the server socket although the host has not reported it
+    /// readable, or turns that off with `None`. Default: after 2,048 datagrams sent, without a time
+    /// trigger.
+    pub fn receive_probe(mut self, probe: Option<RxProbe>) -> Self {
+        self.limits.rx_probe = probe;
         self
     }
 
@@ -578,6 +598,7 @@ impl From<ConnectError> for DriverConnectError {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::num::NonZeroU64;
     use std::task::Context;
     use std::task::Poll;
 
@@ -700,6 +721,71 @@ mod tests {
             builder().release_hold(Duration::MAX).limits.release_hold,
             Some(Duration::MAX),
             "no bound on the wait of runs due at once"
+        );
+    }
+
+    #[test]
+    fn the_builder_sets_the_server_receive_bound_and_the_probe_and_none_turns_the_probe_off() {
+        let builder = || {
+            EndpointDriver::<NoApp, MmsgBackend>::builder(
+                EndpointConfig::builder([7; 32]).build().unwrap(),
+                NoApp,
+            )
+        };
+        let calls = |n| NonZeroU16::new(n).unwrap();
+        assert_eq!(
+            builder().limits.server_rx_calls,
+            calls(32),
+            "32 calls by default"
+        );
+        assert_eq!(
+            builder().limits.rx_probe,
+            Some(RxProbe {
+                datagrams: NonZeroU64::new(2048),
+                after: None,
+            }),
+            "2,048 datagrams by default, without a time trigger"
+        );
+        assert_eq!(
+            builder()
+                .server_receive_calls(calls(4))
+                .limits
+                .server_rx_calls,
+            calls(4)
+        );
+        assert_eq!(
+            builder()
+                .server_receive_calls(calls(u16::MAX))
+                .limits
+                .server_rx_calls,
+            calls(u16::MAX)
+        );
+        let probe = RxProbe {
+            datagrams: NonZeroU64::new(128),
+            after: None,
+        };
+        assert_eq!(
+            builder().receive_probe(Some(probe)).limits.rx_probe,
+            Some(probe)
+        );
+        assert_eq!(builder().receive_probe(None).limits.rx_probe, None, "off");
+        let limits = builder()
+            .receive_probe(Some(probe))
+            .server_receive_calls(calls(7))
+            .limits;
+        assert_eq!(
+            (limits.server_rx_calls, limits.rx_probe),
+            (calls(7), Some(probe)),
+            "the bound leaves the probe alone"
+        );
+        let limits = builder()
+            .server_receive_calls(calls(7))
+            .receive_probe(None)
+            .limits;
+        assert_eq!(
+            (limits.server_rx_calls, limits.rx_probe),
+            (calls(7), None),
+            "the probe leaves the bound alone"
         );
     }
 

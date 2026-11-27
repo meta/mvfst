@@ -188,6 +188,7 @@ impl Scene {
             net: Some(lab.net.clone()),
             release,
             max_segments: socket_segments,
+            ..MemOptions::default()
         };
         let socket = MemBackend::bind(SERVER, &options).expect("the lab binds");
         let mut server = EndpointDriver::builder(Arc::clone(&endpoint), app);

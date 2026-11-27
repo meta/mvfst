@@ -283,6 +283,8 @@ pub(crate) struct Gated {
     inner: MmsgBackend,
     valves: Arc<Valves>,
     server: bool,
+    /// Whether the last receive call was the failure the valve injected, which filled no buffer.
+    failed: bool,
 }
 
 impl Gated {
@@ -486,16 +488,39 @@ impl TxBackend for Gated {
     }
 }
 
-impl RxBackend for Gated {
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        if mem::take(&mut self.valve().state().fail_next_recv) {
+impl Gated {
+    /// Makes a receive call with `recv`, unless a failure was injected for it, and records a batch
+    /// that holds datagrams.
+    fn receive(
+        &mut self,
+        recv: impl FnOnce(&mut MmsgBackend) -> Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<usize>> {
+        let failed = mem::take(&mut self.valve().state().fail_next_recv);
+        self.failed = failed;
+        if failed {
             return Poll::Ready(Err(io::Error::other("an injected receive error")));
         }
-        let poll = self.inner.poll_recv(cx);
+        let poll = recv(&mut self.inner);
         if matches!(&poll, Poll::Ready(Ok(n)) if *n > 0) {
             self.valve().record(Event::Received);
         }
         poll
+    }
+}
+
+impl RxBackend for Gated {
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        self.receive(|inner| inner.poll_recv(cx))
+    }
+
+    fn poll_recv_now(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        self.receive(|inner| inner.poll_recv_now(cx))
+    }
+
+    /// An injected failure filled no buffer, as a real backend's failed call fills none, so it
+    /// does not report the call before it.
+    fn last_full(&self) -> bool {
+        !self.failed && self.inner.last_full()
     }
 
     fn buffers(&mut self) -> impl Iterator<Item = (&RxMeta, &mut [u8])> {
@@ -511,6 +536,7 @@ impl Backend for Gated {
             inner: <MmsgBackend as Backend>::bind(addr, &options.mmsg)?,
             valves: Arc::clone(&options.valves),
             server: true,
+            failed: false,
         })
     }
 
@@ -519,6 +545,7 @@ impl Backend for Gated {
             inner: <MmsgBackend as Backend>::connect(remote, &options.mmsg)?,
             valves: Arc::clone(&options.valves),
             server: false,
+            failed: false,
         })
     }
 

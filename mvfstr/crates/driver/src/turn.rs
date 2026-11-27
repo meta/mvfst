@@ -21,6 +21,8 @@ use std::future::Future;
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
+use std::num::NonZeroU64;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::pin::Pin;
@@ -115,8 +117,23 @@ use crate::wake::Shared;
 /// Turns per poll before the task yields to the worker.
 const TURN_BUDGET: usize = 4;
 
-/// Receive batches per socket per turn.
+/// Receive batches per turn from a connection's own socket.
 pub(crate) const RX_BATCHES: usize = 4;
+
+/// Receive calls per receive phase on the server socket: 1,024 datagrams at the default 32
+/// buffers per call.
+const SERVER_RX_CALLS: NonZeroU16 = NonZeroU16::new(32).expect("not zero");
+
+/// When a receive phase reads the server socket past the readiness the host last reported: once
+/// the connections have sent about twice the datagrams that one busy connection sends between the
+/// host's reports, so that only a late report leads to a probe, and a paced fan-out tick of about
+/// 1,000 datagrams leads to none. The time trigger stays off: within such a tick it would read
+/// acknowledgements in the middle of the burst, and in a ramp of new connections it would take in
+/// Initials faster than the handshakes start, which inflates the clients' first RTT samples.
+const RX_PROBE: RxProbe = RxProbe {
+    datagrams: NonZeroU64::new(2_048),
+    after: None,
+};
 
 /// Transmit attempts that may go back to the tail of one transmit phase after filling their
 /// batch; later full batches wait for the next phase.
@@ -184,6 +201,23 @@ pub(crate) struct Limits {
     /// once before a flush hands it to the kernel; `Duration::MAX` sets no such bound. `None`
     /// turns the hold off.
     pub(crate) release_hold: Option<Duration>,
+    /// The receive calls one receive phase makes on the server socket; the next turn reads on.
+    pub(crate) server_rx_calls: NonZeroU16,
+    /// When a receive phase reads the server socket past a readiness the host has not reported;
+    /// `None` never does.
+    pub(crate) rx_probe: Option<RxProbe>,
+}
+
+/// When a receive phase reads the server socket although the host has not reported it readable:
+/// once its socket is stale, by either trigger. A trigger left `None` never makes it stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RxProbe {
+    /// Stale once the driver's connections have sent this many datagrams since its last receive
+    /// call on the server socket.
+    pub datagrams: Option<NonZeroU64>,
+    /// Stale once this long has passed since that call, by a clock reading the driver took
+    /// anyway.
+    pub after: Option<Duration>,
 }
 
 impl Default for Limits {
@@ -197,6 +231,8 @@ impl Default for Limits {
             handshakes: HANDSHAKES_PER_TURN,
             waiting_initial_bytes: WAITING_INITIAL_BYTES,
             release_hold: None,
+            server_rx_calls: SERVER_RX_CALLS,
+            rx_probe: Some(RX_PROBE),
         }
     }
 }
@@ -288,6 +324,18 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     recv_batch_calls: Cell<u64>,
     receive_passes: Cell<u64>,
     deadline_rearms: Cell<u64>,
+    server_rx_batches: Cell<u64>,
+    server_rx_datagrams: Cell<u64>,
+    server_rx_probes: Cell<u64>,
+    server_rx_probes_empty: Cell<u64>,
+    server_rx_bound_hits: Cell<u64>,
+    /// The server socket as of the last receive call there, which the probe's triggers count
+    /// from.
+    rx_mark: Cell<RxMark>,
+    /// Whether the next turn is the first since the driver waited for a wake.
+    woke_from_park: Cell<bool>,
+    /// The last clock reading, which the probe's time compares with the mark.
+    last_reading: Cell<Option<Instant>>,
     /// The endpoint's count of datagrams dropped for their source port, read without borrowing
     /// the endpoint, because a certificate resolver running inside it may read the counters.
     src_port_drops: SrcPortDrops,
@@ -646,6 +694,20 @@ struct BatchCursor {
     within: usize,
 }
 
+/// The server socket as of the last receive call there.
+#[derive(Clone, Copy, Debug, Default)]
+struct RxMark {
+    /// The datagrams the connections had sent.
+    sent: u64,
+    /// The clock reading taken for that call's batch, or the last one if the call found the
+    /// socket empty; the first turn since the driver waited for a wake takes its own reading's
+    /// place.
+    at: Option<Instant>,
+    /// Whether that call read past the readiness the host last reported and filled every buffer,
+    /// so the socket is read again without waiting for the host.
+    force: bool,
+}
+
 /// Counters of one endpoint driver, from [`EndpointHandle::stats`](crate::EndpointHandle::stats).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -735,6 +797,16 @@ pub struct EndpointStats {
     pub receive_passes: u64,
     /// Moves of a connection's deadline timer.
     pub deadline_rearms: u64,
+    /// Receive calls on the server socket that returned a batch, an empty one or an error.
+    pub server_rx_batches: u64,
+    /// Datagrams routed from the server socket's batches, each datagram of a GRO run counted.
+    pub server_rx_datagrams: u64,
+    /// Receive calls on the server socket made past a readiness the host had not reported.
+    pub server_rx_probes: u64,
+    /// Those of them that found the socket empty.
+    pub server_rx_probes_empty: u64,
+    /// Receive phases that reached their bound on receive calls on the server socket.
+    pub server_rx_bound_hits: u64,
 }
 
 /// The counters of the release hold, kept as the [`EndpointStats`] fields of the same names after
@@ -990,6 +1062,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             recv_batch_calls: Cell::new(0),
             receive_passes: Cell::new(0),
             deadline_rearms: Cell::new(0),
+            server_rx_batches: Cell::new(0),
+            server_rx_datagrams: Cell::new(0),
+            server_rx_probes: Cell::new(0),
+            server_rx_probes_empty: Cell::new(0),
+            server_rx_bound_hits: Cell::new(0),
+            rx_mark: Cell::default(),
+            woke_from_park: Cell::new(true),
+            last_reading: Cell::new(None),
             src_port_drops,
             last: Rc::default(),
             aborted: Cell::new(false),
@@ -1204,6 +1284,21 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.flush_cost.get()
     }
 
+    /// Returns the datagrams of the server socket's last batch that a stop left routed, if a stop
+    /// left part of it.
+    #[cfg(test)]
+    pub(crate) fn rx_resume(&self) -> Option<usize> {
+        self.sched.borrow().rx_resume.map(|at| at.handled)
+    }
+
+    /// Returns whether the next receive phase reads the server socket without waiting for the
+    /// host's report, because the last receive call there read past that report and filled every
+    /// buffer.
+    #[cfg(test)]
+    pub(crate) fn rx_forced(&self) -> bool {
+        self.rx_mark.get().force
+    }
+
     /// Returns the endpoint's counters.
     pub(crate) fn stats(&self) -> EndpointStats {
         let tx = self.tx_counters.get();
@@ -1239,6 +1334,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             recv_batch_calls: self.recv_batch_calls.get(),
             receive_passes: self.receive_passes.get(),
             deadline_rearms: self.deadline_rearms.get(),
+            server_rx_batches: self.server_rx_batches.get(),
+            server_rx_datagrams: self.server_rx_datagrams.get(),
+            server_rx_probes: self.server_rx_probes.get(),
+            server_rx_probes_empty: self.server_rx_probes_empty.get(),
+            server_rx_bound_hits: self.server_rx_bound_hits.get(),
         }
     }
 
@@ -1455,6 +1555,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             phase => phase,
         };
         let now = entry.unwrap_or_else(|| self.clock());
+        // While the driver waited, the host polled the sockets' readiness before a timer or a
+        // socket woke it, so the probe's time starts again. Its count goes on: another task on the
+        // thread may have woken the driver before the host polled.
+        if self.woke_from_park.take() {
+            self.rx_mark.set(RxMark {
+                at: Some(now),
+                ..self.rx_mark.get()
+            });
+        }
         if start == Phase::Intake {
             #[cfg(test)]
             self.record.borrow_mut().marks.push(Mark::Turn);
@@ -1578,7 +1687,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     fn clock(&self) -> Instant {
         #[cfg(test)]
         self.record.borrow_mut().clock_read();
-        self.worker.host().now()
+        let now = self.worker.host().now();
+        self.last_reading.set(Some(now));
+        now
     }
 
     /// Takes the list `pick` chooses whole, leaving the spare allocation in its place.
@@ -2830,7 +2941,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Receives up to [`RX_BATCHES`] batches from the server socket.
+    /// Receives from the server socket, then sends the stateless replies due.
     fn receive_server(&self, server: &Server<B>, cx: &mut Context<'_>) {
         let mut replies = Vec::new();
         self.receive_batches(server, cx, &mut replies);
@@ -2845,8 +2956,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.flush_server(self.clock(), cx);
     }
 
-    /// Receives up to [`RX_BATCHES`] batches from the server socket, collecting the stateless
-    /// replies due.
+    /// Receives from the server socket until a batch fills fewer buffers than the backend has, or
+    /// for [`Limits::server_rx_calls`] calls, collecting the stateless replies due. Where
+    /// `poll_recv` finds the readiness the host last reported clear, a socket gone stale by the
+    /// probe's triggers, or one whose last probe filled every buffer, is read past it.
     fn receive_batches(
         &self,
         server: &Server<B>,
@@ -2861,30 +2974,63 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         if self.stopped.get() {
             return;
         }
-        let mut batches = 0;
+        let mut calls = 0;
         let mut resume = self.sched.borrow_mut().rx_resume.take();
         loop {
-            let start = match resume.take() {
-                Some(start) => start,
+            let (start, force) = match resume.take() {
+                Some(start) => (start, None),
                 None => {
-                    if batches == RX_BATCHES {
+                    if calls == self.limits.server_rx_calls.get() {
                         self.sched.borrow_mut().rx_more = true;
+                        self.server_rx_bound_hits
+                            .set(self.server_rx_bound_hits.get() + 1);
                         return;
                     }
-                    batches += 1;
-                    match server.socket.borrow_mut().poll_recv(cx) {
-                        Poll::Ready(Ok(_)) => BatchCursor::default(),
-                        Poll::Ready(Err(_)) => continue,
-                        Poll::Pending => return,
+                    let mut socket = server.socket.borrow_mut();
+                    let (read, probed) = match socket.poll_recv(cx) {
+                        Poll::Ready(read) => (read, false),
+                        Poll::Pending => {
+                            let mark = self.rx_mark.get();
+                            if !mark.force && !self.rx_stale(mark) {
+                                return;
+                            }
+                            match self.probe(&mut *socket, cx) {
+                                Poll::Ready(read) => (read, true),
+                                Poll::Pending => return,
+                            }
+                        }
+                    };
+                    calls += 1;
+                    self.server_rx_batches.set(self.server_rx_batches.get() + 1);
+                    let force = probed && socket.last_full();
+                    drop(socket);
+                    if read.is_err() {
+                        self.rx_mark.set(RxMark {
+                            sent: self.sent_datagrams.get(),
+                            at: self.last_reading.get(),
+                            force,
+                        });
+                        continue;
                     }
+                    (BatchCursor::default(), Some(force))
                 }
             };
             let now = self.clock();
+            if let Some(force) = force {
+                self.rx_mark.set(RxMark {
+                    sent: self.sent_datagrams.get(),
+                    at: Some(now),
+                    force,
+                });
+            }
             if !self.gate(UnitKind::ReceiveChunk, Some(now)) {
                 self.sched.borrow_mut().rx_resume = Some(start);
                 return;
             }
             let (stopped_at, incoming, more) = self.route_batch(server, now, start, replies);
+            let routed = stopped_at.handled - start.handled;
+            self.server_rx_datagrams
+                .set(self.server_rx_datagrams.get() + routed as u64);
             let Some(incoming) = incoming else {
                 if more {
                     resume = Some(stopped_at);
@@ -2901,6 +3047,40 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             replies.extend(self.accept(server, now, incoming));
             resume = Some(stopped_at);
         }
+    }
+
+    /// Returns whether the server socket has gone stale since `mark` by the probe's triggers: the
+    /// datagrams sent since, or the time from the mark to the last reading.
+    fn rx_stale(&self, mark: RxMark) -> bool {
+        let Some(probe) = self.limits.rx_probe else {
+            return false;
+        };
+        let sent = self.sent_datagrams.get().saturating_sub(mark.sent);
+        probe.datagrams.is_some_and(|count| sent >= count.get())
+            || matches!(
+                (probe.after, self.last_reading.get(), mark.at),
+                (Some(after), Some(now), Some(at)) if now.saturating_duration_since(at) >= after
+            )
+    }
+
+    /// Makes one receive call on the server socket past the readiness the host last reported,
+    /// which `poll_recv` just found clear. A call that finds the socket empty moves the mark
+    /// without a clock reading, to the datagrams sent and the last reading.
+    #[cold]
+    #[inline(never)]
+    fn probe(&self, socket: &mut B, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        self.server_rx_probes.set(self.server_rx_probes.get() + 1);
+        let read = socket.poll_recv_now(cx);
+        if read.is_pending() {
+            self.server_rx_probes_empty
+                .set(self.server_rx_probes_empty.get() + 1);
+            self.rx_mark.set(RxMark {
+                sent: self.sent_datagrams.get(),
+                at: self.last_reading.get(),
+                force: false,
+            });
+        }
+        read
     }
 
     /// Takes up the connection attempt a stop came before, if any. It comes before the receive
@@ -3542,7 +3722,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let coarse = sched.timers.next(Kind::Coarse);
         match sched.host_wake.arm(now, deadline, pacing, coarse, cx) {
             Poll::Ready(()) => Next::Again,
-            Poll::Pending => Next::Park,
+            Poll::Pending => {
+                self.woke_from_park.set(true);
+                Next::Park
+            }
         }
     }
 
