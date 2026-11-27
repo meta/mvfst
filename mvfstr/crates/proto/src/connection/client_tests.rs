@@ -60,6 +60,7 @@ use super::tests::start;
 use crate::ClientTls;
 use crate::CloseReason;
 use crate::ConnEvent;
+use crate::DatagramSize;
 use crate::Initiator;
 use crate::InlineSealer;
 use crate::KeepAlive;
@@ -1245,6 +1246,37 @@ fn a_client_hello_in_two_datagrams_takes_0rtt_data_in_the_first() {
         Some(&PacketType::Initial),
         "the ClientHello goes on in the second datagram"
     );
+}
+
+#[test]
+fn a_resumed_peer_maximum_client_sizes_0rtt_datagrams_from_the_remembered_limit_and_the_cap() {
+    // The server advertised 1,500 bytes, above the cap and above what the client advertises.
+    let setup = Setup {
+        early_data: true,
+        client_transport: transport(|c| {
+            c.max_udp_payload_size(1300)
+                .datagram_size(DatagramSize::PeerMaximum {
+                    initial: 1232,
+                    cap: 1452,
+                })
+        }),
+        server_transport: transport(|c| c.max_udp_payload_size(1500)),
+        ..Setup::default()
+    };
+    let (epoch, mut pair) = start(resumable(&setup));
+    let client = pair.client.conn_mut();
+    let id = client.open_stream(Dir::Bi, ORDER).unwrap();
+    send_all(client, id, 6_000);
+    let sent = transmit(client, epoch);
+    assert_eq!(
+        packet_types(&sent[0]),
+        [PacketType::Initial, PacketType::ZeroRtt]
+    );
+    let sizes: Vec<usize> = sent.iter().map(Vec::len).collect();
+    assert_eq!(sizes[0], 1452, "the first datagram: {sizes:?}");
+    assert!(sizes.iter().all(|&len| len <= 1452), "{sizes:?}");
+    let full = sizes.iter().filter(|&&len| len == 1452).count();
+    assert!(full >= 3, "{sizes:?}");
 }
 
 #[test]

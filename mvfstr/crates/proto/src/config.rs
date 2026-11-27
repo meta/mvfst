@@ -338,17 +338,55 @@ pub enum AlpnPolicy {
     AllowMissing,
 }
 
-/// The size of the datagrams a connection sends. Path MTU discovery is not supported, so mvfstr
-/// does not check that the path carries a larger size.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The size of the datagrams a connection sends, 1,200 to 65,527 bytes. Path MTU discovery is not
+/// supported, so mvfstr does not check that the path carries the size. A datagram that a server
+/// sends with an ack-eliciting Initial packet, that a client sends with any Initial packet, or that
+/// carries a path frame is padded to the size in effect, as mvfst pads them, within the backend's
+/// largest datagram and the path's anti-amplification limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatagramSize {
-    /// 1,200 bytes, the size every QUIC path must carry (RFC 9000).
-    #[default]
-    Minimum,
-    /// Once the peer's transport parameters are processed, the smaller of its
-    /// max_udp_payload_size and ours, as mvfst's tperf does with `--override_packet_size`; 1,200
-    /// bytes before that.
-    PeerMaximum,
+    /// Datagrams of up to this many bytes from the first, whatever the peer advertises, as mvfst
+    /// sends udpSendPacketLen.
+    Fixed(u16),
+    /// `initial` bytes until the peer's transport parameters are processed, then the smaller of
+    /// the peer's max_udp_payload_size and `cap`, as mvfst sends with canIgnorePathMTU and
+    /// maxUdpSendPayloadSize as the cap. The cap does not depend on the max_udp_payload_size
+    /// that this endpoint advertises.
+    PeerMaximum {
+        /// The size before the peer's transport parameters are processed.
+        initial: u16,
+        /// The largest size once they are.
+        cap: u16,
+    },
+}
+
+impl Default for DatagramSize {
+    fn default() -> Self {
+        Self::Fixed(1200)
+    }
+}
+
+impl DatagramSize {
+    /// Returns the size of the datagrams sent before the peer's transport parameters are
+    /// processed.
+    pub(crate) fn initial(self) -> u16 {
+        match self {
+            Self::Fixed(size) | Self::PeerMaximum { initial: size, .. } => size,
+        }
+    }
+
+    /// Returns the size once the peer's transport parameters, with `peer_max` as its
+    /// max_udp_payload_size, are processed, or `None` if the policy does not follow the peer.
+    pub(crate) fn with_peer(self, peer_max: u64) -> Option<u16> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::PeerMaximum { cap, .. } => {
+                let peer_max = u16::try_from(peer_max).unwrap_or(u16::MAX);
+                // The decoder refuses a peer's value below 1,200 bytes, as RFC 9000 requires.
+                Some(peer_max.min(cap).max(1200))
+            }
+        }
+    }
 }
 
 /// How a server connection lays out the transport parameters it sends.
@@ -809,7 +847,7 @@ impl TransportConfigBuilder {
         self
     }
 
-    /// Sets the size of the datagrams sent. Default [`DatagramSize::Minimum`].
+    /// Sets the size of the datagrams sent. Default [`DatagramSize::Fixed`] at 1,200 bytes.
     pub fn datagram_size(mut self, policy: DatagramSize) -> Self {
         self.config.datagram_size = policy;
         self
@@ -930,10 +968,18 @@ impl TransportConfigBuilder {
                 "idle_timeout",
             )?;
         }
+        let sizes = 1200..=65527;
         check(
-            (1200..=65527).contains(&c.max_udp_payload_size),
+            sizes.contains(&c.max_udp_payload_size),
             "max_udp_payload_size",
         )?;
+        match c.datagram_size {
+            DatagramSize::Fixed(size) => check(sizes.contains(&size), "datagram_size")?,
+            DatagramSize::PeerMaximum { initial, cap } => {
+                check(sizes.contains(&initial), "datagram_size.initial")?;
+                check(sizes.contains(&cap), "datagram_size.cap")?;
+            }
+        }
         let ack = &c.ack_policy;
         check(
             // RFC 9000 allows a max_ack_delay below 2^14 ms. It is advertised in whole
@@ -1497,7 +1543,7 @@ mod tests {
         assert_eq!(config.initial_rtt(), Duration::from_millis(333));
         assert_eq!(config.active_connection_id_limit(), 2);
         assert_eq!(config.key_update(), KeyUpdatePolicy::AtLimit);
-        assert_eq!(config.datagram_size(), DatagramSize::Minimum);
+        assert_eq!(config.datagram_size(), DatagramSize::Fixed(1200));
     }
 
     #[test]
@@ -1533,7 +1579,10 @@ mod tests {
             .initial_rtt(Duration::from_millis(50))
             .active_connection_id_limit(5)
             .key_update(KeyUpdatePolicy::Every(1 << 20))
-            .datagram_size(DatagramSize::PeerMaximum)
+            .datagram_size(DatagramSize::PeerMaximum {
+                initial: 1232,
+                cap: 1452,
+            })
             .build()
             .unwrap();
         assert_eq!(config.max_data(), 3 << 20);
@@ -1558,7 +1607,13 @@ mod tests {
         assert_eq!(config.initial_rtt(), Duration::from_millis(50));
         assert_eq!(config.active_connection_id_limit(), 5);
         assert_eq!(config.key_update(), KeyUpdatePolicy::Every(1 << 20));
-        assert_eq!(config.datagram_size(), DatagramSize::PeerMaximum);
+        assert_eq!(
+            config.datagram_size(),
+            DatagramSize::PeerMaximum {
+                initial: 1232,
+                cap: 1452
+            }
+        );
     }
 
     #[test]
@@ -1771,6 +1826,66 @@ mod tests {
                 "{builder:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_datagram_size_is_held_to_1200_through_65527_and_an_error_names_its_field() {
+        let peer = |initial, cap| DatagramSize::PeerMaximum { initial, cap };
+        let accepted = [
+            DatagramSize::Fixed(1200),
+            DatagramSize::Fixed(65527),
+            peer(1200, 1200),
+            peer(65527, 65527),
+            // A cap below the start size, as mvfst allows.
+            peer(1452, 1200),
+        ];
+        for size in accepted {
+            let config = TransportConfig::builder()
+                .datagram_size(size)
+                .build()
+                .unwrap_or_else(|error| panic!("{size:?}: {error}"));
+            assert_eq!(config.datagram_size(), size);
+        }
+        let cases = [
+            (DatagramSize::Fixed(1199), "datagram_size"),
+            (DatagramSize::Fixed(65528), "datagram_size"),
+            (peer(1199, 1452), "datagram_size.initial"),
+            (peer(65528, 1452), "datagram_size.initial"),
+            (peer(1232, 1199), "datagram_size.cap"),
+            (peer(1232, 65528), "datagram_size.cap"),
+        ];
+        for (size, field) in cases {
+            assert_eq!(
+                TransportConfig::builder().datagram_size(size).build(),
+                Err(out_of_range(field)),
+                "{size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_peer_maximum_cap_is_independent_of_the_max_udp_payload_size_we_advertise() {
+        let size = DatagramSize::PeerMaximum {
+            initial: 1232,
+            cap: 1452,
+        };
+        for ours in [1300, 1500] {
+            let config = TransportConfig::builder()
+                .max_udp_payload_size(ours)
+                .datagram_size(size)
+                .build()
+                .unwrap_or_else(|error| panic!("max_udp_payload_size {ours}: {error}"));
+            assert_eq!(config.datagram_size(), size);
+            assert_eq!(config.max_udp_payload_size(), ours);
+        }
+        // The cap's own range applies whatever the advertised size.
+        let large = TransportConfig::builder()
+            .max_udp_payload_size(65527)
+            .datagram_size(DatagramSize::PeerMaximum {
+                initial: 1232,
+                cap: 65528,
+            });
+        assert_eq!(large.build(), Err(out_of_range("datagram_size.cap")));
     }
 
     #[test]

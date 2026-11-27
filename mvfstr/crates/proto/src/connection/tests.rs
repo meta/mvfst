@@ -17,6 +17,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
+use mvfstr_crypto::PacketKeys;
 use mvfstr_crypto::TAG_LEN;
 use mvfstr_crypto::unprotect_header;
 use mvfstr_tls::Level;
@@ -40,7 +41,10 @@ use super::Connection;
 use super::Handshake;
 use super::PacketSpace;
 use super::PeerParams;
+use super::stream_tests::App;
 use super::stream_tests::ORDER;
+use super::stream_tests::pattern;
+use super::stream_tests::run_apps;
 use crate::AckPolicy;
 use crate::AlpnPolicy;
 use crate::AppCode;
@@ -49,6 +53,7 @@ use crate::CongestionControl;
 use crate::ConnEvent;
 use crate::ConnKey;
 use crate::ConnOptions;
+use crate::DatagramSize;
 use crate::DropReason;
 use crate::Ecn;
 use crate::Endpoint;
@@ -87,6 +92,7 @@ use crate::testing::LinkConfig;
 use crate::testing::Loss;
 use crate::testing::Pair;
 use crate::testing::PairConfig;
+use crate::testing::Peer;
 use crate::testing::TestRng;
 use crate::testing::VecSink;
 use crate::testing::fixtures::Setup;
@@ -382,7 +388,7 @@ fn dcid_len(conn: &Connection) -> usize {
         .map_or(8, |(_, cid, _)| cid.len())
 }
 
-fn open_packet(conn: &Connection, ty: PacketType, mut packet: Vec<u8>) -> Vec<u8> {
+fn open_packet(conn: &Connection, ty: PacketType, packet: Vec<u8>) -> Vec<u8> {
     let space = match ty {
         PacketType::Initial => Space::Initial,
         PacketType::Handshake => Space::Handshake,
@@ -390,7 +396,13 @@ fn open_packet(conn: &Connection, ty: PacketType, mut packet: Vec<u8>) -> Vec<u8
         PacketType::ZeroRtt => panic!("no 0-RTT packets are built"),
     };
     let keys = &conn.spaces[space.index()].keys.as_ref().unwrap().local;
-    let Ok(Header::Protected(header)) = Header::parse(&packet, dcid_len(conn)) else {
+    open_with(keys, dcid_len(conn), packet)
+}
+
+/// Opens a packet with `keys`, its short header carrying a Destination Connection ID of `dcid_len`
+/// bytes.
+fn open_with(keys: &PacketKeys, dcid_len: usize, mut packet: Vec<u8>) -> Vec<u8> {
+    let Ok(Header::Protected(header)) = Header::parse(&packet, dcid_len) else {
         panic!("an unparsable packet");
     };
     let pn_offset = header.pn_offset();
@@ -541,10 +553,11 @@ fn the_handshake_completes_over_a_1200_byte_mtu() {
 #[cfg(feature = "aws-lc-rs")]
 #[test]
 fn peer_maximum_datagrams_fill_a_1452_byte_mtu() {
-    use crate::DatagramSize;
-
     let transport = TransportConfig::builder()
-        .datagram_size(DatagramSize::PeerMaximum)
+        .datagram_size(DatagramSize::PeerMaximum {
+            initial: 1200,
+            cap: 1452,
+        })
         .build()
         .unwrap();
     // A post-quantum key share makes the server's flight larger than one datagram.
@@ -587,6 +600,252 @@ fn the_minimum_policy_keeps_datagrams_at_1200_bytes_whatever_the_peer_allows() {
         .map(|(_, datagram)| datagram.data.len())
         .max();
     assert_eq!(largest, Some(1200));
+}
+
+/// Returns a transport config that sends datagrams of `size`, advertises `max_udp_payload_size`
+/// and takes a bulk transfer on a unidirectional stream without its windows holding it back.
+fn sending(size: DatagramSize, max_udp_payload_size: u16) -> Arc<TransportConfig> {
+    TransportConfig::builder()
+        .datagram_size(size)
+        .max_udp_payload_size(max_udp_payload_size)
+        .max_data(1 << 30)
+        .max_stream_data_uni(1 << 30)
+        .build()
+        .unwrap()
+}
+
+/// A client that sends 1,252-byte datagrams and a server that sends 1,232-byte ones, the sizes
+/// of an mvfst client towards an IPv4 server and of an mvfst server.
+fn fixed_sizes() -> Setup {
+    Setup {
+        client_transport: sending(DatagramSize::Fixed(1252), 1452),
+        server_transport: sending(DatagramSize::Fixed(1232), 1452),
+        ..Setup::default()
+    }
+}
+
+/// Runs the handshake of `setup`, then has the server, or the client if not `from_server`, send
+/// `len` bytes on a unidirectional stream that the other side reads. Returns the pair and how many
+/// datagrams the sender had sent when the handshake was confirmed.
+fn transfer(setup: &Setup, from_server: bool, len: usize) -> (Pair, usize) {
+    let (_, mut pair) = handshake(setup.pair());
+    let sender = if from_server {
+        &mut pair.server
+    } else {
+        &mut pair.client
+    };
+    let before = sender.sent.len();
+    let id = sender.conn_mut().open_stream(Dir::Uni, ORDER).unwrap();
+    let (mut client, mut server) = (App::default(), App::default());
+    let writer = if from_server {
+        &mut server
+    } else {
+        &mut client
+    };
+    writer.write(id, pattern(len), true);
+    let until = pair.now + Duration::from_secs(2);
+    run_apps(&mut pair, until, &mut client, &mut server);
+    let reader = if from_server { &client } else { &server };
+    assert_eq!(
+        reader.data.get(&id).map_or(0, Vec::len),
+        len,
+        "the transfer did not complete"
+    );
+    (pair, before)
+}
+
+/// Returns the sizes of the datagrams `peer` sent from its datagram `from` on.
+fn sizes_from(peer: &Peer, from: usize) -> Vec<usize> {
+    peer.sent[from..]
+        .iter()
+        .map(|(_, datagram)| datagram.data.len())
+        .collect()
+}
+
+/// Returns how many of `sizes` are exactly `size`.
+fn count_of(sizes: &[usize], size: usize) -> usize {
+    sizes.iter().filter(|&&len| len == size).count()
+}
+
+/// Returns the sizes of the datagrams `peer` sent that carry an ack-eliciting Initial packet. The
+/// Initial keys are derived again from the client's first Destination Connection ID, so that the
+/// packets open after the connection discarded its own keys.
+fn eliciting_initial_sizes(peer: &Peer) -> Vec<usize> {
+    let conn = peer.conn();
+    let keys = mvfstr_crypto::initial_keys(conn.version, &conn.original_dcid, conn.side)
+        .unwrap()
+        .local;
+    peer.sent
+        .iter()
+        .map(|(_, datagram)| &datagram.data)
+        .filter(|data| {
+            packets(data)
+                .into_iter()
+                .filter(|(ty, _)| *ty == PacketType::Initial)
+                .any(|(_, packet)| {
+                    let plaintext = open_with(&keys, 8, packet);
+                    Frames::new(&plaintext).any(|frame| frame.unwrap().kind().is_ack_eliciting())
+                })
+        })
+        .map(Vec::len)
+        .collect()
+}
+
+/// Asserts that the congestion controller and the pacer of `conn`, which has not received an
+/// acknowledgment yet, are sized for datagrams of `size` bytes: RFC 9002's initial window of 10
+/// datagrams, and runs of `size`-byte datagrams at the pacer's rate.
+fn assert_started_at(conn: &Connection, size: u16) {
+    assert_eq!(conn.cc.cwnd(), 10 * u64::from(size), "the initial window");
+    let mut sized = conn.pacer.clone();
+    sized.set_max_datagram_size(size);
+    assert_eq!(
+        (conn.pacer.burst(), conn.pacer.run_time()),
+        (sized.burst(), sized.run_time()),
+        "the pacer's runs"
+    );
+}
+
+#[test]
+fn a_fixed_size_client_pads_its_first_initial_to_that_size_and_starts_at_it() {
+    let (_, mut pair) = start(fixed_sizes().pair());
+    pair.step();
+    let first = &pair.client.sent[0].1.data;
+    assert_eq!(packet_types(first), [PacketType::Initial]);
+    assert_eq!(first.len(), 1252, "the ClientHello's datagram");
+    assert_started_at(pair.client.conn(), 1252);
+}
+
+#[test]
+fn a_fixed_size_server_starts_its_controller_and_pacer_at_that_size() {
+    let (epoch, mut pair) = start(fixed_sizes().pair());
+    assert!(pair.run_until(epoch + LIMIT, |pair| pair.server.conn.is_some()));
+    assert_started_at(pair.server.conn(), 1232);
+}
+
+#[test]
+fn a_fixed_size_server_pads_every_datagram_with_an_ack_eliciting_initial_to_that_size() {
+    let (_, pair) = handshake(fixed_sizes().pair());
+    let initials = eliciting_initial_sizes(&pair.server);
+    assert!(!initials.is_empty(), "no Initial from the server");
+    assert!(initials.iter().all(|&len| len == 1232), "{initials:?}");
+}
+
+#[test]
+fn a_fixed_size_server_fills_backlogged_datagrams_to_that_size_and_never_more() {
+    let (pair, from) = transfer(&fixed_sizes(), true, 200_000);
+    let sizes = sizes_from(&pair.server, from);
+    assert_eq!(sizes.iter().max(), Some(&1232));
+    let full = count_of(&sizes, 1232);
+    assert!(full >= 100, "{full} full datagrams of {}", sizes.len());
+}
+
+#[test]
+fn a_fixed_size_server_ignores_a_larger_limit_from_the_client() {
+    let setup = Setup {
+        client_transport: sending(DatagramSize::default(), 1500),
+        server_transport: sending(DatagramSize::Fixed(1232), 1500),
+        ..Setup::default()
+    };
+    let (pair, from) = transfer(&setup, true, 200_000);
+    let every = sizes_from(&pair.server, 0);
+    assert_eq!(every.iter().max(), Some(&1232), "{every:?}");
+    let full = count_of(&sizes_from(&pair.server, from), 1232);
+    assert!(full >= 100, "{full} full datagrams");
+}
+
+/// Has a server with `cap` and `ours` as its own max_udp_payload_size send to a client that
+/// advertises `peer`, and asserts that its full 1-RTT datagrams and its datagrams carrying an
+/// ack-eliciting Initial are all `expected` bytes and none is larger.
+fn assert_peer_maximum(ours: u16, cap: u16, peer: u16, expected: usize) {
+    let case = format!("ours {ours}, cap {cap}, the client's {peer}");
+    let setup = Setup {
+        client_transport: sending(DatagramSize::default(), peer),
+        server_transport: sending(DatagramSize::PeerMaximum { initial: 1232, cap }, ours),
+        ..Setup::default()
+    };
+    let (pair, from) = transfer(&setup, true, 200_000);
+    let sizes = sizes_from(&pair.server, from);
+    assert_eq!(sizes.iter().max(), Some(&expected), "{case}");
+    let full = count_of(&sizes, expected);
+    assert!(
+        full >= 100,
+        "{case}: {full} full datagrams of {}",
+        sizes.len()
+    );
+    // The server has the client's parameters from the ClientHello before it sends anything.
+    let initials = eliciting_initial_sizes(&pair.server);
+    assert!(
+        !initials.is_empty() && initials.iter().all(|&len| len == expected),
+        "{case}: Initials of {initials:?}"
+    );
+}
+
+#[test]
+fn a_peer_maximum_server_sends_the_smaller_of_the_clients_limit_and_the_cap() {
+    assert_peer_maximum(1500, 1452, 1500, 1452);
+    assert_peer_maximum(1500, 1452, 1300, 1300);
+    assert_peer_maximum(1280, 1452, 1300, 1300);
+}
+
+#[test]
+fn the_peer_maximum_cap_does_not_follow_the_max_udp_payload_size_we_advertise() {
+    assert_peer_maximum(1300, 1452, 1500, 1452);
+}
+
+#[test]
+fn a_peer_maximum_client_sends_its_initial_size_until_the_servers_parameters_arrive() {
+    let setup = Setup {
+        client_transport: sending(
+            DatagramSize::PeerMaximum {
+                initial: 1232,
+                cap: 1452,
+            },
+            1500,
+        ),
+        server_transport: sending(DatagramSize::default(), 1500),
+        ..Setup::default()
+    };
+    let (pair, from) = transfer(&setup, false, 200_000);
+    let first = &pair.client.sent[0].1.data;
+    assert_eq!(packet_types(first), [PacketType::Initial]);
+    assert_eq!(first.len(), 1232, "the ClientHello's datagram");
+    let sizes = sizes_from(&pair.client, from);
+    assert_eq!(sizes.iter().max(), Some(&1452));
+    let full = count_of(&sizes, 1452);
+    assert!(full >= 100, "{full} full datagrams of {}", sizes.len());
+}
+
+#[test]
+fn a_fixed_size_client_pads_every_datagram_with_an_initial_to_that_size() {
+    let (_, pair) = handshake(fixed_sizes().pair());
+    let initials: Vec<usize> = pair
+        .client
+        .sent
+        .iter()
+        .map(|(_, datagram)| &datagram.data)
+        .filter(|data| packet_types(data).contains(&PacketType::Initial))
+        .map(Vec::len)
+        .collect();
+    // The ClientHello, and the acknowledgment of the server's Initial.
+    assert!(initials.len() >= 2, "{initials:?}");
+    assert!(initials.iter().all(|&len| len == 1252), "{initials:?}");
+}
+
+#[test]
+fn a_server_initial_larger_than_the_anti_amplification_credit_fills_the_credit() {
+    // A 1,200-byte ClientHello allows the server 3,600 bytes, less than its datagram size.
+    let setup = Setup {
+        server_transport: sending(DatagramSize::Fixed(4000), 9000),
+        ..Setup::default()
+    };
+    let mut config = setup.pair();
+    config.max_datagram = 9000;
+    config.to_server.mtu = 9000;
+    config.to_client.mtu = 9000;
+    let (_, pair) = handshake(config);
+    let first = &pair.server.sent[0].1.data;
+    assert_eq!(packet_types(first)[0], PacketType::Initial);
+    assert_eq!(first.len(), 3600, "the server's first datagram");
 }
 
 #[cfg(feature = "aws-lc-rs")]

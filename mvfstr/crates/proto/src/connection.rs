@@ -149,8 +149,8 @@ use crate::streams::conn::StreamState;
 use crate::streams::recv_buf::PagePool;
 use crate::streams::recv_buf::RecvBuffer;
 
-/// The smallest datagram every QUIC path carries, and the size of datagrams carrying a client's
-/// Initial or any ack-eliciting Initial (RFC 9000).
+/// The smallest datagram every QUIC path carries, and the least a datagram carrying a client's
+/// Initial or any ack-eliciting Initial takes (RFC 9000).
 pub(crate) const MIN_DATAGRAM: u16 = 1200;
 /// The number of ACK ranges kept per space.
 const MAX_ACK_RANGES: usize = 32;
@@ -550,8 +550,8 @@ impl<P: Prioritizer> Connection<P> {
         let recovery = LossRecovery::new(recovery_config, side, setup.now, [0; 3])
             .expect("should accept the RTT a validated transport config holds");
         let mut rng = ConnRng::new(setup.rng_seed);
-        let (cc, pacer) =
-            congestion_state(&config, MIN_DATAGRAM, setup.horizon, &recovery, &mut rng);
+        let mtu = config.datagram_size().initial();
+        let (cc, pacer) = congestion_state(&config, mtu, setup.horizon, &recovery, &mut rng);
         let integrity_limit = initial.remote.integrity_limit();
         let mut spaces: [PacketSpace; 3] = Default::default();
         spaces[Space::Initial.index()].keys = Some(initial);
@@ -595,7 +595,7 @@ impl<P: Prioritizer> Connection<P> {
             rx_dcid: setup.local_cid,
             handshake: Handshake::default(),
             peer_ack_delay_exponent: 3,
-            mtu: MIN_DATAGRAM,
+            mtu,
             idle: IdleTimer {
                 base: setup.now,
                 sent_since_receive: false,
@@ -1229,8 +1229,9 @@ impl<P: Prioritizer> Connection<P> {
     }
 
     /// Returns whether a server is at its anti-amplification limit, so that it cannot send a
-    /// probe and must not arm the PTO (RFC 9002). A probe carrying an Initial takes a 1,200-byte
-    /// datagram; a Handshake probe needs only a short packet.
+    /// probe and must not arm the PTO (RFC 9002). A probe carrying an Initial fills a datagram up
+    /// to the send size within the credit, and needs at least 1,200 bytes; a Handshake probe needs
+    /// only a short packet.
     fn amplification_blocked(&self) -> bool {
         let probe = if self
             .recovery
@@ -1352,9 +1353,7 @@ impl<P: Prioritizer> Connection<P> {
             return;
         };
         let view = params::zero_rtt_view(&remembered);
-        if self.config.datagram_size() == crate::DatagramSize::PeerMaximum
-            && self.apply_peer_payload_size(&view).is_err()
-        {
+        if self.apply_peer_payload_size(&view).is_err() {
             return;
         }
         if self.sources.streams.on_peer_params(&view).is_err() {

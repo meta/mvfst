@@ -124,7 +124,10 @@ fn server_backlogged(
         f(c.pacing(true)
             .pacing_granularity(200 * US)
             .initial_window(300)
-            .datagram_size(DatagramSize::PeerMaximum))
+            .datagram_size(DatagramSize::PeerMaximum {
+                initial: 1200,
+                cap: 1452,
+            }))
     });
     let client_transport = config(|c| c.max_data(1 << 40).max_stream_data_uni(1 << 30));
     let setup = Setup {
@@ -423,7 +426,10 @@ fn a_transfer_built_ahead_arrives_whole_and_in_order_with_releases_that_never_go
     let server_transport = config(|c| {
         c.pacing(true)
             .pacing_granularity(200 * US)
-            .datagram_size(DatagramSize::PeerMaximum)
+            .datagram_size(DatagramSize::PeerMaximum {
+                initial: 1200,
+                cap: 1452,
+            })
     });
     let client_transport = config(|c| c.max_data(1 << 40).max_stream_data_uni(1 << 30));
     let setup = Setup {
@@ -534,7 +540,10 @@ fn attempts_without_a_horizon_report_each_built_run_due_now_and_none_after_now()
     let server_transport = config(|c| {
         c.pacing(true)
             .pacing_granularity(200 * US)
-            .datagram_size(DatagramSize::PeerMaximum)
+            .datagram_size(DatagramSize::PeerMaximum {
+                initial: 1200,
+                cap: 1452,
+            })
     });
     let client_transport = config(|c| c.max_data(1 << 40).max_stream_data_uni(1 << 30));
     let setup = Setup {

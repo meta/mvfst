@@ -19,12 +19,13 @@
 //!
 //! The datagram is bounded by the path's anti-amplification credit before validation, so every
 //! byte sent is charged. A client pads every datagram carrying an Initial packet, and a server
-//! every datagram carrying an ack-eliciting one, to 1,200 bytes, as RFC 9000 requires, with
-//! PADDING in the datagram's last packet; earlier packets leave room for the later ones. An open
-//! server's datagram is the exception: an Initial or Handshake packet with CRYPTO data to send
-//! leaves no room, and a packet of a later space joins only if the packets ahead of it took all
-//! the CRYPTO data of the earlier spaces, since a client cannot open such a packet until it has
-//! processed that data, and may drop it (RFC 9001).
+//! every datagram carrying an ack-eliciting one, to the send size within the slot and the credit,
+//! and to at least 1,200 bytes as RFC 9000 requires, with PADDING in the datagram's last packet;
+//! earlier packets leave room for the later ones. An open server's datagram is the exception: an
+//! Initial or Handshake packet with CRYPTO data to send leaves no room, and a packet of a later
+//! space joins only if the packets ahead of it took all the CRYPTO data of the earlier spaces,
+//! since a client cannot open such a packet until it has processed that data, and may drop it
+//! (RFC 9001).
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -555,7 +556,8 @@ impl<P: Prioritizer> Connection<P> {
     }
 
     /// Returns the gate `cand` in `space` must pass to start a datagram on `path`: the datagram is
-    /// charged 1,200 bytes if `cand` forces that size, else the packet `cand` needs.
+    /// charged 1,200 bytes, the least a padded datagram takes, if `cand` forces padding, else the
+    /// packet `cand` needs.
     fn start_gate(&self, space: Space, path: PathId, cand: Candidate, joins: JoinLimits) -> Gate {
         let datagram_size = if full_size(self.side, space, cand.class) {
             u64::from(MIN_DATAGRAM)
@@ -793,18 +795,16 @@ impl<P: Prioritizer> Connection<P> {
                 Side::Client => carries_initial || initial_here,
                 Side::Server => eliciting_initial || (initial_here && w.is_ack_eliciting()),
             };
+            // RFC 9000 requires these datagrams to be at least 1,200 bytes. They are filled as
+            // mvfst fills them: up to the send size, within the slot and the path's credit.
+            let full = room.max(usize::from(MIN_DATAGRAM)).saturating_sub(pos);
             let mut padded = false;
             if last && needs_full && (pos > 0 || !w.is_empty()) {
-                padded = w
-                    .pad_to(usize::from(MIN_DATAGRAM).saturating_sub(pos))
-                    .is_ok();
+                padded = w.pad_to(full).is_ok();
             }
-            // A datagram with Path frames is padded to 1,200 bytes when the path's credit allows,
-            // as RFC 9000 requires.
+            // A datagram with Path frames is filled too, but only if the credit allows 1,200 bytes.
             if last && packet.path && !padded && end >= usize::from(MIN_DATAGRAM) {
-                padded = w
-                    .pad_to(usize::from(MIN_DATAGRAM).saturating_sub(pos))
-                    .is_ok();
+                padded = w.pad_to(full).is_ok();
             }
             if w.is_empty() {
                 continue;

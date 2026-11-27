@@ -387,17 +387,19 @@ fn start_server_with(flags: &Flags, options: MmsgOptions) -> Result<RunningServe
 
 /// Runs a client configured by `flags` and writes its result lines to `out`.
 pub(crate) fn run_client(flags: &Flags, out: &mut impl Write) -> Result<(), RunError> {
-    run_client_with(flags, config::client_config(flags)?, out).map(drop)
+    let remote = resolve(flags)?;
+    let client = config::client_config(flags, remote.ip())?;
+    run_client_with(flags, remote, client, out).map(drop)
 }
 
-/// Runs a client with the config `client` and every other setting from `flags`, and returns what
-/// each of its connections received.
+/// Runs a client that connects to `remote` with the config `client` and every other setting from
+/// `flags`, and returns what each of its connections received.
 fn run_client_with(
     flags: &Flags,
+    remote: SocketAddr,
     client: Arc<ClientConfig>,
     out: &mut impl Write,
 ) -> Result<Vec<ConnTally>, RunError> {
-    let remote = resolve(flags)?;
     let endpoint = config::endpoint_config(flags)?;
     let options = backend_options(flags);
     let name =
@@ -631,9 +633,10 @@ fn max_segments(flags: &Flags) -> u16 {
     if flags.gso { flags.writes_per_loop } else { 1 }
 }
 
-/// Returns the socket settings of either side: transmit slots that hold the largest datagram the
-/// connection may send, which `--max_receive_packet_size` bounds, and on the server under
-/// `--txtime`, kernel release with room for the runs its connections build ahead.
+/// Returns the socket settings of either side: transmit slots of the backend's default 1,500 bytes,
+/// or of `--max_receive_packet_size` when larger, which hold the largest datagram either side
+/// sends, and on the server under `--txtime`, kernel release with room for the runs its
+/// connections build ahead.
 fn backend_options(flags: &Flags) -> MmsgOptions {
     let defaults = MmsgOptions::default();
     let mut options = MmsgOptions {
@@ -666,10 +669,10 @@ fn built_ahead(flags: &Flags, release_horizon: Duration) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
-/// Returns the bytes of one run: a maximum pacing burst, `--writes_per_loop`, of the largest
-/// datagrams.
+/// Returns the bytes of one run: a maximum pacing burst, `--writes_per_loop`, of the server's
+/// largest datagrams.
 fn run_bytes(flags: &Flags) -> usize {
-    usize::from(flags.writes_per_loop) * usize::from(flags.max_receive_packet_size)
+    usize::from(flags.writes_per_loop) * usize::from(config::largest_server_datagram(flags))
 }
 
 /// Why a run failed.
@@ -1050,7 +1053,7 @@ mod tests {
             port: server.addr().port(),
             ..loopback(Mode::Client, 0)
         };
-        let tperf = config::client_config(&flags).unwrap();
+        let tperf = config::client_config(&flags, server.addr().ip()).unwrap();
         let client = ClientConfig::builder(tperf.tls().clone())
             .transport(
                 TransportConfig::builder()
@@ -1063,7 +1066,7 @@ mod tests {
             .build()
             .unwrap();
         let mut out = Vec::new();
-        run_client_with(&flags, client, &mut out).unwrap();
+        run_client_with(&flags, server.addr(), client, &mut out).unwrap();
         let output = String::from_utf8(out).unwrap();
         let parsed =
             report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
@@ -1229,6 +1232,38 @@ mod tests {
             None,
             "the kernel default without txtime"
         );
+    }
+
+    #[test]
+    fn with_txtime_a_run_is_sized_for_the_largest_datagrams_the_server_sends() {
+        // 5 ms at 10 Gbit/s, and one run of 44 datagrams of the server's largest size.
+        let advertising_1200 = Flags {
+            max_receive_packet_size: 1200,
+            ..building_5_ms_ahead()
+        };
+        assert_eq!(
+            backend_options(&advertising_1200).max_unsent,
+            6_250_000 + 44 * 1452,
+            "the server trusts the client up to 1,452 bytes whatever it advertises itself"
+        );
+        assert_eq!(
+            backend_options(&advertising_1200).socket.send_buffer,
+            Some(6_250_000 + 16 * 44 * 1452)
+        );
+        let fixed = Flags {
+            override_packet_size: false,
+            ..building_5_ms_ahead()
+        };
+        assert_eq!(
+            backend_options(&fixed).max_unsent,
+            6_250_000 + 44 * 1232,
+            "without trusting the client, the server sends 1,232 bytes"
+        );
+        let jumbo = Flags {
+            max_receive_packet_size: 9000,
+            ..building_5_ms_ahead()
+        };
+        assert_eq!(backend_options(&jumbo).max_unsent, 6_250_000 + 44 * 9000);
     }
 
     #[test]
@@ -1654,8 +1689,13 @@ mod tests {
             ..loopback(Mode::Client, 0)
         };
         let mut out = Vec::new();
-        let conns =
-            run_client_with(&flags, config::client_config(&flags).unwrap(), &mut out).unwrap();
+        let conns = run_client_with(
+            &flags,
+            server.addr(),
+            config::client_config(&flags, server.addr().ip()).unwrap(),
+            &mut out,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
         // A saturating server feeds every stream on loopback, so each spread is finite.
         let mut spreads: Vec<f64> = conns
@@ -1713,8 +1753,13 @@ mod tests {
             ..loopback(Mode::Client, 0)
         };
         let mut out = Vec::new();
-        let conns =
-            run_client_with(&flags, config::client_config(&flags).unwrap(), &mut out).unwrap();
+        let conns = run_client_with(
+            &flags,
+            server.addr(),
+            config::client_config(&flags, server.addr().ip()).unwrap(),
+            &mut out,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
         assert_eq!(conns.len(), 1, "{output}");
         assert_eq!(
@@ -1827,8 +1872,13 @@ mod tests {
             ..loopback(Mode::Client, 0)
         };
         let mut out = Vec::new();
-        let conns =
-            run_client_with(&flags, config::client_config(&flags).unwrap(), &mut out).unwrap();
+        let conns = run_client_with(
+            &flags,
+            server.addr(),
+            config::client_config(&flags, server.addr().ip()).unwrap(),
+            &mut out,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
         let parsed =
             report::parse(&output).unwrap_or_else(|| panic!("no result lines in {output:?}"));
@@ -1964,7 +2014,7 @@ mod tests {
         .unwrap();
         let flags = loopback(Mode::Client, server.addr().port());
         let endpoint = config::endpoint_config(&flags).unwrap();
-        let client = config::client_config(&flags).unwrap();
+        let client = config::client_config(&flags, server.addr().ip()).unwrap();
         let options = backend_options(&flags);
         let remote = server.addr();
         let worker = ManagedWorker::new(WORKER_COMMANDS).unwrap();

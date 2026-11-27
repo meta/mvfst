@@ -8,6 +8,7 @@
 //! The transport and TLS settings each side runs with, which match those of mvfst's tperf.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,11 +54,28 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The active_connection_id_limit an mvfst server advertises.
 const SERVER_CONNECTION_ID_LIMIT: u64 = 5;
 
+/// The datagram size mvfst sends to an IPv4 peer.
+const V4_DATAGRAM: u16 = 1252;
+/// The datagram size mvfst sends to an IPv6 peer, and a server's size before the client's
+/// transport parameters arrive.
+const V6_DATAGRAM: u16 = 1232;
+/// The largest datagram mvfst sends when it trusts the peer's max_udp_payload_size.
+const MAX_TRUSTED_DATAGRAM: u16 = 1452;
+
 /// Returns the client's transport settings, those of mvfst's tperf client: a `--window`
 /// connection window that autotunes up to 32 MiB with `--autotune_window`, a 4 GiB
 /// unidirectional stream window, and `--max_receive_packet_size` as max_udp_payload_size.
+/// Datagrams are 1,252 bytes to an IPv4 server at `peer` and 1,232 bytes to an IPv6 one, whatever
+/// the server advertises, as that client does not take `--override_packet_size`.
 /// `--initial_rtt_ms` sets the initial RTT, as on the server.
-pub(crate) fn client_transport(flags: &Flags) -> Result<Arc<TransportConfig>, ConfigError> {
+pub(crate) fn client_transport(
+    flags: &Flags,
+    peer: IpAddr,
+) -> Result<Arc<TransportConfig>, ConfigError> {
+    let datagram_size = match peer {
+        IpAddr::V4(_) => V4_DATAGRAM,
+        IpAddr::V6(_) => V6_DATAGRAM,
+    };
     initial_rtt(TransportConfig::builder(), flags)
         .max_data(flags.window)
         .max_data_autotune(
@@ -71,21 +89,19 @@ pub(crate) fn client_transport(flags: &Flags) -> Result<Arc<TransportConfig>, Co
         .idle_timeout(Some(IDLE_TIMEOUT))
         .max_udp_payload_size(flags.max_receive_packet_size)
         .congestion_control(flags.congestion)
+        .datagram_size(DatagramSize::Fixed(datagram_size))
         .build()
 }
 
 /// Returns the server's transport settings: `--congestion`, `--pacing` and `--max_cwnd_mss`, and
-/// with `--override_packet_size` datagrams at the peer's max_udp_payload_size, capped by
-/// `--max_receive_packet_size` as mvfst caps it at its own. `--pacing` also sets mvfst tperf's
-/// 200 µs tick and minimum burst of 5, or the pacing flags' values, and `--writes_per_loop` as
-/// the maximum burst. `--initial_rtt_ms` sets the initial RTT, as on the client. Flow-control
-/// windows are mvfst's defaults.
+/// the datagram sizes of mvfst's tperf server: 1,232 bytes, and with `--override_packet_size` the
+/// client's max_udp_payload_size up to 1,452 bytes once its transport parameters arrive, whatever
+/// `--max_receive_packet_size` advertises. A `--max_receive_packet_size` above 1,452 bytes, which
+/// mvfst does not send, is the cap instead. `--pacing` also sets mvfst tperf's 200 µs tick and
+/// minimum burst of 5, or the pacing flags' values, and `--writes_per_loop` as the maximum burst.
+/// `--initial_rtt_ms` sets the initial RTT, as on the client. Flow-control windows are mvfst's
+/// defaults.
 pub(crate) fn server_transport(flags: &Flags) -> Result<Arc<TransportConfig>, ConfigError> {
-    let datagram_size = if flags.override_packet_size {
-        DatagramSize::PeerMaximum
-    } else {
-        DatagramSize::Minimum
-    };
     let mut builder = initial_rtt(TransportConfig::builder(), flags);
     if flags.pacing {
         let tick = flags.pacing_granularity_us.unwrap_or(PACING_TICK_US);
@@ -103,8 +119,28 @@ pub(crate) fn server_transport(flags: &Flags) -> Result<Arc<TransportConfig>, Co
         .pacing(flags.pacing)
         .max_window(flags.max_cwnd_mss)
         .active_connection_id_limit(SERVER_CONNECTION_ID_LIMIT)
-        .datagram_size(datagram_size)
+        .datagram_size(server_datagram_size(flags))
         .build()
+}
+
+/// Returns the server's datagram sizes, as [`server_transport`] describes them.
+fn server_datagram_size(flags: &Flags) -> DatagramSize {
+    if flags.override_packet_size {
+        DatagramSize::PeerMaximum {
+            initial: V6_DATAGRAM,
+            cap: flags.max_receive_packet_size.max(MAX_TRUSTED_DATAGRAM),
+        }
+    } else {
+        DatagramSize::Fixed(V6_DATAGRAM)
+    }
+}
+
+/// Returns the largest datagram the server sends with `flags`.
+pub(crate) fn largest_server_datagram(flags: &Flags) -> u16 {
+    match server_datagram_size(flags) {
+        DatagramSize::Fixed(size) => size,
+        DatagramSize::PeerMaximum { initial, cap } => initial.max(cap),
+    }
 }
 
 /// Sets `--initial_rtt_ms`, if given, as the RTT assumed before the first sample.
@@ -205,7 +241,7 @@ fn provider() -> CryptoProvider {
 /// Returns the client's settings: version 1 with ALPN `quic_test`, or with `--quic_version=mvfst`
 /// MVFST without ALPN, as mvfst's tperf client offers. The client accepts any server certificate,
 /// as that client does.
-pub(crate) fn client_config(flags: &Flags) -> Result<Arc<ClientConfig>, SetupError> {
+pub(crate) fn client_config(flags: &Flags, peer: IpAddr) -> Result<Arc<ClientConfig>, SetupError> {
     let (version, alpn, policy): (Version, &[&[u8]], AlpnPolicy) = match flags.quic_version {
         QuicVersion::V1 => (Version::V1, &[ALPN], AlpnPolicy::Required),
         QuicVersion::Mvfst => (Version::MVFST, &[], AlpnPolicy::AllowMissing),
@@ -217,7 +253,7 @@ pub(crate) fn client_config(flags: &Flags) -> Result<Arc<ClientConfig>, SetupErr
         alpn,
     )?;
     Ok(ClientConfig::builder(Arc::new(tls))
-        .transport(client_transport(flags)?)
+        .transport(client_transport(flags, peer)?)
         .versions(vec![version])
         .alpn(policy)
         .build()?)
@@ -274,6 +310,9 @@ impl From<ConfigError> for SetupError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
+
     use mvfstr_proto::CongestionControl;
     use rustls::SignatureAlgorithm;
     use rustls::SignatureScheme;
@@ -282,9 +321,13 @@ mod tests {
     use super::*;
     use crate::flags::Mode;
 
+    /// The loopback address of each family, the default `--host` being IPv6's.
+    const V4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
     #[test]
     fn the_client_advertises_what_the_mvfst_tperf_client_does() {
-        let config = client_transport(&Flags::default()).unwrap();
+        let config = client_transport(&Flags::default(), V6).unwrap();
         assert_eq!(config.max_data(), 1 << 20);
         assert_eq!(config.max_data_autotune(), Some(32 << 20));
         assert_eq!(config.max_stream_data_uni(), u64::from(u32::MAX));
@@ -299,7 +342,6 @@ mod tests {
         assert_eq!(config.max_udp_payload_size(), 1452);
         assert_eq!(config.active_connection_id_limit(), 2);
         assert_eq!(config.congestion_control(), CongestionControl::Cubic);
-        assert_eq!(config.datagram_size(), DatagramSize::Minimum);
 
         let flags = Flags {
             window: 3 << 20,
@@ -307,7 +349,7 @@ mod tests {
             congestion: CongestionControl::NewReno,
             ..Flags::default()
         };
-        let config = client_transport(&flags).unwrap();
+        let config = client_transport(&flags, V6).unwrap();
         assert_eq!(config.max_data(), 3 << 20);
         assert_eq!(config.max_udp_payload_size(), 1350);
         assert_eq!(config.congestion_control(), CongestionControl::NewReno);
@@ -315,13 +357,16 @@ mod tests {
             autotune_window: false,
             ..Flags::default()
         };
-        assert_eq!(client_transport(&fixed).unwrap().max_data_autotune(), None);
+        assert_eq!(
+            client_transport(&fixed, V6).unwrap().max_data_autotune(),
+            None
+        );
         let large = Flags {
             window: 64 << 20,
             ..Flags::default()
         };
         assert_eq!(
-            client_transport(&large).unwrap().max_data_autotune(),
+            client_transport(&large, V6).unwrap().max_data_autotune(),
             Some(64 << 20),
             "a window above 32 MiB is its own ceiling"
         );
@@ -330,7 +375,6 @@ mod tests {
     #[test]
     fn the_server_sends_as_the_mvfst_tperf_server_does() {
         let config = server_transport(&Flags::default()).unwrap();
-        assert_eq!(config.datagram_size(), DatagramSize::PeerMaximum);
         assert_eq!(config.max_window(), 860_000);
         assert_eq!(config.congestion_control(), CongestionControl::Cubic);
         assert!(!config.pacing());
@@ -356,12 +400,90 @@ mod tests {
             ..Flags::default()
         };
         let config = server_transport(&flags).unwrap();
-        assert_eq!(config.datagram_size(), DatagramSize::Minimum);
         assert_eq!(config.max_window(), 1000);
         assert_eq!(config.congestion_control(), CongestionControl::NewReno);
         assert!(config.pacing());
         assert_eq!(config.max_udp_payload_size(), 1300);
         assert_eq!(config.max_data(), 1 << 20);
+    }
+
+    #[test]
+    fn the_server_sends_mvfsts_packet_sizes_and_trusts_the_client_up_to_1452_bytes() {
+        let sizes = |flags: &Flags| {
+            let config = server_transport(flags).unwrap();
+            (config.datagram_size(), config.max_udp_payload_size())
+        };
+        let peer = |cap| DatagramSize::PeerMaximum { initial: 1232, cap };
+        // With --override_packet_size, mvfst's server sends 1,232 bytes until the client's
+        // parameters arrive, then the client's max_udp_payload_size up to 1,452 bytes, whatever
+        // it advertises itself.
+        assert_eq!(sizes(&Flags::default()), (peer(1452), 1452));
+        let small = Flags {
+            max_receive_packet_size: 1300,
+            ..Flags::default()
+        };
+        assert_eq!(sizes(&small), (peer(1452), 1300));
+        let fixed = Flags {
+            override_packet_size: false,
+            ..Flags::default()
+        };
+        assert_eq!(sizes(&fixed), (DatagramSize::Fixed(1232), 1452));
+        // Above 1,452 bytes, which mvfst does not send, the advertised size is the cap.
+        let jumbo = Flags {
+            max_receive_packet_size: 9000,
+            ..Flags::default()
+        };
+        assert_eq!(sizes(&jumbo), (peer(9000), 9000));
+        let jumbo_fixed = Flags {
+            override_packet_size: false,
+            ..jumbo
+        };
+        assert_eq!(sizes(&jumbo_fixed), (DatagramSize::Fixed(1232), 9000));
+    }
+
+    #[test]
+    fn the_client_sends_mvfsts_packet_sizes_for_the_servers_address_family() {
+        // mvfst's tperf client does not trust the server's max_udp_payload_size, so
+        // --override_packet_size does not change its size.
+        for override_packet_size in [true, false] {
+            for max_receive_packet_size in [1452, 9000] {
+                let flags = Flags {
+                    mode: Mode::Client,
+                    override_packet_size,
+                    max_receive_packet_size,
+                    ..Flags::default()
+                };
+                let case = format!(
+                    "--override_packet_size={override_packet_size} \
+                     --max_receive_packet_size={max_receive_packet_size}"
+                );
+                for (peer, size) in [(V4, 1252), (V6, 1232)] {
+                    let config = client_transport(&flags, peer).unwrap();
+                    assert_eq!(
+                        config.datagram_size(),
+                        DatagramSize::Fixed(size),
+                        "{case}, server {peer}"
+                    );
+                    assert_eq!(
+                        config.max_udp_payload_size(),
+                        max_receive_packet_size,
+                        "{case}"
+                    );
+                }
+            }
+        }
+        let flags = Flags {
+            mode: Mode::Client,
+            ..Flags::default()
+        };
+        assert_eq!(
+            client_config(&flags, V4)
+                .unwrap()
+                .transport()
+                .datagram_size(),
+            DatagramSize::Fixed(1252),
+            "the client's connections take it"
+        );
     }
 
     #[test]
@@ -411,7 +533,7 @@ mod tests {
             ..Flags::default()
         };
         assert_eq!(
-            client_transport(&client).unwrap().initial_rtt(),
+            client_transport(&client, V6).unwrap().initial_rtt(),
             TransportConfig::default().initial_rtt(),
             "the transport's default without the flag"
         );
@@ -421,7 +543,7 @@ mod tests {
                 ..client.clone()
             };
             assert_eq!(
-                client_transport(&flags).unwrap().initial_rtt(),
+                client_transport(&flags, V6).unwrap().initial_rtt(),
                 rtt,
                 "--initial_rtt_ms={ms}"
             );
@@ -431,7 +553,10 @@ mod tests {
             ..client
         };
         assert_eq!(
-            client_config(&lowered).unwrap().transport().initial_rtt(),
+            client_config(&lowered, V6)
+                .unwrap()
+                .transport()
+                .initial_rtt(),
             Duration::from_millis(100),
             "the client's connections take it"
         );
@@ -580,7 +705,7 @@ mod tests {
 
     #[test]
     fn the_client_offers_version_1_with_quic_test_or_mvfst_without_alpn() {
-        let config = client_config(&Flags::default()).unwrap();
+        let config = client_config(&Flags::default(), V6).unwrap();
         assert_eq!(config.versions(), [Version::V1]);
         assert_eq!(
             config.tls().rustls().unwrap().alpn_protocols,
@@ -598,7 +723,7 @@ mod tests {
             quic_version: QuicVersion::Mvfst,
             ..Flags::default()
         };
-        let config = client_config(&mvfst).unwrap();
+        let config = client_config(&mvfst, V6).unwrap();
         assert_eq!(config.versions(), [Version::MVFST]);
         assert!(config.tls().rustls().unwrap().alpn_protocols.is_empty());
         assert_eq!(config.alpn(), AlpnPolicy::AllowMissing);

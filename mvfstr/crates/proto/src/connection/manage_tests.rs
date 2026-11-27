@@ -49,6 +49,7 @@ use crate::ClockEpoch;
 use crate::CloseReason;
 use crate::CongestionControl;
 use crate::ConnEvent;
+use crate::DatagramSize;
 use crate::Ecn;
 use crate::Endpoint;
 use crate::EndpointConfig;
@@ -907,6 +908,72 @@ fn a_probe_from_a_new_address_is_answered_there_without_migrating() {
     );
     assert!(there[0].data.len() >= 1200, "{}", there[0].data.len());
     assert_eq!(server.remote_address(), client_addr());
+}
+
+/// Returns the sizes of the datagrams among `sent` that went to `to` and carry a path frame that
+/// `wanted` matches.
+fn path_datagram_sizes(
+    conn: &Connection,
+    sent: &[SentDatagram],
+    to: SocketAddr,
+    wanted: impl Fn(&PathFrame) -> bool,
+) -> Vec<usize> {
+    sent.iter()
+        .filter(|datagram| {
+            datagram.meta.dst == to && path_frames(conn, &datagram.data).iter().any(&wanted)
+        })
+        .map(|datagram| datagram.data.len())
+        .collect()
+}
+
+#[test]
+fn path_probing_datagrams_take_a_fixed_size_within_the_credit() {
+    let setup = Setup {
+        server_transport: TransportConfig::builder()
+            .datagram_size(DatagramSize::Fixed(1252))
+            .build()
+            .unwrap(),
+        ..Setup::default()
+    };
+
+    let mut pair = settled(&setup);
+    let now = pair.now;
+    let challenge = from_client(&pair, 10, &[Frame::PathChallenge([7; 8])]);
+    let server = pair.server.conn_mut();
+    deliver(server, now, client_addr(), challenge);
+    let sent = transmit(server, now);
+    let on_path = path_datagram_sizes(server, &sent, client_addr(), |frame| {
+        *frame == PathFrame::Response([7; 8])
+    });
+
+    // The new path's credit is three times the padded probe.
+    let probe = from_client(
+        &pair,
+        11,
+        &[Frame::PathChallenge([3; 8]), Frame::Padding { len: 1200 }],
+    );
+    let server = pair.server.conn_mut();
+    deliver(server, now, stranger(), probe);
+    let sent = transmit(server, now);
+    let new_path = path_datagram_sizes(server, &sent, stranger(), |frame| {
+        *frame == PathFrame::Response([3; 8])
+    });
+
+    // The client moves with a padded packet.
+    let mut pair = settled(&setup);
+    let now = pair.now;
+    let moved = from_client(&pair, 10, &[Frame::Ping, Frame::Padding { len: 1200 }]);
+    let server = pair.server.conn_mut();
+    deliver(server, now, third_address(), moved);
+    let sent = transmit(server, now);
+    let challenge = path_datagram_sizes(server, &sent, third_address(), |frame| {
+        matches!(frame, PathFrame::Challenge(_))
+    });
+    // A response on the path in use and on a new path, and a challenge to a client that moved.
+    assert_eq!(
+        (on_path, new_path, challenge),
+        (vec![1252], vec![1252], vec![1252])
+    );
 }
 
 #[test]

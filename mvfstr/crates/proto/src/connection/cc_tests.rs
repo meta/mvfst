@@ -1169,7 +1169,15 @@ fn initial_and_handshake_packets_are_not_paced_before_the_one_rtt_keys() {
 
 #[test]
 fn the_pacing_burst_follows_the_datagram_size_the_peer_allows() {
-    let mut pair = backlogged(|c| c.datagram_size(DatagramSize::PeerMaximum), 100_000);
+    let mut pair = backlogged(
+        |c| {
+            c.datagram_size(DatagramSize::PeerMaximum {
+                initial: 1200,
+                cap: 1452,
+            })
+        },
+        100_000,
+    );
     let now = pair.now;
     let conn = pair.client.conn();
     assert_eq!(conn.mtu, 1452);

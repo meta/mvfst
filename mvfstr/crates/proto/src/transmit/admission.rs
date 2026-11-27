@@ -144,8 +144,8 @@ pub(crate) fn may_start(class: Class, gate: &Gate) -> Start {
 /// admit, whatever started the datagram.
 ///
 /// The amplification credit binds every class, since every byte sent before validation is
-/// charged to the path: a joiner that would make the datagram an ack-eliciting Initial, which is
-/// padded to 1,200 bytes, needs the credit for that size.
+/// charged to the path: a joiner that would make the datagram an ack-eliciting Initial needs the
+/// credit for the 1,200 bytes such a datagram takes at least.
 pub(crate) fn may_join(class: Class, gate: &Gate, probe_packet: bool) -> bool {
     if !gate.keys || gate.credit < gate.datagram_size {
         return false;

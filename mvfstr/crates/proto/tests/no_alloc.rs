@@ -914,7 +914,10 @@ fn census_datagram_receive() {
     let config = census_config_with(
         TransportConfig::builder()
             .max_datagram_frame_size(65535)
-            .datagram_size(DatagramSize::PeerMaximum),
+            .datagram_size(DatagramSize::PeerMaximum {
+                initial: 1200,
+                cap: 1452,
+            }),
     );
     let mut pair = connected(config);
     let mut app = Datagrams {

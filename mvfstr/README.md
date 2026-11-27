@@ -59,9 +59,10 @@ mvfstr is under active development, and its APIs will change before 1.0.
 - 0-RTT is not supported. A client does not keep the tokens that a server
   sends in NEW_TOKEN frames.
 - A server does not send Retry packets, and a client discards them.
-- Path MTU discovery is not supported. A connection sends datagrams of 1,200
-  bytes, or, if configured to, the smaller of the two endpoints'
-  max_udp_payload_size once the peer's transport parameters arrive.
+- Path MTU discovery is not supported. A connection sends datagrams of a
+  configured size, 1,200 bytes by default, or, if configured to, the peer's
+  max_udp_payload_size up to a configured cap once the peer's transport
+  parameters arrive.
 - QUIC version 2 is not supported.
 - A client does not start a migration to a new address itself.
 - mvfstr does not mark the packets it sends as ECN-capable.

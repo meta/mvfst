@@ -256,8 +256,8 @@ pub(crate) struct PacketCx {
     pub(crate) ack_eliciting: bool,
     /// Whether a frame of a class that takes pacing tokens was written.
     pub(crate) paced: bool,
-    /// Whether a PATH_CHALLENGE or PATH_RESPONSE was written: the datagram is then padded to 1,200
-    /// bytes when the path's credit allows.
+    /// Whether a PATH_CHALLENGE or PATH_RESPONSE was written: when the path's credit allows 1,200
+    /// bytes, the datagram is then padded to the send size within the slot and the credit.
     pub(crate) path: bool,
     /// Whether a PATH_CHALLENGE was written.
     pub(crate) challenge: bool,

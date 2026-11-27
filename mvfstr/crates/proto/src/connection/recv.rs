@@ -52,7 +52,6 @@ use super::params;
 use crate::AlpnPolicy;
 use crate::CloseReason;
 use crate::ConnEvent;
-use crate::DatagramSize;
 use crate::Initiator;
 use crate::Prioritizer;
 use crate::RecvSummary;
@@ -1140,9 +1139,7 @@ impl<P: Prioritizer> Connection<P> {
         // The decoder accepts only exponents up to 20.
         self.peer_ack_delay_exponent =
             u8::try_from(peer.ack_delay_exponent.into_inner()).unwrap_or(20);
-        if self.config.datagram_size() == DatagramSize::PeerMaximum {
-            self.apply_peer_payload_size(&peer)?;
-        }
+        self.apply_peer_payload_size(&peer)?;
         let early = self
             .early
             .take_if(|early| early.params.is_some())
@@ -1161,15 +1158,17 @@ impl<P: Prioritizer> Connection<P> {
         Ok(())
     }
 
-    /// Sizes datagrams to the smaller of the peer's max_udp_payload_size and ours.
+    /// Sizes datagrams, the congestion controller and the pacer for the peer's transport
+    /// parameters `peer`, if the datagram size policy follows the peer.
     pub(super) fn apply_peer_payload_size(
         &mut self,
         peer: &TransportParameters,
     ) -> Result<(), ConnError> {
-        let peer_max = u16::try_from(peer.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX);
-        self.mtu = peer_max
-            .min(self.config.max_udp_payload_size())
-            .max(MIN_DATAGRAM);
+        let peer_max = peer.max_udp_payload_size.into_inner();
+        let Some(mtu) = self.config.datagram_size().with_peer(peer_max) else {
+            return Ok(());
+        };
+        self.mtu = mtu;
         self.cc
             .set_max_datagram_size(self.mtu)
             .map_err(|_| ConnError::new(TransportErrorCode::INTERNAL_ERROR, "datagram size"))?;
