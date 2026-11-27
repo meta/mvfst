@@ -22,14 +22,21 @@ use std::time::Duration;
 use std::time::Instant;
 
 use mvfstr_io::Backend;
+use mvfstr_io::TxBackend;
 use mvfstr_proto::ClientConfig;
+use mvfstr_proto::ConnKey;
 use mvfstr_proto::ConnOptions;
 use mvfstr_proto::EndpointConfig;
+use mvfstr_proto::PathId;
 use mvfstr_proto::Release;
+use mvfstr_proto::SegmentSink;
 use mvfstr_proto::ServerConfig;
 use mvfstr_proto::SrcPortBlocklist;
 use mvfstr_proto::Tick;
 use mvfstr_proto::TransportConfig;
+use mvfstr_proto::TxClass;
+use mvfstr_proto::TxMeta;
+use mvfstr_proto::TxSeqRange;
 use rustls::pki_types::ServerName;
 
 use crate::EndpointDriver;
@@ -2876,6 +2883,49 @@ fn an_end_of_phase_flush_after_a_phase_without_a_stop_is_timed_apart_from_its_la
     assert_eq!((timed, datagrams), (1, u64::from(sent)));
 }
 
+/// Ends a run of `lens` datagrams to [`SERVER`] on `socket`, numbered from `start`.
+fn lab_run(socket: &mut MemBackend, start: u64, lens: &[u16]) {
+    let mut sink = socket.sink(ConnKey {
+        index: 1,
+        generation: 1,
+    });
+    for &len in lens {
+        sink.next_segment(len, TxClass::Data).expect("a slot");
+        sink.end_segment(len);
+    }
+    sink.end_run(TxMeta {
+        path: PathId(0),
+        dst: SERVER,
+        src_ip: None,
+        tos: 0,
+        segment_size: lens[0],
+        segments: lens.len() as u16,
+        release: Release::Asap,
+        class: TxClass::Data,
+        tx: TxSeqRange {
+            start,
+            end: start + lens.len() as u64,
+        },
+        sealed: true,
+    });
+}
+
+#[test]
+fn a_lab_socket_holds_the_datagrams_of_its_runs_until_its_flush() {
+    let lab = Lab::new();
+    let options = MemOptions {
+        net: Some(lab.net.clone()),
+        ..MemOptions::default()
+    };
+    let mut socket = MemBackend::connect(SERVER, &options).expect("a lab socket");
+    assert_eq!(socket.queued_datagrams(), 0);
+    lab_run(&mut socket, 0, &[1_000; 3]);
+    lab_run(&mut socket, 3, &[500]);
+    assert_eq!(socket.queued_datagrams(), 4, "runs of three and one");
+    assert_eq!(socket.flush(lab.net.now()).datagrams, 4);
+    assert_eq!(socket.queued_datagrams(), 0, "a flush sends every run");
+}
+
 #[test]
 fn a_transmit_phase_stops_before_an_attempt_once_less_is_left_than_its_predicted_flush() {
     for (flush, attempts, took, why) in [
@@ -2972,4 +3022,57 @@ fn a_per_attempt_flush_on_a_release_socket_is_part_of_its_attempt_and_leaves_not
         );
         assert_eq!(stats.longest_past_us(UnitKind::TransmitFlush), 0);
     }
+}
+
+#[test]
+fn under_a_work_budget_the_check_before_a_due_pacing_wake_reserves_for_the_server_sockets_queue() {
+    let budget = WorkBudget::per_poll(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        len: Some(1 << 20),
+        segments: 10,
+        budget: Some(budget),
+        ..ServerPlan::default()
+    });
+    scene.establish(2);
+    scene.lab.net.set_costs(Costs {
+        attempt: us(100),
+        flush: us(5),
+        ..Costs::default()
+    });
+    scene.servers()[0].open_streams(4);
+    // The first poll times an end-of-phase flush, from which later checks predict their reserve.
+    scene.poll_server();
+    // The second connection's wake comes due during the next poll's third attempt.
+    scene
+        .server_core()
+        .arm_pacing_at(1, scene.lab.net.now() + us(250));
+    let marks = scene.poll_server();
+    assert_eq!(
+        attempted(&marks)[..4],
+        [0, 0, 0, 1],
+        "the wake's connection went after the third attempt: {marks:?}"
+    );
+    let record = scene.server.tx_record();
+    let next = record
+        .wakes
+        .last()
+        .and_then(|wake| wake.next)
+        .expect("the wake's connection made the next attempt");
+    let checks: Vec<_> = record
+        .reserves
+        .iter()
+        .filter(|check| check.next == next)
+        .collect();
+    let [check] = checks[..] else {
+        panic!("one check let the served attempt run: {checks:?}");
+    };
+    assert!(
+        check.cost.predict(1) > Duration::ZERO,
+        "a flush was timed: {check:?}"
+    );
+    assert_eq!(
+        (check.datagrams, check.reserve),
+        (30, check.cost.predict(30)),
+        "the three attempts before the wake left ten datagrams each queued on the server socket"
+    );
 }

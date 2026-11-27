@@ -106,7 +106,8 @@ pub struct BudgetStats {
     /// Their total time, in µs.
     pub flush_us: u64,
     /// Transmit phases stopped before an attempt because the time left in the slice was less than
-    /// the predicted cost of flushing what they had staged, capped at half the slice.
+    /// the predicted cost of flushing the datagrams queued on the server socket, capped at half the
+    /// slice.
     pub reserve_stops: u64,
     past_us: [u64; UnitKind::COUNT],
 }
@@ -223,8 +224,8 @@ impl WorkBudget {
 
     /// Checks the slice at `now` as [`check`](Self::check) does, and also refuses the unit when
     /// less than `reserve` is left of it, with the reserve capped at half the slice. A transmit
-    /// phase reserves the predicted cost of flushing what it has staged, and a refusal for the
-    /// reserve closes the slice, leaving the rest of it to the flush.
+    /// phase reserves the predicted cost of flushing the server socket's queue, and a refusal for
+    /// the reserve closes the slice, leaving the rest of it to the flush.
     pub(crate) fn check_reserving(&self, now: Instant, kind: UnitKind, reserve: Duration) -> bool {
         self.observe(now);
         let state = &*self.0;
@@ -418,7 +419,7 @@ fn micros(duration: Duration) -> u64 {
 }
 
 /// A running average of what an end-of-phase transmit flush costs per datagram it sends, from
-/// which a driver predicts what flushing the datagrams a transmit phase has staged will cost.
+/// which a driver predicts what flushing the datagrams queued on its server socket will cost.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FlushCost {
     /// Eight times the running averages of a timed flush's time, in ns, and of the datagrams it

@@ -230,6 +230,10 @@ impl<H: IoHost> TxBackend for HostBackend<H> {
         }
     }
 
+    fn queued_datagrams(&self) -> u32 {
+        self.tx.queued_datagrams()
+    }
+
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         loop {
             if !self.tx.blocked() {

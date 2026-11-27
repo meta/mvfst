@@ -494,6 +494,11 @@ impl TxBackend for MemBackend {
         }
     }
 
+    fn queued_datagrams(&self) -> u32 {
+        let datagrams: usize = self.runs.iter().map(|(_, _, run)| run.len()).sum();
+        u32::try_from(datagrams).unwrap_or(u32::MAX)
+    }
+
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.port.blocked.get() {
             *self.port.writable.borrow_mut() = Some(cx.waker().clone());

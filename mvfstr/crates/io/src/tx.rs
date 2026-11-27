@@ -167,6 +167,11 @@ impl Tx {
         self.blocked
     }
 
+    /// Returns the datagrams of the queued messages, saturating at `u32::MAX`.
+    pub(crate) fn queued_datagrams(&self) -> u32 {
+        u32::try_from(self.queued.len()).unwrap_or(u32::MAX)
+    }
+
     /// Sends every queued message it can. Returns the datagrams handed to the kernel.
     pub(crate) fn send(&mut self, fd: BorrowedFd<'_>) -> u32 {
         let mut sent = 0;
@@ -684,12 +689,14 @@ mod tests {
     use std::net::Ipv6Addr;
     use std::net::UdpSocket;
     use std::os::fd::AsFd;
+    use std::os::unix::net::UnixDatagram;
     use std::time::Duration;
     use std::time::Instant;
 
     use mvfstr_proto::ClockEpoch;
     use mvfstr_proto::PathId;
     use mvfstr_proto::Tick;
+    use socket2::SockRef;
 
     use super::*;
     use crate::cmsg::Decoder;
@@ -777,17 +784,9 @@ mod tests {
     /// Returns a transmit half whose GSO sends hold at most `max_segments` segments, with
     /// `release`.
     fn tx(max_segments: u16, release: ReleaseSupport) -> Tx {
-        let caps = TxCaps {
+        configured(
             max_segments,
-            max_datagram: 1500,
-            gro: true,
-            ecn: true,
-            pktinfo: true,
             release,
-            send_buffer: 212_992,
-        };
-        Tx::new(
-            caps,
             TxConfig {
                 slots: 64,
                 urgent_slots: 4,
@@ -797,6 +796,21 @@ mod tests {
                 ipv6: false,
             },
         )
+    }
+
+    /// Returns a transmit half whose GSO sends hold at most `max_segments` segments, with
+    /// `release`, sized by `config`.
+    fn configured(max_segments: u16, release: ReleaseSupport, config: TxConfig) -> Tx {
+        let caps = TxCaps {
+            max_segments,
+            max_datagram: 1500,
+            gro: true,
+            ecn: true,
+            pktinfo: true,
+            release,
+            send_buffer: 212_992,
+        };
+        Tx::new(caps, config)
     }
 
     /// Queues one sealed run of datagrams of `lens` bytes to `dst`, sent as soon as possible.
@@ -827,6 +841,177 @@ mod tests {
             },
         );
         tx.end_sink(conn);
+    }
+
+    /// Returns a transmit half without release support whose GSO sends hold at most four
+    /// segments, with `slots` slots of which four are urgent, `batch` messages per call, and a
+    /// connected socket if `connected`.
+    fn sized(slots: u32, batch: usize, connected: bool) -> Tx {
+        configured(
+            4,
+            ReleaseSupport::None,
+            TxConfig {
+                slots,
+                urgent_slots: 4,
+                max_unsent: 128 * 1024,
+                batch,
+                connected,
+                ipv6: false,
+            },
+        )
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn queued_datagrams_counts_each_queued_datagram_until_a_send_takes_or_drops_it() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let to = peer.local_addr().unwrap();
+        let fd = socket.as_fd();
+        // Twelve slots for data, and a call of three messages.
+        let mut tx = sized(16, 3, false);
+        let conn = ConnKey {
+            index: 7,
+            generation: 1,
+        };
+        queue_run(&mut tx, fd, conn, to, &[100; 3]);
+        assert_eq!(tx.queue.len(), 1);
+        assert_eq!(tx.queued_datagrams(), 3, "one GSO send of three datagrams");
+
+        // Sends of four and one make three messages, which fill the call.
+        queue_run(&mut tx, fd, conn, to, &[100; 5]);
+        assert_eq!(
+            tx.queued_datagrams(),
+            0,
+            "the batch-full send took all eight"
+        );
+
+        queue_run(&mut tx, fd, conn, to, &[100; 6]);
+        assert_eq!(tx.queued_datagrams(), 6, "sends of four and two");
+        // The seventh slot of the next run finds only the urgent slots free, so lending it sends
+        // the six queued datagrams first.
+        queue_run(&mut tx, fd, conn, to, &[100; 7]);
+        assert_eq!(
+            tx.queued_datagrams(),
+            7,
+            "the pool-full send took the earlier six, and the run's own seven wait"
+        );
+        assert_eq!(tx.queued.len(), 7);
+
+        // An IPv6 destination on an IPv4 socket fails with EAFNOSUPPORT. Its message fills the
+        // call: the kernel takes the two before it, then refuses it.
+        let unreachable = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+        queue_run(&mut tx, fd, conn, unreachable, &[100; 2]);
+        assert_eq!(
+            tx.queued_datagrams(),
+            0,
+            "the refused send left the queue with its datagrams, which were never sent"
+        );
+        let mut buf = [0; 200];
+        peer.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        for _ in 0..21 {
+            peer.recv(&mut buf).expect("a datagram");
+        }
+    }
+
+    /// Sends 1,000-byte datagrams on `socket` until its send buffer is full.
+    fn fill(socket: &UnixDatagram) {
+        loop {
+            match socket.send(&[0; 1000]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) => panic!("filling the send buffer: {e}"),
+            }
+        }
+    }
+
+    /// Reads `n` datagrams from `peer`.
+    fn read(peer: &UnixDatagram, n: usize) {
+        let mut buf = [0; 2000];
+        for _ in 0..n {
+            peer.recv(&mut buf).expect("a datagram");
+        }
+    }
+
+    /// Sends until the queue is empty, reading every datagram `peer` has before each send; returns
+    /// the datagrams sent.
+    fn send_all(tx: &mut Tx, fd: BorrowedFd<'_>, peer: &UnixDatagram) -> u32 {
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0; 4000];
+        let mut sent = 0;
+        for _ in 0..100 {
+            while peer.recv(&mut buf).is_ok() {}
+            sent += tx.send(fd);
+            if !tx.blocked() {
+                break;
+            }
+        }
+        peer.set_nonblocking(false).unwrap();
+        assert!(!tx.blocked(), "the queue does not leave");
+        sent
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn queued_datagrams_keeps_what_an_eagain_leaves_and_counts_a_split_gso_send_per_datagram() {
+        // A Unix datagram stays charged to the sender's SO_SNDBUF until the peer reads it, so a
+        // socket whose buffer is full meets EAGAIN, and each datagram the peer reads makes room for
+        // one more of the same size; loopback UDP never returns EAGAIN.
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        SockRef::from(&socket).set_send_buffer_size(1).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let fd = socket.as_fd();
+        let mut tx = sized(64, 64, true);
+        let conn = ConnKey {
+            index: 9,
+            generation: 1,
+        };
+        // A connected socket ignores the destination.
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        fill(&socket);
+        for _ in 0..5 {
+            queue_run(&mut tx, fd, conn, to, &[1000]);
+        }
+        assert_eq!(tx.queued_datagrams(), 5);
+        assert_eq!(tx.send(fd), 0);
+        assert!(tx.blocked());
+        assert_eq!(
+            tx.queued_datagrams(),
+            5,
+            "EAGAIN keeps every datagram queued"
+        );
+
+        read(&peer, 2);
+        assert_eq!(tx.send(fd), 2, "room for two");
+        assert!(tx.blocked());
+        assert_eq!(
+            tx.queued_datagrams(),
+            3,
+            "the call took two before the EAGAIN"
+        );
+
+        assert_eq!(send_all(&mut tx, fd, &peer), 3);
+        assert_eq!(tx.queued_datagrams(), 0);
+
+        // A refused GSO send goes again as single datagrams, which then meet EAGAIN.
+        queue_run(&mut tx, fd, conn, to, &[1000; 3]);
+        assert_eq!(tx.queue.len(), 1);
+        fill(&socket);
+        tx.injected.push_back(libc::EIO);
+        assert_eq!(tx.send(fd), 0);
+        assert!(tx.blocked());
+        assert_eq!(
+            tx.queue.len(),
+            3,
+            "the GSO send split into single datagrams"
+        );
+        assert_eq!(tx.queued_datagrams(), 3, "the same three datagrams");
+
+        assert_eq!(send_all(&mut tx, fd, &peer), 3);
+        assert_eq!(tx.queued_datagrams(), 0);
     }
 
     #[test]

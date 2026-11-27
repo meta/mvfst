@@ -309,7 +309,7 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     /// it, and the transmit queue's pop count at which the last slot the stop left pops.
     leftover: Cell<Option<(Instant, u64)>>,
     /// Under a work budget, what the end-of-phase flush of the server socket has cost per
-    /// datagram, from which a transmit phase predicts the cost of flushing what it has staged.
+    /// datagram, from which a transmit phase predicts the cost of flushing the socket's queue.
     flush_cost: Cell<FlushCost>,
     /// Makes the next turn panic outside every connection's guard.
     #[cfg(test)]
@@ -1397,14 +1397,18 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// the previous unit, or at a fresh reading if `reading` is `None`. A unit that may not run
     /// stops the poll.
     fn gate(&self, kind: UnitKind, reading: Option<Instant>) -> bool {
-        self.gate_staged(kind, reading, 0)
+        self.gate_staged(kind, reading, || 0)
     }
 
-    /// Returns whether a unit of `kind` may run, as [`gate`](Self::gate) does, for a transmit phase
-    /// that has built `staged` datagrams on the server socket for its end-of-phase flush. The check
-    /// also stops the poll when less time is left than the predicted cost of flushing them, capped
-    /// at half the budget's slice.
-    fn gate_staged(&self, kind: UnitKind, reading: Option<Instant>, staged: u32) -> bool {
+    /// Returns whether a unit of `kind` may run, as [`gate`](Self::gate) does. The check also stops
+    /// the poll when less time is left than the predicted cost of flushing `staged()` datagrams,
+    /// capped at half the budget's slice; `staged` is called only when the budget is checked.
+    fn gate_staged(
+        &self,
+        kind: UnitKind,
+        reading: Option<Instant>,
+        staged: impl FnOnce() -> u32,
+    ) -> bool {
         let Some(budget) = &self.budget else {
             return true;
         };
@@ -1415,7 +1419,14 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             return true;
         }
         let now = reading.unwrap_or_else(|| self.clock());
+        let staged = staged();
         let reserve = self.flush_cost.get().predict(staged);
+        #[cfg(test)]
+        if kind == UnitKind::Attempt {
+            self.record
+                .borrow_mut()
+                .reserve(staged, self.flush_cost.get(), reserve);
+        }
         if budget.check_reserving(now, kind, reserve) {
             #[cfg(test)]
             self.record.borrow_mut().unit(kind);
@@ -2039,7 +2050,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// phase. The server socket is still flushed then, but if the phase re-queued a connection
     /// after a full batch without flushing its own socket, that batch waits for a later phase. The
     /// check before an attempt also stops the phase when less time is left than the predicted cost
-    /// of flushing what the phase has built on the server socket, capped at half the budget's slice
+    /// of flushing the datagrams queued on the server socket, capped at half the budget's slice
     /// (see [`Self::phase_flush`]).
     ///
     /// Attempts run at `now`, read as the phase starts. A connection's own socket is flushed after
@@ -2087,8 +2098,13 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         let budgeted = self.budget.is_some();
         // Stale slots popped since the last attempt.
         let mut skips = 0;
-        // Datagrams built on the server socket that wait for the end-of-phase flush.
-        let mut staged = 0;
+        // The datagrams queued on the server socket, those that an EAGAIN held in an earlier phase
+        // included.
+        let server_queued = || {
+            self.server
+                .as_ref()
+                .map_or(0, |server| server.socket.borrow().queued_datagrams())
+        };
         loop {
             let mut reading = None;
             let mut take = Take::Nothing;
@@ -2114,7 +2130,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                         .timers
                         .next_pacing()
                         .is_some_and(|wake| wake <= at)
-                    && !self.gate_staged(UnitKind::Attempt, reading, staged)
+                    && !self.gate_staged(UnitKind::Attempt, reading, server_queued)
                 {
                     break;
                 }
@@ -2164,7 +2180,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 } else {
                     reading
                 };
-                if !(budgeted && served) && !self.gate_staged(UnitKind::Attempt, check, staged) {
+                if !(budgeted && served)
+                    && !self.gate_staged(UnitKind::Attempt, check, server_queued)
+                {
                     // The connection stays dirty and goes back to the head of the queue.
                     entry.dirty = true;
                     stopped = Some(entry.slot_generation);
@@ -2208,9 +2226,6 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                         )
                     }
                 };
-                if entry.socket.is_none() {
-                    staged += u32::from(outcome.datagrams);
-                }
                 // Read once per attempt, off the per-packet path.
                 let sent = entry.conn.sent_packets() - sent_before;
                 self.sent_packets.set(self.sent_packets.get() + sent);
@@ -2246,9 +2261,6 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                     && let Some(server) = &self.server
                 {
                     server_flushes = !server.socket.borrow_mut().flush(at).blocked;
-                    if server_flushes {
-                        staged = 0;
-                    }
                 }
                 self.set_pacing(key, entry, outcome.pacing_at);
                 // A ready datagram producer is polled again once the attempt frees allowance,
@@ -3519,6 +3531,9 @@ pub(crate) struct TxRecord {
     pub(crate) attempts: Vec<AttemptRecord>,
     /// Every pacing wake taken, in order.
     pub(crate) wakes: Vec<WakeRecord>,
+    /// Every check before a transmit attempt that reserved time for flushing the server socket,
+    /// in order.
+    pub(crate) reserves: Vec<ReserveRecord>,
     /// The steps of the driver's polls, in order.
     pub(crate) marks: Vec<Mark>,
     /// Units of work the budget let run.
@@ -3596,6 +3611,20 @@ pub(crate) struct WakeRecord {
     pub(crate) next: Option<usize>,
 }
 
+/// A check of the work budget before a transmit attempt that reserved time for flushing the server
+/// socket: the datagrams it reserved for, the flush cost it predicted their flush from, the
+/// reserve, its transmit phase, and the place in [`TxRecord::attempts`] of the attempt it let run,
+/// if it did.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReserveRecord {
+    pub(crate) datagrams: u32,
+    pub(crate) cost: FlushCost,
+    pub(crate) reserve: Duration,
+    pub(crate) phase: u64,
+    pub(crate) next: usize,
+}
+
 #[cfg(test)]
 impl TxRecord {
     fn begin_phase(&mut self) {
@@ -3628,6 +3657,20 @@ impl TxRecord {
     fn unit(&mut self, kind: UnitKind) {
         self.units += 1;
         self.marks.push(Mark::Unit(kind));
+    }
+
+    /// Records a check before a transmit attempt that reserved `reserve` for flushing `datagrams`,
+    /// predicted from `cost`.
+    fn reserve(&mut self, datagrams: u32, cost: FlushCost, reserve: Duration) {
+        self.reserves.push(ReserveRecord {
+            datagrams,
+            cost,
+            reserve,
+            phase: self
+                .phase
+                .expect("attempts are checked inside transmit phases"),
+            next: self.attempts.len(),
+        });
     }
 
     fn attempt(&mut self, key: ConnKey, at: Instant) {

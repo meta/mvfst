@@ -770,6 +770,28 @@ fn the_backend_flushes_on_its_own_when_its_vector_fills() {
 }
 
 #[test]
+fn the_backend_counts_each_datagram_it_holds_until_a_flush_sends_it() {
+    let rt = runtime();
+    let _guard = rt.enter();
+    let mut sender = MmsgBackend::bind(v4(0), &MmsgOptions::default()).expect("sender");
+    assert!(sender.caps().max_segments > 1, "the kernel offers GSO");
+    let peer = receiver(v4(0));
+    let to = peer.local_addr().unwrap();
+    let gso = segments(3, 100, 40);
+    send_run(&mut sender, conn(19), &gso, meta(to, &gso, 0));
+    let single = vec![vec![9; 20]];
+    send_run(&mut sender, conn(19), &single, meta(to, &single, 3));
+    assert_eq!(
+        sender.queued_datagrams(),
+        4,
+        "a GSO send of three datagrams and a single one"
+    );
+    assert_eq!(sender.flush(Instant::now()).datagrams, 4);
+    assert_eq!(sender.queued_datagrams(), 0);
+    assert_eq!(recv_plain(&peer, 4).len(), 4);
+}
+
+#[test]
 fn the_backend_counts_its_sendmmsg_calls_and_the_messages_they_carry() {
     let rt = runtime();
     let _guard = rt.enter();

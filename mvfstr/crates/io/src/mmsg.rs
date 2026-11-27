@@ -200,6 +200,10 @@ impl TxBackend for MmsgBackend {
         }
     }
 
+    fn queued_datagrams(&self) -> u32 {
+        self.tx.queued_datagrams()
+    }
+
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if !self.tx.blocked() {
             return Poll::Ready(());

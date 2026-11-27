@@ -101,10 +101,12 @@ use crate::QuicSession;
 use crate::Refusal;
 use crate::SendSink;
 use crate::Steering;
+use crate::WorkBudget;
 use crate::gated::Event;
 use crate::gated::Gated;
 use crate::gated::GatedOptions;
 use crate::gated::Run;
+use crate::gated::Started;
 use crate::gated::Valve;
 use crate::gated::Valves;
 use crate::lab::Bulk as LabBulk;
@@ -126,6 +128,7 @@ use crate::turn::Limits;
 use crate::turn::Mark;
 use crate::turn::POLL_CHARGE;
 use crate::turn::RX_BATCHES;
+use crate::turn::ReserveRecord;
 use crate::turn::TURN_STAGING;
 use crate::turn::TxRecord;
 use crate::turn::WakeRecord;
@@ -272,6 +275,8 @@ struct Harness<B: Backend = MmsgBackend> {
     /// A function, run on the server worker, that makes the server driver's timers in place of the
     /// default ones, if any.
     server_timers: Option<Arc<dyn Fn() -> HostTimers + Send + Sync>>,
+    /// The slice of a per-poll work budget for the server driver, if it runs under one.
+    server_budget: Option<Duration>,
 }
 
 impl Harness {
@@ -311,6 +316,7 @@ where
             options,
             worker: None,
             server_timers: None,
+            server_budget: None,
         }
     }
 
@@ -321,6 +327,7 @@ where
         let (endpoint, config) = (self.endpoint.clone(), self.server_config.clone());
         let (limits, options, index) = (self.limits, self.options.clone(), self.worker);
         let timers = self.server_timers.clone();
+        let budget = self.server_budget;
         self.server
             .handle()
             .submit(move |worker| {
@@ -333,6 +340,9 @@ where
                 }
                 if let Some(timers) = timers {
                     builder = builder.host_timers(timers());
+                }
+                if let Some(slice) = budget {
+                    builder = builder.work_budget(WorkBudget::per_poll(slice));
                 }
                 let handle = builder.spawn(worker).expect("the server driver starts");
                 let _ = tx.send(handle.local_addr().expect("the server is bound"));
@@ -8733,6 +8743,208 @@ fn with_kernel_release_a_server_socket_behind_an_eagain_is_not_flushed_again_in_
     valves.server.open();
     await_reports(&pair.rx, vec![Report::Received(uni(3), LEN)]);
     harness.shutdown();
+}
+
+/// The slice of the per-poll work budget in [`reserving_bulk`], so long that no check stops a
+/// poll: every check before an attempt records its reserve and lets the attempt run.
+const LONG_SLICE: Duration = Duration::from_secs(10);
+
+/// What a server did in [`reserving_bulk`] from its client's request on.
+struct Reserving {
+    /// The driver's record of its transmit phases.
+    record: TxRecord,
+    /// The attempts the server socket saw, in order; the first is at place `first` in the record.
+    started: Vec<Started>,
+    first: usize,
+    /// What the server socket did.
+    events: Vec<Event>,
+}
+
+impl Reserving {
+    /// Returns the checks before the attempts the server socket saw, each with the place of its
+    /// attempt among them.
+    fn checks(&self) -> Vec<(usize, ReserveRecord)> {
+        self.record
+            .reserves
+            .iter()
+            .filter_map(|check| Some((check.next.checked_sub(self.first)?, *check)))
+            .filter(|&(n, _)| n < self.started.len())
+            .collect()
+    }
+
+    /// Returns what the server socket did from its `n`th attempt until the next began.
+    fn during(&self, n: usize) -> &[Event] {
+        self.events
+            .split(|&event| event == Event::Attempt)
+            .nth(n + 1)
+            .unwrap_or_default()
+    }
+}
+
+/// Has a [`Bulk`] server under a per-poll work budget of [`LONG_SLICE`] send seven datagrams,
+/// within the initial window, over gated sockets with `mmsg` and at most two datagrams per
+/// attempt, with at most `requeues` attempts back to the tail of one transmit phase. With
+/// `block`, the first flush after the client's request meets the simulated EAGAIN, and the record
+/// is read once the driver waits for the socket, before it opens again; without it, once the
+/// client has the stream.
+fn reserving_bulk(mmsg: MmsgOptions, requeues: u64, block: bool) -> Reserving {
+    const LEN: usize = 8_000;
+    let valves = Arc::new(Valves::default());
+    let mut harness = Harness::<Gated>::with_options(GatedOptions {
+        mmsg,
+        valves: Arc::clone(&valves),
+    });
+    harness.limits.max_segments = 2;
+    harness.limits.requeues = requeues;
+    harness.server_budget = Some(LONG_SLICE);
+    let pair = BulkPair::new(&harness, 1, LEN);
+    valves.server.clear();
+    if block {
+        valves.server.block_next_flush();
+    }
+    pair.go();
+    if block {
+        let deadline = Instant::now() + WAIT;
+        while !valves.server.waiting() {
+            assert!(
+                Instant::now() < deadline,
+                "the server never waited for its socket"
+            );
+            std::thread::yield_now();
+        }
+    } else {
+        await_reports(&pair.rx, vec![Report::Received(uni(3), LEN)]);
+    }
+    let read = Arc::clone(&valves);
+    let (record, (started, events)) = tx_record::<Bulk, _>(&harness.server, move || {
+        (read.server.started(), read.server.events())
+    });
+    if block {
+        valves.server.open();
+        await_reports(&pair.rx, vec![Report::Received(uni(3), LEN)]);
+    }
+    let stats = harness.server_stats::<Bulk>();
+    assert_eq!(stats.contained_panics, 0, "{stats:?}");
+    harness.shutdown();
+    let first = record
+        .attempts
+        .len()
+        .checked_sub(started.len())
+        .expect("the driver recorded every attempt the socket saw");
+    for (attempt, start) in record.attempts[first..].iter().zip(&started) {
+        assert_eq!(
+            attempt.key, start.conn,
+            "the driver and the socket disagree"
+        );
+    }
+    Reserving {
+        record,
+        started,
+        first,
+        events,
+    }
+}
+
+#[test]
+fn under_a_work_budget_the_reserve_is_the_predicted_flush_of_the_server_sockets_queue_and_drops_after_a_backend_send()
+ {
+    // Two messages fill a call, and each attempt builds one, so every second attempt's run sends
+    // both from inside the attempt.
+    let mmsg = MmsgOptions {
+        tx_batch: 2,
+        ..mmsg_options()
+    };
+    let bulk = reserving_bulk(mmsg, Limits::default().requeues, false);
+    let checks = bulk.checks();
+    assert_eq!(
+        checks.len(),
+        4,
+        "seven datagrams at two per attempt take four attempts, each checked: {checks:?}"
+    );
+    assert!(
+        checks
+            .iter()
+            .all(|(_, check)| check.phase == checks[0].1.phase),
+        "the attempts were requeued in one phase: {checks:?}"
+    );
+    // The connection is unpaced and the socket has no kernel release, so nothing flushes the
+    // socket between the attempts.
+    assert!(
+        (0..3).all(
+            |n| bulk.during(n).contains(&Event::Run) && !bulk.during(n).contains(&Event::Flush)
+        ),
+        "each attempt built a run and the socket was not flushed before the next: {:?}",
+        bulk.events
+    );
+    let datagrams: Vec<u32> = checks.iter().map(|(_, check)| check.datagrams).collect();
+    assert_eq!(
+        datagrams,
+        [0, 2, 0, 2],
+        "each check reserved for the datagrams the socket held: the second and fourth attempts' \
+         runs each filled the call and left with the run before them"
+    );
+    let cost = checks[0].1.cost;
+    assert!(
+        cost.predict(1) > Duration::ZERO,
+        "an end-of-phase flush was timed before the request: {cost:?}"
+    );
+    assert!(
+        checks[2].1.reserve < checks[1].1.reserve,
+        "the reserve dropped after the backend send: {checks:?}"
+    );
+    for &(n, check) in &checks {
+        let queued = bulk.started[n].queued;
+        assert_eq!(
+            (check.datagrams, check.reserve),
+            (queued, check.cost.predict(queued)),
+            "the check before attempt {n} reserved for the socket's queue: {checks:?}"
+        );
+    }
+}
+
+#[test]
+fn under_a_work_budget_the_reserve_counts_the_datagrams_held_behind_an_eagain_from_an_earlier_phase()
+ {
+    // With no requeues each transmit phase makes one attempt of two datagrams, so the stream
+    // takes several phases.
+    let bulk = reserving_bulk(mmsg_options(), 0, true);
+    let events = &bulk.events;
+    assert!(
+        bulk.during(0).contains(&Event::Run) && bulk.during(0).contains(&Event::Blocked),
+        "the first attempt built a run and its phase's flush met the EAGAIN: {events:?}"
+    );
+    assert!(
+        bulk.during(1).contains(&Event::Refused),
+        "the socket refused the second attempt: {events:?}"
+    );
+    let attempts = &bulk.record.attempts[bulk.first..];
+    assert!(
+        attempts[0].phase < attempts[1].phase,
+        "the two attempts ran in different phases: {attempts:?}"
+    );
+    let held = bulk.started[1].handed - bulk.started[0].handed;
+    assert_eq!(held, 2, "the first attempt built two datagrams: {events:?}");
+    let checks = bulk.checks();
+    let datagrams: Vec<(usize, u32)> = checks
+        .iter()
+        .map(|&(n, check)| (n, check.datagrams))
+        .collect();
+    assert_eq!(
+        datagrams,
+        [(0, 0), (1, 2)],
+        "the check of the second attempt, the first of its phase, reserved for the two datagrams \
+         the EAGAIN held, and the refused attempt parked its connection: {checks:?}"
+    );
+    let check = checks[1].1;
+    assert!(
+        check.cost.predict(1) > Duration::ZERO,
+        "an end-of-phase flush was timed before the request: {check:?}"
+    );
+    assert_eq!(check.reserve, check.cost.predict(2), "{check:?}");
+    assert_eq!(
+        bulk.started[1].queued, 2,
+        "the gated socket's backend held them as the second attempt began"
+    );
 }
 
 /// How long the server's worker is held after each of its stalled attempts in [`stalled_paced`]:

@@ -79,11 +79,14 @@ pub(crate) struct Run {
     pub(crate) behind: Option<Duration>,
 }
 
-/// A transmit attempt on a gated socket: its connection and when it began.
+/// A transmit attempt on a gated socket: its connection, when it began, the datagrams handed to
+/// the valve's sockets before it, and the datagrams the socket's backend held queued as it began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Started {
     pub(crate) conn: ConnKey,
     pub(crate) at: Instant,
+    pub(crate) handed: usize,
+    pub(crate) queued: u32,
 }
 
 #[derive(Default)]
@@ -358,11 +361,18 @@ impl TxBackend for Gated {
             &self.valves.client
         };
         let started = Instant::now();
+        let queued = self.inner.queued_datagrams();
         let (blocked, attempt) = {
             let mut state = valve.state();
             state.events.push(Event::Attempt);
             state.attempts += 1;
-            state.started.push(Started { conn, at: started });
+            let handed = state.datagrams;
+            state.started.push(Started {
+                conn,
+                at: started,
+                handed,
+                queued,
+            });
             (state.blocked, state.attempts - 1)
         };
         GatedSink {
@@ -391,6 +401,10 @@ impl TxBackend for Gated {
             state.events.push(Event::Flush);
         }
         self.inner.flush(now)
+    }
+
+    fn queued_datagrams(&self) -> u32 {
+        self.inner.queued_datagrams()
     }
 
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()> {

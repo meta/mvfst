@@ -516,6 +516,33 @@ fn after_eagain_poll_writable_asks_the_host_once_and_sends_the_backlog_when_it_r
 }
 
 #[test]
+fn the_backend_counts_the_datagrams_an_eagain_keeps_until_they_leave() {
+    let host = ScriptedHost::default();
+    let (mut backend, peer) = blocked_pair(host.clone());
+    let (_, readiness) = host.registration(0);
+    queue_twenty(&mut backend, conn(19));
+    assert_eq!(backend.queued_datagrams(), 20);
+    let out = backend.flush(Instant::now());
+    assert!(out.blocked && out.datagrams > 0, "{out:?}");
+    assert_eq!(
+        backend.queued_datagrams(),
+        20 - out.datagrams,
+        "the call took {} before the EAGAIN",
+        out.datagrams
+    );
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut reports_needed = 0;
+    while backend.poll_writable(&mut cx).is_pending() {
+        assert!(reports_needed < 100, "the backlog does not leave");
+        reports_needed += 1;
+        drain_peer(&peer);
+        readiness.set(Interest::Write);
+    }
+    assert_eq!(backend.queued_datagrams(), 0);
+}
+
+#[test]
 fn a_host_that_cannot_watch_for_writability_is_asked_again_at_the_next_poll() {
     let host = ScriptedHost::default();
     let (mut backend, _peer) = blocked_pair(host.clone());

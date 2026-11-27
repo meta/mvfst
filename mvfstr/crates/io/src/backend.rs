@@ -125,6 +125,10 @@ pub trait TxBackend {
     /// Sends every queued run it can.
     fn flush(&mut self, now: Instant) -> FlushOutcome;
 
+    /// Returns the datagrams queued and not yet handed to the kernel, each segment of a GSO send
+    /// counted and those held behind an EAGAIN included, saturating at `u32::MAX`.
+    fn queued_datagrams(&self) -> u32;
+
     /// Returns `Ready` once the socket is writable again after an EAGAIN backlog.
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<()>;
 
