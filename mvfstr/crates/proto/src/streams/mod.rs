@@ -10,8 +10,8 @@
 //! The public face is [`StreamMut`], obtained from [`Connection::stream`](crate::Connection::stream),
 //! and [`SendOrder`], the priority every stream carries. The submodules hold the transport-owned
 //! send and receive buffers, the stream map, the per-half state machines, the wire scheduler, the
-//! prioritizers that own the wire order and the staging split, and the guard through which every
-//! per-stream mutation goes.
+//! prioritizers that own the wire order and the staging split, and the guard through which
+//! per-stream mutations go.
 
 mod api;
 #[cfg(test)]

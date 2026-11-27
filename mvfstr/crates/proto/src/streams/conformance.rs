@@ -16,11 +16,17 @@
 //! - The split of the staging budget hands out more than the budget has left only by the bytes
 //!   that peers of an incremental bucket hold beyond an equal part, and streams that stage their
 //!   allowances do not take the connection past its budget.
+//! - An `Opened`, `Readable` or `Finished` edge taken without a guard leaves nothing for a full
+//!   reindex to change, and a connection delivers the same edges in the same order whether it
+//!   takes them without a guard or through one.
 //!
 //! Tests at the end pin what holds only for the default plug: a commit for a stream that left
 //! does not change anything a connection could observe later, a stream's allowance falls by
 //! exactly what the stream stages, and an incremental stream that keeps filling packets gets a
 //! turn within as many packets as its bucket has streams.
+
+use std::collections::HashMap;
+use std::time::Duration;
 
 use bytes::Bytes;
 use mvfstr_wire::Dir;
@@ -30,9 +36,12 @@ use mvfstr_wire::TransportParameters;
 use mvfstr_wire::VarInt;
 
 use super::conn::StreamState;
+use super::guard::Edge;
 use super::guard::List;
 use super::guard::StreamData;
 use super::guard::Streams;
+use super::guard::census;
+use super::map::Half;
 use super::prioritizer::FairShare;
 use super::prioritizer::Figures;
 use super::prioritizer::MvfstOrder;
@@ -41,10 +50,14 @@ use super::prioritizer::Prioritizer;
 use super::recv_buf::PagePool;
 use super::scheduler::SendOrder;
 use super::send_buf::Pending;
+use super::state::RecvState;
+use super::state::SendState;
 use crate::AppCode;
 use crate::SendError;
 use crate::StreamReady;
 use crate::TransportConfig;
+use crate::recovery::sent::ControlKind;
+use crate::recovery::test_epoch;
 use crate::testing::TestRng;
 
 /// The per-stream cap on staged bytes.
@@ -931,6 +944,448 @@ fn staging_by_allowance_does_not_take_the_connection_past_its_budget<P: Prioriti
     );
 }
 
+/// What [`a_full_reindex_after_a_list_edge_changes_nothing`] reached.
+#[derive(Debug, Default)]
+struct ListEdgesSeen {
+    /// `Opened`, `Readable` and `Finished` edges checked.
+    edges: usize,
+    /// Those that took their stream off the readiness list.
+    left: usize,
+    /// Those of closed streams, which stay on the readiness list for their `Closed` edge.
+    closed: usize,
+    /// Those of scheduled streams.
+    scheduled: usize,
+    /// Those of streams with demand that are not alone among their peers, which a guard reshares.
+    reshared: usize,
+}
+
+impl<P: Prioritizer> Harness<P> {
+    /// Opens the client's bidirectional stream `index` with a frame, at a random order with random
+    /// data parts, and marks some of its data edges: `Readable`, then the FIN's `Finished`, then
+    /// an end of both halves that closes it.
+    fn open_peer(&mut self, index: u64) -> StreamId {
+        let id = StreamId::new(Side::Client, Dir::Bi, index).expect("a stream index");
+        let (order, figures, pending) = (self.order(), self.figures(), self.below(4) == 0);
+        let data = Data {
+            wire: self.below(3) != 0,
+            refused: self.below(8) == 0,
+            figures,
+        };
+        let marks = self.below(4);
+        let mut stream = self
+            .streams
+            .peer_frame(id, Half::Recv, |_| (order, data))
+            .expect("a stream within the limit")
+            .expect("a new stream");
+        stream.set_producer_pending(pending);
+        if marks >= 1 {
+            stream.mark(Edge::Readable);
+        }
+        drop(stream);
+        if marks >= 2 {
+            self.finish_peer(id);
+        }
+        if marks >= 3 {
+            self.close_peer(id);
+        }
+        id
+    }
+
+    /// Delivers the FIN of peer stream `id` and every byte before it.
+    fn finish_peer(&mut self, id: StreamId) {
+        let mut stream = self.streams.stream(id).expect("a live stream");
+        stream.on_fin();
+        stream
+            .on_all_received()
+            .expect("a receive half in Size Known");
+        stream.mark(Edge::Finished);
+    }
+
+    /// Reads every byte of peer stream `id`, whose FIN and bytes have arrived, and resets its send
+    /// half with an acknowledged RESET_STREAM, which closes it.
+    fn close_peer(&mut self, id: StreamId) {
+        let mut stream = self.streams.stream(id).expect("a live stream");
+        stream
+            .on_all_data_read()
+            .expect("a receive half in Data Recvd");
+        stream
+            .reset(CODE, 0)
+            .expect("a send half that takes a reset");
+        stream.on_reset_acked().expect("a reset that was sent");
+    }
+
+    /// Changes peer stream `id` at random through its guard: new bytes, its FIN, its close, its
+    /// data parts, its order, its producer, or a commit.
+    fn peer_step(&mut self, id: StreamId) {
+        let stream = self.streams.get(id).expect("a live stream");
+        let (recv, send, slot) = (stream.recv_state(), stream.send_state(), stream.slot());
+        match self.below(7) {
+            0 => self
+                .streams
+                .stream(id)
+                .expect("a live stream")
+                .mark(Edge::Readable),
+            1 if recv == Some(RecvState::Recv) => self.finish_peer(id),
+            2 if recv == Some(RecvState::DataRecvd) && send == Some(SendState::Ready) => {
+                self.close_peer(id);
+            }
+            3 => {
+                let (wire, figures, refused) =
+                    (self.below(2) == 0, self.figures(), self.below(8) == 0);
+                self.set(id, |d| {
+                    (d.wire, d.figures, d.refused) = (wire, figures, refused)
+                });
+            }
+            4 => {
+                let order = self.order();
+                self.streams
+                    .stream(id)
+                    .expect("a live stream")
+                    .set_order(order);
+            }
+            5 => {
+                let pending = self.below(2) == 0;
+                let mut stream = self.streams.stream(id).expect("a live stream");
+                stream.set_producer_pending(pending);
+            }
+            _ => {
+                let bytes = self.bytes();
+                self.streams.commit(slot, id, bytes);
+            }
+        }
+    }
+}
+
+/// Checks that the delivery of an `Opened`, `Readable` or `Finished` edge, which takes it without
+/// a guard, leaves its stream indexed as a full reindex would: the reindex that follows changes
+/// neither the stream's list bits, its alone mark nor what the plug keeps of it, and writes no
+/// neighbour's links.
+fn a_full_reindex_after_a_list_edge_changes_nothing<P: Prioritizer>() {
+    let mut seen = ListEdgesSeen::default();
+    for seed in 101..=108 {
+        let mut h = Harness::<P>::new(seed);
+        for _ in 0..60 {
+            h.step();
+        }
+        let mut peers: Vec<StreamId> = (0..10).map(|index| h.open_peer(index)).collect();
+        let mut step = 0;
+        while let Some(slot) = h.streams.first(List::Readiness) {
+            let at = format!("seed {seed} step {step}");
+            let stream = h.streams.get_slot(slot).expect("a listed stream");
+            let closed = stream.send_state().is_none_or(|s| s.is_terminal())
+                && stream.recv_state().is_none_or(|r| r.is_terminal());
+            let (_, alone) = h.streams.marks(slot).expect("a listed stream");
+            let demand = h.streams.is_on(List::Demand, slot);
+            let scheduled = h.streams.prioritizer().order(slot).is_some();
+            // As the connection delivers edges: without a guard where it can, else through one.
+            let taken = h.streams.take_list_edge(slot).or_else(|| {
+                let mut stream = h.streams.by_slot(slot).expect("a listed stream");
+                let id = stream.id();
+                stream.take_edge().map(|edge| (id, edge))
+            });
+            if let Some((id, edge)) = taken
+                && matches!(
+                    edge,
+                    StreamReady::Opened | StreamReady::Readable | StreamReady::Finished
+                )
+            {
+                h.streams.assert_indexed();
+                let marks = |h: &Harness<P>| {
+                    let digest = format!("{:?}", h.streams.prioritizer().digest(slot));
+                    (h.streams.marks(slot), digest)
+                };
+                let before = marks(&h);
+                census::reset();
+                drop(
+                    h.streams
+                        .by_slot(slot)
+                        .expect("a data edge leaves its stream live"),
+                );
+                let writes = census::read().neighbour_link_writes;
+                assert_eq!(
+                    marks(&h),
+                    before,
+                    "{at}: a full reindex after the {edge:?} edge of {id}"
+                );
+                assert_eq!(
+                    writes, 0,
+                    "{at}: link writes after the {edge:?} edge of {id}"
+                );
+                h.streams.assert_indexed();
+                seen.edges += 1;
+                seen.left += usize::from(!h.streams.is_on(List::Readiness, slot));
+                seen.closed += usize::from(closed);
+                seen.scheduled += usize::from(scheduled);
+                seen.reshared += usize::from(demand && !alone);
+            }
+            peers.retain(|&id| h.streams.get(id).is_some());
+            if step < 200 && h.below(2) == 0 {
+                if let Some(id) = h.pick(&peers) {
+                    h.peer_step(id);
+                } else {
+                    h.step();
+                }
+            }
+            step += 1;
+        }
+    }
+    assert!(
+        seen.edges >= 180
+            && seen.left >= 60
+            && seen.closed >= 60
+            && seen.scheduled >= 80
+            && seen.reshared >= 45,
+        "too little reached: {seen:?}"
+    );
+}
+
+/// What the peer sent on one of its streams: the end of the bytes sent in order, the highest end
+/// sent, the final size once its FIN went, and whether it reset the stream.
+#[derive(Clone, Copy, Debug, Default)]
+struct PeerSent {
+    next: u64,
+    high: u64,
+    fin: Option<u64>,
+    reset: bool,
+}
+
+/// The highest end of the bytes the peer sends on a stream, besides a FIN at the end.
+const PEER_BYTES: u64 = 6_000;
+
+/// One step of [`edge_run`]: the operation, the edges delivered after it, the streams on the
+/// readiness list in order, and the census so far less the counts of the guard's path and the
+/// path without it: reindexes, reshares and edges taken without a guard.
+type EdgeStep = (
+    &'static str,
+    Vec<(StreamId, StreamReady)>,
+    Vec<StreamId>,
+    census::Census,
+);
+
+/// Runs seeded random stream events on a server whose streams `P` orders, taking edges without a
+/// guard if `list_edges`, and delivers a random number of edges after each, as a connection's
+/// readiness does. Returns the steps and the edges taken without a guard.
+fn edge_run<P: Prioritizer>(seed: u64, list_edges: bool) -> (Vec<EdgeStep>, u64) {
+    const BUDGET: u64 = 1 << 20;
+    let (now, srtt) = (test_epoch(), Duration::from_millis(20));
+    let config = TransportConfig::builder()
+        .build()
+        .expect("a valid transport config");
+    let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+    s.on_peer_params(&TransportParameters {
+        initial_max_data: VarInt::from_u32(1 << 30),
+        initial_max_stream_data_bidi_local: VarInt::from_u32(1 << 20),
+        initial_max_stream_data_uni: VarInt::from_u32(1 << 20),
+        initial_max_streams_uni: VarInt::from_u32(1000),
+        ..TransportParameters::default()
+    })
+    .unwrap();
+    s.streams.set_list_edges(list_edges);
+    let mut rng = TestRng::new(seed);
+    // The peer's streams with what it sent on them, and the streams with a send half here.
+    let (mut peers, mut senders): (Vec<(StreamId, PeerSent)>, Vec<StreamId>) = Default::default();
+    let mut opened = [0; 2];
+    let frame = |s: &mut StreamState<P>, id, offset: u64, end: u64, fin| {
+        let data = &ZEROS[..(end - offset) as usize];
+        s.on_stream_frame(id, offset, data, fin, now, srtt)
+            .expect("a frame within the limits");
+    };
+    census::reset();
+    let mut steps = Vec::new();
+    for _ in 0..300 {
+        peers.retain(|&(id, _)| s.streams.get(id).is_some());
+        senders.retain(|&id| s.streams.get(id).is_some());
+        let peer = pick(&mut rng, &(0..peers.len()).collect::<Vec<_>>());
+        let sender = pick(&mut rng, &senders);
+        let roll = below(&mut rng, 100);
+        let len = 1 + below(&mut rng, 1200);
+        let op = match (roll, peer, sender) {
+            (0..12, _, _) | (_, None, None) => {
+                if below(&mut rng, 3) == 0 {
+                    let id = s.open(Dir::Uni, few_buckets(&mut rng)).unwrap();
+                    let pending = below(&mut rng, 2) == 0;
+                    s.streams.stream(id).unwrap().set_producer_pending(pending);
+                    senders.push(id);
+                } else {
+                    let dir = [Dir::Bi, Dir::Uni][below(&mut rng, 2) as usize];
+                    let index = &mut opened[usize::from(dir == Dir::Uni)];
+                    let id = StreamId::new(Side::Client, dir, *index).unwrap();
+                    *index += 1;
+                    let (end, fin) = (below(&mut rng, len), below(&mut rng, 4) == 0);
+                    frame(&mut s, id, 0, end, fin);
+                    let sent = PeerSent {
+                        next: end,
+                        high: end,
+                        fin: fin.then_some(end),
+                        reset: false,
+                    };
+                    peers.push((id, sent));
+                    if dir == Dir::Bi {
+                        senders.push(id);
+                    }
+                }
+                "open"
+            }
+            (12..44, Some(at), _) => {
+                let (id, sent) = &mut peers[at];
+                if sent.fin.is_some() || sent.reset || sent.high > PEER_BYTES {
+                    "none"
+                } else if roll < 26 {
+                    frame(&mut s, *id, sent.next, sent.next + len, false);
+                    sent.next += len;
+                    sent.high = sent.high.max(sent.next);
+                    "data"
+                } else if roll < 34 {
+                    let offset = sent.high + len;
+                    frame(&mut s, *id, offset, offset + len, false);
+                    sent.high = offset + len;
+                    "out_of_order"
+                } else {
+                    frame(&mut s, *id, sent.next, sent.high, true);
+                    (sent.next, sent.fin) = (sent.high, Some(sent.high));
+                    "fin"
+                }
+            }
+            (44..54, Some(at), _) => {
+                let id = peers[at].0;
+                let readable = s.readable(id).chain_length() as u64;
+                if readable > 0 {
+                    let n = 1 + below(&mut rng, readable);
+                    s.consume(id, n as usize, now, srtt).unwrap();
+                }
+                "consume"
+            }
+            (54..62, Some(at), _) => {
+                let (id, sent) = &mut peers[at];
+                if !sent.reset {
+                    let size = sent.fin.unwrap_or(sent.high);
+                    s.on_reset_stream(*id, CODE, size, now, srtt).unwrap();
+                    sent.reset = true;
+                }
+                "reset"
+            }
+            (62..66, _, Some(id)) => {
+                s.on_stop_sending(id, CODE).unwrap();
+                "stop"
+            }
+            (66..78, _, Some(id)) => {
+                let allowance = s.allowance(id, BUDGET);
+                let refused = below(&mut rng, 3) != 0 || allowance == 0;
+                let take = if refused {
+                    allowance + 1
+                } else {
+                    allowance.min(len)
+                };
+                let bytes = Bytes::from_static(&ZEROS[..take as usize]);
+                let _ = s.send_parts(id, bytes, Bytes::new(), BUDGET);
+                if refused { "refused_push" } else { "push" }
+            }
+            (78..84, _, _) => {
+                s.wake_writable(BUDGET);
+                "writable"
+            }
+            (84..90, _, Some(id)) => {
+                let _ = s.track(id, 0);
+                "progress"
+            }
+            (90.., Some(_), _) | (90.., None, Some(_)) => {
+                let (id, sent) = match peer {
+                    Some(at) => (peers[at].0, Some(&mut peers[at].1)),
+                    None => (sender.expect("a stream to close"), None),
+                };
+                // The peer ends its half, the application reads it to the end, and the send half
+                // here resets with a RESET_STREAM that the peer acknowledges.
+                if let Some(sent) = sent
+                    && !sent.reset
+                {
+                    if sent.fin.is_none() {
+                        frame(&mut s, id, sent.next, sent.high, true);
+                        (sent.next, sent.fin) = (sent.high, Some(sent.high));
+                    }
+                    let readable = s.readable(id).chain_length();
+                    s.consume(id, readable, now, srtt).unwrap();
+                }
+                let _ = s.reset(id, CODE);
+                s.on_control_acked(ControlKind::ResetStream, id.into_inner(), 0);
+                "close"
+            }
+            _ => "none",
+        };
+        let mut edges = Vec::new();
+        let wanted = [0, 1, 2, usize::MAX][below(&mut rng, 4) as usize];
+        while edges.len() < wanted {
+            // As `Readiness` does: refused senders after a `Writable` edge are woken once the
+            // edges run out.
+            let Some(edge) = s.next_edge().or_else(|| {
+                s.take_rewake().then(|| s.wake_writable(BUDGET))?;
+                s.next_edge()
+            }) else {
+                break;
+            };
+            edges.push(edge);
+        }
+        let walk = std::iter::successors(s.streams.first(List::Readiness), |&slot| {
+            s.streams.next_on(List::Readiness, slot)
+        })
+        .map(|slot| s.streams.get_slot(slot).expect("a listed stream").id())
+        .collect();
+        let counted = census::Census {
+            reindexes: 0,
+            reshares: 0,
+            list_edges: 0,
+            ..census::read()
+        };
+        s.streams.assert_indexed();
+        steps.push((op, edges, walk, counted));
+    }
+    (steps, census::read().list_edges)
+}
+
+/// Checks that a connection delivers the same edges in the same order whether it takes the
+/// `Opened`, `Readable` and `Finished` edges without a guard or through one, with the same
+/// streams on the readiness list after every step and the same bookkeeping besides the guard's
+/// own.
+fn edges_arrive_in_the_same_order_with_and_without_list_edges<P: Prioritizer>() {
+    // Edges delivered with list edges on, by kind in the order a stream's edges go, and the
+    // `Closed` edges right after a data edge of their stream.
+    let (mut kinds, mut closed_after_data, mut taken) = ([0; 8], 0, 0);
+    for seed in 111..=116 {
+        let (with, list_edges) = edge_run::<P>(seed, true);
+        let (without, none) = edge_run::<P>(seed, false);
+        assert_eq!(none, 0, "seed {seed}: list edges while they are off");
+        for (step, (a, b)) in with.iter().zip(&without).enumerate() {
+            assert_eq!(a, b, "seed {seed} step {step}: with and without list edges");
+        }
+        let mut last = HashMap::new();
+        for (id, edge) in with.iter().flat_map(|step| &step.1) {
+            let kind = match edge {
+                StreamReady::Opened => 0,
+                StreamReady::Readable => 1,
+                StreamReady::Finished => 2,
+                StreamReady::Reset { .. } => 3,
+                StreamReady::Stopped { .. } => 4,
+                StreamReady::Writable => 5,
+                StreamReady::Progress => 6,
+                StreamReady::Closed => 7,
+            };
+            kinds[kind] += 1;
+            closed_after_data += usize::from(kind == 7 && last.get(id).is_some_and(|&k| k < 3));
+            last.insert(*id, kind);
+        }
+        taken += list_edges;
+    }
+    assert!(
+        kinds
+            .iter()
+            .zip([120, 170, 85, 23, 40, 38, 48, 88])
+            .all(|(&n, least)| n >= least)
+            && closed_after_data >= 50
+            && taken >= 380,
+        "too little reached: {kinds:?} by kind, {closed_after_data} Closed after a data edge, \
+         {taken} list edges"
+    );
+}
+
 /// Instantiates each generic test above once per plug.
 macro_rules! on_every_plug {
     ($($test:ident),* $(,)?) => {
@@ -961,6 +1416,8 @@ on_every_plug!(
     a_commit_for_a_reaped_stream_does_not_change_the_order_or_the_split,
     the_split_stays_within_the_staging_budget,
     staging_by_allowance_does_not_take_the_connection_past_its_budget,
+    a_full_reindex_after_a_list_edge_changes_nothing,
+    edges_arrive_in_the_same_order_with_and_without_list_edges,
 );
 
 /// What [`an_allowance_falls_by_exactly_what_its_stream_stages`] reached.

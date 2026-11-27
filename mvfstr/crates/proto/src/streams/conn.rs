@@ -15,7 +15,8 @@
 //!
 //! The Control and Scheduled frame sources and the connection's receive dispatch work on this
 //! state; every per-stream change goes through the stream guard, whose drop recomputes the
-//! stream's list and scheduler membership from what [`StreamData`] reports.
+//! stream's list and scheduler membership from what [`StreamData`] reports, except taking a
+//! readiness edge that changes only the readiness list.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -961,6 +962,9 @@ impl<P: Prioritizer> StreamState<P> {
     /// Takes the next readiness edge of any stream.
     pub(crate) fn next_edge(&mut self) -> Option<(StreamId, StreamReady)> {
         while let Some(slot) = self.streams.first(List::Readiness) {
+            if let Some(edge) = self.streams.take_list_edge(slot) {
+                return Some(edge);
+            }
             let mut stream = self.streams.by_slot(slot)?;
             if let Some(edge) = stream.take_edge() {
                 let id = stream.id();
@@ -1638,6 +1642,147 @@ mod tests {
         assert_eq!(census::read().ranks, 2, "one ranking per collection");
     }
 
+    /// An edge, and the reindexes, reshares and edges taken without a guard that its delivery
+    /// counted.
+    type EdgeCounts = (StreamReady, u64, u64, u64);
+
+    /// Delivers the edges of the eighth request stream of a client on a server whose streams `P`
+    /// orders, taking edges without a guard if `list_edges`. The seven before it have staged
+    /// responses. Its request arrives in one frame with the FIN, and its response is staged after
+    /// its `Readable` edge, before its `Finished` edge. Then its request is read and its send half
+    /// is reset and acknowledged, which closes it. Returns what the census counted around each
+    /// edge's delivery alone, and whether the stream was reaped.
+    fn request_edge_counts<P: Prioritizer>(list_edges: bool) -> (Vec<EdgeCounts>, bool) {
+        const BUDGET: u64 = 1 << 20;
+        let (now, srtt) = (test_epoch(), Duration::from_millis(20));
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+        s.streams.set_list_edges(list_edges);
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_bidi_local: VarInt::from_u32(1 << 16),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let request = |s: &mut StreamState<P>, index| {
+            let id = StreamId::new(Side::Client, Dir::Bi, index).unwrap();
+            s.on_stream_frame(id, 0, &[0; 58], true, now, srtt).unwrap();
+            id
+        };
+        let respond = |s: &mut StreamState<P>, id| {
+            let head = Bytes::from_static(&[0; 15]);
+            s.send_parts(id, head, Bytes::new(), BUDGET).unwrap();
+        };
+        for index in 0..7 {
+            let id = request(&mut s, index);
+            while s.next_edge().is_some() {}
+            respond(&mut s, id);
+        }
+        let id = request(&mut s, 7);
+        let mut counts = Vec::new();
+        let mut deliver = |s: &mut StreamState<P>| {
+            census::reset();
+            let (of, edge) = s.next_edge().expect("an edge of the request stream");
+            let counted = census::read();
+            assert_eq!(of, id);
+            counts.push((
+                edge,
+                counted.reindexes,
+                counted.reshares,
+                counted.list_edges,
+            ));
+        };
+        deliver(&mut s);
+        deliver(&mut s);
+        respond(&mut s, id);
+        s.finish(id).unwrap();
+        deliver(&mut s);
+        assert_eq!(
+            s.streams.len(List::Demand),
+            8,
+            "eight responses share the budget"
+        );
+        s.streams.assert_indexed();
+        s.consume(id, 58, now, srtt).unwrap();
+        s.reset(id, AppCode::from_u32(1)).unwrap();
+        s.on_control_acked(ControlKind::ResetStream, id.into_inner(), 0);
+        deliver(&mut s);
+        s.streams.assert_indexed();
+        (counts, s.streams.get(id).is_none())
+    }
+
+    #[test]
+    fn opened_readable_and_finished_edges_take_no_reindex() {
+        let want = vec![
+            (StreamReady::Opened, 0, 0, 1),
+            (StreamReady::Readable, 0, 0, 1),
+            (StreamReady::Finished, 0, 0, 1),
+            (StreamReady::Closed, 1, 0, 0),
+        ];
+        assert_eq!(
+            [
+                ("FairShare", request_edge_counts::<FairShare>(true)),
+                ("MvfstOrder", request_edge_counts::<MvfstOrder>(true)),
+            ],
+            [
+                ("FairShare", (want.clone(), true)),
+                ("MvfstOrder", (want, true))
+            ],
+            "by plug and edge: reindexes, reshares and edges taken without a guard; then whether \
+             the Closed edge reaped the stream"
+        );
+        // Through the guard, each edge reindexes, and the stream with demand among others is
+        // reshared at its `Finished` edge.
+        let guarded = vec![
+            (StreamReady::Opened, 1, 0, 0),
+            (StreamReady::Readable, 1, 0, 0),
+            (StreamReady::Finished, 1, 1, 0),
+            (StreamReady::Closed, 1, 0, 0),
+        ];
+        assert_eq!(
+            [
+                ("FairShare", request_edge_counts::<FairShare>(false)),
+                ("MvfstOrder", request_edge_counts::<MvfstOrder>(false)),
+            ],
+            [
+                ("FairShare", (guarded.clone(), true)),
+                ("MvfstOrder", (guarded, true)),
+            ],
+            "with list edges off"
+        );
+    }
+
+    #[test]
+    fn a_writable_edge_keeps_its_reindex() {
+        const BUDGET: u64 = 1 << 20;
+        let (mut s, id) = one_stream(10);
+        let refused = s.send_parts(id, Bytes::from_static(&[0; 20]), Bytes::new(), BUDGET);
+        assert_eq!(refused, Err(SendError::OverAllowance));
+        s.on_max_stream_data(id, 1 << 20).unwrap();
+        s.wake_writable(BUDGET);
+        let slot = s.streams.get(id).unwrap().slot();
+        assert!(
+            s.streams.is_on(List::Demand, slot),
+            "the refused sender keeps its demand until its Writable edge is delivered"
+        );
+        census::reset();
+        assert_eq!(s.next_edge(), Some((id, StreamReady::Writable)));
+        let counted = census::read();
+        assert_eq!(
+            (counted.reindexes, counted.list_edges),
+            (1, 0),
+            "the Writable edge goes through the guard"
+        );
+        assert!(
+            !s.streams.is_on(List::Demand, slot),
+            "its delivery releases the demand"
+        );
+        assert!(s.take_rewake(), "the senders after it are woken again");
+        s.streams.assert_indexed();
+    }
+
     #[test]
     fn the_census_counts_one_allowance_per_poll() {
         let (mut s, id) = one_stream(1 << 20);
@@ -1867,7 +2012,11 @@ mod tests {
                 (bidi, StreamReady::Readable),
             ]
         );
-        assert_eq!(counted.reindexes, 6, "one reindex per edge and per consume");
+        assert_eq!(
+            (counted.reindexes, counted.list_edges),
+            (2, 4),
+            "one reindex per consume, and the edges taken without a guard"
+        );
         assert_eq!(
             counted.reshares, 0,
             "reading a stream without demand does not reshare it"

@@ -7,10 +7,12 @@
 
 //! The stream guard.
 //!
-//! Every per-stream mutation goes through the one crate-private guard. Its `Drop` runs the
-//! stream's `reindex()`, which recomputes membership of every per-stream intrusive list
-//! (readable, writable and pull-ready, control-pending, demand, scheduler) from state.
-//! [`StreamMut`](crate::StreamMut) is its public face.
+//! Per-stream mutations go through the one crate-private guard. Its `Drop` runs the stream's
+//! `reindex()`, which recomputes membership of every per-stream intrusive list (readable,
+//! writable and pull-ready, control-pending, demand, scheduler) from state.
+//! [`StreamMut`](crate::StreamMut) is its public face. Taking an `Opened`, `Readable` or
+//! `Finished` edge is the one mutation without a guard, as it changes only the readiness list
+//! (see [`Streams::take_list_edge`]).
 //!
 //! [`Streams`] owns the stream table, the lists and the prioritizer, and hands out a stream only
 //! as a [`StreamGuard`], so a mutation cannot skip the reindex. A stream's state is its two half
@@ -266,12 +268,18 @@ impl<D> Stream<D> {
         }
         Owed(self.owed.0 & permitted)
     }
+
+    /// Returns whether the stream belongs on the readiness list: an edge is undelivered, or the
+    /// stream is closed and its `Closed` edge is not delivered yet.
+    fn ready(&self) -> bool {
+        self.edges.0 != 0 || (self.halves.is_closed() && !self.closed_delivered)
+    }
 }
 
 impl<D: StreamData> Stream<D> {
     fn membership(&self) -> Membership {
         let mut lists = 0;
-        if self.edges.0 != 0 || (self.halves.is_closed() && !self.closed_delivered) {
+        if self.ready() {
             lists |= List::Readiness.bit();
         }
         let send = self.halves.send;
@@ -324,6 +332,10 @@ pub(crate) struct Streams<D, P = MvfstOrder> {
     /// The reindexes run so far, one per dropped guard.
     #[cfg(test)]
     reindexes: u64,
+    /// Whether [`take_list_edge`](Self::take_list_edge) takes edges, so that tests can compare
+    /// its path with the guard's.
+    #[cfg(test)]
+    list_edges: bool,
 }
 
 /// Exclusive access to one stream; dropping it reindexes the stream.
@@ -402,6 +414,8 @@ impl<D: StreamData, P: Prioritizer> Streams<D, P> {
             fin_only: 0,
             #[cfg(test)]
             reindexes: 0,
+            #[cfg(test)]
+            list_edges: true,
         }
     }
 
@@ -420,6 +434,13 @@ impl<D: StreamData, P: Prioritizer> Streams<D, P> {
     #[cfg(test)]
     pub(crate) fn reindexes(&self) -> u64 {
         self.reindexes
+    }
+
+    /// Turns [`take_list_edge`](Self::take_list_edge) on or off; while it is off, every edge goes
+    /// through the guard.
+    #[cfg(test)]
+    pub(crate) fn set_list_edges(&mut self, on: bool) {
+        self.list_edges = on;
     }
 
     /// Opens a local stream at `order` with data parts `data`.
@@ -516,6 +537,71 @@ impl<D: StreamData, P: Prioritizer> Streams<D, P> {
     pub(crate) fn by_slot(&mut self, slot: u32) -> Option<StreamGuard<'_, D, P>> {
         let (_, id, _) = self.table.map().get_slot(slot)?;
         Some(self.guard(slot, id))
+    }
+
+    /// Takes the next readiness edge of the stream in `slot` without a guard if it is `Opened`,
+    /// `Readable` or `Finished`, the first three in [`StreamGuard::take_edge`]'s order, and returns
+    /// it with the stream's ID. For any other edge, or a stream without one, it returns `None` and
+    /// changes nothing, and the edge goes through the guard.
+    ///
+    /// Taking one of these edges clears its bit and changes no other input of list membership,
+    /// scheduling or the shares: the halves, the `Closed` delivery, the order, the producer, the
+    /// data parts, the owed frames and the `Writable` bit stay as the last reindex left them. So
+    /// only the edge bits, the readiness bit and the readiness links change, and the stream leaves
+    /// the readiness list at the edge where a reindex would take it off. This is not a general
+    /// unguarded accessor: lost data, the lone FIN, the prioritizer, the shares and reaping are
+    /// left to the guard.
+    pub(crate) fn take_list_edge(&mut self, slot: u32) -> Option<(StreamId, StreamReady)> {
+        #[cfg(test)]
+        if !self.list_edges {
+            return None;
+        }
+        let (_, id, entry) = self.table.get_slot_mut(slot)?;
+        let stream = &mut entry.stream;
+        let edge = if stream.edges.take(Edges::OPENED) {
+            StreamReady::Opened
+        } else if stream.edges.take(Edges::READABLE) {
+            StreamReady::Readable
+        } else if stream.edges.take(Edges::FINISHED) {
+            StreamReady::Finished
+        } else {
+            return None;
+        };
+        #[cfg(test)]
+        census::count(|c| c.list_edges += 1);
+        if !stream.ready() {
+            entry.member &= !List::Readiness.bit();
+            self.unlink(List::Readiness, slot);
+        }
+        #[cfg(debug_assertions)]
+        self.check_list_edge(slot, id);
+        Some((id, edge))
+    }
+
+    /// Checks that the stream in `slot`, `id`, is indexed as a full reindex would leave it after a
+    /// list edge.
+    #[cfg(debug_assertions)]
+    fn check_list_edge(&self, slot: u32, id: StreamId) {
+        let entry = self
+            .entry(slot)
+            .expect("a list edge leaves its stream live");
+        let want = entry.stream.membership();
+        assert_eq!(
+            want.lists, entry.member,
+            "taking an Opened, Readable or Finished edge changes only the readiness membership of \
+             stream {id}"
+        );
+        assert_eq!(
+            want.scheduled,
+            self.plug.order(slot),
+            "taking an Opened, Readable or Finished edge does not change the scheduling of stream \
+             {id}"
+        );
+        assert!(
+            !want.reap,
+            "taking an Opened, Readable or Finished edge does not reap stream {id}: only its Closed \
+             edge does"
+        );
     }
 
     /// Returns the first stream on `list`.
@@ -1129,6 +1215,9 @@ pub(crate) mod census {
         pub(crate) neighbour_link_writes: u64,
         /// Computations of a stream's allowance for its sender.
         pub(crate) allowances: u64,
+        /// Readiness edges taken without a guard (see
+        /// [`Streams::take_list_edge`](super::Streams::take_list_edge)).
+        pub(crate) list_edges: u64,
     }
 
     thread_local! {
@@ -1141,6 +1230,7 @@ pub(crate) mod census {
                 share_rekeys: 0,
                 neighbour_link_writes: 0,
                 allowances: 0,
+                list_edges: 0,
             })
         };
     }
@@ -1185,6 +1275,11 @@ impl<D: StreamData> Streams<D, FairShare> {
 
 #[cfg(test)]
 impl<D: StreamData, P: Prioritizer> Streams<D, P> {
+    /// Returns the list bits of the stream in `slot` and its alone mark.
+    pub(crate) fn marks(&self, slot: u32) -> Option<(u8, bool)> {
+        self.entry(slot).map(|entry| (entry.member, entry.alone))
+    }
+
     /// Checks that every list and the wire order hold exactly the streams whose state calls for
     /// them, that every list's links are consistent, and that the prioritizer records exactly the
     /// streams on the demand list as peers of the split.
@@ -2279,5 +2374,52 @@ mod tests {
         entry.alone = false;
         entry.stream.data.room = false;
         drop(s.stream(id).unwrap());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "changes only the readiness membership")]
+    fn a_list_edge_asserts_that_only_the_readiness_membership_changes() {
+        let mut s = streams();
+        let id = peer(&mut s, Dir::Bi, 0);
+        let slot = s.table.map().key(id).unwrap().slot();
+        // A woken producer with room, recorded without a reindex, calls for the pull-ready and
+        // demand lists.
+        let stream = &mut s.entry_mut(slot).stream;
+        (stream.producer_pending, stream.data.room) = (false, true);
+        s.take_list_edge(slot);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "does not change the scheduling")]
+    fn a_list_edge_asserts_that_the_scheduling_does_not_change() {
+        let mut s = streams();
+        let id = peer(&mut s, Dir::Bi, 0);
+        let slot = s.table.map().key(id).unwrap().slot();
+        // Bytes for the wire, recorded without a reindex, call for scheduling alone.
+        s.entry_mut(slot).stream.data.wire = true;
+        s.take_list_edge(slot);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "only its Closed edge does")]
+    fn a_list_edge_asserts_that_it_leaves_reaping_to_the_closed_edge() {
+        let mut s = streams();
+        let id = open(&mut s, Dir::Bi, Data::default());
+        let mut guard = s.stream(id).unwrap();
+        guard.on_sent(true).unwrap();
+        guard.on_all_acked().unwrap();
+        guard.on_fin();
+        guard.on_all_received().unwrap();
+        guard.mark(Edge::Finished);
+        guard.on_all_data_read().unwrap();
+        drop(guard);
+        // A closed stream with its `Closed` edge marked delivered while its `Finished` edge is
+        // not would be reaped once that edge goes.
+        let slot = s.table.map().key(id).unwrap().slot();
+        s.entry_mut(slot).stream.closed_delivered = true;
+        s.take_list_edge(slot);
     }
 }
