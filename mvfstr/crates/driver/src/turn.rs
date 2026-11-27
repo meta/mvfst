@@ -309,6 +309,7 @@ pub(crate) struct Core<A: QuicApplication, B: Backend> {
     socket_stops: Cell<u64>,
     contained_panics: Cell<u64>,
     dropped_initials: Cell<u64>,
+    waiting_peaks: Cell<WaitingPeaks>,
     steered_out: Cell<u64>,
     steered_in: Cell<u64>,
     sent_packets: Cell<u64>,
@@ -508,6 +509,9 @@ fn by_connection(routed: &mut [Routed<'_>]) {
 pub(crate) struct Waiting {
     pub(crate) meta: RxMeta,
     pub(crate) datagram: Vec<u8>,
+    /// When the datagram entered the waiting queue, which its wait counts from. In a steering
+    /// inbox it is the receive time, until the worker the datagram was handed to takes it.
+    pub(crate) entered: Instant,
 }
 
 /// The least bytes a [`WaitingQueue`] charges a datagram: 1,200, the smallest datagram that may
@@ -560,6 +564,15 @@ impl WaitingQueue {
         self.bytes = 0;
         self.datagrams.drain(..)
     }
+}
+
+/// The high-water marks of the queue of datagrams waiting for a later turn, kept as the
+/// [`EndpointStats`] fields `waiting_peak_bytes`, `waiting_peak_datagrams` and `waiting_longest`.
+#[derive(Clone, Copy, Debug, Default)]
+struct WaitingPeaks {
+    bytes: usize,
+    datagrams: usize,
+    longest: Duration,
 }
 
 /// A connection's own connected socket, with the wakers for its receive and writable polls.
@@ -729,6 +742,17 @@ pub struct EndpointStats {
     /// Initials for new connections dropped because they did not fit the bytes left in the queue
     /// of those waiting for a later turn, or in the inbox of the worker they were steered to.
     pub dropped_initials: u64,
+    /// The most bytes the queue of datagrams waiting for a later turn has been charged at once,
+    /// since the driver started or since [`EndpointHandle::reset_waiting_peaks`]: each datagram
+    /// its length, but at least 1,200 bytes.
+    ///
+    /// [`EndpointHandle::reset_waiting_peaks`]: crate::EndpointHandle::reset_waiting_peaks
+    pub waiting_peak_bytes: u64,
+    /// The most datagrams that queue has held at once, over the same span.
+    pub waiting_peak_datagrams: u64,
+    /// The longest time a datagram waited in that queue, from when it first entered it until it
+    /// was routed again, over the same span.
+    pub waiting_longest: Duration,
     /// Datagrams of new connections handed to another worker's driver (worker steering).
     pub steered_out: u64,
     /// Datagrams other workers' drivers handed to this one.
@@ -1050,6 +1074,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             socket_stops: Cell::new(0),
             contained_panics: Cell::new(0),
             dropped_initials: Cell::new(0),
+            waiting_peaks: Cell::default(),
             steered_out: Cell::new(0),
             steered_in: Cell::new(0),
             sent_packets: Cell::new(0),
@@ -1303,6 +1328,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     pub(crate) fn stats(&self) -> EndpointStats {
         let tx = self.tx_counters.get();
         let hold = self.hold_stats.get();
+        let peaks = self.waiting_peaks.get();
         EndpointStats {
             turns: self.turns.get(),
             empty_ready_polls: self.empty_ready_polls.get(),
@@ -1310,6 +1336,9 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             socket_stops: self.socket_stops.get(),
             contained_panics: self.contained_panics.get(),
             dropped_initials: self.dropped_initials.get(),
+            waiting_peak_bytes: peaks.bytes as u64,
+            waiting_peak_datagrams: peaks.datagrams as u64,
+            waiting_longest: peaks.longest,
             steered_out: self.steered_out.get(),
             steered_in: self.steered_in.get(),
             sent_packets: self.sent_packets.get(),
@@ -1340,6 +1369,11 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             server_rx_probes_empty: self.server_rx_probes_empty.get(),
             server_rx_bound_hits: self.server_rx_bound_hits.get(),
         }
+    }
+
+    /// Sets the waiting queue's high-water marks back to zero.
+    pub(crate) fn reset_waiting_peaks(&self) {
+        self.waiting_peaks.set(WaitingPeaks::default());
     }
 
     /// Adds the transmit counters a socket kept since they were last taken.
@@ -3121,25 +3155,36 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
     /// created, as the second datagram of a client's first flight does. A stop before an accept
     /// keeps the attempt for the next receive phase.
     fn serve_waiting(&self, server: &Server<B>, replies: &mut Vec<StatelessReply>) {
+        let mut taken_at = None;
         if let Some(steering) = &self.steering {
-            steering.take(|waiting| {
+            steering.take(|mut waiting| {
                 self.steered_in.set(self.steered_in.get() + 1);
+                // Its wait here starts as this worker takes it, not as another worker handed it
+                // over.
+                waiting.entered = *taken_at.get_or_insert_with(|| self.clock());
                 self.queue_waiting(waiting);
             });
         }
         if self.sched.borrow().waiting.is_empty() {
             return;
         }
-        let now = self.clock();
+        let now = taken_at.unwrap_or_else(|| self.clock());
         let mut reading = Some(now);
         while self.turn_handshakes.get() < self.limits.handshakes {
             let Some(mut waiting) = self.sched.borrow_mut().waiting.pop_front() else {
                 return;
             };
             if !self.gate(UnitKind::WaitingDatagram, reading.take()) {
-                self.sched.borrow_mut().waiting.push_front(waiting);
+                let mut sched = self.sched.borrow_mut();
+                sched.waiting.push_front(waiting);
+                // After a reset, the size this restores may be above the peaks.
+                self.raise_waiting_peaks(&sched.waiting);
                 return;
             }
+            let waited = now.saturating_duration_since(waiting.entered);
+            let mut peaks = self.waiting_peaks.get();
+            peaks.longest = peaks.longest.max(waited);
+            self.waiting_peaks.set(peaks);
             let route = self
                 .endpoint
                 .borrow_mut()
@@ -3170,10 +3215,10 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Keeps for a later turn an Initial that came after this turn's connection attempts ran out,
-    /// or drops it when it does not fit the bytes left for waiting Initials; its client sends it
-    /// again.
-    fn keep_waiting(&self, meta: &RxMeta, datagram: &[u8]) {
+    /// Keeps for a later turn, waiting from `now`, an Initial that came after this turn's
+    /// connection attempts ran out, or drops it when it does not fit the bytes left for waiting
+    /// Initials; its client sends it again.
+    fn keep_waiting(&self, now: Instant, meta: &RxMeta, datagram: &[u8]) {
         let bound = self.limits.waiting_initial_bytes;
         if !self.sched.borrow().waiting.fits(datagram.len(), bound) {
             self.dropped_initials.set(self.dropped_initials.get() + 1);
@@ -3182,6 +3227,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         self.queue_waiting(Waiting {
             meta: *meta,
             datagram: datagram.to_vec(),
+            entered: now,
         });
     }
 
@@ -3195,6 +3241,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             return;
         }
         sched.waiting.push_back(waiting);
+        self.raise_waiting_peaks(&sched.waiting);
+    }
+
+    /// Raises the byte and datagram peaks to what `waiting`, the queue just pushed to, holds.
+    fn raise_waiting_peaks(&self, waiting: &WaitingQueue) {
+        let mut peaks = self.waiting_peaks.get();
+        peaks.bytes = peaks.bytes.max(waiting.bytes);
+        peaks.datagrams = peaks.datagrams.max(waiting.datagrams.len());
+        self.waiting_peaks.set(peaks);
     }
 
     /// Routes the server socket's last batch from `start` on, and hands each connection its
@@ -3247,7 +3302,7 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                             incoming = Some(new);
                             break 'buffers;
                         }
-                        self.keep_waiting(meta, datagram);
+                        self.keep_waiting(now, meta, datagram);
                     }
                     Route::Stateless(reply) => replies.push(reply),
                     Route::Drop(RxDropReason::UnknownConnection) => {
@@ -4488,6 +4543,7 @@ mod tests {
         let waiting = |len| Waiting {
             meta,
             datagram: vec![0; len],
+            entered: meta.rx_time,
         };
         let mut queue = WaitingQueue::default();
         queue.push_back(waiting(20));

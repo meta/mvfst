@@ -7695,7 +7695,7 @@ fn datagrams_handed_to_a_worker_beyond_those_it_can_keep_waiting_are_dropped_and
 
 /// Builds a 0-RTT packet with the connection IDs of `initial`, a client's first Initial. Its
 /// payload is not encrypted, since routing depends only on the header.
-fn zero_rtt_like(initial: &[u8]) -> Vec<u8> {
+pub(crate) fn zero_rtt_like(initial: &[u8]) -> Vec<u8> {
     let dcid_len = usize::from(initial[5]);
     let scid_len = usize::from(initial[6 + dcid_len]);
     // Long header, fixed bit and type 0-RTT, then the Initial's version and connection IDs.

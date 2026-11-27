@@ -294,6 +294,7 @@ impl Member {
         let waiting = Waiting {
             meta: *meta,
             datagram: datagram.to_vec(),
+            entered: meta.rx_time,
         };
         match self.group.hand_off(target, waiting) {
             Ok(()) => Steer::HandedOff,
