@@ -15,6 +15,7 @@ use roxygen_bufqueue::BufQueue;
 use super::Connection;
 use crate::AppCode;
 use crate::CreditDue;
+use crate::MvfstOrder;
 use crate::Prioritizer;
 use crate::SendError;
 use crate::SendOrder;
@@ -125,5 +126,26 @@ impl<P: Prioritizer> Connection<P> {
     ) -> Result<CreditDue, StreamError> {
         let srtt = self.recovery.rtt().smoothed();
         self.sources.streams.consume(id, n, self.now, srtt)
+    }
+}
+
+impl Connection<MvfstOrder> {
+    /// Stages a header and a shared payload on stream `id`, both or neither, against the
+    /// allowance its sender carries, and takes the staged bytes off it.
+    pub(crate) fn stream_send_parts_within(
+        &mut self,
+        id: StreamId,
+        allowance: &mut usize,
+        header: Bytes,
+        shared: Bytes,
+    ) -> Result<(), SendError> {
+        let budget = self.staging_budget();
+        let mut carried = u64::try_from(*allowance).unwrap_or(u64::MAX);
+        let staged =
+            self.sources
+                .streams
+                .send_parts_within(id, &mut carried, header, shared, budget);
+        *allowance = usize::try_from(carried).unwrap_or(usize::MAX);
+        staged
     }
 }

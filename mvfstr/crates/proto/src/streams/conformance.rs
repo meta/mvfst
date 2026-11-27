@@ -18,8 +18,9 @@
 //!   allowances do not take the connection past its budget.
 //!
 //! Tests at the end pin what holds only for the default plug: a commit for a stream that left
-//! does not change anything a connection could observe later, and an incremental stream that keeps
-//! filling packets gets a turn within as many packets as its bucket has streams.
+//! does not change anything a connection could observe later, a stream's allowance falls by
+//! exactly what the stream stages, and an incremental stream that keeps filling packets gets a
+//! turn within as many packets as its bucket has streams.
 
 use bytes::Bytes;
 use mvfstr_wire::Dir;
@@ -29,6 +30,7 @@ use mvfstr_wire::TransportParameters;
 use mvfstr_wire::VarInt;
 
 use super::conn::StreamState;
+use super::guard::List;
 use super::guard::StreamData;
 use super::guard::Streams;
 use super::prioritizer::FairShare;
@@ -40,6 +42,7 @@ use super::recv_buf::PagePool;
 use super::scheduler::SendOrder;
 use super::send_buf::Pending;
 use crate::AppCode;
+use crate::SendError;
 use crate::StreamReady;
 use crate::TransportConfig;
 use crate::testing::TestRng;
@@ -959,6 +962,147 @@ on_every_plug!(
     the_split_stays_within_the_staging_budget,
     staging_by_allowance_does_not_take_the_connection_past_its_budget,
 );
+
+/// What [`an_allowance_falls_by_exactly_what_its_stream_stages`] reached.
+#[derive(Debug, Default)]
+struct StagedSeen {
+    /// Pieces staged.
+    pieces: usize,
+    /// Pieces staged on an incremental stream whose allowance was below its room and what reached
+    /// its bucket: its entitlement bound it.
+    entitled: usize,
+    /// Pieces staged on a sequential stream whose allowance was below its room: what the budget
+    /// left after the rooms ahead bound it.
+    behind: usize,
+    /// Pushes over the allowance refused between pieces.
+    refused: usize,
+    /// Streams off the demand list that staged a piece.
+    idle: usize,
+}
+
+/// Opens up to 24 streams on a new server at orders among a few buckets, with random stream
+/// credit, staged bytes and producers, and returns them with a random staging budget.
+fn staged_streams<P: Prioritizer>(rng: &mut TestRng) -> (StreamState<P>, Vec<StreamId>, u64) {
+    let config = TransportConfig::builder()
+        .build()
+        .expect("a valid transport config");
+    let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+    s.on_peer_params(&TransportParameters {
+        initial_max_data: VarInt::from_u32(1 << 30),
+        initial_max_stream_data_uni: VarInt::from_u32(5_000),
+        initial_max_streams_uni: VarInt::from_u32(1000),
+        ..TransportParameters::default()
+    })
+    .unwrap();
+    let ids: Vec<StreamId> = (0..=below(rng, 24))
+        .map(|_| {
+            let id = s.open(Dir::Uni, few_buckets(rng)).unwrap();
+            let credit = [5_000, 40_000, 100_000, 1 << 20][below(rng, 4) as usize];
+            s.on_max_stream_data(id, credit).unwrap();
+            let staged = [0, 0, 1200, 30_000, CAP as usize][below(rng, 5) as usize];
+            let _ = s.send(id, &mut Bytes::from_static(&ZEROS[..staged]), 1 << 30);
+            let pending = below(rng, 3) == 0;
+            s.streams.stream(id).unwrap().set_producer_pending(pending);
+            id
+        })
+        .collect();
+    let budget = [
+        48 * 1024,
+        128 * 1024,
+        256 * 1024,
+        512 * 1024,
+        s.staged + 20_000,
+    ][below(rng, 5) as usize];
+    (s, ids, budget)
+}
+
+/// Checks the identity that lets a sender carry its allowance through a poll: while the other
+/// streams do not stage, a stream that stages bytes within its allowance lowers it by exactly
+/// those bytes, and a refused push leaves it unchanged. The byte-fair plug fails this, as what an
+/// incremental bucket ahead takes depends on what reaches it, so an allowance behind such a bucket
+/// can fall by less.
+fn an_allowance_falls_by_exactly_what_its_stream_stages<P: Prioritizer>() {
+    let mut seen = StagedSeen::default();
+    for seed in 91..=98 {
+        let mut rng = TestRng::new(seed);
+        for trial in 0..60 {
+            let (mut s, ids, budget) = staged_streams::<P>(&mut rng);
+            let mut turns = Vec::new();
+            let mut next = s.streams.first(List::Demand);
+            while let Some(slot) = next {
+                turns.push(s.streams.get_slot(slot).expect("a listed stream").id());
+                next = s.streams.next_on(List::Demand, slot);
+            }
+            let listed = turns.len();
+            let idle: Vec<StreamId> = ids.into_iter().filter(|id| !turns.contains(id)).collect();
+            turns.extend(idle);
+            for (turn, &id) in turns.iter().enumerate() {
+                let at = format!("seed {seed} trial {trial} stream {id}");
+                let first = s.allowance(id, budget);
+                let mut staged = 0;
+                for piece in 0..4 {
+                    let allowance = first - staged;
+                    if allowance == 0 {
+                        break;
+                    }
+                    if below(&mut rng, 3) == 0 {
+                        let over = Bytes::from_static(&ZEROS[..allowance as usize + 1]);
+                        assert_eq!(
+                            s.send_parts(id, over, Bytes::new(), budget),
+                            Err(SendError::OverAllowance),
+                            "{at}: a push of {} over an allowance of {allowance}",
+                            allowance + 1
+                        );
+                        assert_eq!(
+                            s.allowance(id, budget),
+                            allowance,
+                            "{at}: the allowance after a refused push before piece {piece}"
+                        );
+                        seen.refused += 1;
+                    }
+                    let peer = s.streams.get(id).expect("a live stream").peer();
+                    let left = budget.saturating_sub(s.staged);
+                    if peer.order.incremental {
+                        seen.entitled += usize::from(allowance < peer.figures.room.min(left));
+                    } else {
+                        seen.behind += usize::from(allowance < peer.figures.room);
+                    }
+                    seen.idle += usize::from(turn >= listed && staged == 0);
+                    let len = (1 + below(&mut rng, allowance)) as usize;
+                    let header = below(&mut rng, len as u64 + 1) as usize;
+                    s.send_parts(
+                        id,
+                        Bytes::from_static(&ZEROS[..header]),
+                        Bytes::from_static(&ZEROS[header..len]),
+                        budget,
+                    )
+                    .unwrap_or_else(|e| panic!("{at}: piece {piece} of {len}: {e}"));
+                    staged += len as u64;
+                    seen.pieces += 1;
+                    assert_eq!(
+                        s.allowance(id, budget),
+                        first - staged,
+                        "{at}: the allowance after piece {piece} of {len}, {staged} of {first} staged"
+                    );
+                }
+                s.streams.assert_indexed();
+            }
+        }
+    }
+    assert!(
+        seen.pieces >= 2500
+            && seen.entitled >= 900
+            && seen.behind >= 240
+            && seen.refused >= 850
+            && seen.idle >= 100,
+        "too little reached: {seen:?}"
+    );
+}
+
+#[test]
+fn mvfst_order_lowers_an_allowance_by_exactly_what_its_stream_stages() {
+    an_allowance_falls_by_exactly_what_its_stream_stages::<MvfstOrder>();
+}
 
 /// Checks that a commit for a stream that left does not change anything a connection could observe
 /// later: twins that differ only by that commit order and split their streams alike from then on,

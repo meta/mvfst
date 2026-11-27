@@ -2184,13 +2184,17 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         // streams, and poll the new ones, each at most once per application phase. The steps end
         // when every listed stream has been polled, the connection has done its turn's work, or the
         // turn's polls run out. `ids` holds the streams polled so far, then the step's new ones.
+        // The listing's allowance for the step's first new stream holds until that stream is
+        // polled, so its sink starts with it.
         ids.clear();
         let waiting = loop {
             let polled = ids.len();
             let mut listed = false;
-            for (id, _) in conn.pull_ready() {
+            let mut first = None;
+            for (id, allowance) in conn.pull_ready() {
                 listed = true;
                 if !ids[..polled].contains(&id) {
+                    first.get_or_insert(allowance);
                     ids.push(id);
                 }
             }
@@ -2214,7 +2218,12 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
                 let waker = stream_wakers
                     .entry(id)
                     .or_insert_with(|| wake.stream_waker(id));
-                let mut sink = SendSink::new(stream);
+                let mut sink = match first.take() {
+                    Some(allowance) if index == polled => {
+                        SendSink::with_allowance(stream, allowance)
+                    }
+                    _ => SendSink::new(stream),
+                };
                 let poll = session.poll_send(&mut Context::from_waker(waker), id, &mut sink);
                 let progressed = sink.progressed();
                 *pull_work += sink.staged().max(POLL_CHARGE);

@@ -2552,6 +2552,168 @@ fn push_mode_receive_and_pull_ready_over_1024_streams() {
     assert_eq!(edges(conn), [], "{refused} is still refused");
 }
 
+/// The frames a poll in [`a_carried_allowance_equals_a_fresh_one_through_a_round`] stages on a
+/// stream, in turn: a frame header and a payload each, of HEADERS and of DATA sizes.
+const FRAMES: [(usize, usize); 2] = [(2, 40), (3, 1_197)];
+
+/// Polls each of `ids` once, in order, as a pull producer is polled: the poll reads the stream's
+/// send capacity once and stages frames of the sizes in [`FRAMES`] through `send_parts_within`,
+/// the last cut to what is left, until the carried value runs out, and after each push checks
+/// that a fresh send capacity equals the carried value. Without `carried`, the poll stages the
+/// same frames through `send_parts`, reading the send capacity before each. Returns the bytes each
+/// stream staged.
+fn poll_round(conn: &mut Connection, ids: &[StreamId], carried: bool) -> Vec<(StreamId, u64)> {
+    let zeros = Bytes::from_static(&[0; 2_000]);
+    ids.iter()
+        .map(|&id| {
+            let mut stream = conn.stream(id).unwrap();
+            let mut allowance = stream.send_capacity();
+            let mut staged = 0;
+            for (header, payload) in FRAMES.into_iter().cycle() {
+                if !carried {
+                    allowance = stream.send_capacity();
+                }
+                let len = (header + payload).min(allowance);
+                if len == 0 {
+                    break;
+                }
+                let (header, payload) = (
+                    zeros.slice(..header.min(len)),
+                    zeros.slice(header.min(len)..len),
+                );
+                if carried {
+                    stream
+                        .send_parts_within(&mut allowance, header, payload)
+                        .unwrap();
+                    staged += len as u64;
+                    assert_eq!(
+                        stream.send_capacity(),
+                        allowance,
+                        "{id} after {staged} bytes"
+                    );
+                } else {
+                    stream.send_parts(header, payload).unwrap();
+                    staged += len as u64;
+                }
+            }
+            (id, staged)
+        })
+        .collect()
+}
+
+/// Opens client streams at `orders` with stream windows of `window` bytes and wakes their
+/// producers, then polls them as [`poll_round`] does: the pull-ready ones in the order the
+/// listing gives, then the rest in the order they opened. Returns the bytes each stream staged,
+/// sorted by stream ID, and the staging budget.
+fn staged_by_round(
+    orders: &[SendOrder],
+    window: u64,
+    carried: bool,
+) -> (Vec<(StreamId, u64)>, u64) {
+    let setup = Setup {
+        server_transport: config(|c| c.max_streams_uni(100).max_stream_data_uni(window)),
+        ..Setup::default()
+    };
+    let (_, mut pair) = handshake(setup.pair());
+    let conn = pair.client.conn_mut();
+    let mut ids: Vec<StreamId> = orders
+        .iter()
+        .map(|&order| {
+            let id = conn.open_stream(Dir::Uni, order).unwrap();
+            conn.stream(id).unwrap().wake_producer();
+            id
+        })
+        .collect();
+    let mut polled: Vec<StreamId> = conn.pull_ready().map(|(id, _)| id).collect();
+    ids.retain(|id| !polled.contains(id));
+    polled.extend(ids);
+    let budget = conn.staging_budget();
+    let mut staged = poll_round(conn, &polled, carried);
+    staged.sort_by_key(|&(id, _)| id.into_inner());
+    (staged, budget)
+}
+
+#[test]
+fn a_carried_allowance_equals_a_fresh_one_through_a_round() {
+    // 64 sequential streams whose windows add up to more than the staging budget: each takes its
+    // window from what the budget has left, until the budget runs out.
+    let orders = [ORDER; 64];
+    let (staged, budget) = staged_by_round(&orders, 6_000, true);
+    let mut left = budget;
+    let expected: Vec<u64> = (0..64)
+        .map(|_| {
+            let take = left.min(6_000);
+            left -= take;
+            take
+        })
+        .collect();
+    assert!(expected.contains(&0) && expected.iter().any(|&b| b > 0 && b < 6_000));
+    assert_eq!(
+        staged.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(),
+        expected,
+        "sequential: carried"
+    );
+    assert_eq!(
+        staged,
+        staged_by_round(&orders, 6_000, false).0,
+        "sequential: through send_parts alone"
+    );
+
+    // Incremental buckets of 1, 3 and 8 peers with windows of 40,000 bytes. What the rooms of the
+    // first two buckets leave of the budget entitles each peer of the last to an eighth of it,
+    // less than its window.
+    let incremental = |urgency| SendOrder {
+        urgency,
+        incremental: true,
+        ..ORDER
+    };
+    let orders: Vec<SendOrder> = [(1, 1), (2, 3), (4, 8)]
+        .into_iter()
+        .flat_map(|(urgency, peers)| std::iter::repeat_n(incremental(urgency), peers))
+        .collect();
+    let (staged, budget) = staged_by_round(&orders, 40_000, true);
+    let entitled = (budget - 4 * 40_000) / 8;
+    assert!(entitled < 40_000);
+    let expected: Vec<u64> = [40_000; 4].into_iter().chain([entitled; 8]).collect();
+    assert_eq!(
+        staged.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(),
+        expected,
+        "incremental: carried"
+    );
+    assert_eq!(
+        staged,
+        staged_by_round(&orders, 40_000, false).0,
+        "incremental: through send_parts alone"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the carried allowance went stale")]
+fn a_stale_carried_allowance_fails_the_debug_check() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    // Finished streams hold all but 15,536 bytes of the 256 KiB staging budget, so what the budget
+    // leaves binds the allowance of `a`, and a push on `b` behind it lowers that allowance.
+    for len in [CAP, CAP, CAP, 50_000] {
+        let id = conn.open_stream(Dir::Uni, ORDER).unwrap();
+        let mut stream = conn.stream(id).unwrap();
+        assert_eq!(stream.send(&mut Bytes::from(vec![0; len])), Ok(len));
+        stream.finish().unwrap();
+    }
+    let [a, b] = [(); 2].map(|()| conn.open_stream(Dir::Uni, ORDER).unwrap());
+    let mut carried = conn.stream(a).unwrap().send_capacity();
+    assert_eq!(carried, 15_536);
+    let mut bytes = Bytes::from_static(&[0; 1_000]);
+    assert_eq!(conn.stream(b).unwrap().send(&mut bytes), Ok(1_000));
+    assert_eq!(conn.stream(a).unwrap().send_capacity(), carried - 1_000);
+    let _ = conn.stream(a).unwrap().send_parts_within(
+        &mut carried,
+        Bytes::from_static(&[0; 15_000]),
+        Bytes::new(),
+    );
+}
+
 /// An incremental order in the default bucket.
 const INCREMENTAL: SendOrder = SendOrder {
     incremental: true,

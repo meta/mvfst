@@ -1127,6 +1127,8 @@ pub(crate) mod census {
         /// Writes to the links of another stream's list entry while a stream joins or leaves a
         /// list.
         pub(crate) neighbour_link_writes: u64,
+        /// Computations of a stream's allowance for its sender.
+        pub(crate) allowances: u64,
     }
 
     thread_local! {
@@ -1138,6 +1140,7 @@ pub(crate) mod census {
                 scheduler_visits: 0,
                 share_rekeys: 0,
                 neighbour_link_writes: 0,
+                allowances: 0,
             })
         };
     }

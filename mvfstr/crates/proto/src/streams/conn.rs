@@ -557,6 +557,14 @@ impl<P: Prioritizer> StreamState<P> {
     /// its room, up to its part of what the budget has left as [`rank`](Self::rank) splits it,
     /// counting the stream among its bucket's peers, as a stream offering bytes has demand.
     pub(crate) fn allowance(&self, id: StreamId, budget: u64) -> u64 {
+        #[cfg(test)]
+        super::guard::census::count(|c| c.allowances += 1);
+        self.uncounted_allowance(id, budget)
+    }
+
+    /// Returns the allowance of stream `id` as [`allowance`](Self::allowance) does, without
+    /// counting it in the census.
+    fn uncounted_allowance(&self, id: StreamId, budget: u64) -> u64 {
         let Some(stream) = self.streams.get(id) else {
             return 0;
         };
@@ -1454,6 +1462,44 @@ impl<P: Prioritizer> StreamState<P> {
     }
 }
 
+impl StreamState<MvfstOrder> {
+    /// Stages a per-stream `header` and a `shared` payload on stream `id`, both or neither,
+    /// against `allowance`, the stream's allowance as its sender carries it through a poll, and
+    /// takes the staged bytes off it (see
+    /// [`StreamMut::send_parts_within`](crate::StreamMut::send_parts_within)).
+    pub(crate) fn send_parts_within(
+        &mut self,
+        id: StreamId,
+        allowance: &mut u64,
+        header: Bytes,
+        shared: Bytes,
+        budget: u64,
+    ) -> Result<(), SendError> {
+        debug_assert_eq!(
+            self.uncounted_allowance(id, budget),
+            *allowance,
+            "the carried allowance went stale: a stream other than this one staged, or a call on \
+             its handle changed it, after the allowance was read"
+        );
+        self.check_send(id)?;
+        let len = header.len() as u64 + shared.len() as u64;
+        let room = self
+            .streams
+            .get(id)
+            .and_then(|stream| stream.data().send.as_ref())
+            .map_or(0, SendPart::room);
+        // A stale carried allowance can change the split between streams, but it never stages
+        // past the stream's room or the staging budget.
+        if len > *allowance || len > room || len > budget.saturating_sub(self.staged) {
+            self.stage(id, true, |_| Ok(()))?;
+            return Err(SendError::OverAllowance);
+        }
+        self.stage(id, false, |buf| buf.push_parts(header, shared))?;
+        *allowance -= len;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use mvfstr_wire::VarInt;
@@ -1590,6 +1636,144 @@ mod tests {
         s.collect_pull_ready(1 << 20);
         assert_eq!(s.pulled(0).map(|(pulled, _)| pulled), Some(id));
         assert_eq!(census::read().ranks, 2, "one ranking per collection");
+    }
+
+    #[test]
+    fn the_census_counts_one_allowance_per_poll() {
+        let (mut s, id) = one_stream(1 << 20);
+        census::reset();
+        let mut allowance = s.allowance(id, 1 << 20);
+        for part in [&b"head"[..], b"body"] {
+            s.send_parts_within(
+                id,
+                &mut allowance,
+                Bytes::from_static(part),
+                Bytes::new(),
+                1 << 20,
+            )
+            .unwrap();
+        }
+        assert_eq!(allowance, STREAM_CAP - 8);
+        assert_eq!(
+            census::read().allowances,
+            1,
+            "one computation, for the read before the pushes"
+        );
+    }
+
+    /// Returns a server's streams with one unidirectional stream of `window` bytes of stream
+    /// credit, and the stream.
+    fn one_stream(window: u32) -> (StreamState, StreamId) {
+        let mut s = state();
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u32(window),
+            initial_max_streams_uni: VarInt::from_u32(1),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let id = s.open(Dir::Uni, PEER_ORDER).unwrap();
+        (s, id)
+    }
+
+    /// What a push left on stream `id`: the result, whether its sender waits for `Writable`, the
+    /// number of such senders, whether STREAM_DATA_BLOCKED is owed, and the staged bytes.
+    fn after_push(
+        s: &StreamState,
+        id: StreamId,
+        result: Result<(), SendError>,
+    ) -> (Result<(), SendError>, bool, u32, bool, u64) {
+        let stream = s.streams.get(id).unwrap();
+        let blocked = stream.data().send.as_ref().unwrap().push_blocked;
+        let owed = stream.owed().contains(Owed::STREAM_DATA_BLOCKED);
+        (result, blocked, s.push_blocked, owed, s.staged)
+    }
+
+    #[test]
+    fn a_carried_allowance_keeps_the_send_parts_errors() {
+        const BUDGET: u64 = 1 << 20;
+        const CODE: AppCode = AppCode::from_u32(7);
+        let stop = |s: &mut StreamState, id| s.on_stop_sending(id, CODE).unwrap();
+        let finish = |s: &mut StreamState, id| s.finish(id).unwrap();
+        let none = |_: &mut StreamState, _: StreamId| {};
+        let cases: [(&str, u32, &dyn Fn(&mut StreamState, StreamId), usize, _); 4] = [
+            (
+                "stopped",
+                10_000,
+                &stop,
+                100,
+                SendError::Stopped { code: CODE },
+            ),
+            ("finished", 10_000, &finish, 100, SendError::Ended),
+            (
+                "over the allowance",
+                10_000,
+                &none,
+                10_001,
+                SendError::OverAllowance,
+            ),
+            (
+                "at zero stream credit",
+                0,
+                &none,
+                1,
+                SendError::OverAllowance,
+            ),
+        ];
+        for (name, window, setup, len, error) in cases {
+            let push = || Bytes::from(vec![0; len]);
+            let (mut by_parts, id) = one_stream(window);
+            setup(&mut by_parts, id);
+            let result = by_parts.send_parts(id, push(), Bytes::new(), BUDGET);
+            let wanted = after_push(&by_parts, id, result);
+            let (mut within, id) = one_stream(window);
+            setup(&mut within, id);
+            let mut allowance = within.allowance(id, BUDGET);
+            let before = allowance;
+            let result = within.send_parts_within(id, &mut allowance, push(), Bytes::new(), BUDGET);
+            assert_eq!(after_push(&within, id, result), wanted, "{name}");
+            assert_eq!(result, Err(error), "{name}");
+            assert_eq!(
+                allowance, before,
+                "{name}: a refused push keeps the carried allowance"
+            );
+            let refused = error == SendError::OverAllowance;
+            assert_eq!(wanted.1, refused, "{name}: the sender waits for Writable");
+            assert_eq!(wanted.3, window == 0, "{name}: STREAM_DATA_BLOCKED");
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_wrong_carried_allowance_does_not_pass_the_room_or_the_budget() {
+        // Release builds do not check a carried allowance against a fresh one. A value above the
+        // stream's room, or above what the staging budget leaves, still refuses a push past them
+        // as over the allowance.
+        let (mut s, id) = one_stream(10_000);
+        let mut allowance = 20_000;
+        let push = Bytes::from(vec![0; 15_000]);
+        let result = s.send_parts_within(id, &mut allowance, push, Bytes::new(), 1 << 20);
+        assert_eq!(
+            after_push(&s, id, result),
+            (Err(SendError::OverAllowance), true, 1, false, 0),
+            "past the room"
+        );
+        assert_eq!(allowance, 20_000);
+
+        let (mut s, id) = one_stream(10_000);
+        let mut allowance = 5_000;
+        let push = Bytes::from(vec![0; 2_000]);
+        let result = s.send_parts_within(id, &mut allowance, push, Bytes::new(), 1_000);
+        assert_eq!(
+            after_push(&s, id, result),
+            (Err(SendError::OverAllowance), true, 1, false, 0),
+            "past the budget"
+        );
+        assert_eq!(allowance, 5_000);
+        let push = Bytes::from(vec![0; 1_000]);
+        let result = s.send_parts_within(id, &mut allowance, push, Bytes::new(), 1_000);
+        assert_eq!(result, Ok(()), "within both");
+        assert_eq!((allowance, s.staged), (4_000, 1_000));
     }
 
     /// Returns a client's streams after the server's transport parameters, which give the send

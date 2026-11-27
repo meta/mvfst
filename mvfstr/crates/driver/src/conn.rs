@@ -8,6 +8,7 @@
 //! What a session works through: the lent connection, the send and datagram sinks and the
 //! cross-thread handle.
 
+use std::cell::Cell;
 use std::fmt;
 use std::mem;
 use std::ops::Deref;
@@ -115,6 +116,13 @@ pub struct SendSink<'a> {
     progressed: bool,
     /// Bytes stored through this sink.
     staged: u64,
+    /// The stream's allowance once computed, less the bytes stored since, so that a poll computes
+    /// it once. A call through the sink that changes the allowance other than a push must set it,
+    /// as `finish` does.
+    allowance: Cell<Option<usize>>,
+    /// The allowance computations this sink requested of the stream.
+    #[cfg(test)]
+    computations: Cell<usize>,
 }
 
 impl<'a> SendSink<'a> {
@@ -124,7 +132,30 @@ impl<'a> SendSink<'a> {
             stream,
             progressed: false,
             staged: 0,
+            allowance: Cell::new(None),
+            #[cfg(test)]
+            computations: Cell::new(0),
         }
+    }
+
+    /// Creates a sink over `stream` for one `poll_send`, given the stream's allowance as it stands
+    /// now.
+    pub(crate) fn with_allowance(stream: StreamMut<'a>, allowance: usize) -> Self {
+        let sink = Self::new(stream);
+        sink.allowance.set(Some(allowance));
+        sink
+    }
+
+    /// Returns the allowance computations this sink requested of the stream.
+    #[cfg(test)]
+    pub(crate) fn computations(&self) -> usize {
+        self.computations.get()
+    }
+
+    /// Counts an allowance computation requested of the stream.
+    fn count_computation(&self) {
+        #[cfg(test)]
+        self.computations.set(self.computations.get() + 1);
     }
 
     /// Returns whether any byte was stored or the stream finished through this sink.
@@ -146,7 +177,13 @@ impl<'a> SendSink<'a> {
 impl SendSink<'_> {
     /// Returns how many bytes the stream accepts now.
     pub fn allowance(&self) -> usize {
-        self.stream.send_capacity()
+        if let Some(allowance) = self.allowance.get() {
+            return allowance;
+        }
+        self.count_computation();
+        let allowance = self.stream.send_capacity();
+        self.allowance.set(Some(allowance));
+        allowance
     }
 
     /// Stages all of `data`, or fails without staging any of it.
@@ -159,9 +196,12 @@ impl SendSink<'_> {
     /// copied. It stages both or fails without staging either.
     pub fn push_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SinkError> {
         let len = header.len() + shared.len();
-        self.stream
-            .send_parts(header, shared)
-            .map_err(SinkError::from)?;
+        let mut allowance = self.allowance();
+        let pushed = self
+            .stream
+            .send_parts_within(&mut allowance, header, shared);
+        self.allowance.set(Some(allowance));
+        pushed.map_err(SinkError::from)?;
         self.progressed |= len > 0;
         self.staged += len as u64;
         Ok(())
@@ -170,6 +210,7 @@ impl SendSink<'_> {
     /// Ends the stream after the staged bytes.
     pub fn finish(&mut self) -> Result<(), SinkError> {
         self.stream.finish().map_err(SinkError::from)?;
+        self.allowance.set(Some(0));
         self.progressed = true;
         Ok(())
     }

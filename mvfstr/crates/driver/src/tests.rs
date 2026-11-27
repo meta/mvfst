@@ -587,6 +587,9 @@ enum Report {
     /// A datagram producer that stays ready found these allowances in its sink, one per poll,
     /// until a while after its waker fired.
     DatagramPolls(Vec<usize>),
+    /// A stream's producer was polled, and its sink requested this many allowance computations;
+    /// `true` if the allowance it read fell by exactly the bytes it pushed.
+    Computed(StreamId, usize, bool),
 }
 
 /// Reads and consumes every readable byte of stream `id`.
@@ -1037,6 +1040,69 @@ impl QuicSession for Parked {
     }
 }
 
+/// The bytes each [`ThreeReads`] producer pushes, 10 and then 20.
+const THREE_READS: &[u8; 30] = b"0123456789abcdefghijklmnopqrst";
+
+/// A client session that, once connected, opens two bidirectional streams and wakes both
+/// producers, so that one pull step lists them together. Each producer's one poll reads the
+/// allowance three times around two pushes, finishes the stream and reports the allowance
+/// computations its sink requested. It reports each echo.
+struct ThreeReads {
+    reports: mpsc::Sender<Report>,
+    received: HashMap<StreamId, Vec<u8>>,
+}
+
+impl QuicSession for ThreeReads {
+    fn on_event(&mut self, conn: &mut Conn<'_>, event: ConnEvent) {
+        if event != ConnEvent::Connected {
+            return;
+        }
+        for _ in 0..2 {
+            let id = conn.open_stream(Dir::Bi, ORDER).expect("a stream opens");
+            conn.stream_waker(id).wake();
+        }
+    }
+
+    fn on_stream(&mut self, conn: &mut Conn<'_>, id: StreamId, ready: StreamReady) {
+        if matches!(ready, StreamReady::Readable | StreamReady::Finished) {
+            let received = self.received.entry(id).or_default();
+            for segment in read_all(conn, id) {
+                received.extend_from_slice(&segment);
+            }
+            if ready == StreamReady::Finished {
+                let _ = self
+                    .reports
+                    .send(Report::Echoed(id, received[..] == THREE_READS[..]));
+            }
+        }
+    }
+
+    fn poll_send(
+        &mut self,
+        _: &mut Context<'_>,
+        id: StreamId,
+        sink: &mut SendSink<'_>,
+    ) -> Poll<()> {
+        let first = sink.allowance();
+        sink.push(Bytes::from_static(&THREE_READS[..10]))
+            .expect("within the allowance");
+        let second = sink.allowance();
+        sink.push(Bytes::from_static(&THREE_READS[10..]))
+            .expect("within the allowance");
+        let third = sink.allowance();
+        sink.finish().expect("the stream is open");
+        let falls = second + 10 == first && third + 30 == first;
+        let _ = self
+            .reports
+            .send(Report::Computed(id, sink.computations(), falls));
+        Poll::Ready(())
+    }
+
+    fn poll_session(&mut self, _: &mut Context<'_>, _: &mut Conn<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
 /// A client session that reports its events, and each `poll_session` with the token the test
 /// thread set before waking it.
 struct Waking {
@@ -1372,6 +1438,40 @@ fn streams_produced_through_the_pull_path_resume_on_their_stream_wakers() {
         .collect();
     expected.extend([Report::Received(uni, LEN), Report::PolledBeforeRelease(1)]);
     await_reports(&rx, expected);
+    harness.shutdown();
+}
+
+#[test]
+fn a_poll_computes_the_allowance_once() {
+    // The first stream polled after the listing starts from the allowance the listing computed;
+    // the second computes it once, as later polls of a pull step do.
+    let harness = Harness::new();
+    let (server_reports, _server_rx) = mpsc::channel();
+    let addr = harness.serve(move || App::new(move |_| Ok(Echo::new(server_reports.clone()))));
+    let (tx, rx) = mpsc::channel();
+    let _conn = harness.connect(addr, move || ThreeReads {
+        reports: tx,
+        received: HashMap::new(),
+    });
+    let (mut polls, mut echoes) = (Vec::new(), Vec::new());
+    while echoes.len() < 2 {
+        match rx.recv_timeout(WAIT).expect("the session reports") {
+            Report::Computed(id, computations, falls) => {
+                polls.push((id, computations, falls));
+                if polls.len() == 2 {
+                    assert_eq!(
+                        polls,
+                        [(client_bidi(0), 0, true), (client_bidi(1), 1, true)],
+                        "allowance computations per poll, in poll order"
+                    );
+                }
+            }
+            Report::Echoed(id, matches) => echoes.push((id, matches)),
+            other => panic!("unexpected report {other:?}"),
+        }
+    }
+    echoes.sort_by_key(|&(id, _)| id.into_inner());
+    assert_eq!(echoes, [(client_bidi(0), true), (client_bidi(1), true)]);
     harness.shutdown();
 }
 

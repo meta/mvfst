@@ -151,6 +151,36 @@ impl<P: Prioritizer> StreamMut<'_, P> {
     }
 }
 
+impl StreamMut<'_> {
+    /// Stages a per-stream `header` and a `shared` payload as [`send_parts`](Self::send_parts)
+    /// does, against an allowance that the caller carries through a poll, and takes the staged
+    /// bytes off `allowance`, so that a poll computes the allowance once.
+    ///
+    /// `*allowance` must be the [`send_capacity`](Self::send_capacity) read through this handle,
+    /// less every byte staged through this method since, with no other call on the handle in
+    /// between. Other streams cannot stage meanwhile, as the handle borrows the connection. The
+    /// call fails as `send_parts` does, and a refused push leaves `*allowance` unchanged.
+    ///
+    /// Debug builds recompute the allowance and panic if `*allowance` differs from it. In release
+    /// builds a wrong value never stages past the stream's credit, its cap on staged bytes or the
+    /// connection's budget for staged bytes, but it can change how that budget is split between
+    /// streams.
+    ///
+    /// The call is offered with the default [`MvfstOrder`](crate::MvfstOrder) prioritizer only,
+    /// under which a stream's allowance falls by exactly the bytes it stages. Under
+    /// [`FairShare`](crate::FairShare), the allowance of a stream behind an incremental bucket can
+    /// fall by less.
+    pub fn send_parts_within(
+        &mut self,
+        allowance: &mut usize,
+        header: Bytes,
+        shared: Bytes,
+    ) -> Result<(), SendError> {
+        self.conn
+            .stream_send_parts_within(self.id, allowance, header, shared)
+    }
+}
+
 impl<P: Prioritizer> fmt::Debug for StreamMut<'_, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamMut")
