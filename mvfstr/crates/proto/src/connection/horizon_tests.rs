@@ -146,14 +146,24 @@ fn server_backlogged(
 /// Runs one attempt by the server at `now` with room for 44 datagrams, and returns its outcome
 /// and the datagrams of each run.
 fn server_attempt(pair: &mut Pair, now: Instant) -> (TxOutcome, Vec<Vec<SentDatagram>>) {
+    server_attempt_into(pair, now, 44, &mut VecSink::new(1500))
+}
+
+/// Runs one attempt by the server at `now` with room for `max_segments` datagrams into `sink`,
+/// and returns its outcome and the datagrams of each run.
+fn server_attempt_into(
+    pair: &mut Pair,
+    now: Instant,
+    max_segments: u16,
+    sink: &mut VecSink,
+) -> (TxOutcome, Vec<Vec<SentDatagram>>) {
     let limits = TxLimits {
         now,
-        max_segments: 44,
+        max_segments,
         ..pair.limits()
     };
-    let mut sink = VecSink::new(1500);
     let conn = pair.server.conn_mut();
-    let outcome = conn.poll_transmit(&limits, &mut sink, &mut InlineSealer);
+    let outcome = conn.poll_transmit(&limits, sink, &mut InlineSealer);
     let mut runs: Vec<Vec<SentDatagram>> = Vec::new();
     for datagram in sink.take() {
         match runs.last_mut() {
@@ -210,6 +220,79 @@ fn each_attempt_builds_full_runs_due_within_the_horizon_with_their_own_releases(
     let (due, runs) = server_attempt(&mut pair, at);
     assert_eq!(releases(&pair, t0, &runs), [10 * t]);
     assert_eq!(due.stop, Stop::Pacing(t0 + 11 * t - 2 * MS));
+}
+
+/// Returns a sink that refuses every slot.
+fn refusing() -> VecSink {
+    let mut sink = VecSink::new(1500);
+    sink.set_refuse(true);
+    sink
+}
+
+#[test]
+fn an_attempt_reports_whether_a_run_is_due_now_and_its_first_release_after_now() {
+    let mut pair = server_backlogged(|c| c, 400_000);
+    let conn = pair.server.conn_mut();
+    conn.pacer.set_rate(NonZeroU64::new(125_000_000).unwrap());
+    let t = conn.pacer.run_time();
+    assert_eq!(t, 209 * US);
+    let t0 = pair.now;
+    // A refused slot leaves the run the attempt opened empty, so it reports neither.
+    let (refused, _) = server_attempt_into(&mut pair, t0, 44, &mut refusing());
+    assert_eq!((refused.datagrams, refused.stop), (0, Stop::Socket));
+    assert_eq!((refused.due, refused.ahead), (false, None));
+    // From idle, the first attempt's two runs are due now; each later attempt at the same time
+    // builds runs ahead of it and reports the first one's release.
+    let mut leads = Vec::new();
+    loop {
+        let (outcome, _) = server_attempt(&mut pair, t0);
+        leads.push((outcome.due, outcome.ahead.map(|ahead| ahead - t0)));
+        if outcome.stop != Stop::BatchFull {
+            break;
+        }
+    }
+    let ahead = |runs: u32| Some(runs * t);
+    assert_eq!(
+        leads,
+        [
+            (true, None),
+            (false, ahead(1)),
+            (false, ahead(3)),
+            (false, ahead(5)),
+            (false, ahead(7)),
+            (false, ahead(9))
+        ]
+    );
+    // The next run may be built at `at`. An attempt a nanosecond earlier, and one at `at` whose
+    // slot is refused, build nothing and report neither.
+    let at = t0 + 10 * t - 2 * MS;
+    let (early, runs) = server_attempt(&mut pair, at - NS);
+    assert!(runs.is_empty());
+    assert_eq!((early.due, early.ahead), (false, None));
+    let (refused, _) = server_attempt_into(&mut pair, at, 44, &mut refusing());
+    assert_eq!((refused.datagrams, refused.stop), (0, Stop::Socket));
+    assert_eq!((refused.due, refused.ahead), (false, None));
+    let (late, runs) = server_attempt(&mut pair, at);
+    assert_eq!(releases(&pair, t0, &runs), [10 * t]);
+    assert_eq!((late.due, late.ahead), (false, Some(at + 2 * MS)));
+}
+
+#[test]
+fn an_attempt_with_runs_due_now_and_after_now_reports_both_with_the_first_later_release() {
+    let mut pair = server_backlogged(|c| c, 400_000);
+    let conn = pair.server.conn_mut();
+    conn.pacer.set_rate(NonZeroU64::new(125_000_000).unwrap());
+    let t = conn.pacer.run_time();
+    // With room for four runs of 18, the first attempt from idle builds the credit's run and one
+    // more, both due now, then two runs T apart.
+    let t0 = pair.now;
+    let (outcome, runs) = server_attempt_into(&mut pair, t0, 72, &mut VecSink::new(1500));
+    assert_eq!(
+        releases(&pair, t0, &runs),
+        [Duration::ZERO, Duration::ZERO, t, 2 * t]
+    );
+    assert_eq!(outcome.stop, Stop::BatchFull);
+    assert_eq!((outcome.due, outcome.ahead), (true, Some(t0 + t)));
 }
 
 /// Sets the server to 1 Gbit/s with a recording controller, then runs attempts at its time until
@@ -309,6 +392,18 @@ fn an_ack_only_datagram_leaves_after_the_last_release_and_measures_its_delay_fro
 }
 
 #[test]
+fn an_ack_only_run_that_waits_for_the_last_release_is_reported_after_now_and_not_due() {
+    let mut pair = server_backlogged(|c| c, 400_000);
+    let t0 = pair.now;
+    let last = built_ahead(&mut pair).last().unwrap().1;
+    assert!(last > t0);
+    from_client(&mut pair, t0, &[&[Frame::Ping], &[Frame::Ping]]);
+    let (ack, runs) = server_attempt(&mut pair, t0);
+    assert_eq!((ack.datagrams, runs.len()), (1, 1), "{ack:?}");
+    assert_eq!((ack.due, ack.ahead), (false, Some(last)));
+}
+
+#[test]
 fn paced_bytes_released_after_now_keep_the_connection_from_being_marked_application_limited() {
     // About 43 datagrams: two full runs, then the rest in a third released T later.
     let mut pair = server_backlogged(|c| c, 60_000);
@@ -401,4 +496,81 @@ fn an_attempt_without_a_clock_epoch_builds_nothing_ahead_of_now() {
     );
     let data = conn.recovery.space(Space::Data);
     assert!(data.outstanding().all(|packet| packet.time_sent <= t0));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "an unstamped run released at")]
+fn an_attempt_without_a_clock_epoch_after_runs_were_built_ahead_is_a_caller_bug() {
+    // The ACK-only datagram waits for the last release, after now, which only a stamp carries.
+    let mut pair = server_backlogged(|c| c, 400_000);
+    let t0 = pair.now;
+    assert!(built_ahead(&mut pair).last().unwrap().1 > t0);
+    from_client(&mut pair, t0, &[&[Frame::Ping], &[Frame::Ping]]);
+    let limits = TxLimits {
+        max_segments: 44,
+        epoch: None,
+        ..pair.limits()
+    };
+    let conn = pair.server.conn_mut();
+    conn.transmit(&limits, &mut VecSink::new(1500), &mut InlineSealer);
+}
+
+/// Returns `config`'s pair after its paced server sent 256 KiB on one stream.
+fn paced_transfer(config: PairConfig) -> Pair {
+    let (_, mut pair) = handshake(config);
+    let len = 256 << 10;
+    let id = pair.server.conn_mut().open_stream(Dir::Uni, ORDER).unwrap();
+    let (mut client, mut server) = (App::default(), App::default());
+    server.write(id, pattern(len), true);
+    let until = pair.now + Duration::from_secs(10);
+    run_apps(&mut pair, until, &mut client, &mut server);
+    assert_eq!(client.data.get(&id).map(Vec::len), Some(len));
+    pair
+}
+
+#[test]
+fn attempts_without_a_horizon_report_each_built_run_due_now_and_none_after_now() {
+    let server_transport = config(|c| {
+        c.pacing(true)
+            .pacing_granularity(200 * US)
+            .datagram_size(DatagramSize::PeerMaximum)
+    });
+    let client_transport = config(|c| c.max_data(1 << 40).max_stream_data_uni(1 << 30));
+    let setup = Setup {
+        client_transport,
+        server_transport,
+        ..Setup::default()
+    };
+    // Timer endpoints, release endpoints whose connections get a build horizon of 0, and
+    // release endpoints with a horizon, whose client connections do not build ahead.
+    let timer = paced_transfer(paired(&setup, Duration::ZERO));
+    let mut config = paired(&setup, 2 * MS);
+    config.endpoint = EndpointConfig::builder([7; 32])
+        .build_horizon(Duration::ZERO)
+        .build()
+        .expect("an endpoint config");
+    let unstamped = paced_transfer(config);
+    let stamped = paced_transfer(paired(&setup, 2 * MS));
+    for pair in [&timer, &unstamped] {
+        let outcomes = &pair.server.outcomes;
+        assert!(outcomes.iter().any(|o| matches!(o.stop, Stop::Pacing(_))));
+    }
+    for (peer, outcomes) in [
+        ("timer server", &timer.server.outcomes),
+        ("timer client", &timer.client.outcomes),
+        ("unstamped server", &unstamped.server.outcomes),
+        ("unstamped client", &unstamped.client.outcomes),
+        ("stamped client", &stamped.client.outcomes),
+    ] {
+        for outcome in outcomes {
+            assert_eq!(
+                (outcome.due, outcome.ahead),
+                (outcome.datagrams > 0, None),
+                "{peer}: {outcome:?}"
+            );
+        }
+    }
+    // The same transfer's server, with a horizon, builds runs ahead.
+    assert!(stamped.server.outcomes.iter().any(|o| o.ahead.is_some()));
 }

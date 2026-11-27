@@ -214,6 +214,8 @@ impl<P: Prioritizer> Connection<P> {
             bytes: 0,
             stop: Stop::Idle,
             pacing_at: None,
+            ahead: None,
+            due: false,
         };
         let mut skipped = Skipped::default();
         let mut run: Option<Run> = None;
@@ -230,7 +232,7 @@ impl<P: Prioritizer> Connection<P> {
                     .as_ref()
                     .is_some_and(|open| open.is_full(self.pacer.burst()))
             {
-                self.end_run(sink, &mut run, stamps);
+                self.end_run(sink, &mut run, stamps, lim.now, &mut out);
             }
             let in_paced_run = pacing && run.as_ref().is_some_and(|open| open.paced);
             let joins = JoinLimits {
@@ -269,7 +271,7 @@ impl<P: Prioritizer> Connection<P> {
             if let Some(&Run { path, paced, .. }) = run.as_ref()
                 && path != start.path
             {
-                self.end_run(sink, &mut run, stamps);
+                self.end_run(sink, &mut run, stamps, lim.now, &mut out);
                 if paced {
                     continue;
                 }
@@ -277,7 +279,7 @@ impl<P: Prioritizer> Connection<P> {
             // A paced datagram never joins an unpaced run.
             let paced = predict && scan.paced && !self.probing();
             if paced {
-                self.end_run(sink, &mut run, stamps);
+                self.end_run(sink, &mut run, stamps, lim.now, &mut out);
             }
             if run.is_none() {
                 let room = lim.max_segments - out.datagrams;
@@ -336,12 +338,12 @@ impl<P: Prioritizer> Connection<P> {
                     out.bytes += u32::from(len);
                     // A segment shorter than the slot ends its run (the sink's slot contract).
                     if len < seg_max {
-                        self.end_run(sink, &mut run, stamps);
+                        self.end_run(sink, &mut run, stamps, lim.now, &mut out);
                     }
                 }
             }
         }
-        self.end_run(sink, &mut run, stamps);
+        self.end_run(sink, &mut run, stamps, lim.now, &mut out);
         if out.datagrams == 0 && skipped.any() {
             out.stop = Stop::Inconsistent;
         }
@@ -934,19 +936,37 @@ impl<P: Prioritizer> Connection<P> {
         }
     }
 
-    /// Closes the open run, if any, with its metadata, and debits the pacer once with its paced
-    /// bytes. With `stamps`, the run carries its release in the backend's clock.
+    /// Closes the open run, if any, with its metadata, debits the pacer once with its paced
+    /// bytes, and records in `out` whether its release is the attempt's reading `now` or later.
+    /// With `stamps`, the run carries its release in the backend's clock.
     fn end_run<S: SegmentSink>(
         &mut self,
         sink: &mut S,
         run: &mut Option<Run>,
         stamps: Option<ClockEpoch>,
+        now: Instant,
+        out: &mut TxOutcome,
     ) {
         let Some(run) = run.take() else {
             return;
         };
         if run.segments == 0 {
             return;
+        }
+        debug_assert!(
+            run.release >= now,
+            "a run released at {:?} before the attempt's reading {now:?}",
+            run.release
+        );
+        if run.release > now {
+            debug_assert!(
+                stamps.is_some(),
+                "an unstamped run released at {:?}, after the attempt's reading {now:?}",
+                run.release
+            );
+            out.ahead.get_or_insert(run.release);
+        } else {
+            out.due = true;
         }
         self.pacer.on_run(run.release, run.paced_bytes);
         sink.end_run(TxMeta {
@@ -1162,5 +1182,47 @@ mod tests {
             ..run
         };
         assert!(!unpaced.is_full(5));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "before the attempt's reading")]
+    fn closing_a_run_released_before_the_attempts_reading_is_a_bug() {
+        use crate::testing::VecSink;
+
+        // The pacer never releases a run before the reading it is given, so the run is made by
+        // hand, with one datagram in the sink.
+        let (_, mut pair) = handshake(Setup::default().pair());
+        let release = pair.now;
+        let conn = pair.server.conn_mut();
+        let mut sink = VecSink::new(1500);
+        assert!(sink.next_segment(1200, TxClass::Data).is_some());
+        sink.end_segment(1200);
+        let mut run = Some(Run {
+            path: PathId(0),
+            first_tx: conn.tx_seq,
+            segments: 1,
+            segment_size: 1200,
+            class: TxClass::Data,
+            release,
+            paced: false,
+            room: 1,
+            paced_bytes: 0,
+        });
+        let mut out = TxOutcome {
+            datagrams: 1,
+            bytes: 1200,
+            stop: Stop::Idle,
+            pacing_at: None,
+            ahead: None,
+            due: false,
+        };
+        conn.end_run(
+            &mut sink,
+            &mut run,
+            None,
+            release + Duration::from_nanos(1),
+            &mut out,
+        );
     }
 }

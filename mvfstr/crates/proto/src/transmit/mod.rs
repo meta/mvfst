@@ -261,6 +261,11 @@ pub struct TxOutcome {
     /// When an attempt can next build a pacing-blocked candidate, whatever the stop: its
     /// release less the build horizon; always later than `now`.
     pub pacing_at: Option<Instant>,
+    /// The release of the attempt's first run released after `now`, if any. Runs are released
+    /// at `now` without a build horizon, so it is then always `None`.
+    pub ahead: Option<Instant>,
+    /// Whether the attempt built a run released at `now`.
+    pub due: bool,
 }
 
 /// A description of what the next attempt would do and why, for logs and dumps. Its contents are
