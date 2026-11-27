@@ -1656,16 +1656,20 @@ mod tests {
             },
         );
         let summary = read_summary(&output, "tperf_summary", &paced_keys());
-        assert!(
-            summary.int("objects") >= 8_000,
-            "a wake runs every tick it missed, so most of the 10,000 arrive: {output}"
-        );
         let line = server.summary_line();
         let served = read_summary(&line, "tperf_server_summary", &server_paced_keys());
-        assert!(
-            served.int("late_ticks") * 10 < served.int("objects_sent"),
-            "{line}"
-        );
+        // Sanitizer builds set `sanitized` and run several times slower. There, how many objects
+        // arrive and how many ticks start late depend on how busy the host is.
+        if !cfg!(sanitized) {
+            assert!(
+                summary.int("objects") >= 8_000,
+                "a wake runs every tick it missed, so most of the 10,000 arrive: {output}"
+            );
+            assert!(
+                served.int("late_ticks") * 10 < served.int("objects_sent"),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -1933,10 +1937,13 @@ mod tests {
         .map(|key| summary.int(key));
         assert!(latencies[0] > 0, "{output}");
         assert!(latencies.is_sorted(), "{output}");
-        assert!(
-            latencies[3] < 50_000,
-            "p99.9 under 50 ms on idle loopback: {output}"
-        );
+        // Under `sanitized` the latency tail depends on how busy the host is.
+        if !cfg!(sanitized) {
+            assert!(
+                latencies[3] < 50_000,
+                "p99.9 under 50 ms on idle loopback: {output}"
+            );
+        }
 
         let line = server.summary_line();
         let served = read_summary(&line, "tperf_server_summary", &server_paced_keys());
