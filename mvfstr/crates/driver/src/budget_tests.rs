@@ -1527,7 +1527,7 @@ fn a_waiting_initial_that_a_stop_pushes_back_waits_from_when_it_was_first_kept()
 }
 
 #[test]
-fn a_reset_while_initials_wait_zeroes_the_peaks_and_a_wait_across_it_counts_whole() {
+fn a_reset_while_initials_wait_starts_the_peaks_at_what_waits_and_their_waits_count_whole() {
     // The scenario of the push-back test above: the first poll stops in its third turn with the
     // sixth Initial, kept at the start, still waiting.
     let mut scene = Scene::new(ServerPlan {
@@ -1553,11 +1553,7 @@ fn a_reset_while_initials_wait_zeroes_the_peaks_and_a_wait_across_it_counts_whol
     assert_eq!(scene.server.waiting(), (1, false));
     let before = scene.server.stats();
     assert_eq!(
-        (
-            before.waiting_peak_datagrams,
-            before.waiting_peak_bytes,
-            before.waiting_longest
-        ),
+        peaks(&before),
         (4, 4 * FIRST_INITIAL as u64, us(600)),
         "{before:?}"
     );
@@ -1566,12 +1562,13 @@ fn a_reset_while_initials_wait_zeroes_the_peaks_and_a_wait_across_it_counts_whol
     assert_eq!(
         scene.server.stats(),
         EndpointStats {
-            waiting_peak_datagrams: 0,
-            waiting_peak_bytes: 0,
+            waiting_peak_datagrams: 1,
+            waiting_peak_bytes: FIRST_INITIAL as u64,
             waiting_longest: Duration::ZERO,
             ..before
         },
-        "a reset zeroes the peaks even while an Initial waits"
+        "a reset starts the size peaks at the Initial that still waits, and the longest wait at \
+         zero"
     );
     assert_eq!(scene.server.waiting(), (1, false));
     while scene.lab.queued(scene.server_task) {
@@ -1580,19 +1577,15 @@ fn a_reset_while_initials_wait_zeroes_the_peaks_and_a_wait_across_it_counts_whol
     // The next poll routes the sixth Initial again 1,200 µs in without pushing it again.
     let stats = scene.server.stats();
     assert_eq!(
-        (
-            stats.waiting_peak_datagrams,
-            stats.waiting_peak_bytes,
-            stats.waiting_longest
-        ),
-        (0, 0, us(1_200)),
-        "only pushes after the reset raise the size peaks, and a wait across it counts from the \
-         start: {stats:?}"
+        peaks(&stats),
+        (1, FIRST_INITIAL as u64, us(1_200)),
+        "the window still shows the Initial that waited at its start, and its wait counts from \
+         when it was kept: {stats:?}"
     );
 }
 
 #[test]
-fn after_a_reset_an_initial_that_a_stop_pushes_back_raises_the_peaks_to_what_then_waits() {
+fn a_reset_while_initials_wait_keeps_their_peaks_as_they_drain_and_later_pushes_raise_them() {
     // Six attempts, two a turn. The third and the fourth accept each move the clock on by twice
     // the slice, so each closes its poll's slice and the check before the next waiting Initial
     // stops the poll, which pushes that Initial back.
@@ -1620,8 +1613,24 @@ fn after_a_reset_an_initial_that_a_stop_pushes_back_raises_the_peaks_to_what_the
     let mut marks = scene.poll_server();
     assert_eq!(stop(&marks), Some(Phase::Receive), "{marks:?}");
     assert_eq!(scene.server.waiting(), (3, false), "{marks:?}");
+    let before = scene.server.stats();
+    assert_eq!(
+        peaks(&before),
+        (4, 4 * FIRST_INITIAL as u64, Duration::ZERO),
+        "{before:?}"
+    );
 
     scene.server.reset_waiting_peaks();
+    assert_eq!(
+        scene.server.stats(),
+        EndpointStats {
+            waiting_peak_datagrams: 3,
+            waiting_peak_bytes: 3 * FIRST_INITIAL as u64,
+            waiting_longest: Duration::ZERO,
+            ..before
+        },
+        "a reset starts the size peaks at the three Initials that still wait"
+    );
     // The next poll routes the fourth Initial again 2 ms in and pushes the fifth back, which
     // leaves the fifth and the sixth waiting.
     let second = scene.poll_server();
@@ -1629,17 +1638,37 @@ fn after_a_reset_an_initial_that_a_stop_pushes_back_raises_the_peaks_to_what_the
     assert_eq!(scene.server.waiting(), (2, false), "{second:?}");
     let stats = scene.server.stats();
     assert_eq!(
-        (
-            stats.waiting_peak_datagrams,
-            stats.waiting_peak_bytes,
-            stats.waiting_longest
-        ),
-        (2, 2 * FIRST_INITIAL as u64, SLICE * 2),
-        "a push back after the reset raises the size peaks to what the queue then holds: \
-         {stats:?}"
+        peaks(&stats),
+        (3, 3 * FIRST_INITIAL as u64, SLICE * 2),
+        "as the queue drains, the size peaks stay at what waited at the reset: {stats:?}"
     );
-
     marks.extend(second);
+
+    // Four more clients' Initials reach the server while the fifth and the sixth still wait.
+    for _ in 0..4 {
+        scene.connect(0, Some(0));
+    }
+    scene.lab.net.hold(SERVER);
+    scene.lab.settle_except(Some(scene.server_task));
+    let late: Vec<Arrival> = scene
+        .lab
+        .net
+        .take_held()
+        .into_iter()
+        .filter(|arrival| (6..10).any(|n| arrival.src == nth_socket(n)))
+        .collect();
+    assert_eq!(
+        late.iter()
+            .map(|arrival| (arrival.src, arrival.data.len()))
+            .collect::<Vec<_>>(),
+        (6..10)
+            .map(|n| (nth_socket(n), FIRST_INITIAL))
+            .collect::<Vec<_>>(),
+        "each new first flight is one datagram"
+    );
+    for arrival in late {
+        scene.lab.net.inject(SERVER, arrival);
+    }
     while scene.lab.queued(scene.server_task) {
         assert!(marks.len() < 2_000, "the server keeps waking: {marks:?}");
         marks.extend(scene.poll_server());
@@ -1651,21 +1680,97 @@ fn after_a_reset_an_initial_that_a_stop_pushes_back_raises_the_peaks_to_what_the
             vec![nth_socket(2)],
             vec![nth_socket(3)],
             vec![nth_socket(4), nth_socket(5)],
+            vec![nth_socket(6), nth_socket(7)],
+            vec![nth_socket(8), nth_socket(9)],
         ],
         "{marks:?}"
     );
     assert_eq!(scene.lab.net.now() - start, SLICE * 4, "the accepts' costs");
-    // The third poll routes the fifth and the sixth Initials again 4 ms in.
+    // The next turn routes the fifth and the sixth Initials again 4 ms in, which takes up its two
+    // attempts, and keeps the four new ones.
     let stats = scene.server.stats();
     assert_eq!(
-        (
-            stats.waiting_peak_datagrams,
-            stats.waiting_peak_bytes,
-            stats.waiting_longest
-        ),
-        (2, 2 * FIRST_INITIAL as u64, SLICE * 4),
-        "{stats:?}"
+        peaks(&stats),
+        (4, 4 * FIRST_INITIAL as u64, SLICE * 4),
+        "more Initials kept at once than waited at the reset raise the size peaks: {stats:?}"
     );
+}
+
+#[test]
+fn a_pushed_back_initial_whose_accept_a_check_keeps_waits_from_its_first_entry_to_its_route() {
+    // The scenario of the push-back test above: the first poll stops in its third turn and
+    // pushes back the sixth Initial, kept at the start.
+    let budget = WorkBudget::per_poll(SLICE);
+    let mut scene = Scene::new(ServerPlan {
+        budget: Some(budget.clone()),
+        handshakes: Some(2),
+        accept_costs: vec![
+            Duration::ZERO,
+            Duration::ZERO,
+            us(600),
+            Duration::ZERO,
+            us(600),
+            Duration::ZERO,
+        ],
+        ..ServerPlan::default()
+    });
+    for _ in 0..6 {
+        scene.connect(0, Some(0));
+    }
+    scene.lab.settle_except(Some(scene.server_task));
+    scene.lab.advance(DELAY);
+    let start = scene.lab.net.now();
+    let mut marks = scene.poll_server();
+    assert_eq!(stop(&marks), Some(Phase::Receive), "{marks:?}");
+    assert_eq!(scene.server.waiting(), (1, false), "{marks:?}");
+    assert_eq!(scene.lab.net.now() - start, us(1_200), "{marks:?}");
+
+    // 2,000 µs in, polls on grants run one unit each, until one routes the sixth Initial again as
+    // its first unit and the check before its accept stops the poll, which keeps the attempt.
+    scene.lab.advance(us(800));
+    budget.set_hold(true);
+    while scene.server.waiting() != (0, true) {
+        assert!(marks.len() < 2_000, "the server keeps waking: {marks:?}");
+        budget.grant();
+        marks.extend(scene.poll_server());
+    }
+    assert_eq!(scene.servers().len(), 5, "{marks:?}");
+
+    // 2,500 µs in, the next polls accept the kept attempt.
+    scene.lab.advance(us(500));
+    budget.set_hold(false);
+    while scene.lab.queued(scene.server_task) {
+        assert!(marks.len() < 2_000, "the server keeps waking: {marks:?}");
+        marks.extend(scene.poll_server());
+    }
+    assert_eq!(
+        accepts_per_turn(&marks),
+        [
+            vec![nth_socket(0), nth_socket(1)],
+            vec![nth_socket(2), nth_socket(3)],
+            vec![nth_socket(4)],
+            vec![nth_socket(5)],
+        ],
+        "{marks:?}"
+    );
+    assert_eq!(scene.server.waiting(), (0, false), "{marks:?}");
+    assert_eq!(scene.lab.net.now() - start, us(2_500), "{marks:?}");
+    let stats = scene.server.stats();
+    assert_eq!(
+        stats.waiting_longest,
+        us(2_000),
+        "the sixth Initial waited from when it was first kept until the route that took it out \
+         of the queue, past the push back and before the accept: {stats:?}"
+    );
+}
+
+/// Returns the three waiting peaks of `stats`: datagrams, bytes and the longest wait.
+fn peaks(stats: &EndpointStats) -> (u64, u64, Duration) {
+    (
+        stats.waiting_peak_datagrams,
+        stats.waiting_peak_bytes,
+        stats.waiting_longest,
+    )
 }
 
 #[test]

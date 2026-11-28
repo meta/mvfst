@@ -388,12 +388,14 @@ impl<A: QuicApplication, B: Backend> EndpointHandle<A, B> {
             .map_or_else(|| self.last.get(), |core| core.stats())
     }
 
-    /// Sets the waiting peaks ([`EndpointStats::waiting_peak_bytes`],
-    /// [`EndpointStats::waiting_peak_datagrams`] and [`EndpointStats::waiting_longest`]) back to
-    /// zero, so that a reader that wants the peaks of each window resets them as the window starts.
-    /// After it, the byte and datagram peaks rise to what the queue holds each time a datagram
-    /// enters it or a work budget's stop puts one back, and the longest wait counts each datagram
-    /// routed again, with its whole wait. The other counters are cumulative and do not change.
+    /// Starts a new window of the waiting peaks ([`EndpointStats::waiting_peak_bytes`],
+    /// [`EndpointStats::waiting_peak_datagrams`] and [`EndpointStats::waiting_longest`]), for a
+    /// reader that wants the peaks of each window and resets them as the window starts. The byte
+    /// and datagram peaks start at what the queue holds at the reset, zero when it is empty, so a
+    /// window in which a backlog only drains still shows it, and rise whenever the queue holds
+    /// more. The longest wait starts at zero and counts each datagram routed again in the window
+    /// with its whole wait, the part before the reset included. The other counters are cumulative
+    /// and do not change.
     pub fn reset_waiting_peaks(&self) {
         match self.core.upgrade() {
             Some(core) => core.reset_waiting_peaks(),

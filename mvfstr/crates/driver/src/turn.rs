@@ -1371,9 +1371,15 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         }
     }
 
-    /// Sets the waiting queue's high-water marks back to zero.
+    /// Starts the waiting queue's high-water marks again: the byte and datagram peaks from what
+    /// the queue holds, and the longest wait from zero.
     pub(crate) fn reset_waiting_peaks(&self) {
-        self.waiting_peaks.set(WaitingPeaks::default());
+        let sched = self.sched.borrow();
+        self.waiting_peaks.set(WaitingPeaks {
+            bytes: sched.waiting.bytes,
+            datagrams: sched.waiting.datagrams.len(),
+            longest: Duration::ZERO,
+        });
     }
 
     /// Adds the transmit counters a socket kept since they were last taken.
@@ -3177,7 +3183,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             if !self.gate(UnitKind::WaitingDatagram, reading.take()) {
                 let mut sched = self.sched.borrow_mut();
                 sched.waiting.push_front(waiting);
-                // After a reset, the size this restores may be above the peaks.
+                // Like every push, this one raises the peaks, though it only restores the size
+                // from before the pop.
                 self.raise_waiting_peaks(&sched.waiting);
                 return;
             }

@@ -476,7 +476,38 @@ fn the_longest_wait_runs_from_when_an_initial_is_kept_to_the_reading_of_the_turn
 }
 
 #[test]
-fn resetting_the_waiting_peaks_zeroes_only_them_and_later_peaks_count_only_later_initials() {
+fn the_longest_wait_counts_a_datagram_routed_again_to_the_connection_an_earlier_one_created() {
+    // The second and the third accept move the test clock on by 3 and 4 ms.
+    let burst = Burst::costing(vec![Duration::ZERO, ms(3), ms(4)], |server| {
+        server.limits(handshakes(1))
+    });
+    let one = Arc::clone(&burst.client_config);
+    let flights = burst.first_flights(&[Arc::clone(&one), one, two_datagram_hello()]);
+    assert_eq!(
+        flights.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1, 1, 2],
+        "the third client's ClientHello takes two datagrams, the others' one"
+    );
+    let start = burst.lab.net.now();
+    // The first turn takes up the first attempt and keeps the second client's Initial and both
+    // datagrams of the third client's first flight at its reading. The second turn routes the
+    // second client's Initial again at the start, the third turn the third client's first
+    // datagram 3 ms later, and the fourth turn its second datagram 7 ms later, to the connection
+    // the first created, without taking an attempt.
+    let attempts = burst.serve(flights.into_iter().flatten());
+    assert_eq!(attempts, in_turns(&[(1, 0..1), (2, 1..2), (3, 2..3)]));
+    assert_eq!(burst.lab.net.now() - start, ms(7), "the accepts' costs");
+    assert_eq!(burst.server.waiting(), (0, false));
+    let stats = burst.server.stats();
+    assert_eq!(
+        stats.waiting_longest,
+        ms(7),
+        "the longest wait is the second datagram's, which no attempt took up: {stats:?}"
+    );
+}
+
+#[test]
+fn with_the_queue_empty_a_reset_zeroes_only_the_waiting_peaks_and_later_initials_set_them() {
     // The second accept moves the clock on by 4 ms and the sixth by 2 ms; the others cost
     // nothing.
     let costs = vec![
