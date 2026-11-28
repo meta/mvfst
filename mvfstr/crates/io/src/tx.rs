@@ -191,6 +191,11 @@ impl Tx {
                         self.counters.messages_per_call[messages_per_call_bucket(accepted)] += 1;
                         self.count_lateness(accepted);
                     }
+                    // A later message failed, and `sendmmsg` lost its error: the loop sends again
+                    // from that message.
+                    if accepted < n {
+                        self.counters.tx_partial += 1;
+                    }
                     if let Some(first) = self.queue.front()
                         && self
                             .queue
@@ -231,6 +236,9 @@ impl Tx {
                 }
                 // `sendmmsg` reports an error only for the first message it was given.
                 Err(e) => {
+                    if e.raw_os_error() == Some(libc::ENOBUFS) {
+                        self.counters.tx_enobufs += 1;
+                    }
                     self.refused = false;
                     self.retire_front(match did_not_leave(&e) {
                         Some(reason) => Retire::Dropped(reason),
@@ -606,10 +614,12 @@ enum Retire {
 /// refused it before handing anything to a device, or `None` when the error leaves this uncertain.
 fn did_not_leave(error: &io::Error) -> Option<DropReason> {
     match error.raw_os_error()? {
-        // Without IP_RECVERR, ENOBUFS comes only from failing to allocate the datagram.
+        // A qdisc dropped the datagram, which UDP reports as ENOBUFS only on a socket with
+        // IP_RECVERR (`MmsgOptions::recv_errors`), or the kernel could not allocate it.
         libc::ENOBUFS | libc::ENOMEM => Some(DropReason::LocalQueue),
         // Bad arguments, size or GSO checks, routing and address errors, netfilter refusals,
-        // and a pending ICMP error that the failed send consumed on a connected socket.
+        // and a pending ICMP error that the failed send consumed, which a connected socket or one
+        // with IP_RECVERR can have.
         libc::EINVAL
         | libc::EMSGSIZE
         | libc::EIO
@@ -1135,6 +1145,75 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
+    fn a_send_refused_with_enobufs_is_reported_dropped_local_queue_and_counted() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let to = peer.local_addr().unwrap();
+        let fd = socket.as_fd();
+        let mut tx = tx(4, ReleaseSupport::None);
+        // The GSO send at the front fails with ENOBUFS, as a qdisc drop does on a socket with
+        // IP_RECVERR; this socket has no such option.
+        tx.injected.push_back(libc::ENOBUFS);
+        let (run, single) = (
+            ConnKey {
+                index: 9,
+                generation: 1,
+            },
+            ConnKey {
+                index: 10,
+                generation: 1,
+            },
+        );
+        queue_run(&mut tx, fd, run, to, &[100, 100, 100]);
+        queue_run(&mut tx, fd, single, to, &[40]);
+        assert_eq!(tx.send(fd), 1);
+
+        let mut buf = [0; 200];
+        assert_eq!(peer.recv(&mut buf).expect("a datagram"), 40);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the refused run did not leave"
+        );
+        let mut reports = Vec::new();
+        tx.drain_reports(|conn, report| reports.push((conn, report)));
+        assert_eq!(
+            reports,
+            vec![
+                (
+                    run,
+                    TxReport::Dropped {
+                        tx: TxSeqRange { start: 0, end: 3 },
+                        reason: DropReason::LocalQueue,
+                    }
+                ),
+                (
+                    single,
+                    TxReport::Flushed {
+                        tx: TxSeqRange { start: 0, end: 1 }
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            tx.take_counters(),
+            TxCounters {
+                calls: 2,
+                messages: 1,
+                messages_per_call: [1, 0, 0, 0, 0, 0, 0, 0],
+                tx_enobufs: 1,
+                ..TxCounters::default()
+            },
+            "the call refused with ENOBUFS, which is neither a GSO retry nor partial, then the \
+             single datagram's call"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn every_gso_send_cut_from_a_stamped_run_carries_its_release() {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let fd = socket.as_fd();
@@ -1391,10 +1470,11 @@ mod tests {
                 messages: 3,
                 release_lateness: [0, 0, 0, 0, 0, 0, 0, 3],
                 messages_per_call: [1, 1, 0, 0, 0, 0, 0, 0],
+                tx_partial: 1,
                 ..TxCounters::default()
             },
-            "the calls that took two messages and one; the EAGAIN and the refused message count \
-             only as calls"
+            "the calls that took two messages and one, the first of them partial; the EAGAIN and \
+             the refused message count only as calls"
         );
     }
 }

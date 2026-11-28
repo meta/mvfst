@@ -111,6 +111,13 @@ pub struct TxCounters {
     /// Calls by the messages the kernel accepted: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, and
     /// 128 or more. Only calls that accepted a message are counted.
     pub messages_per_call: [u64; 8],
+    /// Calls whose first message the kernel refused with ENOBUFS, which on a socket with
+    /// IP_RECVERR is how a qdisc drop shows, and otherwise a failed allocation; that message's
+    /// datagrams are reported dropped.
+    pub tx_enobufs: u64,
+    /// Calls that returned fewer messages than they were given, because a later message failed and
+    /// `sendmmsg` lost its error; the backend sends again from the failed message.
+    pub tx_partial: u64,
 }
 
 /// The transmit half of a backend.

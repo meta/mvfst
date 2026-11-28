@@ -87,7 +87,7 @@ pub fn open(
         socket.set_send_buffer_size(bytes)?;
     }
     // Before binding, so that every datagram arrives with its control messages.
-    prepare(&socket, options.gro);
+    prepare(&socket, options.gro, false);
     socket.bind(&local.into())?;
     if let Some(remote) = remote {
         socket.connect(&remote.into())?;
@@ -184,9 +184,11 @@ fn jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 }
 
 /// Readies a socket for the backend with each setting the socket supports: Don't Fragment, a TOS
-/// and traffic class of 0, and the receive control messages the backend parses. [`probe`] reports
-/// which of the control messages took effect.
-pub(crate) fn prepare(socket: &Socket, gro: bool) {
+/// and traffic class of 0, IP_RECVERR and IPV6_RECVERR if `recv_errors`, and the receive control
+/// messages the backend parses. Without `recv_errors`, the socket keeps its own error options.
+/// [`probe`] reports which of the control messages took effect, and [`queues_errors`] whether the
+/// error options did.
+pub(crate) fn prepare(socket: &Socket, gro: bool, recv_errors: bool) {
     // Failures are not errors. A socket that refuses a control message lacks that capability, and
     // `probe` reports it; the other settings are best effort.
     let set = |level, name, value| {
@@ -204,6 +206,14 @@ pub(crate) fn prepare(socket: &Socket, gro: bool) {
     // A run with TOS 0 is sent without a TOS control message and takes the socket's own value,
     // which a socket from elsewhere may have set.
     set(libc::IPPROTO_IP, libc::IP_TOS, 0);
+    // With IP_RECVERR, a send that a qdisc drops fails with ENOBUFS, where UDP otherwise counts a
+    // send buffer error and reports success, and the kernel queues the ICMP errors from every
+    // peer, not only a connected one's, on the socket's error queue, which the receive half
+    // drains. IPv4-mapped sends and their ICMP errors on a dual-stack socket obey this option, not
+    // IPV6_RECVERR.
+    if recv_errors {
+        on(libc::IPPROTO_IP, libc::IP_RECVERR);
+    }
     if is_ipv6(socket) {
         set(
             libc::IPPROTO_IPV6,
@@ -211,6 +221,9 @@ pub(crate) fn prepare(socket: &Socket, gro: bool) {
             libc::IPV6_PMTUDISC_PROBE,
         );
         set(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, 0);
+        if recv_errors {
+            on(libc::IPPROTO_IPV6, libc::IPV6_RECVERR);
+        }
         on(libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO);
         on(libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS);
         // IPv4 datagrams on a dual-stack socket carry IPV6_PKTINFO with a mapped address, but
@@ -253,6 +266,13 @@ pub fn probe(socket: &Socket, max_datagram: u16) -> TxCaps {
         // An unreadable buffer size is reported as 0, as if the socket could not buffer anything.
         send_buffer: socket.send_buffer_size().unwrap_or(0),
     }
+}
+
+/// Returns whether `socket` queues errors on its error queue, with IP_RECVERR or IPV6_RECVERR. A
+/// socket that is not an IP socket has neither.
+pub(crate) fn queues_errors(socket: &Socket) -> bool {
+    let flag = |level, name| sys::get_int(socket, level, name).is_ok_and(|v| v != 0);
+    flag(libc::IPPROTO_IP, libc::IP_RECVERR) || flag(libc::IPPROTO_IPV6, libc::IPV6_RECVERR)
 }
 
 /// Turns on kernel release for `socket`: SO_TXTIME, with every flag clear, on CLOCK_MONOTONIC, the

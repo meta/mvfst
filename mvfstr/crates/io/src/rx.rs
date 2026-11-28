@@ -52,9 +52,20 @@ pub(crate) struct Rx {
     )]
     iovs: Vec<libc::iovec>,
     hdrs: Vec<libc::mmsghdr>,
+    /// Whether the socket queues errors (IP_RECVERR or IPV6_RECVERR), whose queue `recv` then
+    /// drains.
+    error_queue: bool,
+    /// Errors read from the socket's error queue, one per queued error: the ICMP errors the kernel
+    /// queues, and the local error it also queues for a send it refuses with EMSGSIZE, which that
+    /// send's report already covers.
+    pub(crate) icmp_errors: u64,
     /// The `recvmmsg` calls made, for tests that count them.
     #[cfg(test)]
     pub(crate) calls: usize,
+    /// The `MSG_ERRQUEUE` reads made, those that found the error queue empty included, for tests
+    /// that count them.
+    #[cfg(test)]
+    pub(crate) errqueue_reads: usize,
 }
 
 impl Rx {
@@ -109,14 +120,33 @@ impl Rx {
             control,
             iovs,
             hdrs,
+            error_queue: false,
+            icmp_errors: 0,
             #[cfg(test)]
             calls: 0,
+            #[cfg(test)]
+            errqueue_reads: 0,
         }
     }
 
+    /// Makes `recv` drain the socket's error queue, for a socket that queues errors. Only for one:
+    /// on a socket without an error queue, such as a Unix datagram socket, a read of the error
+    /// queue takes an ordinary datagram.
+    pub(crate) fn with_error_queue(mut self, queues_errors: bool) -> Self {
+        self.error_queue = queues_errors;
+        self
+    }
+
     /// Receives one batch. Returns how many buffers hold datagrams, possibly 0.
+    ///
+    /// On a socket that queues errors, an ICMP error from `recvmmsg` or EAGAIN first drains the
+    /// error queue, since a queued error keeps the socket reported readable until it is read. An
+    /// ICMP error both sets the socket's pending error, which the next send or receive returns
+    /// once, and queues it; EAGAIN is how a queued error shows once a send or an earlier receive
+    /// took the pending error. A batch of datagrams costs no read of the error queue.
     pub(crate) fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
         self.rearm();
+        let mut queue_drained = false;
         let n = loop {
             #[cfg(test)]
             {
@@ -128,11 +158,40 @@ impl Rx {
             // them until the call returns.
             match unsafe { sys::recvmmsg(fd, &mut self.hdrs) } {
                 Ok(n) => break n,
+                Err(e) if icmp_error(&e) => {
+                    self.drain_errors(fd);
+                    queue_drained = true;
+                }
                 Err(e) if absorbed(&e) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A new ICMP error after the drain would have set the pending error, which
+                    // `recvmmsg` returns before EAGAIN, so the queue is still empty.
+                    if e.kind() == io::ErrorKind::WouldBlock && !queue_drained {
+                        self.drain_errors(fd);
+                    }
+                    return Err(e);
+                }
             }
         };
         Ok(self.parse(n))
+    }
+
+    /// Reads every entry of the socket's error queue, counting each, until the read that finds it
+    /// empty. Does nothing on a socket that does not queue errors.
+    fn drain_errors(&mut self, fd: RawFd) {
+        if !self.error_queue {
+            return;
+        }
+        loop {
+            #[cfg(test)]
+            {
+                self.errqueue_reads += 1;
+            }
+            if sys::recv_error(fd).is_err() {
+                return;
+            }
+            self.icmp_errors += 1;
+        }
     }
 
     /// Gives the headers the last call filled their whole name and control space again. The
@@ -209,17 +268,24 @@ fn whole_lengths(hdr: &mut libc::msghdr) {
     hdr.msg_controllen = cmsg::SPACE as _;
 }
 
-/// Returns whether a receive error is one the backend retries past: EINTR, or an ICMP error a
-/// connected socket reports on the next call, which that call consumes. These are the errors the
-/// kernel leaves pending without IP_RECVERR: the fatal unreachable codes, parameter problems
-/// (EPROTO), and frag-needed or packet too big (EMSGSIZE) while path MTU discovery is on. An
-/// unreachable peer is left to the connection's own timers.
+/// Returns whether a receive error is one the backend retries past: EINTR, or an ICMP error the
+/// call consumed (see [`icmp_error`]).
 fn absorbed(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EINTR) || icmp_error(error)
+}
+
+/// Returns whether a receive error is an ICMP error the socket reports on the next call, which that
+/// call consumes. Without IP_RECVERR, only a connected socket reports one, and only for the fatal
+/// unreachable codes, parameter problems (EPROTO), and frag-needed or packet too big (EMSGSIZE)
+/// while path MTU discovery is on. With IP_RECVERR or IPV6_RECVERR, every socket reports every ICMP
+/// error, which adds a failed source route (EOPNOTSUPP) and the soft unreachable codes and time
+/// exceeded, whose errors are among those above. An unreachable peer is left to the connection's
+/// own timers.
+fn icmp_error(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(
-            libc::EINTR
-                | libc::ECONNREFUSED
+            libc::ECONNREFUSED
                 | libc::EHOSTUNREACH
                 | libc::ENETUNREACH
                 | libc::EHOSTDOWN
@@ -228,6 +294,7 @@ fn absorbed(error: &io::Error) -> bool {
                 | libc::ENONET
                 | libc::EPROTO
                 | libc::EMSGSIZE
+                | libc::EOPNOTSUPP
         )
     )
 }
@@ -732,5 +799,27 @@ mod tests {
             assert!(absorbed(&error), "{error}");
         }
         assert!(!absorbed(&io::Error::from_raw_os_error(libc::EBADF)));
+    }
+
+    #[test]
+    fn every_icmp_error_a_socket_with_ip_recverr_can_return_is_absorbed() {
+        // With IP_RECVERR or IPV6_RECVERR, `__udp4_lib_err` and `__udp6_lib_err` leave every ICMP
+        // error pending, on unconnected sockets and soft errors included: the `icmp_err_convert`
+        // and `icmpv6_err_convert` codes, time exceeded (EHOSTUNREACH) and parameter problems.
+        for errno in [
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+            libc::ENOPROTOOPT,
+            libc::ECONNREFUSED,
+            libc::EMSGSIZE,
+            libc::EOPNOTSUPP,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EACCES,
+            libc::EPROTO,
+        ] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(absorbed(&error), "{error}");
+        }
     }
 }

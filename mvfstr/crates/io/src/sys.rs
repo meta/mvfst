@@ -176,6 +176,23 @@ pub(crate) unsafe fn recvmmsg(fd: RawFd, msgs: &mut [libc::mmsghdr]) -> io::Resu
     }
 }
 
+/// Reads one entry of the socket's error queue (`recvmsg` with MSG_ERRQUEUE) and discards it with
+/// its payload and control data. Fails with EAGAIN when the queue is empty.
+///
+/// Only for a socket that queues errors: on a socket without an error queue, such as a Unix
+/// datagram socket, the call reads and discards an ordinary datagram.
+pub(crate) fn recv_error(fd: RawFd) -> io::Result<()> {
+    let mut msg = empty_mmsghdr().msg_hdr;
+    // SAFETY: the header has no name, iovecs or control data, so the kernel writes only its flags
+    // and its control length (0), both into `msg`, which is live.
+    let rc = unsafe { libc::recvmsg(fd, &raw mut msg, libc::MSG_ERRQUEUE) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Returns an empty `mmsghdr`, without a name, iovecs or control data.
 pub(crate) fn empty_mmsghdr() -> libc::mmsghdr {
     // SAFETY: `mmsghdr` is a C struct of integers and raw pointers, for which all zeroes (null

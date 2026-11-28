@@ -8213,6 +8213,27 @@ fn the_lateness_and_call_size_histograms_of_each_socket_reach_the_endpoint_count
 }
 
 #[test]
+fn the_send_error_counts_of_the_server_socket_reach_the_endpoint_counters() {
+    let ping = GatedPing::new();
+    let before = ping.harness.server_stats::<Echo>();
+    // The socket counts two calls refused with ENOBUFS and three partial calls, which the flush of
+    // the echo takes.
+    ping.valves.server.count_send_errors(2, 3);
+    ping.ping();
+    ping.await_echo(0);
+    let after = ping.harness.server_stats::<Echo>();
+    assert_eq!(
+        (
+            after.tx_enobufs - before.tx_enobufs,
+            after.tx_partial - before.tx_partial,
+        ),
+        (2, 3),
+        "the socket's ENOBUFS refusals and partial calls, each in its own counter"
+    );
+    ping.harness.shutdown();
+}
+
+#[test]
 fn a_finished_drivers_handle_keeps_its_last_counters() {
     let harness = Harness::new();
     let (tx, rx) = mpsc::channel();

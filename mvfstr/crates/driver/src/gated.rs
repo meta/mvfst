@@ -7,9 +7,9 @@
 
 //! A backend for the driver's tests: [`MmsgBackend`] behind a [`Valve`] that the test thread
 //! controls. A valve can hold its sockets' flushes behind a simulated EAGAIN, which loopback never
-//! returns, drop a run as the backend drops one that must not leave, fail a receive, add GSO and
-//! histogram counts to what the sockets count, and hold the worker after an attempt. It records
-//! what the sockets did.
+//! returns, drop a run as the backend drops one that must not leave, fail a receive, add GSO,
+//! histogram and send error counts to what the sockets count, and hold the worker after an
+//! attempt. It records what the sockets did.
 
 use std::io;
 use std::mem;
@@ -105,6 +105,9 @@ struct State {
     /// taken.
     release_lateness: [u64; 8],
     messages_per_call: [u64; 8],
+    /// Send error counts the sockets add to what they count when they are next taken.
+    tx_enobufs: u64,
+    tx_partial: u64,
     /// The sockets keep their queued runs and refuse every segment until the test opens them.
     blocked: bool,
     /// The waker of the last `poll_writable` while blocked.
@@ -186,6 +189,15 @@ impl Valve {
         let mut state = self.state();
         add_buckets(&mut state.release_lateness, release_lateness);
         add_buckets(&mut state.messages_per_call, messages_per_call);
+    }
+
+    /// Adds `enobufs` calls refused with ENOBUFS and `partial` calls that sent fewer messages than
+    /// they were given to the counters the sockets return when they are next taken, as a socket
+    /// whose qdisc dropped datagrams counts them. Loopback has no qdisc that drops.
+    pub(crate) fn count_send_errors(&self, enobufs: u64, partial: u64) {
+        let mut state = self.state();
+        state.tx_enobufs += enobufs;
+        state.tx_partial += partial;
     }
 
     /// Returns whether the sockets are blocked and the driver is waiting for them to be writable.
@@ -484,6 +496,8 @@ impl TxBackend for Gated {
             &mut counted.messages_per_call,
             mem::take(&mut state.messages_per_call),
         );
+        counted.tx_enobufs += mem::take(&mut state.tx_enobufs);
+        counted.tx_partial += mem::take(&mut state.tx_partial);
         counted
     }
 }

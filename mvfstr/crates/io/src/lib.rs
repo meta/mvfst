@@ -20,8 +20,10 @@
 //! kernel release through SO_TXTIME. [`HostBackend`] makes the same system calls but takes its
 //! readiness from an [`IoHost`], the event loop of the thread it runs on, so it does not need a
 //! tokio runtime; [`ManualHost`] is an epoll host run by hand. [`socket`] holds the socket setup
-//! both use. Backends do not support userspace or NIC release, recalling queued datagrams, TX
-//! timestamps or IP_RECVERR.
+//! both use. With [`MmsgOptions::recv_errors`], a server socket gets IP_RECVERR: a send whose
+//! datagram a qdisc drops fails with ENOBUFS, so the datagram is not reported sent, and the receive
+//! half drains the ICMP errors that the kernel queues. Backends do not support userspace or NIC
+//! release, recalling queued datagrams or TX timestamps.
 
 pub mod backend;
 #[cfg(target_os = "linux")]

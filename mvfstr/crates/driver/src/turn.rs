@@ -813,6 +813,13 @@ pub struct EndpointStats {
     /// Pacing wakes taken inside transmit phases, counted in `phase_pacing_wakes`, by how late
     /// the check that took each one ran, in the buckets of `release_lateness`.
     pub pacing_wake_lateness: [u64; 8],
+    /// `sendmmsg` calls whose first message the kernel refused with ENOBUFS, which on a socket
+    /// with IP_RECVERR ([`mvfstr_io::MmsgOptions::recv_errors`]) is how a qdisc drop shows, and
+    /// otherwise a failed allocation; the message's datagrams were reported dropped.
+    pub tx_enobufs: u64,
+    /// `sendmmsg` calls that returned fewer messages than they were given, because a later
+    /// message failed and the call lost its error; the socket sent again from that message.
+    pub tx_partial: u64,
     /// `recv_batch` calls the driver makes on its connections. The call inside `Endpoint::accept`
     /// on a new server connection's first datagram is not counted.
     pub recv_batch_calls: u64,
@@ -1360,6 +1367,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
             hold_blocked: hold.blocked,
             hold_carried_flushes: hold.carried_flushes,
             pacing_wake_lateness: self.pacing_wake_lateness.get(),
+            tx_enobufs: tx.tx_enobufs,
+            tx_partial: tx.tx_partial,
             recv_batch_calls: self.recv_batch_calls.get(),
             receive_passes: self.receive_passes.get(),
             deadline_rearms: self.deadline_rearms.get(),
@@ -1392,6 +1401,8 @@ impl<A: QuicApplication, B: Backend> Core<A, B> {
         total.gso_disabled += counted.gso_disabled;
         add_buckets(&mut total.release_lateness, counted.release_lateness);
         add_buckets(&mut total.messages_per_call, counted.messages_per_call);
+        total.tx_enobufs += counted.tx_enobufs;
+        total.tx_partial += counted.tx_partial;
         self.tx_counters.set(total);
     }
 

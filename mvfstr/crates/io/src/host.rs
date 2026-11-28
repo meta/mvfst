@@ -15,9 +15,11 @@
 //! [clears](Readiness::clear) it when the socket returns EAGAIN or after a receive that fills fewer
 //! buffers than the backend has, which ends at the socket's last datagram or at an ICMP error. The
 //! backend reads until then or until its caller's batch budget runs out; with a level-triggered
-//! host, a socket left readable is reported again on the loop's next iteration. Write interest is
-//! requested only after a send returned EAGAIN. [`ManualHost`] is such a host on an epoll instance
-//! that its owner runs by hand.
+//! host, a socket left readable is reported again on the loop's next iteration. On a socket with
+//! IP_RECVERR, a queued ICMP error keeps the socket reported until it is read, so a receive that
+//! meets an ICMP error or EAGAIN drains the socket's error queue. Write interest is requested only
+//! after a send returned EAGAIN. [`ManualHost`] is such a host on an epoll instance that its owner
+//! runs by hand.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -209,6 +211,14 @@ impl<H: IoHost> HostBackend<H> {
             rx,
         })
     }
+
+    /// Returns how many ICMP errors the backend has read from the socket's error queue since it
+    /// opened, one per queued error, and always 0 on a socket that does not queue errors. A send
+    /// the kernel refuses with EMSGSIZE, as larger than the path allows, also queues an error,
+    /// which counts here too.
+    pub fn icmp_errors(&self) -> u64 {
+        self.rx.icmp_errors
+    }
 }
 
 impl<H: IoHost> TxBackend for HostBackend<H> {
@@ -271,7 +281,9 @@ impl<H: IoHost> RxBackend for HostBackend<H> {
     /// Makes one `recvmmsg` call while the host has the socket readable. A batch whose every
     /// datagram was discarded is `Ready(Ok(0))`. A batch that fills every buffer leaves the
     /// readiness set, so the caller reads on while its budget lasts. A shorter one, which ends at
-    /// the socket's last datagram or at an ICMP error, clears it, and so does EAGAIN.
+    /// the socket's last datagram or at an ICMP error, clears it, and so does EAGAIN. On a socket
+    /// that queues errors, an ICMP error from `recvmmsg`, which the call retries past, and EAGAIN
+    /// first drain the socket's error queue, which counts in [`icmp_errors`](Self::icmp_errors).
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         if self.readiness.is_set(Interest::Read) {
             match self.rx.recv(self.socket.as_raw_fd()) {
@@ -610,15 +622,24 @@ fn epoll_ctl(
 }
 
 #[cfg(test)]
+mod netns_tests;
+
+#[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
     use std::net::UdpSocket;
     use std::os::fd::AsFd;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::task::Wake;
 
+    use socket2::Domain;
+    use socket2::Protocol;
+    use socket2::Type;
+
     use super::*;
+    use crate::sys;
 
     /// A waker that counts its wakes.
     #[derive(Default)]
@@ -739,6 +760,20 @@ mod tests {
             host: Some(host.clone()),
             mmsg: MmsgOptions {
                 rx_batch,
+                ..MmsgOptions::default()
+            },
+        };
+        HostBackend::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &options).unwrap()
+    }
+
+    /// Binds a backend on `host` to an IPv4 loopback port, with `rx_batch` receive buffers and
+    /// [`MmsgOptions::recv_errors`].
+    fn bind_queueing_errors(host: &ManualHost, rx_batch: u16) -> HostBackend<ManualHost> {
+        let options = HostOptions {
+            host: Some(host.clone()),
+            mmsg: MmsgOptions {
+                rx_batch,
+                recv_errors: true,
                 ..MmsgOptions::default()
             },
         };
@@ -1054,5 +1089,237 @@ mod tests {
         wait_readable(&backend);
         assert!(matches!(backend.poll_recv_now(&mut cx), Poll::Ready(Ok(2))));
         assert!(!backend.last_full());
+    }
+
+    /// How long a loopback port unreachable has to reach a socket; it takes well under a
+    /// millisecond.
+    const ICMP_WAIT: Duration = Duration::from_secs(2);
+
+    /// Sends one datagram from `backend`'s socket to a closed loopback port, and returns once the
+    /// port unreachable has reached the socket, whose poll then reports an error.
+    fn draw_port_unreachable(backend: &HostBackend<ManualHost>) {
+        let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let to = closed.local_addr().unwrap();
+        drop(closed);
+        backend.socket.send_to(&[1; 10], &to.into()).unwrap();
+        let mut ready = libc::pollfd {
+            fd: backend.socket.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd`; the timeout only bounds the wait.
+        let n = unsafe { libc::poll(&raw mut ready, 1, ICMP_WAIT.as_millis() as libc::c_int) };
+        assert!(
+            n == 1 && ready.revents & libc::POLLERR != 0,
+            "the port unreachable never reached the socket; without IP_RECVERR an unconnected \
+             socket ignores it"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_queued_icmp_error_costs_one_error_queue_read_and_one_that_finds_the_queue_empty() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind_queueing_errors(&host, 32);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // The receive takes the pending error, reads the queued error and then the empty queue,
+        // and its next `recvmmsg` meets EAGAIN without reading the queue again.
+        draw_port_unreachable(&backend);
+        assert_eq!(host.poll(Some(HANG_GUARD)).unwrap(), 1);
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        assert_eq!(
+            (
+                backend.icmp_errors(),
+                backend.rx.errqueue_reads,
+                backend.rx.calls
+            ),
+            (1, 2, 2),
+            "the receive that took the pending error"
+        );
+        assert_eq!(
+            host.poll(Some(Duration::ZERO)).unwrap(),
+            0,
+            "the socket fell quiet"
+        );
+
+        // A send takes the pending error first, so the receive meets EAGAIN, then reads the queued
+        // error and the empty queue.
+        draw_port_unreachable(&backend);
+        let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let refused = backend
+            .socket
+            .send_to(&[2; 10], &sink.local_addr().unwrap().into())
+            .unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::ECONNREFUSED));
+        assert_eq!(host.poll(Some(HANG_GUARD)).unwrap(), 1);
+        assert!(backend.poll_recv(&mut cx).is_pending());
+        assert_eq!(
+            (
+                backend.icmp_errors(),
+                backend.rx.errqueue_reads,
+                backend.rx.calls
+            ),
+            (2, 4, 3),
+            "the receive that met EAGAIN"
+        );
+        assert_eq!(
+            host.poll(Some(Duration::ZERO)).unwrap(),
+            0,
+            "the socket fell quiet"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn only_a_socket_that_queues_errors_has_its_error_queue_read() {
+        let host = ManualHost::new().unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let queueing = MmsgOptions {
+            recv_errors: true,
+            ..MmsgOptions::default()
+        };
+
+        // A UDP socket queues errors, so a receive that meets EAGAIN reads its empty error queue.
+        let mut udp = bind_queueing_errors(&host, 32);
+        udp.readiness.set(Interest::Read);
+        assert!(udp.poll_recv(&mut cx).is_pending());
+        assert_eq!((udp.rx.calls, udp.rx.errqueue_reads), (1, 1), "UDP");
+
+        // A Unix datagram socket refuses the option and has no error queue: a read with
+        // MSG_ERRQUEUE would take one of its datagrams.
+        let (a, _b) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let socket = Socket::from(OwnedFd::from(a));
+        let mut unix = HostBackend::from_socket(socket, host.clone(), &queueing).unwrap();
+        unix.readiness.set(Interest::Read);
+        assert!(unix.poll_recv(&mut cx).is_pending());
+        assert_eq!((unix.rx.calls, unix.rx.errqueue_reads), (1, 0), "Unix");
+    }
+
+    /// Returns `socket`'s value of the integer option `name` at `level`.
+    fn sockopt(socket: &Socket, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        sys::get_int(socket, level, name).unwrap()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_default_server_socket_has_no_ip_recverr_and_never_reads_its_error_queue() {
+        let host = ManualHost::new().unwrap();
+        let mut backend = bind(&host, 32);
+        assert_eq!(
+            sockopt(&backend.socket, libc::IPPROTO_IP, libc::IP_RECVERR),
+            0,
+            "the option is off by default"
+        );
+        backend.readiness.set(Interest::Read);
+        assert!(
+            backend
+                .poll_recv(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(
+            (backend.rx.calls, backend.rx.errqueue_reads),
+            (1, 0),
+            "the receive that met EAGAIN made no other system call"
+        );
+        assert_eq!(backend.icmp_errors(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_option_gives_a_handed_over_socket_ip_recverr_and_a_dual_stack_one_both_options() {
+        let host = ManualHost::new().unwrap();
+        let queueing = MmsgOptions {
+            recv_errors: true,
+            ..MmsgOptions::default()
+        };
+
+        let v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        v4.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+            .unwrap();
+        let v4 = HostBackend::from_socket(v4, host.clone(), &queueing).unwrap();
+        assert_eq!(
+            sockopt(&v4.socket, libc::IPPROTO_IP, libc::IP_RECVERR),
+            1,
+            "IP_RECVERR on an AF_INET socket"
+        );
+
+        // IPv4-mapped sends and their ICMP errors on a dual-stack socket follow IP_RECVERR.
+        let dual = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        dual.set_only_v6(false).unwrap();
+        dual.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+            .unwrap();
+        let dual = HostBackend::from_socket(dual, host.clone(), &queueing).unwrap();
+        assert_eq!(
+            (
+                sockopt(&dual.socket, libc::IPPROTO_IP, libc::IP_RECVERR),
+                sockopt(&dual.socket, libc::IPPROTO_IPV6, libc::IPV6_RECVERR),
+            ),
+            (1, 1),
+            "IP_RECVERR and IPV6_RECVERR on a dual-stack socket"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_socket_opened_for_a_client_connection_never_gets_ip_recverr() {
+        let host = ManualHost::new().unwrap();
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let options = HostOptions {
+            host: Some(host.clone()),
+            mmsg: MmsgOptions {
+                recv_errors: true,
+                ..MmsgOptions::default()
+            },
+        };
+        let mut client = HostBackend::connect(server.local_addr().unwrap(), &options).unwrap();
+        assert_eq!(
+            sockopt(&client.socket, libc::IPPROTO_IP, libc::IP_RECVERR),
+            0,
+            "the option is the server socket's"
+        );
+        client.readiness.set(Interest::Read);
+        assert!(
+            client
+                .poll_recv(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(
+            (client.rx.calls, client.rx.errqueue_reads),
+            (1, 0),
+            "the receive that met EAGAIN read no error queue"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_handed_over_socket_that_already_queues_errors_is_drained_without_the_option() {
+        let host = ManualHost::new().unwrap();
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        socket
+            .bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+            .unwrap();
+        sys::set_int(&socket, libc::IPPROTO_IP, libc::IP_RECVERR, 1).unwrap();
+        let mut backend =
+            HostBackend::from_socket(socket, host.clone(), &MmsgOptions::default()).unwrap();
+        assert_eq!(
+            sockopt(&backend.socket, libc::IPPROTO_IP, libc::IP_RECVERR),
+            1,
+            "the backend leaves the socket's own setting"
+        );
+
+        // A queued error would keep a level-triggered host reporting the socket until it is read,
+        // so the drain follows what the socket does, not the option.
+        backend.readiness.set(Interest::Read);
+        assert!(
+            backend
+                .poll_recv(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(
+            (backend.rx.calls, backend.rx.errqueue_reads),
+            (1, 1),
+            "the receive that met EAGAIN read the empty error queue"
+        );
     }
 }

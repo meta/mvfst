@@ -82,16 +82,28 @@ pub struct MmsgOptions {
     ///
     /// The operator must make sure that an fq qdisc honours the stamps on the sending device: the
     /// setsockopt also succeeds where the qdisc ignores them, and built-ahead datagrams then leave
-    /// at once. The backend does not set IP_RECVERR, so a datagram the qdisc drops, beyond its
+    /// at once. Without [`recv_errors`](Self::recv_errors), a datagram the qdisc drops, beyond its
     /// horizon or a flow's packet limit, is reported flushed; loss detection recovers it, and the
-    /// controller counts it as congestion rather than as a local drop. Production use needs
-    /// IP_RECVERR and an error-queue drain. Every byte waiting in fq stays charged to the socket's
-    /// send buffer, which must hold the connections' built-ahead bytes. Default off.
+    /// controller counts it as congestion rather than as a local drop. With it, that send fails
+    /// with ENOBUFS, and its datagrams are reported dropped
+    /// ([`TxCounters::tx_enobufs`](crate::TxCounters::tx_enobufs) counts such sends) unless the
+    /// send was a later message of a `sendmmsg` call, which loses its error
+    /// ([`TxCounters::tx_partial`](crate::TxCounters::tx_partial)); the backend then sends that
+    /// message again. Every byte waiting in fq stays charged to the socket's send buffer, which
+    /// must hold the connections' built-ahead bytes. Default off.
     pub txtime: bool,
     /// With `txtime`, the furthest ahead of now a release may be, which bounds every
     /// connection's build horizon; at most 1 s, far inside fq's 10 s drop horizon. Default
     /// 100 ms.
     pub txtime_horizon: Duration,
+    /// Sets IP_RECVERR on the backend's socket, and IPV6_RECVERR too on an AF_INET6 one. A send
+    /// whose datagram a qdisc drops then fails with ENOBUFS, and its datagrams are reported dropped
+    /// instead of flushed. The kernel queues the ICMP errors from every peer, and the receive half
+    /// drains them. Each such error also sets the socket's pending error, which the next send or
+    /// receive returns once, so on a socket shared by many connections one ICMP error, a forged one
+    /// included, fails one send of whichever connection comes next. Sockets opened by
+    /// [`Backend::connect`] never set it. Default off.
+    pub recv_errors: bool,
 }
 
 impl Default for MmsgOptions {
@@ -107,6 +119,7 @@ impl Default for MmsgOptions {
             rx_buffer: 65_536,
             txtime: false,
             txtime_horizon: Duration::from_millis(100),
+            recv_errors: false,
         }
     }
 }
@@ -149,9 +162,11 @@ pub struct MmsgBackend {
 impl MmsgBackend {
     /// Opens a backend on an existing socket, probing its capabilities. Like [`socket::open`],
     /// it makes the socket non-blocking, forbids fragmentation, zeroes its TOS and turns on the
-    /// receive control messages the backend parses. A datagram whose control data does not fit
-    /// the backend's buffer is discarded, so the socket must not have other receive control
-    /// messages turned on.
+    /// receive control messages the backend parses and, with
+    /// [`recv_errors`](MmsgOptions::recv_errors), IP_RECVERR. A datagram whose control data does
+    /// not fit the backend's buffer is discarded, so the socket must not have other receive control
+    /// messages turned on. A socket that already has IP_RECVERR or IPV6_RECVERR keeps it, and the
+    /// receive half drains its error queue.
     ///
     /// Fails with `InvalidInput` when `options` are invalid, and with an error when the thread is
     /// not running a tokio runtime. Panics if the thread's runtime does not have I/O enabled.
@@ -325,7 +340,7 @@ fn poll_io<R>(
 /// for its capabilities.
 pub(crate) fn ready(socket: &Socket, options: &MmsgOptions) -> io::Result<(Tx, Rx)> {
     socket.set_nonblocking(true)?;
-    socket::prepare(socket, options.socket.gro);
+    socket::prepare(socket, options.socket.gro, options.recv_errors);
     let mut caps = socket::probe(socket, options.max_datagram);
     if options.txtime {
         caps.release = socket::kernel_release(socket, options.txtime_horizon)?;
@@ -340,7 +355,8 @@ pub(crate) fn ready(socket: &Socket, options: &MmsgOptions) -> io::Result<(Tx, R
     };
     Ok((
         Tx::new(caps, config),
-        Rx::new(options.rx_batch as usize, options.rx_buffer as usize),
+        Rx::new(options.rx_batch as usize, options.rx_buffer as usize)
+            .with_error_queue(socket::queues_errors(socket)),
     ))
 }
 
@@ -359,10 +375,11 @@ pub(crate) fn open_connected(
         reuse_port: false,
         ..options.socket.clone()
     };
-    // Kernel release is the server socket's: a client connection's endpoint cannot give it a
-    // horizon, so its runs are never stamped.
+    // Kernel release and IP_RECVERR belong to the server socket: a client connection's endpoint
+    // cannot give the socket a horizon, so its runs are never stamped.
     let options = MmsgOptions {
         txtime: false,
+        recv_errors: false,
         ..options.clone()
     };
     Ok((socket::open(local, Some(remote), &socket_options)?, options))
@@ -410,6 +427,17 @@ mod tests {
     fn bind(rx_batch: u16) -> MmsgBackend {
         let options = MmsgOptions {
             rx_batch,
+            ..MmsgOptions::default()
+        };
+        MmsgBackend::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &options).unwrap()
+    }
+
+    /// Binds a backend to an IPv4 loopback port, with `rx_batch` receive buffers and
+    /// [`MmsgOptions::recv_errors`].
+    fn bind_queueing_errors(rx_batch: u16) -> MmsgBackend {
+        let options = MmsgOptions {
+            rx_batch,
+            recv_errors: true,
             ..MmsgOptions::default()
         };
         MmsgBackend::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &options).unwrap()
@@ -836,5 +864,45 @@ mod tests {
         wait_queued(&backend, 3);
         assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent);
         assert!(!backend.last_full());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_receive_that_takes_an_icmp_error_drains_it_and_delivers_the_datagrams_behind_it() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let mut backend = bind_queueing_errors(32);
+        let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let to = closed.local_addr().unwrap();
+        drop(closed);
+        backend.io.get_ref().send_to(&[1; 10], &to.into()).unwrap();
+        let mut ready = libc::pollfd {
+            fd: backend.io.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd`; the timeout only bounds the wait.
+        let n = unsafe { libc::poll(&raw mut ready, 1, 2_000) };
+        assert!(
+            n == 1 && ready.revents & libc::POLLERR != 0,
+            "the port unreachable never reached the socket; without IP_RECVERR an unconnected \
+             socket ignores it"
+        );
+
+        // tokio wakes a reader for a readable socket, not for an error alone, so the error waits
+        // for the next datagram, which the receive that takes the error then delivers.
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sent = send(&sender, &backend, 0..1);
+        assert_eq!(recv(&rt, &mut backend, |_| {}).0, sent);
+        assert_eq!(
+            (
+                backend.rx.icmp_errors,
+                backend.rx.errqueue_reads,
+                backend.rx.calls
+            ),
+            (1, 2, 2),
+            "the first recvmmsg took the pending error, the error queue was read for the queued \
+             error and found empty, and the second recvmmsg delivered the datagram"
+        );
     }
 }
