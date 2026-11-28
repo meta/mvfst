@@ -1518,6 +1518,32 @@ fn a_server_lowering_its_idle_timeout_under_0rtt_is_fine() {
     assert_eq!(read_all(pair.server.conn_mut(), id), (1_000, true));
 }
 
+#[test]
+fn a_credit_value_armed_on_a_0rtt_stream_gets_an_edge_for_the_raise_by_the_servers_parameters() {
+    let config = resumable(&early_setup());
+    let higher = with_server(
+        &config,
+        transport(|c| c.max_stream_data_bidi_remote(1 << 20)),
+        true,
+    );
+    let (epoch, mut pair) = start(higher);
+    let client = pair.client.conn_mut();
+    let id = client.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = client.stream(id).unwrap();
+    let remembered = stream.credit_limit();
+    assert_eq!(remembered, 65 * 1024, "the remembered limit is in force");
+    assert_eq!(stream.notify_credit_above(remembered), Ok(()));
+    assert!(pair.handshake(epoch + LIMIT));
+    assert!(
+        pair.client
+            .has_event(&ConnEvent::EarlyData { accepted: true })
+    );
+    let client = pair.client.conn_mut();
+    assert_eq!(client.stream(id).unwrap().credit_limit(), 1 << 20);
+    let edges: Vec<_> = client.readiness().collect();
+    assert_eq!(edges, [(id, StreamReady::CreditRaised)]);
+}
+
 /// Returns a transport config that advertises a max_datagram_frame_size of 65535.
 fn datagrams() -> Arc<TransportConfig> {
     transport(|c| c.max_datagram_frame_size(65535))

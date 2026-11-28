@@ -106,6 +106,26 @@ impl<P: Prioritizer> StreamMut<'_, P> {
         self.conn.stream_track(self.id, offset)
     }
 
+    /// Returns the peer's absolute limit on the send half's offsets: its initial limit for the
+    /// stream from its transport parameters, raised by each MAX_STREAM_DATA, and on a client's
+    /// 0-RTT stream by the parameters of a server that accepted 0-RTT. Sending does not lower it.
+    /// Zero without a send half.
+    pub fn credit_limit(&self) -> u64 {
+        self.conn.stream_credit_limit(self.id)
+    }
+
+    /// Arms one [`StreamReady::CreditRaised`](crate::StreamReady::CreditRaised) edge for when the
+    /// peer raises [`credit_limit`](Self::credit_limit) above `limit`, as [`track`](Self::track)
+    /// does for acknowledged bytes: a limit above `limit` already gives the edge at once, each
+    /// call replaces the value armed before and drops an undelivered edge for it, and each arm
+    /// gives at most one edge. A reset of the send half by [`reset`](Self::reset), and the
+    /// peer's STOP_SENDING whether or not it resets the half, disarm it and drop an undelivered
+    /// edge. It then fails with [`SendError::Stopped`] if the peer sent STOP_SENDING, or else
+    /// with [`SendError::Ended`] once the half is reset.
+    pub fn notify_credit_above(&mut self, limit: u64) -> Result<(), SendError> {
+        self.conn.stream_notify_credit_above(self.id, limit)
+    }
+
     /// Moves the stream to a new place in the wire order.
     pub fn set_order(&mut self, order: SendOrder) {
         self.conn.stream_set_order(self.id, order);

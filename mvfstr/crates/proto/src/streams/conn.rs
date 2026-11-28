@@ -35,6 +35,7 @@ use super::guard::Edge;
 use super::guard::List;
 use super::guard::Owed;
 use super::guard::StreamData;
+use super::guard::StreamGuard;
 use super::guard::Streams;
 use super::map::Half;
 use super::prioritizer::Figures;
@@ -103,6 +104,11 @@ pub(crate) fn staging_budget(cwnd: u64) -> u64 {
     cwnd.saturating_mul(2).max(MIN_STAGING_BUDGET)
 }
 
+/// Marks a [`SendPart`] field that holds a stream limit, or a value compared with one, as unset.
+/// Every peer limit stays below it, since a limit is below 2^62, and a plain `u64` with this value
+/// takes half the room of an `Option<u64>` in every stream.
+const NO_LIMIT: u64 = u64::MAX;
+
 /// A stream's sending part.
 #[derive(Debug)]
 pub(crate) struct SendPart {
@@ -111,11 +117,23 @@ pub(crate) struct SendPart {
     pub(crate) credit: SendCredit,
     /// Whether a push sender was refused bytes and waits for a `Writable` edge.
     pub(crate) push_blocked: bool,
-    /// The limit of the last STREAM_DATA_BLOCKED the peer acknowledged.
-    blocked_delivered: Option<u64>,
+    /// The limit of the last STREAM_DATA_BLOCKED the peer acknowledged, or [`NO_LIMIT`].
+    blocked_delivered: u64,
+    /// The value armed by `notify_credit_above`, or [`NO_LIMIT`]: a raise of the credit limit
+    /// above it marks a `CreditRaised` edge and disarms it.
+    credit_armed: u64,
 }
 
 impl SendPart {
+    /// Returns whether the credit limit is above the armed value, and disarms it if so.
+    fn take_credit_raise(&mut self) -> bool {
+        let raised = self.credit.limit() > self.credit_armed;
+        if raised {
+            self.credit_armed = NO_LIMIT;
+        }
+        raised
+    }
+
     /// Returns the stream credit beyond the staged bytes, or zero once the FIN is staged.
     fn credit_room(&self) -> u64 {
         if self.buf.final_size().is_some() {
@@ -246,7 +264,8 @@ impl PartsConfig {
                 buf: SendBuffer::new(),
                 credit: SendCredit::new(limit),
                 push_blocked: false,
-                blocked_delivered: None,
+                blocked_delivered: NO_LIMIT,
+                credit_armed: NO_LIMIT,
             }),
             recv: recv.map(|window| RecvPart {
                 buf: RecvBuffer::new(),
@@ -254,6 +273,24 @@ impl PartsConfig {
                 stop_delivered: false,
             }),
         }
+    }
+}
+
+/// Takes a new peer limit for `stream`'s send half, from MAX_STREAM_DATA or a 0-RTT server's
+/// transport parameters. A limit that rises makes a pending STREAM_DATA_BLOCKED stale, and one
+/// that rises above the armed value marks `CreditRaised`. On a stream that is not armed, a raise
+/// costs one comparison more.
+fn raise_credit<P: Prioritizer>(stream: &mut StreamGuard<'_, StreamParts, P>, limit: u64) {
+    let Some(send) = stream.data_mut().send.as_mut() else {
+        return;
+    };
+    if !send.credit.on_max(limit) {
+        return;
+    }
+    let raised = send.take_credit_raise();
+    stream.on_control_sent(Owed::STREAM_DATA_BLOCKED);
+    if raised {
+        stream.mark(Edge::CreditRaised);
     }
 }
 
@@ -523,14 +560,7 @@ impl<P: Prioritizer> StreamState<P> {
             let Some(mut stream) = self.streams.stream(id) else {
                 continue;
             };
-            let rose = stream
-                .data_mut()
-                .send
-                .as_mut()
-                .is_some_and(|send| send.credit.on_max(window));
-            if rose {
-                stream.on_control_sent(Owed::STREAM_DATA_BLOCKED);
-            }
+            raise_credit(&mut stream, window);
         }
         let mut available = [false; 2];
         for (dir, max) in [
@@ -808,6 +838,7 @@ impl<P: Prioritizer> StreamState<P> {
         let unsent = send.buf.staged();
         let final_size = send.buf.reset();
         let was_blocked = std::mem::take(&mut send.push_blocked);
+        send.credit_armed = NO_LIMIT;
         let reset = stream.reset(code, final_size);
         debug_assert!(reset.is_ok(), "a send half that may send may reset");
         drop(stream);
@@ -892,6 +923,48 @@ impl<P: Prioritizer> StreamState<P> {
             stream.mark(Edge::Progress);
         }
         Ok(())
+    }
+
+    /// Arms stream `id` for a `CreditRaised` edge once its send credit limit is above `limit`,
+    /// at once if it is already.
+    pub(crate) fn notify_credit_above(
+        &mut self,
+        id: StreamId,
+        limit: u64,
+    ) -> Result<(), SendError> {
+        let Some(mut stream) = self.streams.stream(id) else {
+            return Err(SendError::Ended);
+        };
+        let view = stream.view();
+        let reset = matches!(
+            view.send_state(),
+            Some(SendState::ResetSent { .. } | SendState::ResetRecvd { .. })
+        );
+        let peer_stop = view.peer_stop();
+        let Some(send) = stream.data_mut().send.as_mut() else {
+            return Err(SendError::NoSendHalf);
+        };
+        if let Some(code) = peer_stop {
+            return Err(SendError::Stopped { code });
+        }
+        if reset {
+            return Err(SendError::Ended);
+        }
+        send.credit_armed = limit;
+        let raised = send.take_credit_raise();
+        stream.on_credit_armed();
+        if raised {
+            stream.mark(Edge::CreditRaised);
+        }
+        Ok(())
+    }
+
+    /// Returns the peer's absolute limit on stream `id`'s send half, or zero without one.
+    pub(crate) fn credit_limit(&self, id: StreamId) -> u64 {
+        self.streams
+            .get(id)
+            .and_then(|stream| stream.data().send.as_ref())
+            .map_or(0, |send| send.credit.limit())
     }
 
     /// Returns stream `id`'s send buffer, if the stream has a send half here.
@@ -1168,7 +1241,8 @@ impl<P: Prioritizer> StreamState<P> {
 
     /// Takes a STOP_SENDING for stream `id` with the peer's `code`: the send half resets with the
     /// peer's code at once, queueing RESET_STREAM whatever the application does, as RFC 9000
-    /// requires until the FIN is sent, and the application gets `Stopped`.
+    /// requires until the FIN is sent, the armed credit value is dropped, and the application
+    /// gets `Stopped`.
     pub(crate) fn on_stop_sending(&mut self, id: StreamId, code: AppCode) -> Result<(), ConnError> {
         let config = self.config;
         let Some(mut stream) = self
@@ -1194,15 +1268,17 @@ impl<P: Prioritizer> StreamState<P> {
             return Ok(());
         };
         if stream.on_stop_sending(code, final_size) == Transition::Moved
-            && resets
             && let Some(send) = stream.data_mut().send.as_mut()
         {
-            let unsent = send.buf.staged();
-            send.buf.reset();
-            let was_blocked = std::mem::take(&mut send.push_blocked);
-            drop(stream);
-            self.drop_staged(unsent);
-            self.push_blocked -= u32::from(was_blocked);
+            send.credit_armed = NO_LIMIT;
+            if resets {
+                let unsent = send.buf.staged();
+                send.buf.reset();
+                let was_blocked = std::mem::take(&mut send.push_blocked);
+                drop(stream);
+                self.drop_staged(unsent);
+                self.push_blocked -= u32::from(was_blocked);
+            }
         }
         Ok(())
     }
@@ -1232,14 +1308,7 @@ impl<P: Prioritizer> StreamState<P> {
         else {
             return Ok(());
         };
-        let rose = stream
-            .data_mut()
-            .send
-            .as_mut()
-            .is_some_and(|send| send.credit.on_max(max));
-        if rose {
-            stream.on_control_sent(Owed::STREAM_DATA_BLOCKED);
-        }
+        raise_credit(&mut stream, max);
         Ok(())
     }
 
@@ -1361,7 +1430,7 @@ impl<P: Prioritizer> StreamState<P> {
                     && let Some(send) = stream.data_mut().send.as_mut()
                     && send.credit.limit() == value
                 {
-                    send.blocked_delivered = Some(value);
+                    send.blocked_delivered = value;
                     stream.on_control_sent(Owed::STREAM_DATA_BLOCKED);
                 }
             }
@@ -1430,9 +1499,7 @@ impl<P: Prioritizer> StreamState<P> {
             ControlKind::StreamDataBlocked => parts
                 .send
                 .as_ref()
-                .filter(|send| {
-                    send.credit.is_blocked_at(value) && send.blocked_delivered != Some(value)
-                })
+                .filter(|send| send.credit.is_blocked_at(value) && send.blocked_delivered != value)
                 .map(|_| Owed::STREAM_DATA_BLOCKED),
             ControlKind::ResetStream => Some(Owed::RESET_STREAM),
             ControlKind::StopSending => parts
@@ -1754,6 +1821,108 @@ mod tests {
         );
     }
 
+    /// An edge, and the reindexes and edges taken without a guard that its delivery counted.
+    type GuardCounts = (StreamReady, u64, u64);
+
+    /// Delivers the edges of a request stream on a server whose streams `P` orders, taking edges
+    /// without a guard if `list_edges`. The request arrives in one frame without the FIN, which
+    /// leaves its `Opened` and `Readable` edges pending. The server then arms credit below the
+    /// stream's limit and, if `track`, tracks offset 0, each of which marks its edge at once.
+    /// Returns what the census counted around each edge's delivery alone, and whether the stream
+    /// is still on the readiness list after the last one.
+    fn credit_edge_counts<P: Prioritizer>(
+        list_edges: bool,
+        track: bool,
+    ) -> (Vec<GuardCounts>, bool) {
+        const LIMIT: u32 = 1 << 16;
+        let (now, srtt) = (test_epoch(), Duration::from_millis(20));
+        let config = TransportConfig::builder()
+            .build()
+            .expect("a valid transport config");
+        let mut s = StreamState::<P>::new(Side::Server, &config, PagePool::new());
+        s.streams.set_list_edges(list_edges);
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_bidi_local: VarInt::from_u32(LIMIT),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        let id = StreamId::new(Side::Client, Dir::Bi, 0).unwrap();
+        s.on_stream_frame(id, 0, &[0; 58], false, now, srtt)
+            .unwrap();
+        assert_eq!(s.notify_credit_above(id, u64::from(LIMIT) - 1), Ok(()));
+        if track {
+            assert_eq!(s.track(id, 0), Ok(()));
+        }
+        let mut counts = Vec::new();
+        loop {
+            census::reset();
+            let Some((of, edge)) = s.next_edge() else {
+                break;
+            };
+            let counted = census::read();
+            assert_eq!(of, id);
+            counts.push((edge, counted.reindexes, counted.list_edges));
+        }
+        s.streams.assert_indexed();
+        let slot = s.streams.get(id).expect("the stream is open").slot();
+        (counts, s.streams.is_on(List::Readiness, slot))
+    }
+
+    #[test]
+    fn a_credit_edge_keeps_its_reindex_and_its_place_after_the_list_edges() {
+        let listed = vec![
+            (StreamReady::Opened, 0, 1),
+            (StreamReady::Readable, 0, 1),
+            (StreamReady::CreditRaised, 1, 0),
+            (StreamReady::Progress, 1, 0),
+        ];
+        let guarded = vec![
+            (StreamReady::Opened, 1, 0),
+            (StreamReady::Readable, 1, 0),
+            (StreamReady::CreditRaised, 1, 0),
+            (StreamReady::Progress, 1, 0),
+        ];
+        for (list_edges, want) in [(true, listed), (false, guarded)] {
+            assert_eq!(
+                [
+                    (
+                        "FairShare",
+                        credit_edge_counts::<FairShare>(list_edges, true)
+                    ),
+                    (
+                        "MvfstOrder",
+                        credit_edge_counts::<MvfstOrder>(list_edges, true)
+                    ),
+                ],
+                [
+                    ("FairShare", (want.clone(), false)),
+                    ("MvfstOrder", (want, false)),
+                ],
+                "list edges {list_edges}: by plug and edge, reindexes and edges taken without a \
+                 guard; then whether the stream is still on the readiness list"
+            );
+        }
+        // Without a tracked offset, the pending credit edge alone keeps the stream on the readiness
+        // list once its data edges are taken without a guard.
+        let want = vec![
+            (StreamReady::Opened, 0, 1),
+            (StreamReady::Readable, 0, 1),
+            (StreamReady::CreditRaised, 1, 0),
+        ];
+        assert_eq!(
+            [
+                ("FairShare", credit_edge_counts::<FairShare>(true, false)),
+                ("MvfstOrder", credit_edge_counts::<MvfstOrder>(true, false)),
+            ],
+            [
+                ("FairShare", (want.clone(), false)),
+                ("MvfstOrder", (want, false)),
+            ],
+            "without a tracked offset"
+        );
+    }
+
     #[test]
     fn a_writable_edge_keeps_its_reindex() {
         const BUDGET: u64 = 1 << 20;
@@ -1803,6 +1972,52 @@ mod tests {
             census::read().allowances,
             1,
             "one computation, for the read before the pushes"
+        );
+    }
+
+    #[test]
+    fn arming_credit_leaves_a_carried_allowance_fresh() {
+        const BUDGET: u64 = 1 << 20;
+        const WINDOW: u64 = 10_000;
+        let mut s = state();
+        s.on_peer_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1 << 20),
+            initial_max_stream_data_uni: VarInt::from_u64(WINDOW).unwrap(),
+            initial_max_streams_uni: VarInt::from_u32(2),
+            ..TransportParameters::default()
+        })
+        .unwrap();
+        // Both streams have staged bytes, so they have demand, and a reindex after an arm may
+        // reshare the budget between them.
+        let [a, b] = [(); 2].map(|()| s.open(Dir::Uni, PEER_ORDER).unwrap());
+        for id in [a, b] {
+            let staged = Bytes::from_static(&[0; 1_000]);
+            s.send_parts(id, staged, Bytes::new(), BUDGET).unwrap();
+        }
+        let mut allowance = s.allowance(a, BUDGET);
+        assert_eq!(
+            allowance,
+            WINDOW - 1_000,
+            "the stream credit beyond the staged bytes bounds the allowance"
+        );
+        // Below the limit, which gives the edge at once, then at the limit, which drops it.
+        assert_eq!(s.notify_credit_above(a, WINDOW - 1), Ok(()));
+        assert_eq!(s.notify_credit_above(a, WINDOW), Ok(()));
+        for part in [&b"head"[..], b"body"] {
+            let pushed = s.send_parts_within(
+                a,
+                &mut allowance,
+                Bytes::from_static(part),
+                Bytes::new(),
+                BUDGET,
+            );
+            assert_eq!(pushed, Ok(()), "the carried allowance takes the push");
+        }
+        assert_eq!(allowance, WINDOW - 1_008);
+        assert_eq!(
+            allowance,
+            s.allowance(a, BUDGET),
+            "arming leaves every input of the allowance as it was"
         );
     }
 

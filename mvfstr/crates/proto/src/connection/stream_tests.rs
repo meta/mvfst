@@ -2241,6 +2241,129 @@ fn finishing_a_stream_drops_its_undelivered_writable_edge() {
     assert!(!on_demand(conn), "nor holds a share of the staging budget");
 }
 
+#[test]
+fn a_credit_arm_fails_with_the_reason_on_a_stream_that_sends_no_more_bytes() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let [reset, stopped] = [(); 2].map(|()| conn.open_stream(Dir::Uni, ORDER).unwrap());
+    assert_eq!(
+        conn.stream(reset).unwrap().reset(AppCode::from_u32(1)),
+        Ok(())
+    );
+    let peer_uni = id(Side::Server, Dir::Uni, 0);
+    to_client(
+        &mut pair,
+        &[
+            Frame::StopSending {
+                id: stopped,
+                error_code: varint(7),
+            },
+            stream_frame(peer_uni, 0, 10, false),
+        ],
+    );
+    let conn = pair.client.conn_mut();
+    let code = AppCode::from_u32(7);
+    for (id, error) in [
+        (reset, SendError::Ended),
+        (stopped, SendError::Stopped { code }),
+        (peer_uni, SendError::NoSendHalf),
+    ] {
+        let mut stream = conn.stream(id).unwrap();
+        assert_eq!(stream.notify_credit_above(0), Err(error), "{id}");
+    }
+    assert!(
+        edges(conn)
+            .iter()
+            .all(|(_, edge)| *edge != StreamReady::CreditRaised),
+        "a failed arm does not mark an edge"
+    );
+    assert_eq!(
+        conn.state,
+        super::State::Open,
+        "misuse leaves the connection open"
+    );
+}
+
+#[test]
+fn a_stop_sending_after_every_byte_and_the_fin_are_acknowledged_drops_the_armed_credit() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Bi, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    stream.send(&mut Bytes::from(pattern(2_000))).unwrap();
+    stream.finish().unwrap();
+    pair.run(pair.now + RTT);
+    assert_eq!(send_state(&pair.client, a), Some(SendState::DataRecvd));
+    let conn = pair.client.conn_mut();
+    let mut stream = conn.stream(a).unwrap();
+    let limit = stream.credit_limit();
+    assert_eq!(stream.notify_credit_above(limit), Ok(()));
+    let _ = edges(conn);
+    // The STOP_SENDING leaves the send half in Data Recvd, since every byte and the FIN are
+    // acknowledged, and disarms the credit value: the raise after it in the same packet does not
+    // mark an edge.
+    to_client(
+        &mut pair,
+        &[
+            Frame::StopSending {
+                id: a,
+                error_code: varint(7),
+            },
+            Frame::MaxStreamData {
+                id: a,
+                max: varint(limit + 1_000),
+            },
+        ],
+    );
+    assert_eq!(send_state(&pair.client, a), Some(SendState::DataRecvd));
+    let conn = pair.client.conn_mut();
+    assert_eq!(
+        conn.stream(a).unwrap().credit_limit(),
+        limit + 1_000,
+        "the raise arrived"
+    );
+    assert_eq!(
+        edges(conn),
+        [(
+            a,
+            StreamReady::Stopped {
+                code: AppCode::from_u32(7)
+            }
+        )]
+    );
+}
+
+#[test]
+fn arming_again_drops_an_undelivered_credit_edge_and_compares_with_the_limit_again() {
+    let (_, mut pair) = handshake(Setup::default().pair());
+    let conn = pair.client.conn_mut();
+    let a = conn.open_stream(Dir::Uni, ORDER).unwrap();
+    let mut stream = conn.stream(a).unwrap();
+    let limit = stream.credit_limit();
+    assert_eq!(stream.notify_credit_above(limit), Ok(()));
+    to_client(
+        &mut pair,
+        &[Frame::MaxStreamData {
+            id: a,
+            max: varint(limit + 1_000),
+        }],
+    );
+    // The raise marked an edge. Arming at the new limit replaces the value and drops the edge.
+    let conn = pair.client.conn_mut();
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.notify_credit_above(limit + 1_000), Ok(()));
+    assert_eq!(
+        edges(conn),
+        [],
+        "the limit is not above the value armed now"
+    );
+    // Arming twice below the limit gives one edge.
+    let mut stream = conn.stream(a).unwrap();
+    assert_eq!(stream.notify_credit_above(limit), Ok(()));
+    assert_eq!(stream.notify_credit_above(limit), Ok(()));
+    assert_eq!(edges(conn), [(a, StreamReady::CreditRaised)]);
+}
+
 /// Fills the client's 256 KiB staging budget with four finished streams of 64 KiB each.
 fn fill_the_staging_budget(conn: &mut Connection) {
     for _ in 0..4 {

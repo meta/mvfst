@@ -103,6 +103,20 @@ impl<P: Prioritizer> Connection<P> {
         self.sources.streams.track(id, offset)
     }
 
+    /// Arms stream `id` for a `CreditRaised` edge once its send credit limit is above `limit`.
+    pub(crate) fn stream_notify_credit_above(
+        &mut self,
+        id: StreamId,
+        limit: u64,
+    ) -> Result<(), SendError> {
+        self.sources.streams.notify_credit_above(id, limit)
+    }
+
+    /// Returns the peer's absolute limit on stream `id`'s send half, or zero without one.
+    pub(crate) fn stream_credit_limit(&self, id: StreamId) -> u64 {
+        self.sources.streams.credit_limit(id)
+    }
+
     /// Returns stream `id`'s send buffer, if it has a send half here.
     pub(crate) fn stream_send_buf(&self, id: StreamId) -> Option<&SendBuffer> {
         self.sources.streams.send_buf(id)

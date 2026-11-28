@@ -1348,7 +1348,7 @@ fn edge_run<P: Prioritizer>(seed: u64, list_edges: bool) -> (Vec<EdgeStep>, u64)
 fn edges_arrive_in_the_same_order_with_and_without_list_edges<P: Prioritizer>() {
     // Edges delivered with list edges on, by kind in the order a stream's edges go, and the
     // `Closed` edges right after a data edge of their stream.
-    let (mut kinds, mut closed_after_data, mut taken) = ([0; 8], 0, 0);
+    let (mut kinds, mut closed_after_data, mut taken) = ([0; 9], 0, 0);
     for seed in 111..=116 {
         let (with, list_edges) = edge_run::<P>(seed, true);
         let (without, none) = edge_run::<P>(seed, false);
@@ -1365,11 +1365,12 @@ fn edges_arrive_in_the_same_order_with_and_without_list_edges<P: Prioritizer>() 
                 StreamReady::Reset { .. } => 3,
                 StreamReady::Stopped { .. } => 4,
                 StreamReady::Writable => 5,
-                StreamReady::Progress => 6,
-                StreamReady::Closed => 7,
+                StreamReady::CreditRaised => 6,
+                StreamReady::Progress => 7,
+                StreamReady::Closed => 8,
             };
             kinds[kind] += 1;
-            closed_after_data += usize::from(kind == 7 && last.get(id).is_some_and(|&k| k < 3));
+            closed_after_data += usize::from(kind == 8 && last.get(id).is_some_and(|&k| k < 3));
             last.insert(*id, kind);
         }
         taken += list_edges;
@@ -1377,7 +1378,7 @@ fn edges_arrive_in_the_same_order_with_and_without_list_edges<P: Prioritizer>() 
     assert!(
         kinds
             .iter()
-            .zip([120, 170, 85, 23, 40, 38, 48, 88])
+            .zip([120, 170, 85, 23, 40, 38, 0, 48, 88])
             .all(|(&n, least)| n >= least)
             && closed_after_data >= 50
             && taken >= 380,

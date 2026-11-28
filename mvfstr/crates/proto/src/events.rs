@@ -167,6 +167,13 @@ pub enum StreamReady {
     /// The peer acknowledged every byte below the offset given to
     /// [`StreamMut::track`](crate::StreamMut::track).
     Progress,
+    /// The peer raised the send half's absolute limit
+    /// ([`StreamMut::credit_limit`](crate::StreamMut::credit_limit)) above the value given to
+    /// [`StreamMut::notify_credit_above`](crate::StreamMut::notify_credit_above), with
+    /// MAX_STREAM_DATA or, on a client's 0-RTT stream, with its transport parameters. Unlike
+    /// `Writable`, it fires for any raise above the armed value, however small. Arming a value
+    /// that the limit is already above gives the edge at once.
+    CreditRaised,
     /// Both halves are terminal; the stream is reaped after this edge.
     Closed,
     /// The peer sent STOP_SENDING.

@@ -3,6 +3,15 @@
 Notable changes to mvfstr are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `StreamMut::credit_limit`, the peer's absolute limit on a send half, and
+  `StreamMut::notify_credit_above`, which arms one `StreamReady::CreditRaised`
+  edge for a raise of that limit above a given value. `StreamReady` gains the
+  `CreditRaised` variant, so exhaustive matches on it need a new arm.
+
 ## 0.1.0
 
 The first public version of mvfstr:

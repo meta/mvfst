@@ -97,6 +97,8 @@ pub(crate) enum Edge {
     Writable,
     /// The acknowledged bytes reached the tracked offset.
     Progress,
+    /// The peer's limit on the send half rose above the armed value.
+    CreditRaised,
 }
 
 /// Undelivered readiness edges, as bits.
@@ -111,6 +113,7 @@ impl Edges {
     const STOPPED: u8 = 1 << 4;
     const WRITABLE: u8 = 1 << 5;
     const PROGRESS: u8 = 1 << 6;
+    const CREDIT: u8 = 1 << 7;
 
     /// Clears `bit`, returning whether it was set.
     fn take(&mut self, bit: u8) -> bool {
@@ -904,8 +907,9 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
     }
 
     /// Abandons the send half with RESET_STREAM carrying `code` and `final_size` (the bytes sent
-    /// so far), and marks the frame owed. Pending writable and progress edges are dropped: the
-    /// half does not take bytes, and the reset cancels the tracked offset.
+    /// so far), and marks the frame owed. Pending writable, progress and credit edges are
+    /// dropped: the half does not take bytes, and the reset cancels the tracked offset and the
+    /// armed credit value.
     pub(crate) fn reset(
         &mut self,
         code: AppCode,
@@ -914,7 +918,7 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
         let stream = self.stream_mut();
         let transition = send_half(&mut stream.halves, "reset")?.reset(code, final_size)?;
         stream.owed.0 |= Owed::RESET_STREAM.0;
-        stream.edges.0 &= !(Edges::WRITABLE | Edges::PROGRESS);
+        stream.edges.0 &= !(Edges::WRITABLE | Edges::PROGRESS | Edges::CREDIT);
         Ok(transition)
     }
 
@@ -928,6 +932,12 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
     /// was for the offset tracked before.
     pub(crate) fn on_track(&mut self) {
         self.stream_mut().edges.0 &= !Edges::PROGRESS;
+    }
+
+    /// Records that the application arms a new credit value, and drops a pending credit edge,
+    /// which was for the value armed before.
+    pub(crate) fn on_credit_armed(&mut self) {
+        self.stream_mut().edges.0 &= !Edges::CREDIT;
     }
 
     /// Records that a packet carrying the RESET_STREAM was acknowledged.
@@ -995,10 +1005,11 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
     }
 
     /// Marks a readiness edge after the data parts changed: new in-order bytes, the FIN made
-    /// readable, the allowance back at its low-water mark, or the tracked offset acknowledged.
-    /// Data edges after the receive half was reset or read to the end, and writable edges after
-    /// the send half ended, are dropped; a reset cancels the tracked offset, so a progress edge
-    /// is not marked after it.
+    /// readable, the allowance back at its low-water mark, the tracked offset acknowledged, or
+    /// the send limit raised above the armed value. Data edges after the receive half was reset
+    /// or read to the end, and writable edges after the send half ended, are dropped; a reset
+    /// cancels the tracked offset and the armed value, so neither a progress edge nor a credit
+    /// edge is marked after it.
     pub(crate) fn mark(&mut self, edge: Edge) {
         let stream = self.stream_mut();
         let delivering = matches!(
@@ -1013,6 +1024,7 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
                 stream.halves.send.is_some_and(|s| s.takes_new_data()),
             ),
             Edge::Progress => (Edges::PROGRESS, true),
+            Edge::CreditRaised => (Edges::CREDIT, true),
         };
         if permitted {
             stream.edges.0 |= bit;
@@ -1036,10 +1048,10 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
     }
 
     /// Records that a STOP_SENDING arrived (the table has checked the stream has a send half).
-    /// The first one marks a stopped edge in place of a pending writable one, and the send half
-    /// resets with the peer's code and `final_size` (the bytes sent so far) unless it already
-    /// ended, queueing RESET_STREAM whatever the application does, as RFC 9000 requires until
-    /// the FIN is sent, and dropping a pending progress edge.
+    /// The first one marks a stopped edge in place of pending writable and credit edges, and the
+    /// send half resets with the peer's code and `final_size` (the bytes sent so far) unless it
+    /// already ended, queueing RESET_STREAM whatever the application does, as RFC 9000 requires
+    /// until the FIN is sent, and dropping a pending progress edge.
     pub(crate) fn on_stop_sending(&mut self, code: AppCode, final_size: u64) -> Transition {
         let stream = self.stream_mut();
         let Some(send) = stream.halves.send.as_mut() else {
@@ -1049,7 +1061,7 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
             return Transition::Unchanged;
         }
         stream.peer_stop = Some(code);
-        stream.edges.0 &= !Edges::WRITABLE;
+        stream.edges.0 &= !(Edges::WRITABLE | Edges::CREDIT);
         stream.edges.0 |= Edges::STOPPED;
         if send.reset(code, final_size).is_ok() {
             stream.owed.0 |= Owed::RESET_STREAM.0;
@@ -1059,8 +1071,8 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
     }
 
     /// Delivers the stream's next readiness edge, in the order opened, readable, finished,
-    /// reset, stopped, writable, progress, and last closed. Delivering a reset moves the receive
-    /// half to Reset Read.
+    /// reset, stopped, writable, credit raised, progress, and last closed. Delivering a reset
+    /// moves the receive half to Reset Read.
     pub(crate) fn take_edge(&mut self) -> Option<StreamReady> {
         let stream = self.stream_mut();
         let edges = &mut stream.edges;
@@ -1088,6 +1100,9 @@ impl<D: StreamData, P: Prioritizer> StreamGuard<'_, D, P> {
         }
         if edges.take(Edges::WRITABLE) {
             return Some(StreamReady::Writable);
+        }
+        if edges.take(Edges::CREDIT) {
+            return Some(StreamReady::CreditRaised);
         }
         if edges.take(Edges::PROGRESS) {
             return Some(StreamReady::Progress);
