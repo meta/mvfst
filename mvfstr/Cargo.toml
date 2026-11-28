@@ -8,7 +8,7 @@ members = [
   "crates/tperf",
   "crates/wire",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 license = "MIT"
