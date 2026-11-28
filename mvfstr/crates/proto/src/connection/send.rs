@@ -797,14 +797,13 @@ impl<P: Prioritizer> Connection<P> {
             };
             // RFC 9000 requires these datagrams to be at least 1,200 bytes. They are filled as
             // mvfst fills them: up to the send size, within the slot and the path's credit.
-            let full = room.max(usize::from(MIN_DATAGRAM)).saturating_sub(pos);
             let mut padded = false;
             if last && needs_full && (pos > 0 || !w.is_empty()) {
-                padded = w.pad_to(full).is_ok();
+                padded = fill_datagram(&mut w, room, pos);
             }
             // A datagram with Path frames is filled too, but only if the credit allows 1,200 bytes.
             if last && packet.path && !padded && end >= usize::from(MIN_DATAGRAM) {
-                padded = w.pad_to(full).is_ok();
+                padded = fill_datagram(&mut w, room, pos);
             }
             if w.is_empty() {
                 continue;
@@ -1128,6 +1127,16 @@ fn keep_joiners(
             }
         }
     }
+}
+
+/// Pads `w`, the last packet of a datagram whose earlier packets take `pos` bytes, until the
+/// datagram is `room` bytes long, or 1,200 if `room` is smaller. Returns false if the buffer of
+/// `w` is too short for that. It is cold and out of line because most datagrams are not padded.
+#[cold]
+#[inline(never)]
+fn fill_datagram(w: &mut PacketWriter<'_>, room: usize, pos: usize) -> bool {
+    w.pad_to(room.max(usize::from(MIN_DATAGRAM)).saturating_sub(pos))
+        .is_ok()
 }
 
 /// Returns whether a datagram carrying `class` in `space` must reach 1,200 bytes: a client's
